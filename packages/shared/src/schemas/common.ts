@@ -1,5 +1,12 @@
 import { z } from "zod";
 
+// Query parameters arrive as strings. Boolean("false") is true, so coercion
+// cannot be used for boolean filters.
+export const QueryBooleanSchema = z.union([
+  z.boolean(),
+  z.enum(["true", "false"]).transform((value) => value === "true"),
+]);
+
 export const PaginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),

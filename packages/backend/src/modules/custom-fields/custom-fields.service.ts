@@ -1,4 +1,5 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
+import { assertTaskEdit } from "../../utils/project-access.js";
 import type {
   CreateCustomFieldInput,
   UpdateCustomFieldInput,
@@ -154,6 +155,7 @@ export async function setFieldValue(
   taskId: string,
   fieldId: string,
   data: SetCustomFieldValueInput,
+  actorId: string,
 ) {
   // Bind both resources to the project authorized by the route. Independent
   // foreign keys alone do not prevent cross-project or cross-workspace writes.
@@ -172,6 +174,8 @@ export async function setFieldValue(
   if (!field) {
     throw new NotFoundError("Custom field not found in this project");
   }
+
+  await assertTaskEdit(prisma, taskId, actorId);
 
   // Validate value type matches field type
   if (data.value !== null) {

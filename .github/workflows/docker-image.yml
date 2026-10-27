@@ -1,43 +1,113 @@
-  name: Docker Image CI                                                                                                          
-   
-  on:                                                                                                                            
-    push:         
-      branches: ["main"]
-    pull_request:
-      branches: ["main"]
+name: CI
 
-  permissions:
-    contents: read
-    packages: write
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-  jobs:
-    build:
-      runs-on: ubuntu-latest
+permissions:
+  contents: read
 
-      steps:
-        - uses: actions/checkout@v4
+jobs:
+  validate:
+    name: Tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: audit
+          POSTGRES_PASSWORD: ci-disposable-only
+          POSTGRES_DB: werkyn_ci
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U audit -d werkyn_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Configure disposable database
+        env:
+          POSTGRES_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          CI_DATABASE_URL="postgresql://audit:ci-disposable-only@127.0.0.1:${POSTGRES_PORT}/werkyn_ci"
+          printf 'DATABASE_URL=%s\nTEST_DATABASE_URL=%s\n' "$CI_DATABASE_URL" "$CI_DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate and generate Prisma client
+        run: |
+          pnpm --filter @pm/backend exec prisma validate
+          pnpm --filter @pm/backend exec prisma generate
+      - name: Apply migrations to disposable PostgreSQL
+        run: pnpm --filter @pm/backend exec prisma migrate deploy
+      - name: Unit and frontend regression tests
+        run: pnpm test
+      - name: PostgreSQL integration tests
+        run: pnpm test:integration
+      - name: Typecheck
+        run: pnpm lint
+      - name: Production build
+        run: pnpm build
 
-        - name: Log in to GHCR
-          uses: docker/login-action@v3
-          with:
-            registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
+  build_image:
+    name: Container build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
 
-        - name: Generate image tags
-          id: meta
-          uses: docker/metadata-action@v5
-          with:
-            images: ghcr.io/${{ github.repository }}
-            tags: |
-              type=ref,event=branch
-              type=ref,event=pr
-              type=sha,prefix=
-
-        - name: Build and push
-          uses: docker/build-push-action@v6
-          with:
-            context: .
-            push: true
-            tags: ${{ steps.meta.outputs.tags }}
-            labels: ${{ steps.meta.outputs.labels }}
+  publish:
+    name: Publish authorized main image
+    needs: [validate, build_image]
+    if: >-
+      ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLICATION == 'true' && needs.validate.result == 'success' && needs.build_image.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

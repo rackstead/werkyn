@@ -73,6 +73,22 @@ A06 regression family and add actual PostgreSQL row-lock contention, fixed-clock
 revision changes, retry exhaustion, verification overlap, token-switch and
 refetch-failure cases.
 
+The PostgreSQL concurrency fixture has an explicit connection budget. Its
+application pool defaults to four actor connections, or retains an explicitly
+supplied `connection_limit=4` or `connection_limit=5` in `TEST_DATABASE_URL`.
+Other explicit pool sizes are rejected for this fixture. A separate Prisma pool
+has two control connections: one holds the row lock and the other observes
+`pg_stat_activity`. Thus the default fixture uses at most six connections; the
+five-connection application case uses at most seven. The test prints the requested
+and effective budgets. It does not run with five total connections or silently
+raise a supplied application limit. All four Drive UPDATEs must be observed
+waiting on real PostgreSQL locks before release. The existing five-second wait
+bound and ten-second held-transaction timeout are unchanged. Cleanup releases the
+holder and awaits both its transaction and every actor, including rejected-lock
+paths, before disconnecting the pools and removing fixtures. The Wiki fixture
+deliberately rolls back its control holder while Drive commits, covering both
+outcomes without changing the blocked-writer or credential assertions.
+
 The opt-in browser fixture uses an installed Playwright package and Chromium,
 plus OpenSSL for a disposable self-signed HTTPS certificate. The isolated browser
 allows that local certificate and disables back/forward document caching; it does

@@ -10,7 +10,27 @@ if (!process.env.TEST_DATABASE_URL)
   throw new Error(
     "Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database",
   );
-process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+// Four actor connections admit every blocked Drive writer. Preserve the
+// explicitly supplied five-connection CI pool; reject other fixture budgets.
+const actorDatabaseUrl = new URL(process.env.TEST_DATABASE_URL);
+const requestedActorLimit =
+  actorDatabaseUrl.searchParams.get("connection_limit");
+const actorConnections =
+  requestedActorLimit === null ? 4 : Number(requestedActorLimit);
+assert(
+  [4, 5].includes(actorConnections),
+  "Public-share concurrency fixture requires connection_limit=4 or 5",
+);
+actorDatabaseUrl.searchParams.set("connection_limit", String(actorConnections));
+const controlDatabaseUrl = new URL(actorDatabaseUrl);
+controlDatabaseUrl.searchParams.set("connection_limit", "2");
+process.env.DATABASE_URL = actorDatabaseUrl.toString();
+console.info("Public-share fixture connection budget", {
+  requestedActorLimit,
+  actorConnections,
+  controlConnections: 2,
+  totalConnections: actorConnections + 2,
+});
 process.env.NODE_ENV = "test";
 process.env.LOG_LEVEL = "error";
 process.env.JWT_SECRET = "public-share-test-jwt-secret";
@@ -21,11 +41,12 @@ const storageDir = await mkdtemp(
   path.join(os.tmpdir(), "werkyn-public-share-"),
 );
 process.env.STORAGE_DIR = storageDir;
+const { PrismaClient } = await import("@prisma/client");
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { createShareGrant, shareGrantCookieName } =
   await import("../../src/utils/share-grants.ts");
-let app, user, workspace, space, ownerToken, passwordHash;
+let app, control, user, workspace, space, ownerToken, passwordHash;
 let requestNumber = 0,
   storageReads = 0;
 
@@ -198,6 +219,11 @@ async function assertReadable(share, cookie) {
 }
 
 before(async () => {
+  // The lock holder and observer must remain independent of blocked actors.
+  control = new PrismaClient({
+    datasources: { db: { url: controlDatabaseUrl.toString() } },
+  });
+  await control.$connect();
   app = await buildApp();
   await app.ready();
   const originalRead = app.storage.readStream.bind(app.storage);
@@ -237,8 +263,13 @@ after(async () => {
       await app.prisma.workspace.delete({ where: { id: workspace.id } });
     if (user) await app.prisma.user.delete({ where: { id: user.id } });
   } finally {
-    await app?.close();
+    const closed = await Promise.allSettled([
+      app?.close(),
+      control?.$disconnect(),
+    ]);
     await rm(storageDir, { recursive: true, force: true });
+    for (const result of closed)
+      if (result.status === "rejected") throw result.reason;
   }
 });
 
@@ -640,7 +671,7 @@ test("authenticated management create/get/list returns hasPassword without passw
 async function waitForDatabaseWaiters(table, expected) {
   const deadline = performance.now() + 5000;
   while (performance.now() < deadline) {
-    const rows = await app.prisma.$queryRaw`
+    const rows = await control.$queryRaw`
       SELECT count(*)::int AS count FROM pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock'
         AND query LIKE ${`%UPDATE%${table}%`}
@@ -668,6 +699,9 @@ for (const kind of ["wiki", "files"]) {
         ? [{ expiresAt: new Date(Date.now() + 120_000).toISOString() }]
         : []),
     ];
+    // Exercise rejected-holder cleanup as well as the normal committed holder.
+    const controlFailure =
+      kind === "wiki" ? new Error("Expected control rollback") : undefined;
     let unlock, locked;
     const unlocked = new Promise((resolve) => {
       unlock = resolve;
@@ -675,7 +709,7 @@ for (const kind of ["wiki", "files"]) {
     const ready = new Promise((resolve) => {
       locked = resolve;
     });
-    const lock = app.prisma.$transaction(
+    const lock = control.$transaction(
       async (tx) => {
         await tx.$queryRawUnsafe(
           `SELECT id FROM "${table}" WHERE id = $1 FOR UPDATE`,
@@ -683,13 +717,21 @@ for (const kind of ["wiki", "files"]) {
         );
         locked();
         await unlocked;
+        if (controlFailure) throw controlFailure;
       },
       { timeout: 10_000 },
     );
     let pending, results;
     const realNow = Date.now;
     try {
-      await ready;
+      await Promise.race([
+        ready,
+        lock.then(() => {
+          throw new Error(
+            "Control transaction ended before its row lock was ready",
+          );
+        }),
+      ]);
       Date.now = () => share.updatedAt.getTime();
       pending = writes.map((body) =>
         request("PATCH", mutationPath(share), body, undefined, true),
@@ -699,13 +741,15 @@ for (const kind of ["wiki", "files"]) {
       pending = running;
       await waitForDatabaseWaiters(table, writes.length);
       unlock();
-      await lock;
+      if (controlFailure)
+        await assert.rejects(lock, (error) => error === controlFailure);
+      else await lock;
       results = await Promise.all(running);
     } finally {
       Date.now = realNow;
       unlock();
-      await lock;
-      await Promise.allSettled(pending ?? []);
+      // A rejected lock must never skip waiting for the remaining actors.
+      await Promise.allSettled([lock, ...(pending ?? [])]);
     }
     for (const result of results)
       assert.equal(result.statusCode, 200, result.body);

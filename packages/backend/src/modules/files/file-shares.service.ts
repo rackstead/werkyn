@@ -3,13 +3,12 @@ import type { FastifyInstance } from "fastify";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
 import { NotFoundError, ForbiddenError } from "../../utils/errors.js";
-import { assertFileAccess } from "./file-access.js";
+import {
+  assertFileAccess,
+  fileAccessRole,
+  type AccessContext,
+} from "./file-access.js";
 import { notify } from "../../utils/notify.js";
-
-interface AccessContext {
-  userId: string;
-  workspaceRole: string;
-}
 
 // ─── Member Shares ──────────────────────────────────────
 
@@ -24,7 +23,7 @@ export async function createFileShares(
 ) {
   // Verify access to all files
   for (const fileId of fileIds) {
-    await assertFileAccess(prisma, fileId, ctx);
+    await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
   }
 
   // Verify recipients are workspace members
@@ -52,7 +51,10 @@ export async function createFileShares(
 
   if (data.length === 0) return { count: 0 };
 
-  const result = await prisma.fileShare.createMany({ data, skipDuplicates: true });
+  const result = await prisma.fileShare.createMany({
+    data,
+    skipDuplicates: true,
+  });
 
   // Send notifications to recipients
   if (fastify && result.count > 0) {
@@ -96,7 +98,7 @@ export async function removeFileShare(
   userId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
 
   return prisma.fileShare.deleteMany({
     where: { workspaceId, fileId, sharedWithId: userId },
@@ -109,7 +111,7 @@ export async function getFileShares(
   fileId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   return prisma.fileShare.findMany({
     where: { workspaceId, fileId },
@@ -128,12 +130,18 @@ export async function getFileShares(
 export async function listSharedWithMe(
   prisma: PrismaClient,
   workspaceId: string,
-  userId: string,
+  ctx: AccessContext,
   cursor?: string,
   limit = 50,
 ) {
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const userId = ctx.userId;
   const shares = await prisma.fileShare.findMany({
-    where: { workspaceId, sharedWithId: userId },
+    where: {
+      workspaceId,
+      sharedWithId: userId,
+      file: { workspaceId, trashedAt: null },
+    },
     include: {
       file: {
         include: {
@@ -163,14 +171,20 @@ export async function listSharedWithMe(
 export async function listSharedByMe(
   prisma: PrismaClient,
   workspaceId: string,
-  userId: string,
+  ctx: AccessContext,
   _cursor?: string,
   _limit = 50,
 ) {
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const userId = ctx.userId;
   // Query both member shares and public link shares in parallel
   const [memberShares, linkShareFiles] = await Promise.all([
     prisma.fileShare.findMany({
-      where: { workspaceId, sharedById: userId },
+      where: {
+        workspaceId,
+        sharedById: userId,
+        file: { workspaceId, trashedAt: null },
+      },
       include: {
         file: {
           include: {
@@ -188,6 +202,7 @@ export async function listSharedByMe(
     prisma.fileShareLinkFile.findMany({
       where: {
         shareLink: { workspaceId, createdById: userId },
+        file: { workspaceId, trashedAt: null },
       },
       include: {
         file: {
@@ -251,7 +266,7 @@ export async function createFileShareLink(
   expiresAt?: string,
 ) {
   for (const fileId of fileIds) {
-    await assertFileAccess(prisma, fileId, ctx);
+    await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
   }
 
   const token = crypto.randomBytes(6).toString("base64url");
@@ -289,7 +304,7 @@ export async function getFileShareLinks(
   fileId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   return prisma.fileShareLink.findMany({
     where: {
@@ -362,9 +377,16 @@ export async function getPublicShareLink(prisma: PrismaClient, token: string) {
     where: { token },
     include: {
       files: {
+        where: { file: { trashedAt: null } },
         include: {
           file: {
-            select: { id: true, name: true, mimeType: true, size: true },
+            select: {
+              id: true,
+              name: true,
+              mimeType: true,
+              size: true,
+              workspaceId: true,
+            },
           },
         },
       },
@@ -381,7 +403,12 @@ export async function getPublicShareLink(prisma: PrismaClient, token: string) {
   }
 
   return {
-    files: link.files,
+    files: link.files
+      .filter((entry) => entry.file.workspaceId === link.workspaceId)
+      .map((entry) => {
+        const { workspaceId: _workspaceId, ...file } = entry.file;
+        return { ...entry, file };
+      }),
     createdBy: link.createdBy,
     hasPassword: !!link.passwordHash,
     createdAt: link.createdAt,
@@ -431,7 +458,12 @@ export async function downloadPublicFile(
   }
 
   const file = link.files[0].file;
-  if (!file.storagePath) {
+  if (
+    file.workspaceId !== link.workspaceId ||
+    file.trashedAt ||
+    file.isFolder ||
+    !file.storagePath
+  ) {
     throw new NotFoundError("File content not available");
   }
 
@@ -445,10 +477,16 @@ export async function getFileShareStatus(
   prisma: PrismaClient,
   workspaceId: string,
   fileIds: string[],
+  ctx: AccessContext,
 ) {
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
   const [shares, linkFiles] = await Promise.all([
     prisma.fileShare.findMany({
-      where: { workspaceId, fileId: { in: fileIds } },
+      where: {
+        workspaceId,
+        fileId: { in: fileIds },
+        file: { workspaceId, trashedAt: null },
+      },
       select: { fileId: true },
       distinct: ["fileId"],
     }),
@@ -456,6 +494,7 @@ export async function getFileShareStatus(
       where: {
         fileId: { in: fileIds },
         shareLink: { workspaceId },
+        file: { workspaceId, trashedAt: null },
       },
       select: { fileId: true },
       distinct: ["fileId"],

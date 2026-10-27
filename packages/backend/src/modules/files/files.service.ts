@@ -14,12 +14,12 @@ import sharp from "sharp";
 import archiver from "archiver";
 import { env } from "../../config/env.js";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
-import { assertFileAccess, resolveTeamFolderForParent } from "./file-access.js";
-
-interface AccessContext {
-  userId: string;
-  workspaceRole: string;
-}
+import {
+  assertFileAccess,
+  fileAccessRole,
+  resolveFileDestination,
+  type AccessContext,
+} from "./file-access.js";
 
 export async function uploadFileStream(
   prisma: PrismaClient,
@@ -32,20 +32,18 @@ export async function uploadFileStream(
   stream: Readable,
   ctx: AccessContext,
 ) {
-  // Run access checks BEFORE streaming to avoid writing a large file then failing
-  if (parentId) {
-    await assertFileAccess(prisma, parentId, ctx, true);
-  }
-
-  const teamFolderId = await resolveTeamFolderForParent(prisma, parentId);
+  const destination = await resolveFileDestination(
+    prisma,
+    { ...ctx, workspaceId },
+    parentId,
+  );
+  const { teamFolderId } = destination;
   const isTeamContext = !!teamFolderId;
 
   const ext = path.extname(fileName) || "";
   const fileId = crypto.randomUUID();
 
-  const scopeId = isTeamContext
-    ? `groupfolders/${teamFolderId}`
-    : uploadedById;
+  const scopeId = isTeamContext ? `groupfolders/${teamFolderId}` : uploadedById;
 
   // Stream to disk with size enforcement
   const { storagePath, size } = await storage.saveStream(
@@ -83,14 +81,14 @@ export async function uploadFileStream(
     const file = await prisma.file.create({
       data: {
         workspaceId,
-        parentId: parentId || null,
+        parentId: destination.parentId,
         name: fileName,
         mimeType,
         size,
         storagePath,
         isFolder: false,
         uploadedById,
-        ownerId: isTeamContext ? null : uploadedById,
+        ownerId: destination.ownerId,
         teamFolderId: teamFolderId,
         thumbnailPath,
       },
@@ -111,34 +109,20 @@ export async function createFolder(
   input: CreateFolderInput,
   ctx: AccessContext,
 ) {
-  // Check access on parent if specified
-  if (input.parentId) {
-    await assertFileAccess(prisma, input.parentId, ctx, true);
-  }
-
-  const teamFolderId =
-    input.teamFolderId ??
-    (await resolveTeamFolderForParent(prisma, input.parentId));
-  const isTeamContext = !!teamFolderId;
-
-  // If teamFolderId was explicitly provided, verify it exists and user has access
-  if (input.teamFolderId) {
-    const tf = await prisma.teamFolder.findUnique({
-      where: { id: input.teamFolderId },
-    });
-    if (!tf) throw new NotFoundError("Team folder not found");
-    await assertFileAccess(prisma, tf.folderId, ctx, true);
-  }
+  const destination = await resolveFileDestination(
+    prisma,
+    { ...ctx, workspaceId },
+    input.parentId,
+    input.teamFolderId,
+  );
 
   const folder = await prisma.file.create({
     data: {
       workspaceId,
-      parentId: input.parentId || null,
+      ...destination,
       name: input.name,
       isFolder: true,
       uploadedById,
-      ownerId: isTeamContext ? null : uploadedById,
-      teamFolderId: teamFolderId,
     },
   });
 
@@ -151,7 +135,17 @@ export async function listFiles(
   query: FileQueryInput,
   ctx: AccessContext,
 ) {
-  const { parentId, teamFolderId, search, cursor, limit, trashed, sortBy, sortOrder } = query;
+  const role = await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const {
+    parentId,
+    teamFolderId,
+    search,
+    cursor,
+    limit,
+    trashed,
+    sortBy,
+    sortOrder,
+  } = query;
 
   const where: Record<string, unknown> = {
     workspaceId,
@@ -161,7 +155,7 @@ export async function listFiles(
     where.trashedAt = { not: null };
 
     // Scope trash to personal files + team folder files user can access
-    if (ctx.workspaceRole !== "ADMIN") {
+    if (role !== "ADMIN") {
       const userTeamFolderIds = await getUserTeamFolderIds(prisma, ctx.userId);
       where.OR = [
         { ownerId: ctx.userId },
@@ -176,8 +170,11 @@ export async function listFiles(
     if (search) {
       where.name = { contains: search, mode: "insensitive" };
       // Scope search to accessible files
-      if (ctx.workspaceRole !== "ADMIN") {
-        const userTeamFolderIds = await getUserTeamFolderIds(prisma, ctx.userId);
+      if (role !== "ADMIN") {
+        const userTeamFolderIds = await getUserTeamFolderIds(
+          prisma,
+          ctx.userId,
+        );
         where.OR = [
           { ownerId: ctx.userId },
           ...(userTeamFolderIds.length > 0
@@ -185,10 +182,28 @@ export async function listFiles(
             : []),
         ];
       }
-    } else if (parentId) {
-      // Inside a specific folder — check access on parent
-      await assertFileAccess(prisma, parentId, ctx);
-      where.parentId = parentId;
+    } else if (parentId || teamFolderId) {
+      let folderId = parentId;
+      if (!folderId && teamFolderId) {
+        const team = await prisma.teamFolder.findFirst({
+          where: { id: teamFolderId, workspaceId },
+          select: { folderId: true },
+        });
+        if (!team) throw new NotFoundError("Team folder not found");
+        folderId = team.folderId;
+      }
+      await assertFileAccess(prisma, folderId!, { ...ctx, workspaceId });
+      const parent = await prisma.file.findFirst({
+        where: { id: folderId!, workspaceId, isFolder: true, trashedAt: null },
+        select: { teamFolderId: true, asTeamFolder: { select: { id: true } } },
+      });
+      if (!parent) throw new NotFoundError("Folder not found");
+      if (
+        teamFolderId &&
+        (parent.asTeamFolder?.id ?? parent.teamFolderId) !== teamFolderId
+      )
+        throw new ForbiddenError("Team folder does not match its parent");
+      where.parentId = folderId;
     } else {
       // Root listing — only personal files (team folders shown separately)
       where.parentId = null;
@@ -256,7 +271,7 @@ export async function getFile(
 
   if (!file) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   return file;
 }
@@ -276,7 +291,7 @@ export async function downloadFile(
     throw new NotFoundError("File not found");
   }
 
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   const stream = storage.readStream(file.storagePath);
   return { stream, file };
@@ -295,60 +310,65 @@ export async function updateFile(
   });
   if (!existing) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, ctx, true);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true, true);
 
-  // If moving (changing parentId), handle cross-scope moves
-  if (input.parentId !== undefined) {
-    const sourceTeamFolderId = existing.teamFolderId;
-    const destTeamFolderId = input.teamFolderId !== undefined
-      ? input.teamFolderId
-      : input.parentId
-        ? await resolveTeamFolderForParent(prisma, input.parentId)
-        : null;
-
-    // Check access on destination
-    if (input.parentId) {
-      await assertFileAccess(prisma, input.parentId, ctx, true);
+  if (input.parentId !== undefined || input.teamFolderId !== undefined) {
+    if (existing.asTeamFolder)
+      throw new ForbiddenError("Team folder roots cannot be moved");
+    const destination = await resolveFileDestination(
+      prisma,
+      { ...ctx, workspaceId },
+      input.parentId,
+      input.teamFolderId,
+    );
+    if (destination.parentId === fileId)
+      throw new ForbiddenError("A folder cannot contain itself");
+    // Reject descendant destinations with a visited set, including legacy cycles.
+    const visited = new Set<string>([fileId]);
+    let ancestor = destination.parentId;
+    while (ancestor) {
+      if (visited.has(ancestor))
+        throw new ForbiddenError("Invalid folder ancestry");
+      visited.add(ancestor);
+      const row = await prisma.file.findFirst({
+        where: { id: ancestor, workspaceId },
+        select: { parentId: true },
+      });
+      if (!row) throw new NotFoundError("Destination folder not found");
+      ancestor = row.parentId;
     }
+    const destTeamFolderId = destination.teamFolderId;
+    const crossScope =
+      existing.teamFolderId !== destTeamFolderId ||
+      existing.ownerId !== destination.ownerId;
+    const updateData = destination;
 
-    // Handle cross-scope move: update teamFolderId and ownerId
-    const crossScope = sourceTeamFolderId !== destTeamFolderId;
-    const updateData: Record<string, unknown> = {
-      parentId: input.parentId,
-    };
-
-    if (crossScope) {
-      if (destTeamFolderId) {
-        // Moving to team folder
-        updateData.teamFolderId = destTeamFolderId;
-        updateData.ownerId = null;
-      } else {
-        // Moving to personal drive
-        updateData.teamFolderId = null;
-        updateData.ownerId = ctx.userId;
-      }
-    }
-
-    const file = await prisma.file.update({
-      where: { id: fileId },
-      data: {
-        ...(input.name !== undefined ? { name: input.name } : {}),
-        ...updateData,
-        ...(input.trashedAt !== undefined
-          ? { trashedAt: input.trashedAt }
-          : {}),
-      },
-    });
-
-    // For folders: recursively update all descendants' scope
-    if (crossScope && existing.isFolder) {
-      await updateDescendantsScope(
-        prisma,
-        fileId,
-        destTeamFolderId,
-        destTeamFolderId ? null : ctx.userId,
-      );
-    }
+    const descendants = existing.isFolder
+      ? await collectDescendantFiles(prisma, fileId, { ...ctx, workspaceId })
+      : [];
+    const [file] = await prisma.$transaction([
+      prisma.file.update({
+        where: { id: fileId, workspaceId },
+        data: {
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...updateData,
+          ...(input.trashedAt !== undefined
+            ? { trashedAt: input.trashedAt }
+            : {}),
+        },
+      }),
+      ...(crossScope && descendants.length > 0
+        ? [
+            prisma.file.updateMany({
+              where: { id: { in: descendants.map((d) => d.id) }, workspaceId },
+              data: {
+                teamFolderId: destTeamFolderId,
+                ownerId: destination.ownerId,
+              },
+            }),
+          ]
+        : []),
+    ]);
 
     return file;
   }
@@ -357,9 +377,7 @@ export async function updateFile(
     where: { id: fileId },
     data: {
       ...(input.name !== undefined ? { name: input.name } : {}),
-      ...(input.trashedAt !== undefined
-        ? { trashedAt: input.trashedAt }
-        : {}),
+      ...(input.trashedAt !== undefined ? { trashedAt: input.trashedAt } : {}),
     },
   });
 
@@ -372,12 +390,21 @@ export async function getFileBreadcrumbs(
   fileId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   const breadcrumbs: Array<{ id: string; name: string }> = [];
   let currentId: string | null = fileId;
 
-  while (currentId) {
+  const visited = new Set<string>();
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    try {
+      await assertFileAccess(prisma, currentId, { ...ctx, workspaceId });
+    } catch (error) {
+      if (error instanceof ForbiddenError || error instanceof NotFoundError)
+        break;
+      throw error;
+    }
     const found: { id: string; name: string; parentId: string | null } | null =
       await prisma.file.findFirst({
         where: { id: currentId, workspaceId },
@@ -404,10 +431,13 @@ export async function deleteFile(
   });
   if (!file) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, ctx, true);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true, true);
 
   if (file.isFolder) {
-    const descendants = await collectDescendantFiles(prisma, fileId);
+    const descendants = await collectDescendantFiles(prisma, fileId, {
+      ...ctx,
+      workspaceId,
+    });
     await prisma.file.delete({ where: { id: fileId } });
     for (const desc of descendants) {
       if (desc.storagePath) {
@@ -433,7 +463,7 @@ export async function getFileAttachmentCount(
   });
   if (!file) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   const count = await prisma.attachment.count({
     where: { fileId },
@@ -453,7 +483,7 @@ export async function starFile(
   });
   if (!file) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
   await prisma.starredFile.upsert({
     where: { userId_fileId: { userId: ctx.userId, fileId } },
@@ -468,6 +498,7 @@ export async function unstarFile(
   fileId: string,
   ctx: AccessContext,
 ) {
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
   const file = await prisma.file.findFirst({
     where: { id: fileId, workspaceId },
   });
@@ -483,6 +514,7 @@ export async function listStarredFiles(
   workspaceId: string,
   ctx: AccessContext,
 ) {
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
   const starred = await prisma.starredFile.findMany({
     where: {
       userId: ctx.userId,
@@ -520,19 +552,15 @@ export async function copyFile(
   }
 
   // Assert read access on source
-  await assertFileAccess(prisma, fileId, ctx);
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
-  // Assert write access on destination
-  if (input.parentId) {
-    await assertFileAccess(prisma, input.parentId, ctx, true);
-  }
-
-  // Resolve team folder context for destination
-  const destTeamFolderId = input.teamFolderId !== undefined
-    ? input.teamFolderId
-    : input.parentId
-      ? await resolveTeamFolderForParent(prisma, input.parentId)
-      : null;
+  const destination = await resolveFileDestination(
+    prisma,
+    { ...ctx, workspaceId },
+    input.parentId,
+    input.teamFolderId,
+  );
+  const destTeamFolderId = destination.teamFolderId;
 
   const ext = path.extname(source.name) || "";
   const baseName = source.name.slice(0, source.name.length - ext.length);
@@ -559,14 +587,14 @@ export async function copyFile(
     const file = await prisma.file.create({
       data: {
         workspaceId,
-        parentId: input.parentId,
+        ...destination,
         name: copyName,
         mimeType: source.mimeType,
         size,
         storagePath,
         isFolder: false,
         uploadedById: ctx.userId,
-        ownerId: destTeamFolderId ? null : ctx.userId,
+        ownerId: destination.ownerId,
         teamFolderId: destTeamFolderId,
       },
     });
@@ -578,46 +606,40 @@ export async function copyFile(
   }
 }
 
-async function updateDescendantsScope(
-  prisma: PrismaClient,
-  parentId: string,
-  teamFolderId: string | null,
-  ownerId: string | null,
-): Promise<void> {
-  const children = await prisma.file.findMany({
-    where: { parentId },
-    select: { id: true, isFolder: true },
-  });
-
-  for (const child of children) {
-    await prisma.file.update({
-      where: { id: child.id },
-      data: { teamFolderId, ownerId },
-    });
-    if (child.isFolder) {
-      await updateDescendantsScope(prisma, child.id, teamFolderId, ownerId);
-    }
-  }
-}
-
 export async function collectDescendantFiles(
   prisma: PrismaClient,
   parentId: string,
+  ctx?: AccessContext,
 ): Promise<Array<{ id: string; storagePath: string | null }>> {
-  const children = await prisma.file.findMany({
-    where: { parentId },
-    select: { id: true, storagePath: true, isFolder: true },
+  const root = await prisma.file.findUnique({
+    where: { id: parentId },
+    select: { workspaceId: true },
   });
-
+  if (!root || (ctx && root.workspaceId !== ctx.workspaceId))
+    throw new NotFoundError("Folder not found");
   const result: Array<{ id: string; storagePath: string | null }> = [];
-  for (const child of children) {
-    result.push({ id: child.id, storagePath: child.storagePath });
-    if (child.isFolder) {
-      const nested = await collectDescendantFiles(prisma, child.id);
-      result.push(...nested);
+  const visited = new Set([parentId]);
+  let parents = [parentId];
+  while (parents.length) {
+    const children = await prisma.file.findMany({
+      where: { parentId: { in: parents } },
+      select: {
+        id: true,
+        workspaceId: true,
+        storagePath: true,
+        isFolder: true,
+      },
+    });
+    parents = [];
+    for (const child of children) {
+      if (visited.has(child.id) || child.workspaceId !== root.workspaceId)
+        throw new ForbiddenError("Invalid folder ancestry");
+      visited.add(child.id);
+      if (ctx) await assertFileAccess(prisma, child.id, ctx, true, true);
+      result.push({ id: child.id, storagePath: child.storagePath });
+      if (child.isFolder) parents.push(child.id);
     }
   }
-
   return result;
 }
 
@@ -644,7 +666,12 @@ async function collectFolderEntries(
   storage: StorageProvider,
   parentId: string,
   prefix: string,
+  ctx: AccessContext,
+  visited = new Set<string>(),
 ): Promise<ArchiveEntry[]> {
+  if (visited.has(parentId))
+    throw new ForbiddenError("Invalid folder ancestry");
+  visited.add(parentId);
   const children = await prisma.file.findMany({
     where: { parentId, trashedAt: null },
     select: { id: true, name: true, isFolder: true, storagePath: true },
@@ -652,16 +679,22 @@ async function collectFolderEntries(
 
   const entries: ArchiveEntry[] = [];
   for (const child of children) {
+    await assertFileAccess(prisma, child.id, ctx);
     if (child.isFolder) {
       const nested = await collectFolderEntries(
         prisma,
         storage,
         child.id,
         `${prefix}${child.name}/`,
+        ctx,
+        visited,
       );
       entries.push(...nested);
     } else if (child.storagePath) {
-      entries.push({ name: `${prefix}${child.name}`, storagePath: child.storagePath });
+      entries.push({
+        name: `${prefix}${child.name}`,
+        storagePath: child.storagePath,
+      });
     }
   }
   return entries;
@@ -680,18 +713,25 @@ export async function archiveFiles(
     select: { id: true, name: true, isFolder: true, storagePath: true },
   });
 
-  if (files.length === 0) throw new NotFoundError("No files found");
+  if (files.length !== new Set(fileIds).size)
+    throw new NotFoundError("File not found");
 
   // Assert read access on each file
   for (const file of files) {
-    await assertFileAccess(prisma, file.id, ctx);
+    await assertFileAccess(prisma, file.id, { ...ctx, workspaceId });
   }
 
   // Collect all entries, expanding folders recursively
   const entries: ArchiveEntry[] = [];
   for (const file of files) {
     if (file.isFolder) {
-      const nested = await collectFolderEntries(prisma, storage, file.id, `${file.name}/`);
+      const nested = await collectFolderEntries(
+        prisma,
+        storage,
+        file.id,
+        `${file.name}/`,
+        { ...ctx, workspaceId },
+      );
       entries.push(...nested);
     } else if (file.storagePath) {
       entries.push({ name: file.name, storagePath: file.storagePath });

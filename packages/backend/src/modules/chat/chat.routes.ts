@@ -10,6 +10,7 @@ import {
   CreateDmSchema,
   AddMembersSchema,
   ChatMessageQuerySchema,
+  ChatBookmarkQuerySchema,
   ToggleReactionSchema,
   PinMessageSchema,
   ArchiveChannelSchema,
@@ -276,7 +277,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/:wid/bookmarks",
-    preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
+    preHandler: [
+      authenticate,
+      authorize("ADMIN", "MEMBER", "VIEWER"),
+      validateQuery(ChatBookmarkQuerySchema),
+    ],
     handler: listBookmarksHandler,
   });
 

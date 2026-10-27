@@ -90,6 +90,7 @@ export async function setFieldValueHandler(
 
   const result = await customFieldsService.setFieldValue(
     request.server.prisma,
+    params.pid,
     params.tid,
     params.fieldId,
     body,

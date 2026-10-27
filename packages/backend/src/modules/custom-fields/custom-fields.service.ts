@@ -150,16 +150,27 @@ export async function reorderCustomFields(
 
 export async function setFieldValue(
   prisma: PrismaClient,
+  projectId: string,
   taskId: string,
   fieldId: string,
   data: SetCustomFieldValueInput,
 ) {
-  // Validate field exists
-  const field = await prisma.customField.findUnique({
-    where: { id: fieldId },
-  });
+  // Bind both resources to the project authorized by the route. Independent
+  // foreign keys alone do not prevent cross-project or cross-workspace writes.
+  const [task, field] = await Promise.all([
+    prisma.task.findFirst({
+      where: { id: taskId, projectId },
+      select: { id: true },
+    }),
+    prisma.customField.findFirst({
+      where: { id: fieldId, projectId },
+    }),
+  ]);
+  if (!task) {
+    throw new NotFoundError("Task not found in this project");
+  }
   if (!field) {
-    throw new NotFoundError("Custom field not found");
+    throw new NotFoundError("Custom field not found in this project");
   }
 
   // Validate value type matches field type

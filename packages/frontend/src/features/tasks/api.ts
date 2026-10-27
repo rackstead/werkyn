@@ -33,7 +33,12 @@ export interface Task {
     labelId: string;
     label: { id: string; name: string; color: string };
   }>;
-  status: { id: string; name: string; color: string | null; isCompletion: boolean };
+  status: {
+    id: string;
+    name: string;
+    color: string | null;
+    isCompletion: boolean;
+  };
   customFieldValues: Array<{
     fieldId: string;
     value: string | number | boolean | string[] | null;
@@ -48,7 +53,12 @@ export interface Task {
 }
 
 export interface TaskDetail extends Task {
-  subtasks?: Array<{ id: string; title: string; completed: boolean; position: number }>;
+  subtasks?: Array<{
+    id: string;
+    title: string;
+    completed: boolean;
+    position: number;
+  }>;
   blockedBy?: Array<{
     id: string;
     blockingTask: { id: string; title: string; status: { name: string } };
@@ -103,9 +113,7 @@ function invalidateMyTasks() {
 export function useCreateTask(pid: string) {
   return useMutation({
     mutationFn: (data: CreateTaskInput) =>
-      api
-        .post(`projects/${pid}/tasks`, { json: data })
-        .json<{ data: Task }>(),
+      api.post(`projects/${pid}/tasks`, { json: data }).json<{ data: Task }>(),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(pid),
@@ -122,7 +130,9 @@ export function useUpdateTask() {
     mutationFn: ({ id, ...data }: UpdateTaskInput & { id: string }) =>
       api.patch(`tasks/${id}`, { json: data }).json<{ data: Task }>(),
     onSuccess: (res) => {
-      queryClient.setQueryData(queryKeys.task(res.data.id), res);
+      // PATCH returns a summary, not the relations supplied by GET /tasks/:id.
+      // Keep the complete cached detail visible while refreshing it.
+      queryClient.invalidateQueries({ queryKey: queryKeys.task(res.data.id) });
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(res.data.projectId),
         exact: false,
@@ -153,9 +163,7 @@ export function useDeleteTask(pid: string, onDeleted?: () => void) {
 export function useArchiveTask(pid: string, onArchived?: () => void) {
   return useMutation({
     mutationFn: ({ id, ...data }: ArchiveInput & { id: string }) =>
-      api
-        .patch(`tasks/${id}/archive`, { json: data })
-        .json<{ data: Task }>(),
+      api.patch(`tasks/${id}/archive`, { json: data }).json<{ data: Task }>(),
     onSuccess: (res) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(pid),
@@ -215,7 +223,10 @@ export function useMoveTask(pid: string) {
         const isSameColumn = oldStatusId === statusId;
 
         // Build a position map for all affected tasks
-        const posMap = new Map<string, { position: number; statusId?: string }>();
+        const posMap = new Map<
+          string,
+          { position: number; statusId?: string }
+        >();
 
         if (isSameColumn) {
           // Same-column reorder: remove task, re-insert at index
@@ -278,7 +289,8 @@ export function useMoveTask(pid: string) {
           queryClient.setQueryData(snapshot.queryKey, snapshot.data);
         }
       }
-      const message = err instanceof Error ? err.message : "Failed to move task";
+      const message =
+        err instanceof Error ? err.message : "Failed to move task";
       toast.error(message);
     },
     onSuccess: (res) => {
@@ -432,7 +444,12 @@ export function useTaskActivity(tid: string, page = 1, limit = 20) {
         })
         .json<{
           data: ActivityEntry[];
-          pagination: { page: number; limit: number; total: number; totalPages: number };
+          pagination: {
+            page: number;
+            limit: number;
+            total: number;
+            totalPages: number;
+          };
         }>(),
     enabled: !!tid,
   });
@@ -461,8 +478,11 @@ export function useAddDependency(tid: string, pid: string) {
       api
         .post(`tasks/${tid}/dependencies`, { json: { blockingTaskId } })
         .json(),
-    onSuccess: () => {
+    onSuccess: (_res, blockingTaskId) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.task(tid) });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.task(blockingTaskId),
+      });
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(pid),
         exact: false,
@@ -480,10 +500,13 @@ export function useAddDependency(tid: string, pid: string) {
 
 export function useRemoveDependency(tid: string, pid: string) {
   return useMutation({
-    mutationFn: (depId: string) =>
+    mutationFn: ({ depId }: { depId: string; blockingTaskId: string }) =>
       api.delete(`tasks/${tid}/dependencies/${depId}`),
-    onSuccess: () => {
+    onSuccess: (_res, { blockingTaskId }) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.task(tid) });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.task(blockingTaskId),
+      });
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(pid),
         exact: false,

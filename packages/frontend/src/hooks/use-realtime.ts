@@ -11,7 +11,13 @@ export function useRealtime(projectId: string | undefined) {
 
     client.subscribe(projectId);
 
-    const handler = () => {
+    const handler = (msg: unknown) => {
+      const data = (msg as { data?: { taskId?: string } })?.data;
+      if (data?.taskId) {
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.task(data.taskId),
+        });
+      }
       // Invalidate task queries for this project
       queryClient.invalidateQueries({
         queryKey: queryKeys.tasks(projectId),
@@ -23,7 +29,7 @@ export function useRealtime(projectId: string | undefined) {
     };
 
     const subtaskHandler = (msg: unknown) => {
-      const data = msg as { taskId?: string } | undefined;
+      const data = (msg as { data?: { taskId?: string } })?.data;
       if (data?.taskId) {
         queryClient.invalidateQueries({
           queryKey: queryKeys.subtasks(data.taskId),
@@ -39,7 +45,7 @@ export function useRealtime(projectId: string | undefined) {
     };
 
     const commentHandler = (msg: unknown) => {
-      const data = msg as { taskId?: string } | undefined;
+      const data = (msg as { data?: { taskId?: string } })?.data;
       if (data?.taskId) {
         queryClient.invalidateQueries({
           queryKey: queryKeys.comments(data.taskId),
@@ -51,7 +57,9 @@ export function useRealtime(projectId: string | undefined) {
     };
 
     const dependencyHandler = (msg: unknown) => {
-      const data = msg as { taskId?: string; blockingTaskId?: string } | undefined;
+      const data = (
+        msg as { data?: { taskId?: string; blockingTaskId?: string } }
+      )?.data;
       if (data?.taskId) {
         queryClient.invalidateQueries({
           queryKey: queryKeys.task(data.taskId),

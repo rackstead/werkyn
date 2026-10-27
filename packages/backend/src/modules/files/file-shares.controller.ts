@@ -156,6 +156,7 @@ export async function updateFileShareLinkHandler(
     request.server.prisma,
     lid,
     body,
+    getAccessCtx(request),
   );
 
   return reply.send({ data: link });
@@ -167,7 +168,11 @@ export async function deleteFileShareLinkHandler(
 ) {
   const { lid } = request.params as { lid: string };
 
-  await shareService.deleteFileShareLink(request.server.prisma, lid);
+  await shareService.deleteFileShareLink(
+    request.server.prisma,
+    lid,
+    getAccessCtx(request),
+  );
 
   return reply.status(204).send();
 }

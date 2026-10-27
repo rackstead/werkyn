@@ -10,7 +10,9 @@ database or deployment secret is required.
 
 `pnpm test` also validates the workflow's event/permission policy. It runs each
 workspace's unit test script when present; the frontend regression suite is
-always required. `pnpm test:integration` builds the shared package before running
+always required. Required frontend/integration commands run directly in their
+workspace directories and fail if their scripts are missing or fail.
+`pnpm test:integration` builds the shared package before running
 the backend integration suite. Local integration runs require an explicit
 `TEST_DATABASE_URL` pointing to a migrated disposable PostgreSQL database.
 

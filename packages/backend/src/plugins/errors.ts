@@ -7,6 +7,16 @@ import { env } from "../config/env.js";
 export default fp(async (fastify: FastifyInstance) => {
   fastify.setErrorHandler(
     (error: FastifyError | Error, request, reply) => {
+      // A failed download may already have selected a binary response type.
+      // Every branch below sends a JSON error object, not the original file.
+      reply.type("application/json");
+      reply.removeHeader("Content-Disposition");
+      // Fastify stages stream headers on ServerResponse before reading bytes.
+      // Removing its pending header alone leaves that staged value in place.
+      if (!reply.raw.headersSent) {
+        reply.raw.removeHeader("Content-Disposition");
+      }
+
       // Known application errors
       if (error instanceof AppError) {
         const response: Record<string, unknown> = {

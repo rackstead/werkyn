@@ -7,8 +7,10 @@ and successful download bytes/headers are preserved.
 
 Before-fix proof captures the real handler safely: one ordinary JSON case passes,
 seven binary-type cases fail. The after-fix HTTP group requires that captured JSON
-contract first, so older code stops before opening a missing stream. Nine cases now
-pass, including isolated file/inline/archive failures, health and successful bytes.
+contract first, so older code stops before opening a missing stream. Captured
+contracts also check raw-only staged headers, committed-header protection, exact
+error/detail/retry bodies and production redaction/logging. Guarded Fastify tests
+cover isolated file/inline/archive failures, health and successful bytes.
 The initial staged-filename failure log is retained; pending removal alone failed.
 
 Missing blobs retain500; B02 durable repair remains separate. Partial streams retain

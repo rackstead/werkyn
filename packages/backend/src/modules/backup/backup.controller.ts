@@ -4,6 +4,7 @@ import AdmZip from "adm-zip";
 import { exportBackup } from "./backup.service.js";
 import { previewRestore, executeRestore } from "./restore.service.js";
 import { ValidationError } from "../../utils/errors.js";
+import { formatContentDisposition } from "../../utils/content-disposition.js";
 
 export async function exportHandler(
   request: FastifyRequest,
@@ -26,7 +27,7 @@ export async function exportHandler(
 
   return reply
     .header("Content-Type", "application/zip")
-    .header("Content-Disposition", `attachment; filename="${filename}"`)
+    .header("Content-Disposition", formatContentDisposition(filename))
     .send(zipBuffer);
 }
 

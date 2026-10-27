@@ -12,6 +12,7 @@ import type {
   ArchiveFilesInput,
 } from "@pm/shared";
 import { ValidationError } from "../../utils/errors.js";
+import { formatContentDisposition } from "../../utils/content-disposition.js";
 
 function getAccessCtx(request: FastifyRequest) {
   return {
@@ -123,8 +124,6 @@ export async function downloadFileHandler(
     getAccessCtx(request),
   );
 
-  const safeName = file.name.replace(/"/g, '\\"');
-  const encodedName = encodeURIComponent(file.name);
   const isInline =
     query.inline === "true" && isSafeInlineContentType(file.mimeType);
   applyUntrustedContentPolicy(reply);
@@ -132,7 +131,7 @@ export async function downloadFileHandler(
   return reply
     .header(
       "Content-Disposition",
-      `${isInline ? "inline" : "attachment"}; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
+      formatContentDisposition(file.name, isInline ? "inline" : "attachment"),
     )
     .header("Content-Type", isInline && file.mimeType ? file.mimeType : "application/octet-stream")
     .send(stream);
@@ -316,13 +315,10 @@ export async function archiveFilesHandler(
     getAccessCtx(request),
   );
 
-  const safeName = archiveName.replace(/"/g, '\\"');
-  const encodedName = encodeURIComponent(archiveName);
-
   return reply
     .header(
       "Content-Disposition",
-      `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
+      formatContentDisposition(archiveName),
     )
     .header("Content-Type", "application/zip")
     .send(stream);

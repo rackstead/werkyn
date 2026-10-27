@@ -15,6 +15,7 @@ import { ValidationError } from "../../utils/errors.js";
 
 function getAccessCtx(request: FastifyRequest) {
   return {
+    workspaceId: (request.params as { wid: string }).wid,
     userId: request.user!.id,
     workspaceRole: request.workspaceMember!.role,
   };

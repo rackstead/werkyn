@@ -58,42 +58,9 @@ after(async () => {
   }
 });
 
-function openSocket() {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/ws`);
-  const inbox = [];
-  const waiters = [];
-  ws.addEventListener("message", (event) => {
-    inbox.push(JSON.parse(event.data));
-    while (waiters.length) waiters.shift()();
-  });
-  const closed = new Promise((resolve) =>
-    ws.addEventListener("close", (event) => resolve({ code: event.code, reason: event.reason })),
-  );
-  const next = async (predicate, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const index = inbox.findIndex(predicate);
-      if (index !== -1) return inbox.splice(index, 1)[0];
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`No matching message; received ${JSON.stringify(inbox)}`);
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, remaining);
-        waiters.push(() => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-    }
-  };
-  const opened = new Promise((resolve, reject) => {
-    ws.addEventListener("open", () => resolve(), { once: true });
-    ws.addEventListener("error", () => reject(new Error("WebSocket failed to open")), { once: true });
-  });
-  return { ws, next, closed, opened };
-}
-
-// Raw RFC 6455 client so the test controls framing (fragments), which the
-// built-in WebSocket client never exposes.
+// Minimal RFC 6455 client over a plain TCP socket. It runs on every supported
+// Node.js release (Node 20 has no global WebSocket client) and lets the tests
+// control framing, including fragmented messages.
 async function rawSocket() {
   const socket = net.connect(port, "127.0.0.1");
   let buffered = Buffer.alloc(0);
@@ -164,56 +131,97 @@ async function rawSocket() {
       buffered = buffered.subarray(offset + length);
       return frame;
     }, timeoutMs);
-  return { socket, nextFrame, isEnded: () => ended };
+
+  const inbox = [];
+  // Resolves the next JSON text message matching predicate.
+  const next = async (predicate, timeoutMs = 5000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const index = inbox.findIndex(predicate);
+      if (index !== -1) return inbox.splice(index, 1)[0];
+      const frame = await nextFrame(Math.max(0, deadline - Date.now()));
+      if (!frame) throw new Error(`No matching message; received ${JSON.stringify(inbox)}`);
+      if (frame.opcode === 0x8) throw new Error(`Socket closed with ${frame.payload.readUInt16BE(0)}`);
+      if (frame.opcode === 0x1) inbox.push(JSON.parse(frame.payload.toString("utf8")));
+    }
+  };
+  // Reads up to the server's close frame and returns its status and reason.
+  const closed = async (timeoutMs = 5000) => {
+    for (;;) {
+      const frame = await nextFrame(timeoutMs);
+      if (!frame) return undefined;
+      if (frame.opcode === 0x8) {
+        return { code: frame.payload.readUInt16BE(0), reason: frame.payload.subarray(2).toString("utf8") };
+      }
+    }
+  };
+  const sendJSON = (value) => socket.write(clientFrame(0x1, true, Buffer.from(JSON.stringify(value))));
+  const close = (code) => {
+    const payload = Buffer.alloc(2);
+    payload.writeUInt16BE(code);
+    socket.write(clientFrame(0x8, true, payload));
+  };
+  return { socket, nextFrame, next, closed, sendJSON, close };
 }
 
 function clientFrame(opcode, fin, payload) {
-  assert.ok(payload.length < 126);
+  assert.ok(payload.length < 65536);
+  const first = (fin ? 0x80 : 0) | opcode;
+  const head =
+    payload.length < 126
+      ? Buffer.from([first, 0x80 | payload.length])
+      : Buffer.from([first, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
   const mask = crypto.randomBytes(4);
   const masked = Buffer.from(payload.map((byte, index) => byte ^ mask[index % 4]));
-  return Buffer.concat([Buffer.from([(fin ? 0x80 : 0) | opcode, 0x80 | payload.length]), mask, masked]);
+  return Buffer.concat([head, mask, masked]);
 }
 
 test("an authenticated socket subscribes to its own workspace and receives its events", async () => {
-  const client = openSocket();
-  await client.opened;
-  client.ws.send(JSON.stringify({ type: "auth", token }));
-  assert.deepEqual(await client.next((m) => m.event === "authenticated"), { event: "authenticated" });
+  const client = await rawSocket();
+  try {
+    client.sendJSON({ type: "auth", token });
+    assert.deepEqual(await client.next((m) => m.event === "authenticated"), { event: "authenticated" });
 
-  client.ws.send(JSON.stringify({ type: "subscribe_workspace", workspaceId: workspace.id }));
-  assert.deepEqual(await client.next((m) => m.event === "subscribed_workspace"), {
-    event: "subscribed_workspace",
-    workspaceId: workspace.id,
-    success: true,
-  });
-  client.ws.send(JSON.stringify({ type: "subscribe_workspace", workspaceId: foreignWorkspace.id }));
-  assert.deepEqual(await client.next((m) => m.event === "subscribed_workspace"), {
-    event: "subscribed_workspace",
-    workspaceId: foreignWorkspace.id,
-    success: false,
-  });
+    client.sendJSON({ type: "subscribe_workspace", workspaceId: workspace.id });
+    assert.deepEqual(await client.next((m) => m.event === "subscribed_workspace"), {
+      event: "subscribed_workspace",
+      workspaceId: workspace.id,
+      success: true,
+    });
+    client.sendJSON({ type: "subscribe_workspace", workspaceId: foreignWorkspace.id });
+    assert.deepEqual(await client.next((m) => m.event === "subscribed_workspace"), {
+      event: "subscribed_workspace",
+      workspaceId: foreignWorkspace.id,
+      success: false,
+    });
 
-  app.broadcastToWorkspace(workspace.id, "fixture_event", { value: 1 });
-  app.broadcastToWorkspace(foreignWorkspace.id, "fixture_event", { value: 2 });
-  assert.deepEqual(await client.next((m) => m.event === "fixture_event"), {
-    event: "fixture_event",
-    data: { value: 1 },
-    workspaceId: workspace.id,
-  });
+    app.broadcastToWorkspace(workspace.id, "fixture_event", { value: 1 });
+    app.broadcastToWorkspace(foreignWorkspace.id, "fixture_event", { value: 2 });
+    assert.deepEqual(await client.next((m) => m.event === "fixture_event"), {
+      event: "fixture_event",
+      data: { value: 1 },
+      workspaceId: workspace.id,
+    });
 
-  client.ws.send(JSON.stringify({ type: "ping" }));
-  assert.deepEqual(await client.next((m) => m.event === "pong"), { event: "pong" });
-  await assert.rejects(client.next((m) => m.event === "fixture_event", 200), /No matching message/);
+    client.sendJSON({ type: "ping" });
+    assert.deepEqual(await client.next((m) => m.event === "pong"), { event: "pong" });
+    await assert.rejects(client.next((m) => m.event === "fixture_event", 200), /No matching message/);
 
-  client.ws.close(1000);
-  assert.equal((await client.closed).code, 1000);
+    client.close(1000);
+    assert.equal((await client.closed())?.code, 1000);
+  } finally {
+    client.socket.destroy();
+  }
 });
 
 test("a socket presenting an invalid token is closed as unauthenticated", async () => {
-  const client = openSocket();
-  await client.opened;
-  client.ws.send(JSON.stringify({ type: "auth", token: `${token}tampered` }));
-  assert.deepEqual(await client.closed, { code: 4002, reason: "Authentication failed" });
+  const client = await rawSocket();
+  try {
+    client.sendJSON({ type: "auth", token: `${token}tampered` });
+    assert.deepEqual(await client.closed(), { code: 4002, reason: "Authentication failed" });
+  } finally {
+    client.socket.destroy();
+  }
 });
 
 test("a legitimately fragmented message is still reassembled", async () => {

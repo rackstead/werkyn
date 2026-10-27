@@ -140,6 +140,8 @@ test("the bare /dex path and JSON request bodies are forwarded intact", async ()
   assert.equal(post.method, "POST");
   assert.equal(post.url, "/dex/approval?req=fixture");
   assert.equal(post.headers.authorization, undefined);
+  // reply-from re-serializes the JSON body Fastify parsed and sends the bare
+  // media type, dropping the client's charset parameter.
   assert.equal(post.headers["content-type"], "application/json");
   assert.equal(Number(post.headers["content-length"]), Buffer.byteLength(post.body));
   assert.deepEqual(JSON.parse(post.body), { login: "fixture", remember: true });

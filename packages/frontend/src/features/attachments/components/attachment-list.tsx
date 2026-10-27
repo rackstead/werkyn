@@ -59,6 +59,7 @@ export function AttachmentList({
         <div className="space-y-1 mb-2">
           {attachments.map((att) => {
             const Icon = getFileIcon(att.mimeType, false);
+            const unavailable = !att.file || !!att.file.trashedAt;
             return (
               <div
                 key={att.id}
@@ -74,8 +75,8 @@ export function AttachmentList({
                     <AlertTriangle className="h-3 w-3 shrink-0 text-amber-500" />
                   </span>
                 )}
-                {att.fileId && !att.file && (
-                  <span title="Source file has been deleted">
+                {!att.file && (
+                  <span title="Source file is unavailable">
                     <AlertTriangle className="h-3 w-3 shrink-0 text-destructive" />
                   </span>
                 )}
@@ -86,8 +87,9 @@ export function AttachmentList({
                 )}
                 <button
                   onClick={() => handleDownload(att.id, att.name)}
+                  disabled={unavailable}
                   className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-accent transition-all"
-                  title="Download"
+                  title={unavailable ? "Source file is unavailable" : "Download"}
                 >
                   <Download className="h-3.5 w-3.5" />
                 </button>

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { QueryBooleanSchema } from "./common.js";
 
 export const PriorityEnum = z.enum(["NONE", "LOW", "MEDIUM", "HIGH", "URGENT"]);
 
@@ -64,7 +65,7 @@ export const TaskQuerySchema = z.object({
   dueBefore: z.string().optional(),
   dueAfter: z.string().optional(),
   search: z.string().optional(),
-  archived: z.coerce.boolean().default(false),
+  archived: QueryBooleanSchema.default(false),
   sort: z
     .enum(["dueDate", "priority", "createdAt", "position"])
     .default("position"),

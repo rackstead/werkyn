@@ -12,6 +12,7 @@
     }
   },
   "scripts": {
+    "test": "pnpm build && node --test tests/*.test.mjs",
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "tsc --noEmit"

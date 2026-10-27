@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { QueryBooleanSchema } from "./common.js";
 
 export const CreateFolderSchema = z.object({
   name: z
@@ -28,7 +29,7 @@ export const FileQuerySchema = z.object({
   search: z.string().optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
-  trashed: z.coerce.boolean().optional().default(false),
+  trashed: QueryBooleanSchema.default(false),
   sortBy: z.enum(["name", "size", "updatedAt", "uploadedBy"]).optional().default("name"),
   sortOrder: z.enum(["asc", "desc"]).optional().default("asc"),
 });

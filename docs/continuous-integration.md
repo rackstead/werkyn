@@ -8,10 +8,11 @@ checks TypeScript, and builds production assets. The container check builds the
 Dockerfile without logging into a registry or pushing an image. No application
 database or deployment secret is required.
 
-`pnpm test` also validates the workflow's event/permission policy. It runs each
-workspace's unit test script when present; the frontend regression suite is
-always required. Required frontend/integration commands run directly in their
-workspace directories and fail if their scripts are missing or fail.
+`pnpm test` first builds and tests the shared package, then validates the
+workflow's event/permission policy, runs the backend unit script when present,
+and requires the frontend regression suite. Shared and frontend test commands,
+and the backend integration command, run directly in their workspace directories
+and fail if their scripts are missing or fail.
 `pnpm test:integration` builds the shared package before running
 the backend integration suite. Local integration runs require an explicit
 `TEST_DATABASE_URL` pointing to a migrated disposable PostgreSQL database.

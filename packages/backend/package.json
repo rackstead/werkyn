@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --import tsx --test tests/*.test.mjs",
     "test:integration": "node --import tsx --test test/api-keys.test.ts",
     "dev": "tsx watch --env-file=.env src/server.ts",
     "build": "tsc",

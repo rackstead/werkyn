@@ -115,7 +115,7 @@ export async function exportCSVHandler(
   );
 
   return reply
-    .header("Content-Type", "text/csv")
+    .header("Content-Type", "text/csv; charset=utf-8")
     .header("Content-Disposition", "attachment; filename=time-report.csv")
     .send(csv);
 }

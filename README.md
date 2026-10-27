@@ -28,7 +28,19 @@ git clone https://github.com/werkyn/werkyn.git
 cd werkyn
 ```
 
-2. Start the application:
+2. Create your local environment file and generate three separate secrets:
+```bash
+cp .env.example .env
+openssl rand -hex 32
+openssl rand -hex 32
+openssl rand -hex 32
+```
+Put the three generated values in `.env` as `JWT_SECRET`, `COOKIE_SECRET`, and
+`POSTGRES_PASSWORD`. Keep the database password hexadecimal, as it is embedded in
+the database URL. The environment file is ignored by git. For a remote HTTPS
+installation, also set `COOKIE_SECURE=true`, `FRONTEND_URL`, and `CORS_ORIGIN`.
+
+3. Start the application:
 ```bash
 docker compose up --build
 ```
@@ -36,6 +48,12 @@ docker compose up --build
 This builds the app image, starts PostgreSQL, runs database migrations, and launches the server.
 
 - **App**: `http://localhost:3000`
+
+When upgrading an existing installation, back up the database and storage first.
+Set new JWT and cookie secrets to invalidate credentials signed with the published
+sample secrets. Changing `POSTGRES_PASSWORD` in `.env` does not change the password
+inside an existing PostgreSQL volume: rotate that role's password in PostgreSQL
+and update `.env` together. Keep the volume; deleting it deletes your data.
 
 ## Features
 
@@ -155,7 +173,8 @@ pnpm install
 ```bash
 cd packages/backend
 cp .env.example .env
-# Edit .env with your database connection and other settings
+# Edit .env with your database connection and other settings.
+# Match DATABASE_URL's password to POSTGRES_PASSWORD in the root .env.
 ```
 
 4. Set up the database:

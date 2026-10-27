@@ -2,6 +2,8 @@
   "name": "project-management-app",
   "private": true,
   "scripts": {
+    "test": "pnpm --filter @pm/shared build && node --test .github/tests/*.test.mjs && pnpm --filter @pm/shared --if-present test && pnpm --filter @pm/backend --if-present test && pnpm --dir packages/frontend test",
+    "test:integration": "pnpm --filter @pm/shared build && pnpm --dir packages/backend test:integration",
     "dev": "pnpm --filter @pm/backend dev & pnpm --filter @pm/frontend dev",
     "build": "pnpm --filter @pm/shared build && pnpm --filter @pm/backend build && pnpm --filter @pm/frontend build",
     "lint": "pnpm --filter \"./packages/*\" lint",

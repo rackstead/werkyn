@@ -10,9 +10,9 @@ export async function listTemplates(prisma: PrismaClient, projectId: string) {
   });
 }
 
-export async function getTemplate(prisma: PrismaClient, templateId: string) {
-  const template = await prisma.taskTemplate.findUnique({
-    where: { id: templateId },
+export async function getTemplate(prisma: PrismaClient, projectId: string, templateId: string) {
+  const template = await prisma.taskTemplate.findFirst({
+    where: { id: templateId, projectId },
   });
   if (!template) throw new NotFoundError("Template not found");
   return template;
@@ -41,10 +41,11 @@ export async function createTemplate(
 
 export async function updateTemplate(
   prisma: PrismaClient,
+  projectId: string,
   templateId: string,
   data: UpdateTemplateInput,
 ) {
-  const existing = await prisma.taskTemplate.findUnique({ where: { id: templateId } });
+  const existing = await prisma.taskTemplate.findFirst({ where: { id: templateId, projectId } });
   if (!existing) throw new NotFoundError("Template not found");
 
   const updateData: Prisma.TaskTemplateUpdateInput = {};
@@ -59,15 +60,15 @@ export async function updateTemplate(
   if (data.subtasks !== undefined) updateData.subtasks = data.subtasks as Prisma.InputJsonValue;
 
   return prisma.taskTemplate.update({
-    where: { id: templateId },
+    where: { id: templateId, projectId },
     data: updateData,
   });
 }
 
-export async function deleteTemplate(prisma: PrismaClient, templateId: string) {
-  const existing = await prisma.taskTemplate.findUnique({ where: { id: templateId } });
+export async function deleteTemplate(prisma: PrismaClient, projectId: string, templateId: string) {
+  const existing = await prisma.taskTemplate.findFirst({ where: { id: templateId, projectId } });
   if (!existing) throw new NotFoundError("Template not found");
-  await prisma.taskTemplate.delete({ where: { id: templateId } });
+  await prisma.taskTemplate.delete({ where: { id: templateId, projectId } });
 }
 
 export async function createTaskFromTemplate(
@@ -78,13 +79,10 @@ export async function createTaskFromTemplate(
   actorRole: string,
   overrides?: InstantiateTemplateInput,
 ) {
-  const template = await prisma.taskTemplate.findUnique({
-    where: { id: templateId },
+  const template = await prisma.taskTemplate.findFirst({
+    where: { id: templateId, projectId },
   });
   if (!template) throw new NotFoundError("Template not found");
-  if (template.projectId !== projectId) {
-    throw new ValidationError("Template does not belong to this project");
-  }
 
   // Check project is not archived
   const project = await prisma.project.findUnique({

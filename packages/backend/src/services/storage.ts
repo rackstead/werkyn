@@ -47,7 +47,7 @@ export class LocalStorageProvider implements StorageProvider {
     ext: string,
   ) {
     const relPath = path.join(category, scopeId, `${fileId}${ext}`);
-    const fullPath = path.join(this.rootDir, relPath);
+    const fullPath = this.safePath(relPath);
     return { relPath, fullPath };
   }
 

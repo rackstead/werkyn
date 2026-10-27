@@ -1,6 +1,6 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type { CreateRecurringInput, UpdateRecurringInput } from "@pm/shared";
-import { NotFoundError, ValidationError } from "../../utils/errors.js";
+import { NotFoundError } from "../../utils/errors.js";
 
 export async function listRecurringConfigs(prisma: PrismaClient, projectId: string) {
   return prisma.recurringTaskConfig.findMany({
@@ -18,14 +18,11 @@ export async function createRecurringConfig(
   data: CreateRecurringInput,
 ) {
   // Validate template belongs to project
-  const template = await prisma.taskTemplate.findUnique({
-    where: { id: data.templateId },
+  const template = await prisma.taskTemplate.findFirst({
+    where: { id: data.templateId, projectId },
     select: { projectId: true },
   });
   if (!template) throw new NotFoundError("Template not found");
-  if (template.projectId !== projectId) {
-    throw new ValidationError("Template does not belong to this project");
-  }
 
   const nextRunDate = calculateNextRunDate(
     data.frequency,
@@ -53,10 +50,11 @@ export async function createRecurringConfig(
 
 export async function updateRecurringConfig(
   prisma: PrismaClient,
+  projectId: string,
   configId: string,
   data: UpdateRecurringInput,
 ) {
-  const existing = await prisma.recurringTaskConfig.findUnique({ where: { id: configId } });
+  const existing = await prisma.recurringTaskConfig.findFirst({ where: { id: configId, projectId } });
   if (!existing) throw new NotFoundError("Recurring config not found");
 
   const updateData: Prisma.RecurringTaskConfigUpdateInput = {};
@@ -75,7 +73,7 @@ export async function updateRecurringConfig(
   }
 
   return prisma.recurringTaskConfig.update({
-    where: { id: configId },
+    where: { id: configId, projectId },
     data: updateData,
     include: {
       template: { select: { id: true, name: true, title: true } },
@@ -83,10 +81,10 @@ export async function updateRecurringConfig(
   });
 }
 
-export async function deleteRecurringConfig(prisma: PrismaClient, configId: string) {
-  const existing = await prisma.recurringTaskConfig.findUnique({ where: { id: configId } });
+export async function deleteRecurringConfig(prisma: PrismaClient, projectId: string, configId: string) {
+  const existing = await prisma.recurringTaskConfig.findFirst({ where: { id: configId, projectId } });
   if (!existing) throw new NotFoundError("Recurring config not found");
-  await prisma.recurringTaskConfig.delete({ where: { id: configId } });
+  await prisma.recurringTaskConfig.delete({ where: { id: configId, projectId } });
 }
 
 // ─── Date Utilities ──────────────────────────────────────

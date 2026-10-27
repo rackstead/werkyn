@@ -58,7 +58,11 @@ export async function createChannelHandler(
     body,
   );
 
-  broadcastToWorkspace(wid, "chat_channel_created", { channel }, request.user!.id);
+  if (channel.type === "PUBLIC") {
+    broadcastToWorkspace(wid, "chat_channel_created", { channel }, request.user!.id);
+  } else {
+    broadcastToChannel(channel.id, "chat_channel_created", { channel }, request.user!.id);
+  }
 
   return reply.status(201).send({ data: channel });
 }
@@ -89,14 +93,18 @@ export async function deleteChannelHandler(
 ) {
   const { wid, channelId } = request.params as { wid: string; channelId: string };
 
-  await chatService.deleteChannel(
+  const channel = await chatService.deleteChannel(
     request.server.prisma,
     channelId,
     request.user!.id,
     request.workspaceMember!.role,
   );
 
-  broadcastToWorkspace(wid, "chat_channel_deleted", { channelId }, request.user!.id);
+  if (channel.type === "PUBLIC") {
+    broadcastToWorkspace(wid, "chat_channel_deleted", { channelId }, request.user!.id);
+  } else {
+    broadcastToChannel(channelId, "chat_channel_deleted", { channelId }, request.user!.id);
+  }
 
   return reply.status(204).send();
 }
@@ -245,11 +253,22 @@ export async function sendMessageHandler(
     channelId,
   });
 
+  // Notification payloads include private message snippets. A mentioned global
+  // user ID or stale membership must never become an alternate content reader.
+  const currentMembers = await request.server.prisma.chatChannelMember.findMany({
+    where: {
+      channelId,
+      user: { workspaces: { some: { workspaceId: wid } } },
+    },
+    select: { userId: true },
+  });
+  const recipientIds = new Set(currentMembers.map((member) => member.userId));
+
   // Mention notifications
   const mentionedIds = chatService.parseMentions(body.content);
   if (mentionedIds.length > 0) {
     const mentionNotifs = mentionedIds
-      .filter((id) => id !== userId)
+      .filter((id) => id !== userId && recipientIds.has(id))
       .map((mentionedUserId) => ({
         userId: mentionedUserId,
         type: "CHAT_MENTION" as const,
@@ -270,7 +289,7 @@ export async function sendMessageHandler(
   });
   if (channel?.type === "DM") {
     const dmNotifs = channel.members
-      .filter((m) => m.userId !== userId)
+      .filter((m) => m.userId !== userId && recipientIds.has(m.userId))
       .map((m) => ({
         userId: m.userId,
         type: "CHAT_DM_MESSAGE" as const,
@@ -291,7 +310,7 @@ export async function sendMessageHandler(
       body.parentId,
     );
     for (const subUserId of subscribers) {
-      if (subUserId !== userId) {
+      if (subUserId !== userId && recipientIds.has(subUserId)) {
         broadcastToUser(subUserId, "chat_thread_reply", {
           channelId,
           messageId: message.id,
@@ -591,7 +610,11 @@ export async function archiveChannelHandler(
   );
 
   const event = body.archived ? "chat_channel_archived" : "chat_channel_unarchived";
-  broadcastToWorkspace(wid, event, { channel, channelId });
+  if (channel.type === "PUBLIC") {
+    broadcastToWorkspace(wid, event, { channel, channelId });
+  } else {
+    broadcastToChannel(channelId, event, { channel, channelId });
+  }
 
   return reply.send({ data: channel });
 }

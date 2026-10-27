@@ -270,6 +270,21 @@ pnpm --filter @pm/backend test:integration
 The migration adds the `ApiKey` table. Apply migrations when upgrading, as the
 Docker entrypoint does automatically.
 
+### Testing first-account creation
+
+The integration suite includes overlapping local/local, local/OIDC and OIDC/OIDC
+account creation against an empty disposable database. It checks committed users,
+provider records, rollback/retry behavior and verification mail through a local
+stub that never connects to SMTP or Ethereal. The fixtures refuse to run if any
+users already exist and delete only their UUID-scoped accounts afterward.
+
+Only local registration is eligible for automatic instance-admin assignment, and
+only when it creates the first account. OIDC accounts remain ordinary, including
+on an empty installation. Existing accounts prevent later automatic bootstrap;
+deliberate administrator promotion remains available. Account/provider creation is
+atomic; invite admission, verification/session token creation and refresh-family
+concurrency have separate transaction boundaries.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

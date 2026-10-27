@@ -194,13 +194,15 @@ test("rate and report routes keep their admin-only boundary", async () => {
 });
 
 test("a new rate keeps the member's currency unless a valid currency code is supplied", async () => {
+  // A future-dated rate in another currency does not decide today's currency.
+  await setRate("EVE", { rate: 9, currency: "EUR", effectiveFrom: "2099-01-01" });
   await setRate("EVE", { rate: 5 });
   await setRate("DAN", { rate: 40, currency: "chf", effectiveFrom: "2026-01-01" });
   await setRate("DAN", { rate: 45, effectiveFrom: "2026-02-01" });
   const stored = (actor) => app.prisma.userRate.findMany({
     where: { workspaceId: workspace.id, userId: users[actor].id }, orderBy: { effectiveFrom: "asc" },
   }).then((rows) => rows.map((row) => [row.effectiveFrom, row.rate, row.currency]));
-  assert.deepEqual((await stored("EVE")).map(([, rate, currency]) => [rate, currency]), [[5, "USD"]]);
+  assert.deepEqual((await stored("EVE")).map(([, rate, currency]) => [rate, currency]), [[5, "USD"], [9, "EUR"]]);
   assert.deepEqual(await stored("DAN"), [["2026-01-01", 40, "CHF"], ["2026-02-01", 45, "CHF"]]);
   for (const currency of ["U$D", "EURO", "12", ""]) {
     const response = await req("ADMIN", "POST", `/api/workspaces/${workspace.id}/time/rates/${users.DAN.id}`, {

@@ -51,8 +51,12 @@ function RatesList({ workspaceId }: { workspaceId: string }) {
   const { data: rates = [] } = useUserRates(workspaceId);
   const members = membersData?.data ?? [];
 
+  // The rate in force today: a future-dated rate is not yet current. Today is
+  // the UTC date, which the server uses as the default effectiveFrom.
+  const today = new Date().toISOString().slice(0, 10);
   const rateMap = new Map<string, UserRate>();
   for (const rate of rates) {
+    if (rate.effectiveFrom > today) continue;
     const existing = rateMap.get(rate.userId);
     if (!existing || rate.effectiveFrom > existing.effectiveFrom) {
       rateMap.set(rate.userId, rate);

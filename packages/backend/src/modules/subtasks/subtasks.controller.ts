@@ -79,6 +79,7 @@ export async function reorderSubtasksHandler(
     request.server.prisma,
     params.tid,
     body.orderedIds,
+    request.user!.id,
   );
   request.server.broadcast(projectId, "subtask_updated", {
     taskId: params.tid,

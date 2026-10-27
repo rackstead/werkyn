@@ -113,7 +113,7 @@ export async function deleteTaskHandler(
     where: { id: params.tid },
     select: { projectId: true },
   });
-  await tasksService.deleteTask(request.server.prisma, params.tid);
+  await tasksService.deleteTask(request.server.prisma, params.tid, request.user!.id);
   if (taskToDelete) {
     request.server.broadcast(taskToDelete.projectId, "task_deleted", { taskId: params.tid });
   }
@@ -172,6 +172,7 @@ export async function archiveTaskHandler(
     request.server.prisma,
     params.tid,
     body,
+    request.user!.id,
   );
   request.server.broadcast(task.projectId, "task_updated", { taskId: params.tid });
   return reply.send({ data: task });
@@ -244,6 +245,7 @@ export async function addLabelHandler(
     request.server.prisma,
     params.tid,
     body,
+    request.user!.id,
   );
   const taskForLabel = await request.server.prisma.task.findUnique({ where: { id: params.tid }, select: { projectId: true } });
   if (taskForLabel) {
@@ -297,6 +299,7 @@ export async function bulkDeleteHandler(
     request.server.prisma,
     params.pid,
     body.taskIds,
+    request.user!.id,
   );
   request.server.broadcast(params.pid, "task_deleted", { bulk: true });
   return reply.send({ data: result });

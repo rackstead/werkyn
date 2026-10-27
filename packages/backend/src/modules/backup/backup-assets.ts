@@ -32,6 +32,28 @@ export function extractStorageUrls(content: unknown): string[] {
   return Array.from(urls);
 }
 
+/** Export replaces complete reference tokens only; denied/missing suffixes stay intact. */
+export function rewriteStorageUrls(
+  content: unknown,
+  urlMap: Map<string, string>,
+): unknown {
+  if (typeof content === "string") {
+    return content.replace(STORAGE_URL_RE, (url) => urlMap.get(url) ?? url);
+  }
+  if (Array.isArray(content)) {
+    return content.map((item) => rewriteStorageUrls(item, urlMap));
+  }
+  if (content !== null && typeof content === "object") {
+    return Object.fromEntries(
+      Object.entries(content).map(([key, value]) => [
+        key,
+        rewriteStorageUrls(value, urlMap),
+      ]),
+    );
+  }
+  return content;
+}
+
 /**
  * Recursively walk an unknown JSON value and replace URLs using a mapping.
  * Returns a deep-cloned structure with replacements applied.

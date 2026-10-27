@@ -285,6 +285,7 @@ export async function createFileShareLink(
     },
     include: {
       files: {
+        where: { file: { workspaceId, trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },
@@ -313,6 +314,7 @@ export async function getFileShareLinks(
     },
     include: {
       files: {
+        where: { file: { workspaceId, trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },
@@ -351,6 +353,7 @@ export async function updateFileShareLink(
     data: updateData,
     include: {
       files: {
+        where: { file: { workspaceId: existing.workspaceId, trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },

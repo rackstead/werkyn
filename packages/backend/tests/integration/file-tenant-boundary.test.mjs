@@ -937,3 +937,127 @@ test("member share issuance retains legitimate same-workspace behavior", async (
   }
   assert.fail("Expected the legitimate share notification");
 });
+
+test("authenticated legacy link listings retain all active local sources and omit foreign or trashed nested metadata", async () => {
+  const active = await makeFile("MEMBER", { name: "Active local source one" });
+  const another = await makeFile("MEMBER", { name: "Active local source two" });
+  const trash = await makeFile("MEMBER", {
+    name: "Trashed nested source",
+    trashedAt: new Date(),
+  });
+  const link = await app.prisma.fileShareLink.create({
+    data: {
+      workspaceId: workspace.id,
+      createdById: users.MEMBER.id,
+      token: crypto.randomUUID(),
+      files: {
+        create: [active, another, foreignFile, trash].map((file) => ({
+          fileId: file.id,
+        })),
+      },
+    },
+  });
+  const rows = () =>
+    app.prisma.fileShareLink.findUnique({
+      where: { id: link.id },
+      include: { files: { orderBy: { id: "asc" } } },
+    });
+  const before = await rows();
+  const initial = { reads, writes, events, deletes };
+  const notifications = await app.prisma.notification.count();
+  const expected = [active.id, another.id].sort();
+  for (const actor of ["MEMBER", "ADMIN"]) {
+    const response = await req(
+      actor,
+      "GET",
+      `${base()}/files/${active.id}/share-links`,
+    );
+    assert.equal(response.statusCode, 200, response.body);
+    const listed = response.json().data.find((entry) => entry.id === link.id);
+    assert(listed, "The valid local link should remain listed");
+    assert.deepEqual(
+      listed.files.map((entry) => entry.file.id).sort(),
+      expected,
+    );
+    assert.equal(listed.files.length, expected.length);
+    assert(!response.body.includes(foreignFile.id));
+    assert(!response.body.includes(trash.id));
+  }
+  const publicResponse = await app.inject({
+    method: "GET",
+    url: `/api/public/files/${link.token}`,
+  });
+  assert.equal(publicResponse.statusCode, 200, publicResponse.body);
+  assert.deepEqual(
+    publicResponse
+      .json()
+      .data.files.map((entry) => entry.file.id)
+      .sort(),
+    expected,
+  );
+  assert.deepEqual(await rows(), before);
+  assert.equal(await app.prisma.notification.count(), notifications);
+  assert.deepEqual({ reads, writes, events, deletes }, initial);
+});
+
+test("share-link create and owner-update responses preserve active local metadata while filtering legacy siblings", async () => {
+  const active = await makeFile("MEMBER", {
+    name: "Local creation source one",
+  });
+  const another = await makeFile("MEMBER", {
+    name: "Local creation source two",
+  });
+  const trash = await makeFile("MEMBER", {
+    trashedAt: new Date(),
+    name: "Hidden inactive sibling",
+  });
+  const expected = [active.id, another.id].sort();
+  const created = await req("MEMBER", "POST", `${base()}/files/share-links`, {
+    fileIds: expected,
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.deepEqual(
+    created
+      .json()
+      .data.files.map((entry) => entry.file.id)
+      .sort(),
+    expected,
+  );
+  const link = created.json().data;
+  await app.prisma.fileShareLinkFile.createMany({
+    data: [foreignFile, trash].map((file) => ({
+      shareLinkId: link.id,
+      fileId: file.id,
+    })),
+  });
+  const before = await app.prisma.fileShareLinkFile.findMany({
+    where: { shareLinkId: link.id },
+    orderBy: { id: "asc" },
+  });
+  const initial = { reads, writes, events, deletes };
+  const updated = await req(
+    "MEMBER",
+    "PATCH",
+    `${base()}/file-share-links/${link.id}`,
+    { enabled: false },
+  );
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json().data.enabled, false);
+  assert.deepEqual(
+    updated
+      .json()
+      .data.files.map((entry) => entry.file.id)
+      .sort(),
+    expected,
+  );
+  assert(!updated.body.includes(foreignFile.id));
+  assert(!updated.body.includes(trash.id));
+  assert.deepEqual(
+    await app.prisma.fileShareLinkFile.findMany({
+      where: { shareLinkId: link.id },
+      orderBy: { id: "asc" },
+    }),
+    before,
+  );
+  assert.deepEqual({ reads, writes, events, deletes }, initial);
+});

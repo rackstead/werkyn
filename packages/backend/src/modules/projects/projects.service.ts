@@ -7,6 +7,7 @@ import type {
   AddProjectMemberInput,
 } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { revokeProjectAccess } from "../realtime/realtime.service.js";
 
 const DEFAULT_STATUSES = [
   { name: "To Do", color: "#94a3b8", position: 0, isCompletion: false },
@@ -251,4 +252,5 @@ export async function removeProjectMember(
 
     await tx.projectMember.delete({ where: { id: member.id } });
   });
+  revokeProjectAccess(targetUserId, projectId);
 }

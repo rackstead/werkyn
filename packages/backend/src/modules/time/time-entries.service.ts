@@ -1,6 +1,40 @@
-import type { PrismaClient, WorkspaceRole } from "@prisma/client";
+import type { Prisma, PrismaClient, WorkspaceRole } from "@prisma/client";
 import type { CreateTimeEntryInput, UpdateTimeEntryInput, TimeEntryQuery } from "@pm/shared";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { assertProjectAccess, projectAccessWhere } from "../../utils/project-access.js";
+
+/** Both nullable relations can carry project content, including legacy mismatches. */
+export function timeEntryProjectWhere(workspaceId: string, userId: string): Prisma.TimeEntryWhereInput {
+  const project = projectAccessWhere(workspaceId, userId);
+  return {
+    AND: [
+      { OR: [{ projectId: null }, { project }] },
+      { OR: [{ taskId: null }, { task: { project } }] },
+    ],
+  };
+}
+
+async function assertEntryProjects(
+  prisma: PrismaClient,
+  workspaceId: string,
+  userId: string,
+  references: { projectId?: string | null; taskId?: string | null },
+) {
+  const projectIds = new Set<string>();
+  if (references.projectId) projectIds.add(references.projectId);
+  let taskProjectId: string | undefined;
+  if (references.taskId) {
+    const task = await prisma.task.findUnique({ where: { id: references.taskId }, select: { projectId: true } });
+    if (!task) throw new NotFoundError("Task not found");
+    taskProjectId = task.projectId;
+    projectIds.add(task.projectId);
+  }
+  for (const projectId of projectIds) {
+    const access = await assertProjectAccess(prisma, projectId, userId);
+    if (access.workspaceId !== workspaceId) throw new NotFoundError("Project not found in this workspace");
+  }
+  return taskProjectId;
+}
 
 export async function createEntry(
   prisma: PrismaClient,
@@ -8,18 +42,8 @@ export async function createEntry(
   userId: string,
   data: CreateTimeEntryInput,
 ) {
-  let projectId = data.projectId ?? null;
-
-  // Auto-populate projectId from task if taskId provided
-  if (data.taskId && !projectId) {
-    const task = await prisma.task.findUnique({
-      where: { id: data.taskId },
-      select: { projectId: true },
-    });
-    if (task) {
-      projectId = task.projectId;
-    }
-  }
+  const taskProjectId = await assertEntryProjects(prisma, workspaceId, userId, data);
+  const projectId = data.projectId ?? taskProjectId ?? null;
 
   return prisma.timeEntry.create({
     data: {
@@ -56,17 +80,18 @@ export async function updateEntry(
     throw new ForbiddenError("You can only edit your own time entries");
   }
 
+  await assertEntryProjects(prisma, entry.workspaceId, userId, entry);
+
   let projectId = data.projectId;
   // Auto-populate projectId from task if taskId changes
   if (data.taskId !== undefined && data.taskId && projectId === undefined) {
-    const task = await prisma.task.findUnique({
-      where: { id: data.taskId },
-      select: { projectId: true },
-    });
-    if (task) {
-      projectId = task.projectId;
-    }
+    projectId = await assertEntryProjects(prisma, entry.workspaceId, userId, { taskId: data.taskId });
   }
+
+  await assertEntryProjects(prisma, entry.workspaceId, userId, {
+    taskId: data.taskId === undefined ? entry.taskId : data.taskId,
+    projectId: projectId === undefined ? entry.projectId : projectId,
+  });
 
   const updateData: Record<string, unknown> = {};
   if (data.date !== undefined) updateData.date = data.date;
@@ -102,6 +127,8 @@ export async function deleteEntry(
     throw new ForbiddenError("You can only delete your own time entries");
   }
 
+  await assertEntryProjects(prisma, entry.workspaceId, userId, entry);
+
   return prisma.timeEntry.delete({ where: { id: entryId } });
 }
 
@@ -122,6 +149,7 @@ export async function listEntries(
   return prisma.timeEntry.findMany({
     where: {
       workspaceId,
+      ...timeEntryProjectWhere(workspaceId, userId),
       ...(filterUserId ? { userId: filterUserId } : {}),
       date: {
         gte: query.startDate,

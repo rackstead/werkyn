@@ -1,5 +1,6 @@
 export const queryKeys = {
   me: ["me"] as const,
+  apiKeys: (userId: string) => ["api-keys", userId] as const,
   workspaces: ["workspaces"] as const,
   workspace: (wid: string) => ["workspaces", wid] as const,
   workspaceMembers: (wid: string) => ["workspaces", wid, "members"] as const,

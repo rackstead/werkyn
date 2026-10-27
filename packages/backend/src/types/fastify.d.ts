@@ -10,6 +10,7 @@ declare module "fastify" {
   }
 
   interface FastifyRequest {
+    apiKeyId?: string;
     user?: {
       id: string;
       email: string;

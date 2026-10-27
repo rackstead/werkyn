@@ -29,6 +29,7 @@ model User {
   subtaskAssignments      Subtask[]
   comments                Comment[]
   refreshTokens           RefreshToken[]
+  apiKeys                 ApiKey[]
   activityLogs            ActivityLog[]
   passwordResetTokens     PasswordResetToken[]
   emailVerificationTokens EmailVerificationToken[]
@@ -62,6 +63,22 @@ model User {
   fileSharesReceived      FileShare[]       @relation("FileSharesReceived")
   fileShareLinksCreated   FileShareLink[]   @relation("FileShareLinksCreated")
   dashboardPreferences    DashboardPreference[]
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  name       String    @db.VarChar(100)
+  prefix     String    @db.VarChar(11)
+  tokenHash  String    @unique
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 model RefreshToken {

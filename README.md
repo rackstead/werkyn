@@ -199,6 +199,58 @@ This will start both the backend and frontend in development mode:
 - `pnpm build` - Build for production
 - `pnpm preview` - Preview production build
 
+## API keys
+
+Open **Settings → API keys** to create a named personal key for scripts, bots, and
+integrations. Choose 1, 7, 30, 90, or 365 days, or **Never expires**. The default is
+30 days. Copy the key when it is created; it cannot be displayed again. The list
+shows its prefix, expiration, last use, and revocation status.
+
+Send the key in the Authorization header:
+
+```bash
+curl -H "Authorization: Bearer $WERKYN_API_KEY" \
+  https://your-werkyn.example/api/users/me
+```
+
+Keys have their owner's current permissions across all their workspaces; they
+are not separately scoped identities or service accounts. Existing workspace
+membership, role, and task ownership checks still apply. Expired or revoked keys
+are rejected on the next request. Keys are stored only as SHA-256 hashes and
+cannot be supplied in URL query parameters. Existing JWT login and refresh-cookie
+authentication continues to work. API keys currently support HTTP API access;
+WebSocket authentication continues to require a JWT.
+
+API key management requires a JWT user session; API keys cannot manage keys:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/api/api-keys` | List your keys' metadata |
+| POST | `/api/api-keys` | Create a key; returns its plaintext value once |
+| DELETE | `/api/api-keys/:id` | Revoke one of your keys |
+
+Creation accepts `{"name":"CI pipeline","expiresInDays":30}`. `expiresInDays`
+accepts whole numbers from 1 to 365, defaults to 30, and accepts `null` to opt out
+of expiration.
+
+### Testing API keys
+
+Run the settings tests with `pnpm --filter @pm/frontend test`. The backend
+integration tests exercise the full application against a disposable PostgreSQL
+database, including key creation, hashing, expiration, revocation, authorization,
+and existing login/refresh behavior. They require an explicit test database URL:
+
+```bash
+export TEST_DATABASE_URL=postgresql://user:password@localhost:5432/werkyn_test
+DATABASE_URL="$TEST_DATABASE_URL" pnpm --filter @pm/backend exec prisma migrate deploy
+pnpm --filter @pm/backend db:generate
+pnpm --filter @pm/shared build
+pnpm --filter @pm/backend test:integration
+```
+
+The migration adds the `ApiKey` table. Apply migrations when upgrading, as the
+Docker entrypoint does automatically.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

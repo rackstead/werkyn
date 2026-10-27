@@ -7,6 +7,7 @@ import type {
   CreateDmInput,
   AddMembersInput,
   ChatMessageQueryInput,
+  ChatBookmarkQueryInput,
   ToggleReactionInput,
   PinMessageInput,
   ArchiveChannelInput,
@@ -536,7 +537,7 @@ export async function listBookmarksHandler(
   reply: FastifyReply,
 ) {
   const { wid } = request.params as { wid: string };
-  const query = request.query as { cursor?: string; limit?: number };
+  const query = request.query as ChatBookmarkQueryInput;
 
   const result = await chatService.listBookmarks(
     request.server.prisma,

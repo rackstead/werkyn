@@ -98,14 +98,12 @@ export function useVerifyEmail() {
         .post(`auth/verify-email/${token}`)
         .json<{ data: { user: User } }>(),
     onSuccess: (res) => {
-      const store = useAuthStore.getState();
-      if (store.user) {
-        store.setAuth(
-          { ...store.user, emailVerified: true },
-          store.accessToken!,
-          store.workspaces,
-        );
-      }
+      const verifiedUser = res.data.user;
+      useAuthStore.setState((state) =>
+        state.user?.id === verifiedUser.id
+          ? { user: { ...state.user, emailVerified: verifiedUser.emailVerified } }
+          : state,
+      );
       toast.success("Email verified successfully");
     },
   });

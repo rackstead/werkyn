@@ -6,6 +6,7 @@ import { NotFoundError, ForbiddenError } from "../../utils/errors.js";
 import {
   assertFileAccess,
   fileAccessRole,
+  fileReadWhere,
   type AccessContext,
 } from "./file-access.js";
 import { notify } from "../../utils/notify.js";
@@ -111,7 +112,7 @@ export async function getFileShares(
   fileId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
 
   return prisma.fileShare.findMany({
     where: { workspaceId, fileId },
@@ -134,13 +135,13 @@ export async function listSharedWithMe(
   cursor?: string,
   limit = 50,
 ) {
-  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
   const shares = await prisma.fileShare.findMany({
     where: {
       workspaceId,
       sharedWithId: userId,
-      file: { workspaceId, trashedAt: null },
+      file: { AND: [readable], trashedAt: null },
     },
     include: {
       file: {
@@ -175,7 +176,7 @@ export async function listSharedByMe(
   _cursor?: string,
   _limit = 50,
 ) {
-  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
   // Query both member shares and public link shares in parallel
   const [memberShares, linkShareFiles] = await Promise.all([
@@ -183,7 +184,7 @@ export async function listSharedByMe(
       where: {
         workspaceId,
         sharedById: userId,
-        file: { workspaceId, trashedAt: null },
+        file: { AND: [readable], trashedAt: null },
       },
       include: {
         file: {
@@ -202,7 +203,7 @@ export async function listSharedByMe(
     prisma.fileShareLinkFile.findMany({
       where: {
         shareLink: { workspaceId, createdById: userId },
-        file: { workspaceId, trashedAt: null },
+        file: { AND: [readable], trashedAt: null },
       },
       include: {
         file: {
@@ -213,7 +214,7 @@ export async function listSharedByMe(
           },
         },
         shareLink: {
-          select: { id: true, token: true, createdAt: true },
+          select: { createdAt: true },
         },
       },
     }),
@@ -272,6 +273,8 @@ export async function createFileShareLink(
   const token = crypto.randomBytes(6).toString("base64url");
   const passwordHash = password ? await bcrypt.hash(password, 10) : undefined;
 
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
+
   return prisma.fileShareLink.create({
     data: {
       workspaceId,
@@ -285,7 +288,7 @@ export async function createFileShareLink(
     },
     include: {
       files: {
-        where: { file: { workspaceId, trashedAt: null } },
+        where: { file: { AND: [readable], trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },
@@ -305,16 +308,20 @@ export async function getFileShareLinks(
   fileId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
+  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
+
+  const role = await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
 
   return prisma.fileShareLink.findMany({
     where: {
       workspaceId,
+      ...(role === "ADMIN" ? {} : { createdById: ctx.userId }),
       files: { some: { fileId } },
     },
     include: {
       files: {
-        where: { file: { workspaceId, trashedAt: null } },
+        where: { file: { AND: [readable], trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },
@@ -355,7 +362,7 @@ export async function updateFileShareLink(
   data: { enabled?: boolean; password?: string | null; expiresAt?: string | null },
   ctx: AccessContext,
 ) {
-  const existing = await assertShareLinkManager(prisma, linkId, ctx);
+  await assertShareLinkManager(prisma, linkId, ctx);
 
   const updateData: Record<string, unknown> = {};
   if (data.enabled !== undefined) updateData.enabled = data.enabled;
@@ -368,12 +375,14 @@ export async function updateFileShareLink(
       : null;
   }
 
+  const readable = await fileReadWhere(prisma, ctx);
+
   return prisma.fileShareLink.update({
     where: { id: linkId, workspaceId: ctx.workspaceId },
     data: updateData,
     include: {
       files: {
-        where: { file: { workspaceId: existing.workspaceId, trashedAt: null } },
+        where: { file: { AND: [readable], trashedAt: null } },
         include: {
           file: {
             select: { id: true, name: true, mimeType: true, size: true },
@@ -507,13 +516,13 @@ export async function getFileShareStatus(
   fileIds: string[],
   ctx: AccessContext,
 ) {
-  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const [shares, linkFiles] = await Promise.all([
     prisma.fileShare.findMany({
       where: {
         workspaceId,
         fileId: { in: fileIds },
-        file: { workspaceId, trashedAt: null },
+        file: { AND: [readable], trashedAt: null },
       },
       select: { fileId: true },
       distinct: ["fileId"],
@@ -522,7 +531,7 @@ export async function getFileShareStatus(
       where: {
         fileId: { in: fileIds },
         shareLink: { workspaceId },
-        file: { workspaceId, trashedAt: null },
+        file: { AND: [readable], trashedAt: null },
       },
       select: { fileId: true },
       distinct: ["fileId"],

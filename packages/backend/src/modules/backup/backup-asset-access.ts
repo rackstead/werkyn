@@ -22,13 +22,29 @@ export async function assertBackupExportAccess(
 }
 
 function storagePathsFromUrl(url: string): string[] {
-  const pathname = url.split(/[?#]/, 1)[0];
-  if (!pathname.startsWith("/storage/")) return [];
-  const raw = pathname.slice("/storage/".length).split("/");
-  // Upload responses contain literal filename extensions, including lone '%' or
-  // percent text resembling URL escapes. Also accept their URI-encoded spelling.
-  // Decode at most once; raw and decoded paths receive separate identity checks.
-  const decoded = raw.map((segment) => {
+  if (!url.startsWith("/storage/")) return [];
+  const raw = url.slice("/storage/".length);
+  const pathname = raw.split(/[?#]/, 1)[0];
+  const candidates = new Set<string>();
+  const add = (segments: string[]) => {
+    if (
+      segments.every(
+        (segment) =>
+          segment &&
+          segment !== "." &&
+          segment !== ".." &&
+          !/[\\/\u0000-\u001f\u007f]/.test(segment),
+      )
+    ) {
+      candidates.add(segments.join("/"));
+    }
+  };
+  // Current upload responses contain literal extensions, including '%2f', '?'
+  // and '#'. Resolve their FULL exact storage identity before interpreting any
+  // URL syntax. These characters are filename data when storage reads the path.
+  add(raw.split("/"));
+  const uriSegments = pathname.split("/");
+  const decoded = uriSegments.map((segment) => {
     try {
       return decodeURIComponent(segment.replace(/%(?![\da-f]{2})/gi, "%25"));
     } catch {
@@ -36,21 +52,12 @@ function storagePathsFromUrl(url: string): string[] {
       return segment;
     }
   });
-  const invalid = (segment: string) =>
-    !segment ||
-    segment === "." ||
-    segment === ".." ||
-    /[\\/\u0000-\u001f\u007f]/.test(segment);
-  if (
-    raw.some(invalid) ||
-    decoded.some(invalid) ||
-    // Reject encoded structural characters even alongside malformed UTF-8. Do
-    // not turn residual encoded dot segments into a second path decoding step.
-    raw.some((segment) => /%(?:2f|5c|0[\da-f]|1[\da-f]|7f)/i.test(segment)) ||
-    decoded.some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment))
-  )
-    return [];
-  return [...new Set([decoded.join("/"), raw.join("/")])];
+  // Reject only an unsafe interpretation, not a separately valid raw filename.
+  // Never decode a resulting storage candidate again; residual percent text is
+  // literal data, not a second chance to introduce separators or parent paths.
+  add(decoded);
+  add(uriSegments);
+  return [...candidates];
 }
 
 /** Resolve current resource authority before opening any embedded storage path. */

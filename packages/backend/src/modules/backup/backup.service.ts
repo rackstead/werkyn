@@ -363,11 +363,11 @@ export async function exportBackup(
       const storagePaths = await resolveBackupAssetPaths(prisma, ctx, url);
       for (const storagePath of storagePaths) {
         try {
-          // Raw upload responses can contain percent text which also spells a
-          // valid URL escape. Stat only independently authorized candidates and
-          // read the existing exact path; storage never decodes it again.
+          // Resolve literal upload filenames before URI alternatives. Stat only
+          // independently authorized candidates; storage never decodes them.
+          // A missing literal spelling of URI syntax must not become a read.
           if (
-            storagePaths.length > 1 &&
+            (storagePaths.length > 1 || /[%?#]/.test(url)) &&
             !(await storage.exists(storagePath))
           ) continue;
           const buffer = await storage.read(storagePath);

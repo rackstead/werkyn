@@ -366,7 +366,7 @@ test("canonical URL spelling permits encoded filename and query suffix without p
   ]);
 });
 
-test("current uploads with literal percent filenames export wiki and Drive bytes through raw and encoded URLs", async () => {
+test("current uploads with literal filename syntax export wiki and Drive bytes through raw and encoded URLs", async () => {
   const assets = [],
     refs = [];
   for (const name of [
@@ -375,6 +375,13 @@ test("current uploads with literal percent filenames export wiki and Drive bytes
     "progress.20%20",
     "progress.%complete",
     "progress.%AB",
+    "progress.p%2f",
+    "progress.p%5C",
+    "progress.p%00",
+    "progress.p%7f",
+    "progress.p?rev",
+    "progress.p#tag",
+    "progress.p?rev#tag",
   ]) {
     const boundary = `backup-percent-${crypto.randomUUID()}`;
     const wikiBytes = bytes(`wiki ${name}`);
@@ -469,6 +476,37 @@ test("current uploads with literal percent filenames export wiki and Drive bytes
     assert.deepEqual(stats, []);
     assert.equal(result.zip.getEntries().length, 1);
     assert.deepEqual(result.json.wikiSpaces[0].pages[0].content, denied);
+    assert.deepEqual(await snapshot(), before);
+  }
+  for (const asset of assets.filter((item) =>
+    /\.p[?#]/.test(item.storagePath),
+  )) {
+    const prefix = asset.storagePath.split(/[?#]/, 1)[0];
+    await put(prefix, "Different authorized URI-prefix bytes");
+    const alternative = await file(prefix);
+    await content([url(asset.storagePath)]);
+    const literal = unpack(await request());
+    assert.deepEqual(reads, [asset.storagePath]);
+    assert.deepEqual(stats, [asset.storagePath]);
+    assert.deepEqual(
+      literal.zip
+        .getEntry(`assets/${path.basename(asset.storagePath)}`)
+        .getData(),
+      asset.expected,
+    );
+    await app.prisma.file.update({
+      where: { id: alternative.id },
+      data: { workspaceId: foreign.id },
+    });
+    await content([url(asset.storagePath)]);
+    const before = await snapshot();
+    const denied = unpack(await request());
+    assert.deepEqual(reads, []);
+    assert.deepEqual(stats, []);
+    assert.equal(denied.zip.getEntries().length, 1);
+    assert.deepEqual(denied.json.wikiSpaces[0].pages[0].content, [
+      url(asset.storagePath),
+    ]);
     assert.deepEqual(await snapshot(), before);
   }
 });

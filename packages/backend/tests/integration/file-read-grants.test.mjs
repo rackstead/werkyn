@@ -779,6 +779,96 @@ test("shared-by-me and share status recheck current read rights after group auth
   assert.deepEqual(sideEffects(), effectsBefore);
 });
 
+test("own sent-share history survives write loss only while current membership and source reads remain", async () => {
+  const { folder, file } = await team();
+  await share(file, "PEER", "MEMBER");
+  await share(file, "VIEWER", "ADMIN");
+  await share(file, "MEMBER", "ADMIN");
+  const removed = await req(
+    "ADMIN",
+    "DELETE",
+    `${base()}/team-folders/${folder.id}/members/${users.MEMBER.id}`,
+  );
+  assert.equal(removed.statusCode, 204, removed.body);
+  await content("MEMBER", file, "bytes-ADMIN");
+  await deniedUnchanged("MEMBER", [
+    ["PATCH", `/files/${file.id}`, { name: "Denied" }],
+    ["GET", `/files/${file.id}/shares`],
+  ]);
+
+  const before = await state();
+  const history = (await list("MEMBER", "/files/shared-by-me")).filter(
+    (row) => row.file.id === file.id,
+  );
+  assert.equal(history.length, 1);
+  assert.equal(history[0].shareType, "member");
+  assert.equal(history[0].sharedWith.id, users.PEER.id);
+  assert.equal(history[0].sharedWith.email, users.PEER.email);
+  assert(!JSON.stringify(history).includes(users.VIEWER.email));
+  // A grant recipient gets no other issuer's sent-share history or source roster.
+  assert(
+    !(await list("PEER", "/files/shared-by-me")).some(
+      (row) => row.file.id === file.id,
+    ),
+  );
+  assert.deepEqual(await state(), before);
+  await deniedUnchanged("PEER", [["GET", `/files/${file.id}/shares`]]);
+
+  const revoked = await req(
+    "ADMIN",
+    "DELETE",
+    `${base()}/files/${file.id}/shares/${users.MEMBER.id}`,
+  );
+  assert.equal(revoked.statusCode, 204, revoked.body);
+  const afterRevocation = await state();
+  assert(
+    !(await list("MEMBER", "/files/shared-by-me")).some(
+      (row) => row.file.id === file.id,
+    ),
+  );
+  assert.deepEqual(await state(), afterRevocation);
+
+  await app.prisma.fileShare.create({
+    data: {
+      workspaceId: workspace.id,
+      fileId: file.id,
+      sharedById: users.ADMIN.id,
+      sharedWithId: users.MEMBER.id,
+    },
+  });
+  await app.prisma.workspaceMember.delete({
+    where: {
+      userId_workspaceId: {
+        userId: users.MEMBER.id,
+        workspaceId: workspace.id,
+      },
+    },
+  });
+  try {
+    await deniedUnchanged("MEMBER", [["GET", "/files/shared-by-me"]]);
+    const { listSharedByMe } =
+      await import("../../src/modules/files/file-shares.service.ts");
+    const beforeDirectRead = await state();
+    await assert.rejects(
+      listSharedByMe(app.prisma, workspace.id, {
+        workspaceId: workspace.id,
+        userId: users.MEMBER.id,
+        workspaceRole: "ADMIN",
+      }),
+      /member/,
+    );
+    assert.deepEqual(await state(), beforeDirectRead);
+  } finally {
+    await app.prisma.workspaceMember.create({
+      data: {
+        workspaceId: workspace.id,
+        userId: users.MEMBER.id,
+        role: "MEMBER",
+      },
+    });
+  }
+});
+
 test("removed workspace membership overrides retained explicit, group and stale ADMIN contexts on all read entry points", async () => {
   const file = await makeFile("PEER");
   await share(file);

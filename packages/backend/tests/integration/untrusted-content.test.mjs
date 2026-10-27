@@ -158,8 +158,12 @@ before(async () => {
 
 after(async () => {
   try {
-    if (workspace)
+    if (workspace) {
+      await app.prisma.task.deleteMany({
+        where: { project: { workspaceId: workspace.id } },
+      });
       await app.prisma.workspace.deleteMany({ where: { id: workspace.id } });
+    }
     if (user) await app.prisma.user.deleteMany({ where: { id: user.id } });
   } finally {
     await app?.close();
@@ -291,12 +295,28 @@ test("private thumbnails retain valid raster bytes without public caching", asyn
 });
 
 test("attachment and public-share siblings keep their forced-download behavior", async () => {
+  // Attachment reads require a real target in the actor's current project scope.
+  const project = await app.prisma.project.create({
+    data: {
+      workspaceId: workspace.id,
+      name: "Response policy target",
+      statuses: { create: { name: "Open" } },
+    },
+    include: { statuses: true },
+  });
+  const task = await app.prisma.task.create({
+    data: {
+      projectId: project.id,
+      statusId: project.statuses[0].id,
+      title: "Response policy target",
+    },
+  });
   const file = await driveFile("text/html");
   const attachment = await app.prisma.attachment.create({
     data: {
       workspaceId: workspace.id,
       entityType: "task",
-      entityId: "response-policy-fixture",
+      entityId: task.id,
       name: "Fixture.html",
       mimeType: "text/html",
       storagePath: file.storagePath,

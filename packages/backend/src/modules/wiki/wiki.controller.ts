@@ -21,6 +21,7 @@ import * as versionsService from "./wiki-versions.service.js";
 import * as locksService from "./wiki-locks.service.js";
 import * as commentsService from "./wiki-comments.service.js";
 import * as sharesService from "./wiki-shares.service.js";
+import { setShareGrantCookie, shareGrantCookieName, shareSummary } from "../../utils/share-grants.js";
 
 // ─── Spaces ─────────────────────────────────────────────
 
@@ -480,7 +481,7 @@ export async function getShareHandler(
   const { pgid } = request.params as { pgid: string };
 
   const share = await sharesService.getShare(request.server.prisma, pgid);
-  return reply.send({ data: share });
+  return reply.send({ data: share ? shareSummary(share) : null });
 }
 
 export async function createShareHandler(
@@ -497,7 +498,7 @@ export async function createShareHandler(
     body.password,
   );
 
-  return reply.status(201).send({ data: share });
+  return reply.status(201).send({ data: shareSummary(share) });
 }
 
 export async function updateShareHandler(
@@ -513,7 +514,7 @@ export async function updateShareHandler(
     body,
   );
 
-  return reply.send({ data: share });
+  return reply.send({ data: shareSummary(share) });
 }
 
 export async function deleteShareHandler(
@@ -537,6 +538,7 @@ export async function getPublicPageHandler(
   const result = await sharesService.getPublicPage(
     request.server.prisma,
     token,
+    request.cookies[shareGrantCookieName("wiki", token)],
   );
   return reply.send({ data: result });
 }
@@ -548,11 +550,12 @@ export async function validatePublicPageHandler(
   const { token } = request.params as { token: string };
   const body = request.body as ValidateWikiShareInput;
 
-  await sharesService.validateShareAccess(
+  const share = await sharesService.validateShareAccess(
     request.server.prisma,
     token,
     body.password,
   );
+  setShareGrantCookie(reply, "wiki", token, share);
 
   return reply.send({ data: { valid: true } });
 }

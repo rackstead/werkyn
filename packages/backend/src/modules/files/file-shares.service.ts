@@ -1,8 +1,16 @@
+import {
+  hasShareGrant,
+  updateShareRevision,
+} from "../../utils/share-grants.js";
 import type { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
-import { NotFoundError, ForbiddenError } from "../../utils/errors.js";
+import {
+  NotFoundError,
+  ForbiddenError,
+  ConflictError,
+} from "../../utils/errors.js";
 import {
   assertFileAccess,
   fileAccessRole,
@@ -359,7 +367,11 @@ async function assertShareLinkManager(
 export async function updateFileShareLink(
   prisma: PrismaClient,
   linkId: string,
-  data: { enabled?: boolean; password?: string | null; expiresAt?: string | null },
+  data: {
+    enabled?: boolean;
+    password?: string | null;
+    expiresAt?: string | null;
+  },
   ctx: AccessContext,
 ) {
   await assertShareLinkManager(prisma, linkId, ctx);
@@ -377,23 +389,35 @@ export async function updateFileShareLink(
 
   const readable = await fileReadWhere(prisma, ctx);
 
-  return prisma.fileShareLink.update({
-    where: { id: linkId, workspaceId: ctx.workspaceId },
-    data: updateData,
-    include: {
-      files: {
-        where: { file: { AND: [readable], trashedAt: null } },
+  return updateShareRevision(
+    () =>
+      prisma.fileShareLink.findUnique({
+        where: { id: linkId, workspaceId: ctx.workspaceId },
+      }),
+    (existing, updatedAt) =>
+      prisma.fileShareLink.update({
+        where: {
+          id: linkId,
+          workspaceId: ctx.workspaceId,
+          updatedAt: existing.updatedAt,
+        },
+        data: { ...updateData, updatedAt },
         include: {
-          file: {
-            select: { id: true, name: true, mimeType: true, size: true },
+          files: {
+            where: { file: { AND: [readable], trashedAt: null } },
+            include: {
+              file: {
+                select: { id: true, name: true, mimeType: true, size: true },
+              },
+            },
+          },
+          createdBy: {
+            select: { id: true, displayName: true, avatarUrl: true },
           },
         },
-      },
-      createdBy: {
-        select: { id: true, displayName: true, avatarUrl: true },
-      },
-    },
-  });
+      }),
+    () => new NotFoundError("Share link not found"),
+  );
 }
 
 export async function deleteFileShareLink(
@@ -409,45 +433,52 @@ export async function deleteFileShareLink(
 
 // ─── Public Access (no auth) ────────────────────────────
 
-export async function getPublicShareLink(prisma: PrismaClient, token: string) {
+export async function getPublicShareLink(
+  prisma: PrismaClient,
+  token: string,
+  grant?: string,
+) {
   const link = await prisma.fileShareLink.findUnique({
     where: { token },
-    include: {
-      files: {
-        where: { file: { trashedAt: null } },
-        include: {
-          file: {
-            select: {
-              id: true,
-              name: true,
-              mimeType: true,
-              size: true,
-              workspaceId: true,
-            },
-          },
-        },
-      },
-      createdBy: {
-        select: { id: true, displayName: true, avatarUrl: true },
-      },
-    },
   });
 
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 
-  if (link.expiresAt && link.expiresAt < new Date()) {
+  if (link.expiresAt && link.expiresAt <= new Date()) {
     throw new NotFoundError("This share link has expired");
   }
 
+  if (link.passwordHash && !hasShareGrant(grant, "files", link)) {
+    return {
+      files: [],
+      createdBy: null,
+      hasPassword: true,
+      authorized: false as const,
+      createdAt: null,
+    };
+  }
+
+  const authorizedLink = await prisma.fileShareLink.findUnique({
+    where: { id: link.id, updatedAt: link.updatedAt, enabled: true },
+    select: {
+      files: {
+        where: { file: { workspaceId: link.workspaceId, trashedAt: null } },
+        include: {
+          file: {
+            select: { id: true, name: true, mimeType: true, size: true },
+          },
+        },
+      },
+      createdBy: { select: { id: true, displayName: true, avatarUrl: true } },
+    },
+  });
+  if (!authorizedLink) throw new NotFoundError("Shared files not found");
+
   return {
-    files: link.files
-      .filter((entry) => entry.file.workspaceId === link.workspaceId)
-      .map((entry) => {
-        const { workspaceId: _workspaceId, ...file } = entry.file;
-        return { ...entry, file };
-      }),
-    createdBy: link.createdBy,
+    files: authorizedLink.files,
+    createdBy: authorizedLink.createdBy,
     hasPassword: !!link.passwordHash,
+    authorized: true as const,
     createdAt: link.createdAt,
   };
 }
@@ -460,15 +491,23 @@ export async function validateShareLinkAccess(
   const link = await prisma.fileShareLink.findUnique({ where: { token } });
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 
-  if (link.expiresAt && link.expiresAt < new Date()) {
+  if (link.expiresAt && link.expiresAt <= new Date()) {
     throw new NotFoundError("This share link has expired");
   }
 
-  if (!link.passwordHash) return true;
+  if (!link.passwordHash) return link;
 
   const valid = await bcrypt.compare(password, link.passwordHash);
   if (!valid) throw new ForbiddenError("Invalid password");
-  return true;
+  const current = await prisma.fileShareLink.findUnique({
+    where: { id: link.id, updatedAt: link.updatedAt, enabled: true },
+  });
+  if (!current)
+    throw new ConflictError("Share changed; please verify its password again");
+  if (current.expiresAt && current.expiresAt <= new Date()) {
+    throw new NotFoundError("This share link has expired");
+  }
+  return current;
 }
 
 export async function downloadPublicFile(
@@ -476,6 +515,7 @@ export async function downloadPublicFile(
   storage: { readStream: (path: string) => NodeJS.ReadableStream },
   token: string,
   fileId: string,
+  grant?: string,
 ) {
   const link = await prisma.fileShareLink.findUnique({
     where: { token },
@@ -486,8 +526,12 @@ export async function downloadPublicFile(
 
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 
-  if (link.expiresAt && link.expiresAt < new Date()) {
+  if (link.expiresAt && link.expiresAt <= new Date()) {
     throw new NotFoundError("This share link has expired");
+  }
+
+  if (link.passwordHash && !hasShareGrant(grant, "files", link)) {
+    throw new ForbiddenError("Share password verification required");
   }
 
   if (link.files.length === 0) {
@@ -496,10 +540,10 @@ export async function downloadPublicFile(
 
   const file = link.files[0].file;
   if (
-    file.workspaceId !== link.workspaceId ||
-    file.trashedAt ||
+    !file.storagePath ||
     file.isFolder ||
-    !file.storagePath
+    file.workspaceId !== link.workspaceId ||
+    file.trashedAt
   ) {
     throw new NotFoundError("File content not available");
   }

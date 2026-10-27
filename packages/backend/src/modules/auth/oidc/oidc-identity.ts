@@ -2,17 +2,11 @@ import crypto from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { UnauthorizedError } from "../../../utils/errors.js";
-
-const userSelect = {
-  id: true,
-  email: true,
-  displayName: true,
-  avatarUrl: true,
-  jobTitle: true,
-  phone: true,
-  timezone: true,
-  emailVerified: true,
-} satisfies Prisma.UserSelect;
+import {
+  accountUserSelect as userSelect,
+  createAccount,
+  waitForAccountRetry,
+} from "../account-creation.js";
 
 export interface OidcIdentity {
   issuer: string;
@@ -146,6 +140,8 @@ export async function resolveOidcUser(
   const provider = oidcProviderNamespace(identity.issuer);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      const existingAccountObserved =
+        (await prisma.user.findFirst({ select: { id: true } })) !== null;
       return await prisma.$transaction(
         async (tx) => {
           const config = await assertSsoEnabled(tx, actualConnectorId);
@@ -219,8 +215,9 @@ export async function resolveOidcUser(
             return existing;
           }
 
-          return tx.user.create({
-            data: {
+          const { user } = await createAccount(
+            tx,
+            {
               email: identity.email,
               displayName: identity.displayName ?? identity.email.slice(0, 100),
               passwordHash: null,
@@ -234,8 +231,9 @@ export async function resolveOidcUser(
                 },
               },
             },
-            select: userSelect,
-          });
+            { bootstrapAdminEligible: false, existingAccountObserved },
+          );
+          return user;
         },
         { isolationLevel: "Serializable" },
       );
@@ -249,6 +247,7 @@ export async function resolveOidcUser(
         throw new UnauthorizedError(
           "Concurrent SSO sign-in. Please try again.",
         );
+      await waitForAccountRetry(attempt);
     }
   }
   throw new UnauthorizedError("SSO sign-in failed");

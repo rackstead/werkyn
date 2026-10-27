@@ -6,11 +6,36 @@ import { fileURLToPath } from "node:url";
 import { env } from "../config/env.js";
 import { authenticate } from "../middleware/authenticate.js";
 import { ForbiddenError } from "../utils/errors.js";
+import {
+  applyUntrustedContentPolicy,
+  isSafeInlineContentType,
+} from "../utils/untrusted-content.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default fp(async (fastify: FastifyInstance) => {
   const storageDir = path.resolve(env.STORAGE_DIR);
+
+  const uploadRoutes = new Set([
+    "/storage/avatars/*",
+    "/storage/uploads/*",
+    "/storage/:workspaceId/uploads/*",
+    "/uploads/*",
+  ]);
+  fastify.addHook("onSend", async (request, reply, payload) => {
+    if (uploadRoutes.has(request.routeOptions.url ?? "") && reply.statusCode < 400) {
+      // Static metadata is available here; setHeaders runs before MIME metadata
+      // and can have its response type overwritten by the static file server.
+      const type = reply.getHeader("Content-Type");
+      applyUntrustedContentPolicy(reply);
+      if (!isSafeInlineContentType(typeof type === "string" ? type : undefined)) {
+        reply
+          .type("application/octet-stream")
+          .header("Content-Disposition", "attachment");
+      }
+    }
+    return payload;
+  });
 
   // New storage-based avatar path
   await fastify.register(fastifyStatic, {

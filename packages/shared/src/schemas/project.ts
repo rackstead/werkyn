@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { QueryBooleanSchema } from "./common.js";
 
 export const CreateProjectSchema = z.object({
   name: z
@@ -25,7 +26,7 @@ export const ArchiveSchema = z.object({
 export type ArchiveInput = z.infer<typeof ArchiveSchema>;
 
 export const ProjectQuerySchema = z.object({
-  archived: z.coerce.boolean().default(false),
+  archived: QueryBooleanSchema.default(false),
   search: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),

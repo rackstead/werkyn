@@ -1,4 +1,5 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
+import { formatContentDisposition } from "../../utils/content-disposition.js";
 import * as shareService from "./file-shares.service.js";
 import type {
   CreateFileShareInput,
@@ -244,13 +245,10 @@ export async function downloadPublicFileHandler(
     fid,
   );
 
-  const safeName = file.name.replace(/"/g, '\\"');
-  const encodedName = encodeURIComponent(file.name);
-
   return reply
     .header(
       "Content-Disposition",
-      `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
+      formatContentDisposition(file.name),
     )
     .header("Content-Type", "application/octet-stream")
     .send(stream);

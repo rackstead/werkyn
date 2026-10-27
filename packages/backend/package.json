@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --import tsx --test tests/*.test.mjs",
-    "test:integration": "node --import tsx --test test/api-keys.test.ts",
+    "test:integration": "NODE_ENV=test node --import tsx --test --test-concurrency=1 test/*.test.ts tests/integration/*.test.mjs",
     "dev": "tsx watch --env-file=.env src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",

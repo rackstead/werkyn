@@ -278,7 +278,8 @@ for (const actor of ["OWNER", "ADMIN"])
     assert.equal(updated.json().data.enabled, false);
     assert.deepEqual(
       updated.json().data.files.map((entry) => entry.file.id),
-      [local.id],
+      // Revocation authority is independent of source-file read authority.
+      actor === "ADMIN" ? [local.id] : [],
     );
     assert(!updated.body.includes(trash.id));
     assert(!updated.body.includes(other.id));

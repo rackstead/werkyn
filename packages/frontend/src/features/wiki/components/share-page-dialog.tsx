@@ -191,7 +191,7 @@ export function SharePageDialog({
             <div className="space-y-2">
               <div className="flex items-center justify-between">
                 <Label>
-                  Password {share.passwordHash ? "(set)" : "(none)"}
+                  Password {share.hasPassword ? "(set)" : "(none)"}
                 </Label>
                 <Button
                   size="sm"

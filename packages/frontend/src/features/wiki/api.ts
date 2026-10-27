@@ -95,14 +95,14 @@ export interface WikiShare {
   id: string;
   pageId: string;
   token: string;
-  passwordHash: string | null;
+  hasPassword: boolean;
   enabled: boolean;
   createdById: string;
   createdAt: string;
   updatedAt: string;
 }
 
-export interface WikiPublicPage {
+interface WikiSharedPageContent {
   page: {
     id: string;
     title: string;
@@ -112,8 +112,12 @@ export interface WikiPublicPage {
     createdBy: { displayName: string };
     lastEditedBy: { displayName: string } | null;
   };
-  hasPassword: boolean;
 }
+
+export type WikiPublicPage = { hasPassword: boolean } & (
+  | { authorized: false; page: null }
+  | ({ authorized: true } & WikiSharedPageContent)
+);
 
 export interface WikiComment {
   id: string;
@@ -561,14 +565,19 @@ export function usePublicWikiPage(token: string) {
         .json<{ data: WikiPublicPage }>(),
     enabled: !!token,
     retry: false,
+    staleTime: 0,
+    gcTime: 0,
+    refetchOnMount: "always",
   });
 }
 
 export function useValidateWikiShare() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ token, password }: { token: string; password: string }) =>
       api
         .post(`public/wiki/${token}/validate`, { json: { password } })
         .json<{ data: { valid: boolean } }>(),
+    onSuccess: (_result, { token }) => qc.invalidateQueries({ queryKey: ["wiki-public", token] }),
   });
 }

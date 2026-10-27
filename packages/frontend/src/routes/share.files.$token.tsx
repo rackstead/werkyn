@@ -23,7 +23,6 @@ function ShareFilesPage() {
   const { data, isLoading, isError } = usePublicFileShare(token);
   const validateShare = useValidateFileShare();
   const [password, setPassword] = useState("");
-  const [authenticated, setAuthenticated] = useState(false);
   const [passwordError, setPasswordError] = useState("");
 
   const publicShare = data?.data;
@@ -57,15 +56,15 @@ function ShareFilesPage() {
   }
 
   // Password gate
-  if (publicShare.hasPassword && !authenticated) {
+  if (!publicShare.authorized) {
     const handleValidate = (e: React.FormEvent) => {
       e.preventDefault();
       setPasswordError("");
       validateShare.mutate(
         { token, password },
         {
-          onSuccess: () => setAuthenticated(true),
-          onError: () => setPasswordError("Incorrect password"),
+          onSuccess: () => setPassword(""),
+          onError: (error) => setPasswordError(error.message || "Unable to verify password"),
         },
       );
     };

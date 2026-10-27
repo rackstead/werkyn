@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { publicShareNoStore } from "../../utils/share-grants.js";
 import { authenticate } from "../../middleware/authenticate.js";
 import { authorize } from "../../middleware/authorize.js";
 import { validate, validateQuery } from "../../middleware/validate.js";
@@ -373,12 +374,15 @@ export default async function wikiRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/public/wiki/:token",
+    onRequest: publicShareNoStore,
     handler: getPublicPageHandler,
   });
 
   fastify.route({
     method: "POST",
     url: "/public/wiki/:token/validate",
+    onRequest: publicShareNoStore,
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
     preHandler: [validate(ValidateWikiShareSchema)],
     handler: validatePublicPageHandler,
   });

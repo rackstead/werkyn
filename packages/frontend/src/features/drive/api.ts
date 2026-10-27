@@ -633,7 +633,7 @@ export interface FileShareMember {
 export interface FileShareLinkDetail {
   id: string;
   token: string;
-  passwordHash: string | null;
+  hasPassword: boolean;
   expiresAt: string | null;
   enabled: boolean;
   files: { file: { id: string; name: string; mimeType: string | null; size: number | null } }[];
@@ -650,12 +650,21 @@ export interface SharedFileEntry {
   createdAt: string;
 }
 
-interface PublicShareData {
+interface AuthorizedPublicShareData {
+  authorized: true;
   files: { file: { id: string; name: string; mimeType: string | null; size: number | null } }[];
   createdBy: { id: string; displayName: string; avatarUrl: string | null };
   hasPassword: boolean;
   createdAt: string;
 }
+
+type PublicShareData = AuthorizedPublicShareData | {
+  authorized: false;
+  hasPassword: true;
+  files: [];
+  createdBy: null;
+  createdAt: null;
+};
 
 // ── File Share Queries ──
 
@@ -814,15 +823,21 @@ export function usePublicFileShare(token: string) {
         .get(`public/files/${token}`)
         .json<{ data: PublicShareData }>(),
     enabled: !!token,
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
+    refetchOnMount: "always",
   });
 }
 
 export function useValidateFileShare() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ token, password }: { token: string; password: string }) =>
       api
         .post(`public/files/${token}/validate`, { json: { password } })
         .json<{ data: { valid: boolean } }>(),
+    onSuccess: (_result, { token }) => qc.invalidateQueries({ queryKey: ["public-file-share", token] }),
   });
 }
 

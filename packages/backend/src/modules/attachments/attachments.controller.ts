@@ -2,6 +2,14 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import * as attachmentsService from "./attachments.service.js";
 import type { AttachmentQueryInput, LinkAttachmentInput } from "@pm/shared";
 
+function getAccessCtx(request: FastifyRequest) {
+  return {
+    workspaceId: (request.params as { wid: string }).wid,
+    userId: request.user!.id,
+    workspaceRole: request.workspaceMember!.role,
+  };
+}
+
 export async function listAttachmentsHandler(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -13,6 +21,7 @@ export async function listAttachmentsHandler(
     request.server.prisma,
     params.wid,
     query,
+    getAccessCtx(request),
   );
 
   return reply.send(result);
@@ -29,6 +38,7 @@ export async function downloadAttachmentHandler(
     request.server.prisma,
     params.wid,
     params.aid,
+    getAccessCtx(request),
   );
 
   const safeName = attachment.name.replace(/"/g, '\\"');
@@ -53,6 +63,7 @@ export async function deleteAttachmentHandler(
     request.server.prisma,
     params.wid,
     params.aid,
+    getAccessCtx(request),
   );
 
   return reply.status(204).send();
@@ -70,6 +81,7 @@ export async function linkAttachmentHandler(
     params.wid,
     request.user!.id,
     body,
+    getAccessCtx(request),
   );
 
   return reply.status(201).send({ data: attachment });

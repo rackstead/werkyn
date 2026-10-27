@@ -1,4 +1,8 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
+import {
+  applyUntrustedContentPolicy,
+  isSafeInlineContentType,
+} from "../../utils/untrusted-content.js";
 import * as filesService from "./files.service.js";
 import type {
   CreateFolderInput,
@@ -120,7 +124,9 @@ export async function downloadFileHandler(
 
   const safeName = file.name.replace(/"/g, '\\"');
   const encodedName = encodeURIComponent(file.name);
-  const isInline = query.inline === "true";
+  const isInline =
+    query.inline === "true" && isSafeInlineContentType(file.mimeType);
+  applyUntrustedContentPolicy(reply);
 
   return reply
     .header(
@@ -157,7 +163,7 @@ export async function downloadThumbnailHandler(
 
   return reply
     .header("Content-Type", "image/webp")
-    .header("Cache-Control", "public, max-age=86400")
+    .header("Cache-Control", "private, no-store")
     .send(stream);
 }
 

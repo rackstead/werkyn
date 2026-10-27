@@ -45,6 +45,20 @@ const envSchema = z.object({
   DEX_INTERNAL_PORT: z.coerce.number().default(5556),
   DEX_STORAGE_TYPE: z.enum(["sqlite3", "postgres"]).default("sqlite3"),
   DEX_CLIENT_SECRET: z.string().optional(),
+}).superRefine((values, ctx) => {
+  if (values.NODE_ENV !== "production") return;
+  for (const name of ["JWT_SECRET", "COOKIE_SECRET"] as const) {
+    if (
+      values[name].length < 32 ||
+      /^(?:change-me|your-secret|your-cookie)/i.test(values[name])
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [name],
+        message: "Use a unique random secret of at least 32 characters in production",
+      });
+    }
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);

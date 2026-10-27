@@ -3,7 +3,11 @@ import type { BackupExportRequest, BackupFile } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import archiver from "archiver";
 import path from "node:path";
-import { extractStorageUrls, rewriteUrls } from "./backup-assets.js";
+import { extractStorageUrls, rewriteStorageUrls } from "./backup-assets.js";
+import {
+  assertBackupExportAccess,
+  resolveBackupAssetPath,
+} from "./backup-asset-access.js";
 
 export interface BackupExportResult {
   zipBuffer: Buffer;
@@ -15,7 +19,9 @@ export async function exportBackup(
   workspaceId: string,
   request: BackupExportRequest,
   storage: StorageProvider,
+  actorId: string,
 ): Promise<BackupExportResult> {
+  await assertBackupExportAccess(prisma, workspaceId, actorId);
   const workspace = await prisma.workspace.findUniqueOrThrow({
     where: { id: workspaceId },
     select: { name: true, slug: true },
@@ -353,8 +359,9 @@ export async function exportBackup(
     }
 
     for (const url of allStorageUrls) {
-      // url looks like "/storage/uploads/userId/2026/02/uuid.png"
-      const storagePath = url.replace(/^\/storage\//, "");
+      const ctx = await assertBackupExportAccess(prisma, workspaceId, actorId);
+      const storagePath = await resolveBackupAssetPath(prisma, ctx, url);
+      if (!storagePath) continue;
       const filename = path.basename(storagePath);
       const assetPath = `assets/${filename}`;
 
@@ -372,7 +379,7 @@ export async function exportBackup(
       for (const ws of wikiSpaceEntries) {
         for (const page of ws.pages) {
           if (page.content) {
-            page.content = rewriteUrls(page.content, urlRewriteMap);
+            page.content = rewriteStorageUrls(page.content, urlRewriteMap);
           }
         }
       }

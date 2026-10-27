@@ -83,7 +83,11 @@ export function RegisterForm({ inviteToken }: { inviteToken?: string }) {
 
       <p className="text-center text-sm text-muted-foreground">
         Already have an account?{" "}
-        <Link to="/login" className="text-primary hover:underline">
+        <Link
+          to="/login"
+          search={{ inviteToken }}
+          className="text-primary hover:underline"
+        >
           Sign in
         </Link>
       </p>

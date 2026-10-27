@@ -5,6 +5,8 @@ import { useAuthStore } from "@/stores/auth-store";
 import { router } from "@/lib/router";
 import { toast } from "sonner";
 import { queryKeys } from "@/lib/query-keys";
+import type { WorkspaceAdmissionResult } from "@pm/shared";
+import { rememberInviteAdmission } from "@/features/workspaces/api";
 
 interface User {
   id: string;
@@ -34,6 +36,7 @@ interface AuthResponse {
     user: User;
     accessToken: string;
     workspaces: WorkspaceMembership[];
+    admission?: WorkspaceAdmissionResult;
   };
 }
 
@@ -69,9 +72,22 @@ export function useRegister(inviteToken?: string) {
         })
         .json<AuthResponse>(),
     onSuccess: async (res) => {
-      const { user, accessToken, workspaces } = res.data;
+      const { user, accessToken, workspaces, admission } = res.data;
       useAuthStore.getState().setAuth(user, accessToken, workspaces);
       await router.invalidate();
+      if (inviteToken && admission) {
+        rememberInviteAdmission(user.id, inviteToken, admission);
+        if (admission.status === "joined") {
+          navigate({
+            to: "/$workspaceSlug",
+            params: { workspaceSlug: admission.workspace.slug },
+          });
+        } else {
+          // Verification, approval or a refusal is explained on the invite.
+          navigate({ to: "/invite/$token", params: { token: inviteToken } });
+        }
+        return;
+      }
       navigate({ to: "/" });
     },
   });
@@ -109,9 +125,14 @@ export function useVerifyEmail() {
   });
 }
 
-export function useResendVerification() {
+export function useResendVerification(inviteToken?: string) {
   return useMutation({
-    mutationFn: () => api.post("auth/resend-verification").json(),
+    mutationFn: () =>
+      api
+        .post("auth/resend-verification", {
+          json: inviteToken ? { inviteToken } : {},
+        })
+        .json(),
     onSuccess: () => toast.success("Verification email sent"),
     onError: () => toast.error("Failed to send verification email"),
   });

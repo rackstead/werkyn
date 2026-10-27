@@ -1,5 +1,8 @@
 import type { PrismaClient } from "@prisma/client";
+import type { WorkspaceAdmissionResult } from "@pm/shared";
 import { createAccount, waitForAccountRetry } from "./account-creation.js";
+import { admitWithInvite } from "../invites/admission.service.js";
+import { logger } from "../../utils/logger.js";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
   signAccessToken,
@@ -35,7 +38,7 @@ function getLockoutDuration(failedCount: number): number {
   return 0;
 }
 
-async function getUserWorkspaces(prisma: PrismaClient, userId: string) {
+export async function getUserWorkspaces(prisma: PrismaClient, userId: string) {
   return prisma.workspaceMember.findMany({
     where: { userId },
     select: {
@@ -112,6 +115,26 @@ export async function register(
     passwordHash,
   });
 
+  // Admission runs in its own transaction after the account commits; it is
+  // never nested in the account-creation retry. A failed or refused join keeps
+  // the account and is reported explicitly instead of being swallowed.
+  let admission: WorkspaceAdmissionResult | undefined;
+  if (data.inviteToken) {
+    try {
+      admission = await admitWithInvite(prisma, {
+        userId: user.id,
+        token: data.inviteToken,
+      });
+    } catch (error) {
+      logger.warn({ err: error }, "Workspace admission after registration failed");
+      admission = {
+        status: "unavailable",
+        message:
+          "Your account was created, but joining the workspace could not be completed. Open the invitation again to retry.",
+      };
+    }
+  }
+
   // Skip verification for first user (already verified as instance admin)
   if (!isBootstrapAdmin) {
     const verificationToken = generateSecureToken();
@@ -123,39 +146,14 @@ export async function register(
       },
     });
 
-    await sendVerificationEmail(user.email, verificationToken);
-  }
-
-  // Handle invite token if provided
-  if (data.inviteToken) {
-    try {
-      const invite = await prisma.workspaceInvite.findUnique({
-        where: { token: data.inviteToken },
-      });
-
-      if (
-        invite &&
-        (!invite.expiresAt || invite.expiresAt > new Date()) &&
-        (invite.maxUses === null || invite.useCount < invite.maxUses) &&
-        (!invite.email || invite.email.toLowerCase() === user.email)
-      ) {
-        await prisma.$transaction([
-          prisma.workspaceMember.create({
-            data: {
-              userId: user.id,
-              workspaceId: invite.workspaceId,
-              role: invite.role,
-            },
-          }),
-          prisma.workspaceInvite.update({
-            where: { id: invite.id },
-            data: { useCount: { increment: 1 } },
-          }),
-        ]);
-      }
-    } catch {
-      // Ignore invite errors — user is still created
-    }
+    // Carry the invitation only when verification is what blocks joining.
+    await sendVerificationEmail(
+      user.email,
+      verificationToken,
+      admission?.status === "verification_required"
+        ? data.inviteToken
+        : undefined,
+    );
   }
 
   // Generate tokens
@@ -167,7 +165,7 @@ export async function register(
 
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
-  return { user, accessToken, refreshToken, workspaces };
+  return { user, accessToken, refreshToken, workspaces, admission };
 }
 
 async function createPasswordAccount(
@@ -503,6 +501,7 @@ export async function verifyEmail(prisma: PrismaClient, token: string) {
 export async function resendVerification(
   prisma: PrismaClient,
   userId: string,
+  inviteToken?: string,
 ) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -531,7 +530,14 @@ export async function resendVerification(
     },
   });
 
-  await sendVerificationEmail(user.email, token);
+  // Only an existing invitation is carried into the verification link.
+  const invite = inviteToken
+    ? await prisma.workspaceInvite.findUnique({
+        where: { token: inviteToken },
+        select: { token: true },
+      })
+    : null;
+  await sendVerificationEmail(user.email, token, invite?.token);
 
   return { message: "Verification email sent." };
 }

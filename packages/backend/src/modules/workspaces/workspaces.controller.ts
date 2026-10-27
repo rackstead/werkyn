@@ -86,6 +86,7 @@ export async function updateMemberRoleHandler(
     request.server.prisma,
     params.wid,
     params.uid,
+    request.user!.id,
     body,
   );
   return reply.send({ data: member });
@@ -155,6 +156,7 @@ export async function updateWorkspaceSettingsHandler(
   const settings = await workspacesService.updateWorkspaceSettings(
     request.server.prisma,
     params.wid,
+    request.user!.id,
     body,
   );
   return reply.send({ data: settings });

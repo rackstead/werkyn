@@ -64,11 +64,19 @@ function LoginPage() {
           )}
 
           {isFirstUserSetup ? (
-            <RegisterForm />
+            <RegisterForm inviteToken={inviteToken} />
           ) : (
             <>
               {ssoEnabled && (
-                <SsoButtons connectors={ssoInfo!.data.connectors} />
+                <SsoButtons
+                  connectors={ssoInfo!.data.connectors}
+                  // Existing sanitized OIDC return flow back to the invitation.
+                  returnUrl={
+                    inviteToken
+                      ? `/invite/${encodeURIComponent(inviteToken)}`
+                      : undefined
+                  }
+                />
               )}
 
               {ssoEnabled && passwordEnabled && (

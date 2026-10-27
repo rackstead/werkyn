@@ -112,11 +112,16 @@ async function getFromAddress(): Promise<string> {
 export async function sendVerificationEmail(
   to: string,
   token: string,
+  inviteToken?: string,
 ): Promise<void> {
   try {
     const transport = await getTransporter();
     const from = await getFromAddress();
-    const verifyUrl = `${env.FRONTEND_URL}/verify-email/${token}`;
+    // An existing invitation token is the only continuation context: the
+    // verification page links to that fixed invite route, never an arbitrary URL.
+    const verifyUrl = `${env.FRONTEND_URL}/verify-email/${encodeURIComponent(token)}${
+      inviteToken ? `?invite=${encodeURIComponent(inviteToken)}` : ""
+    }`;
 
     const info = await transport.sendMail({
       from,

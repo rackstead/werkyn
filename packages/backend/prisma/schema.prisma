@@ -63,6 +63,7 @@ model User {
   fileSharesReceived      FileShare[]       @relation("FileSharesReceived")
   fileShareLinksCreated   FileShareLink[]   @relation("FileShareLinksCreated")
   dashboardPreferences    DashboardPreference[]
+  admissionRequests       WorkspaceAdmissionRequest[]
 }
 
 model ApiKey {
@@ -242,6 +243,7 @@ model Workspace {
   fileShares     FileShare[]
   fileShareLinks FileShareLink[]
   dashboardPreferences DashboardPreference[]
+  admissionRequests WorkspaceAdmissionRequest[]
 }
 
 enum WorkspaceRole {
@@ -276,10 +278,32 @@ model WorkspaceInvite {
   useCount    Int           @default(0)
   createdAt   DateTime      @default(now())
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace         Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  admissionRequests WorkspaceAdmissionRequest[]
 
+  @@unique([id, workspaceId])
   @@index([workspaceId])
   @@index([token])
+}
+
+// A pending request to join through an invitation while the workspace requires
+// administrator approval. Approval creates the membership and deletes the row;
+// rejection deletes it. Rows grant no access. The composite invite relation
+// guarantees that a request never pairs one workspace with another's invite.
+model WorkspaceAdmissionRequest {
+  id          String   @id @default(cuid())
+  workspaceId String
+  inviteId    String
+  userId      String
+  createdAt   DateTime @default(now())
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invite    WorkspaceInvite @relation(fields: [inviteId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+  @@index([workspaceId, createdAt])
+  @@index([inviteId, workspaceId])
 }
 
 // ─── Projects ────────────────────────────────────────────

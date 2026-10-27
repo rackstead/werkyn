@@ -1,6 +1,8 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import type { CreateInviteInput } from "@pm/shared";
 import * as invitesService from "./invites.service.js";
+import * as admissionService from "./admission.service.js";
+import { getUserWorkspaces } from "../auth/auth.service.js";
 
 export async function createInviteHandler(
   request: FastifyRequest,
@@ -11,6 +13,7 @@ export async function createInviteHandler(
   const invite = await invitesService.createInvite(
     request.server.prisma,
     params.wid,
+    request.user!.id,
     body,
   );
   return reply.status(201).send({ data: invite });
@@ -33,42 +36,11 @@ export async function revokeInviteHandler(
   reply: FastifyReply,
 ) {
   const params = request.params as { id: string };
-  // Need to look up the invite to get its workspaceId for admin check
-  const invite = await request.server.prisma.workspaceInvite.findUnique({
-    where: { id: params.id },
-    select: { workspaceId: true },
-  });
-
-  if (!invite) {
-    return reply.status(404).send({
-      statusCode: 404,
-      error: "Not Found",
-      message: "Invite not found",
-    });
-  }
-
-  // Verify the current user is an admin of this workspace
-  const member = await request.server.prisma.workspaceMember.findUnique({
-    where: {
-      userId_workspaceId: {
-        userId: request.user!.id,
-        workspaceId: invite.workspaceId,
-      },
-    },
-  });
-
-  if (!member || member.role !== "ADMIN") {
-    return reply.status(403).send({
-      statusCode: 403,
-      error: "Forbidden",
-      message: "Only admins can revoke invites",
-    });
-  }
-
+  // The service rechecks the caller's ADMIN role under the workspace lock.
   await invitesService.revokeInvite(
     request.server.prisma,
     params.id,
-    invite.workspaceId,
+    request.user!.id,
   );
   return reply.status(204).send();
 }
@@ -90,11 +62,57 @@ export async function acceptInviteHandler(
   reply: FastifyReply,
 ) {
   const params = request.params as { token: string };
-  const workspace = await invitesService.acceptInvite(
+  const userId = request.user!.id;
+  const result = await admissionService.admitWithInvite(request.server.prisma, {
+    userId,
+    token: params.token,
+  });
+  if (result.status === "denied") {
+    throw admissionService.admissionDenialError(result.reason);
+  }
+  if (result.status === "joined") {
+    // The requester's committed memberships, so the client can enter the
+    // workspace without depending on a separate session refresh.
+    const workspaces = await getUserWorkspaces(request.server.prisma, userId);
+    return reply.send({ data: { ...result, userId, workspaces } });
+  }
+  // Not a member yet: verification or administrator approval is pending.
+  return reply.status(202).send({ data: { ...result, userId } });
+}
+
+export async function listAdmissionRequestsHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const params = request.params as { wid: string };
+  const requests = await admissionService.listAdmissionRequests(
     request.server.prisma,
-    params.token,
-    request.user!.id,
-    request.user!.email,
+    params.wid,
   );
-  return reply.send({ data: workspace });
+  return reply.send({ data: requests });
+}
+
+export async function approveAdmissionRequestHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const params = request.params as { wid: string; rid: string };
+  const result = await admissionService.approveAdmissionRequest(
+    request.server.prisma,
+    { workspaceId: params.wid, requestId: params.rid, actorId: request.user!.id },
+  );
+  return reply.send({ data: result });
+}
+
+export async function rejectAdmissionRequestHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const params = request.params as { wid: string; rid: string };
+  await admissionService.rejectAdmissionRequest(request.server.prisma, {
+    workspaceId: params.wid,
+    requestId: params.rid,
+    actorId: request.user!.id,
+  });
+  return reply.status(204).send();
 }

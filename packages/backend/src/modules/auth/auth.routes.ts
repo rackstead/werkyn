@@ -17,6 +17,7 @@ import {
   RegisterSchema,
   ForgotPasswordSchema,
   ResetPasswordSchema,
+  ResendVerificationSchema,
 } from "@pm/shared";
 
 export default async function authRoutes(fastify: FastifyInstance) {
@@ -127,7 +128,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
     method: "POST",
     url: "/resend-verification",
     config: { rateLimit: { max: 3, timeWindow: "1 minute" } },
-    preHandler: [authenticate],
+    preHandler: [authenticate, validate(ResendVerificationSchema)],
     handler: resendVerificationHandler,
   });
 }

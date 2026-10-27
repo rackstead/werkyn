@@ -172,6 +172,12 @@ export function GeneralSettings({ workspaceId }: GeneralSettingsProps) {
                 Require admin approval for new members
               </Label>
             </div>
+            {requireAdminApproval && (
+              <p className="text-xs text-muted-foreground -mt-2">
+                People who use an invite wait under Invites → Join requests
+                until an admin approves them.
+              </p>
+            )}
 
             <div className="space-y-2">
               <Label>Allowed Email Domains</Label>

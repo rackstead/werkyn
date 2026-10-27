@@ -21,6 +21,11 @@ export const queryKeys = {
   myTasks: (wid: string) => ["my-tasks", { wid }] as const,
   search: (wid: string, q: string) => ["search", { wid, q }] as const,
   invites: (wid: string) => ["workspaces", wid, "invites"] as const,
+  admissionRequests: (wid: string) =>
+    ["workspaces", wid, "admission-requests"] as const,
+  // Client-only memory of the latest admission result for one account.
+  inviteAdmission: (userId: string, token: string) =>
+    ["invite-admission", userId, token] as const,
   templates: (pid: string) => ["projects", pid, "templates"] as const,
   recurring: (pid: string) => ["projects", pid, "recurring"] as const,
   notifications: ["notifications"] as const,

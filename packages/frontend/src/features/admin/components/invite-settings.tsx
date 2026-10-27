@@ -5,6 +5,7 @@ import {
   useRevokeInvite,
 } from "@/features/workspaces/api";
 import { InviteDialog } from "@/features/workspaces/components/invite-dialog";
+import { AdmissionRequests } from "./admission-requests";
 import { Loader2, Plus, Trash2, Copy, Check } from "lucide-react";
 import { toast } from "sonner";
 
@@ -45,6 +46,8 @@ export function InviteSettings({ workspaceId }: InviteSettingsProps) {
 
   return (
     <div className="space-y-4">
+      <AdmissionRequests workspaceId={workspaceId} />
+
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">
           Invites ({invites.length})

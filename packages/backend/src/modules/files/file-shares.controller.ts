@@ -1,3 +1,8 @@
+import {
+  setShareGrantCookie,
+  shareGrantCookieName,
+  shareSummary,
+} from "../../utils/share-grants.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 import * as shareService from "./file-shares.service.js";
@@ -127,7 +132,7 @@ export async function createFileShareLinkHandler(
     body.expiresAt,
   );
 
-  return reply.status(201).send({ data: link });
+  return reply.status(201).send({ data: shareSummary(link) });
 }
 
 export async function getFileShareLinksHandler(
@@ -143,7 +148,7 @@ export async function getFileShareLinksHandler(
     getAccessCtx(request),
   );
 
-  return reply.send({ data: links });
+  return reply.send({ data: links.map(shareSummary) });
 }
 
 export async function updateFileShareLinkHandler(
@@ -160,7 +165,7 @@ export async function updateFileShareLinkHandler(
     getAccessCtx(request),
   );
 
-  return reply.send({ data: link });
+  return reply.send({ data: shareSummary(link) });
 }
 
 export async function deleteFileShareLinkHandler(
@@ -211,6 +216,7 @@ export async function getPublicShareHandler(
   const result = await shareService.getPublicShareLink(
     request.server.prisma,
     token,
+    request.cookies[shareGrantCookieName("files", token)],
   );
 
   return reply.send({ data: result });
@@ -223,11 +229,12 @@ export async function validatePublicShareHandler(
   const { token } = request.params as { token: string };
   const body = request.body as ValidateFileShareLinkInput;
 
-  await shareService.validateShareLinkAccess(
+  const share = await shareService.validateShareLinkAccess(
     request.server.prisma,
     token,
     body.password,
   );
+  setShareGrantCookie(reply, "files", token, share);
 
   return reply.send({ data: { valid: true } });
 }
@@ -243,6 +250,7 @@ export async function downloadPublicFileHandler(
     request.server.storage,
     token,
     fid,
+    request.cookies[shareGrantCookieName("files", token)],
   );
 
   return reply

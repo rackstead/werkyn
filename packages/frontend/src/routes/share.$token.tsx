@@ -22,7 +22,6 @@ function SharePage() {
   const { data, isLoading, isError } = usePublicWikiPage(token);
   const validateShare = useValidateWikiShare();
   const [password, setPassword] = useState("");
-  const [authenticated, setAuthenticated] = useState(false);
   const [passwordError, setPasswordError] = useState("");
 
   const publicPage = data?.data;
@@ -55,15 +54,15 @@ function SharePage() {
   }
 
   // Password gate
-  if (publicPage.hasPassword && !authenticated) {
+  if (!publicPage.authorized) {
     const handleValidate = (e: React.FormEvent) => {
       e.preventDefault();
       setPasswordError("");
       validateShare.mutate(
         { token, password },
         {
-          onSuccess: () => setAuthenticated(true),
-          onError: () => setPasswordError("Incorrect password"),
+          onSuccess: () => setPassword(""),
+          onError: (error) => setPasswordError(error.message || "Unable to verify password"),
         },
       );
     };

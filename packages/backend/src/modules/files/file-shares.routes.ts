@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { publicShareNoStore } from "../../utils/share-grants.js";
 import {
   createFileSharesHandler,
   getFileSharesHandler,
@@ -134,6 +135,7 @@ export default async function fileSharesRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/public/files/:token",
+    onRequest: publicShareNoStore,
     handler: getPublicShareHandler,
   });
 
@@ -141,6 +143,8 @@ export default async function fileSharesRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/public/files/:token/validate",
+    onRequest: publicShareNoStore,
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
     preHandler: [validate(ValidateFileShareLinkSchema)],
     handler: validatePublicShareHandler,
   });
@@ -149,6 +153,7 @@ export default async function fileSharesRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/public/files/:token/:fid/download",
+    onRequest: publicShareNoStore,
     handler: downloadPublicFileHandler,
   });
 }

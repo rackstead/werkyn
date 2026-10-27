@@ -15,6 +15,7 @@ Run `pnpm test`; run upload tests on a migrated disposable database with
 `TEST_DATABASE_URL=<disposable-url> pnpm --filter @pm/backend exec node --import tsx
 --test tests/integration/upload-authorization.test.mjs`.
 
-The separate known-size ZIP probing issue needs the subsequent21.3.2 update.
+The separate known-size ZIP probing issue is fixed by the 21.3.2 update described
+in [file-type-zip-security.md](file-type-zip-security.md).
 Other dependency advisories, native image decoding, aggregate resource budgets,
 container modernization and broader C01 release gates remain separate.

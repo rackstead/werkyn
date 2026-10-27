@@ -69,8 +69,8 @@ importers:
         specifier: ^5.0.1
         version: 5.1.0
       file-type:
-        specifier: ^21.3.1
-        version: 21.3.1
+        specifier: ^21.3.2
+        version: 21.3.2
       jsonwebtoken:
         specifier: ^9.0.2
         version: 9.0.3
@@ -3101,8 +3101,8 @@ packages:
       picomatch:
         optional: true
 
-  file-type@21.3.1:
-    resolution: {integrity: sha512-SrzXX46I/zsRDjTb82eucsGg0ODq2NpGDp4HcsFKApPy8P8vACjpJRDoGGMfEzhFC0ry61ajd7f72J3603anBA==}
+  file-type@21.3.2:
+    resolution: {integrity: sha512-DLkUvGwep3poOV2wpzbHCOnSKGk1LzyXTv+aHFgN2VFl96wnp8YA9YjO2qPzg5PuL8q/SW9Pdi6WTkYOIh995w==}
     engines: {node: '>=20'}
 
   fill-range@7.1.1:
@@ -7742,7 +7742,7 @@ snapshots:
     optionalDependencies:
       picomatch: 4.0.3
 
-  file-type@21.3.1:
+  file-type@21.3.2:
     dependencies:
       '@tokenizer/inflate': 0.4.1
       strtok3: 10.3.4

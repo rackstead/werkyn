@@ -22,7 +22,7 @@
   "packageManager": "pnpm@9.15.0",
   "pnpm": {
     "overrides": {
-      "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.1"
+      "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.2"
     }
   }
 }

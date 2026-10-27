@@ -16,6 +16,7 @@ const manifest = JSON.parse(
 );
 
 for (const [workspace, script, rootScript] of [
+  ["shared", "test", "test"],
   ["frontend", "test", "test"],
   ["backend", "test:integration", "test:integration"],
 ]) {
@@ -36,17 +37,24 @@ for (const [workspace, script, rootScript] of [
         join(dir, ".github", "tests", "dispatch-fixture.test.mjs"),
         'import test from "node:test"; test("fixture policy check", () => {});',
       );
+      const noop = 'node -e "process.exit(0)"';
+      const validScripts = {
+        shared: { build: noop, test: noop },
+        backend: { test: noop, "test:integration": noop },
+        frontend: { test: noop },
+      };
       for (const name of ["shared", "backend", "frontend"]) {
         const directory = join(dir, "packages", name);
         mkdirSync(directory, { recursive: true });
+        const scripts = { ...validScripts[name] };
+        if (name === workspace) delete scripts[script];
         writeFileSync(
           join(directory, "package.json"),
           JSON.stringify({
             name: `@pm/${name}`,
             version: "0.0.1",
             private: true,
-            scripts:
-              name === "shared" ? { build: 'node -e "process.exit(0)"' } : {},
+            scripts,
           }),
         );
       }
@@ -57,7 +65,7 @@ for (const [workspace, script, rootScript] of [
             name: `@pm/${workspace}`,
             version: "0.0.1",
             private: true,
-            scripts,
+            scripts: { ...validScripts[workspace], ...scripts },
           }),
         );
       const run = () =>

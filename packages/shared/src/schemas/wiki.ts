@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { QueryBooleanSchema } from "./common.js";
 
 // ─── Wiki Spaces ────────────────────────────────────────
 
@@ -81,7 +82,7 @@ export const UpdateWikiCommentSchema = z.object({
 export type UpdateWikiCommentInput = z.infer<typeof UpdateWikiCommentSchema>;
 
 export const WikiCommentQuerySchema = z.object({
-  resolved: z.coerce.boolean().optional(),
+  resolved: QueryBooleanSchema.optional(),
 });
 export type WikiCommentQueryInput = z.infer<typeof WikiCommentQuerySchema>;
 

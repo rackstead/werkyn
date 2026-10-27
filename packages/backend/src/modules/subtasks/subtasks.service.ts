@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { CreateSubtaskInput, UpdateSubtaskInput } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
+import { assertTaskEdit } from "../../utils/project-access.js";
 
 export async function listSubtasks(prisma: PrismaClient, taskId: string) {
   return prisma.subtask.findMany({
@@ -21,6 +22,7 @@ export async function createSubtask(
   actorId: string,
   data: CreateSubtaskInput,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   const task = await prisma.task.findUnique({
     where: { id: taskId },
     select: { id: true, projectId: true },
@@ -70,6 +72,8 @@ export async function updateSubtask(
   });
   if (!existing) throw new NotFoundError("Subtask not found");
 
+  await assertTaskEdit(prisma, existing.taskId, actorId);
+
   const subtask = await prisma.subtask.update({
     where: { id: subtaskId },
     data,
@@ -101,6 +105,8 @@ export async function toggleSubtask(
   });
   if (!existing) throw new NotFoundError("Subtask not found");
 
+  await assertTaskEdit(prisma, existing.taskId, actorId);
+
   const subtask = await prisma.subtask.update({
     where: { id: subtaskId },
     data: { completed: !existing.completed },
@@ -125,7 +131,9 @@ export async function reorderSubtasks(
   prisma: PrismaClient,
   taskId: string,
   orderedIds: string[],
+  actorId: string,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   const task = await prisma.task.findUnique({
     where: { id: taskId },
     select: { id: true, projectId: true },
@@ -166,6 +174,8 @@ export async function deleteSubtask(
     include: { task: { select: { projectId: true } } },
   });
   if (!existing) throw new NotFoundError("Subtask not found");
+
+  await assertTaskEdit(prisma, existing.taskId, actorId);
 
   await prisma.subtask.delete({ where: { id: subtaskId } });
 

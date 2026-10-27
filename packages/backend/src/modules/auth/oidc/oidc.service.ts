@@ -9,6 +9,11 @@ import {
   generateRefreshToken,
   hashToken,
 } from "../../../utils/tokens.js";
+import {
+  assertSsoEnabled,
+  readOidcIdentity,
+  resolveOidcUser,
+} from "./oidc-identity.js";
 
 const CLIENT_ID = "werkyn";
 const REDIRECT_URI = () => `${env.FRONTEND_URL}/api/auth/oidc/callback`;
@@ -16,8 +21,7 @@ const REDIRECT_URI = () => `${env.FRONTEND_URL}/api/auth/oidc/callback`;
 // Talk directly to Dex on the internal port for backend-to-backend calls
 // (discovery, token exchange, JWKS). Only the authorization_endpoint uses
 // the external URL since the browser navigates there.
-const DEX_INTERNAL_BASE = () =>
-  `http://127.0.0.1:${env.DEX_INTERNAL_PORT}/dex`;
+const DEX_INTERNAL_BASE = () => `http://127.0.0.1:${env.DEX_INTERNAL_PORT}/dex`;
 
 let cachedAuthServer: oauth.AuthorizationServer | null = null;
 
@@ -52,6 +56,7 @@ export async function initiateOidcLogin(
   connectorId?: string,
   returnUrl?: string,
 ): Promise<string> {
+  await assertSsoEnabled(prisma, connectorId);
   const as = await getAuthServer();
   if (!as.authorization_endpoint) {
     throw new Error("Dex authorization endpoint not found");
@@ -77,7 +82,7 @@ export async function initiateOidcLogin(
   authUrl.searchParams.set("client_id", CLIENT_ID);
   authUrl.searchParams.set("redirect_uri", REDIRECT_URI());
   authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("scope", "openid email profile");
+  authUrl.searchParams.set("scope", "openid email profile federated:id");
   authUrl.searchParams.set("state", state);
   authUrl.searchParams.set("nonce", nonce);
   authUrl.searchParams.set("code_challenge", codeChallenge);
@@ -138,6 +143,7 @@ export async function handleOidcCallback(
 
   // Delete used state
   await prisma.oidcState.delete({ where: { id: oidcState.id } });
+  await assertSsoEnabled(prisma, oidcState.connectorId);
 
   const as = await getAuthServer();
   const clientAuth = oauth.ClientSecretPost(env.DEX_CLIENT_SECRET);
@@ -180,21 +186,21 @@ export async function handleOidcCallback(
     { expectedNonce: oidcState.nonce, requireIdToken: true },
   );
 
+  // The token endpoint is reached over loopback HTTP. Verify its actual ID-token
+  // signature instead of relying on transport authentication for the response.
+  await oauth.validateApplicationLevelSignature(
+    as,
+    tokenResponse,
+    isDev ? { [allowInsecureRequests]: true } : {},
+  );
+
   const claims = oauth.getValidatedIdTokenClaims(tokenResult);
   if (!claims) {
     throw new UnauthorizedError("No ID token claims");
   }
 
-  const sub = claims.sub;
-  const email = (claims.email as string | undefined)?.toLowerCase();
-  const name = (claims.name as string | undefined) || email || "SSO User";
-
-  if (!email) {
-    throw new UnauthorizedError("OIDC provider did not return an email");
-  }
-
-  // Find or create user
-  const user = await findOrCreateUser(prisma, sub, email, name, oidcState.connectorId);
+  const identity = readOidcIdentity(claims, as.issuer);
+  const user = await resolveOidcUser(prisma, identity, oidcState.connectorId);
 
   // Generate werkyn tokens
   const accessToken = signAccessToken({ sub: user.id, email: user.email });
@@ -228,132 +234,4 @@ export async function handleOidcCallback(
     returnUrl: oidcState.returnUrl,
     workspaces,
   };
-}
-
-async function findOrCreateUser(
-  prisma: PrismaClient,
-  sub: string,
-  email: string,
-  displayName: string,
-  connectorId: string | null,
-) {
-  // 1. Check existing AuthProvider by OIDC sub
-  const existingProvider = await prisma.authProvider.findUnique({
-    where: { provider_providerSub: { provider: "oidc", providerSub: sub } },
-    include: {
-      user: {
-        select: {
-          id: true,
-          email: true,
-          displayName: true,
-          avatarUrl: true,
-          jobTitle: true,
-          phone: true,
-          timezone: true,
-          emailVerified: true,
-        },
-      },
-    },
-  });
-
-  if (existingProvider) {
-    return existingProvider.user;
-  }
-
-  // 2. Check if auto-link by email is enabled
-  const ssoConfig = await prisma.ssoConfig.findUnique({
-    where: { id: "singleton" },
-  });
-
-  const existingUser = await prisma.user.findUnique({
-    where: { email },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
-  });
-
-  if (existingUser && existingUser.emailVerified && ssoConfig?.autoLinkByEmail) {
-    // Auto-link: create AuthProvider for existing user
-    await prisma.authProvider.create({
-      data: {
-        userId: existingUser.id,
-        provider: "oidc",
-        providerSub: sub,
-        connectorId,
-        email,
-      },
-    });
-    return existingUser;
-  }
-
-  if (existingUser && !existingUser.emailVerified) {
-    // Existing unverified user — link and verify
-    await prisma.$transaction([
-      prisma.authProvider.create({
-        data: {
-          userId: existingUser.id,
-          provider: "oidc",
-          providerSub: sub,
-          connectorId,
-          email,
-        },
-      }),
-      prisma.user.update({
-        where: { id: existingUser.id },
-        data: { emailVerified: true },
-      }),
-    ]);
-    return { ...existingUser, emailVerified: true };
-  }
-
-  if (existingUser) {
-    // User exists but auto-link disabled — still link since they authenticated via OIDC
-    await prisma.authProvider.create({
-      data: {
-        userId: existingUser.id,
-        provider: "oidc",
-        providerSub: sub,
-        connectorId,
-        email,
-      },
-    });
-    return existingUser;
-  }
-
-  // 3. Create new user
-  const newUser = await prisma.user.create({
-    data: {
-      email,
-      displayName,
-      passwordHash: null,
-      emailVerified: true,
-      authProviders: {
-        create: {
-          provider: "oidc",
-          providerSub: sub,
-          connectorId,
-          email,
-        },
-      },
-    },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
-  });
-
-  return newUser;
 }

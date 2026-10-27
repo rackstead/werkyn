@@ -17,6 +17,7 @@ const manifest = JSON.parse(
 
 for (const [workspace, script, rootScript] of [
   ["shared", "test", "test"],
+  ["backend", "test", "test"],
   ["frontend", "test", "test"],
   ["backend", "test:integration", "test:integration"],
 ]) {

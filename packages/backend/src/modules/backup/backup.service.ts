@@ -3,7 +3,11 @@ import type { BackupExportRequest, BackupFile } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import archiver from "archiver";
 import path from "node:path";
-import { extractStorageUrls, rewriteUrls } from "./backup-assets.js";
+import { extractStorageUrls, rewriteStorageUrls } from "./backup-assets.js";
+import {
+  assertBackupExportAccess,
+  resolveBackupAssetPaths,
+} from "./backup-asset-access.js";
 
 export interface BackupExportResult {
   zipBuffer: Buffer;
@@ -15,7 +19,9 @@ export async function exportBackup(
   workspaceId: string,
   request: BackupExportRequest,
   storage: StorageProvider,
+  actorId: string,
 ): Promise<BackupExportResult> {
+  await assertBackupExportAccess(prisma, workspaceId, actorId);
   const workspace = await prisma.workspace.findUniqueOrThrow({
     where: { id: workspaceId },
     select: { name: true, slug: true },
@@ -353,17 +359,25 @@ export async function exportBackup(
     }
 
     for (const url of allStorageUrls) {
-      // url looks like "/storage/uploads/userId/2026/02/uuid.png"
-      const storagePath = url.replace(/^\/storage\//, "");
-      const filename = path.basename(storagePath);
-      const assetPath = `assets/${filename}`;
-
-      try {
-        const buffer = await storage.read(storagePath);
-        assetBuffers.set(assetPath, buffer);
-        urlRewriteMap.set(url, assetPath);
-      } catch {
-        // File not found on disk — skip, leave original URL in JSON
+      const ctx = await assertBackupExportAccess(prisma, workspaceId, actorId);
+      const storagePaths = await resolveBackupAssetPaths(prisma, ctx, url);
+      for (const storagePath of storagePaths) {
+        try {
+          // Resolve literal upload filenames before URI alternatives. Stat only
+          // independently authorized candidates; storage never decodes them.
+          // A missing literal spelling of URI syntax must not become a read.
+          if (
+            (storagePaths.length > 1 || /[%?#]/.test(url)) &&
+            !(await storage.exists(storagePath))
+          ) continue;
+          const buffer = await storage.read(storagePath);
+          const assetPath = `assets/${path.basename(storagePath)}`;
+          assetBuffers.set(assetPath, buffer);
+          urlRewriteMap.set(url, assetPath);
+          break;
+        } catch {
+          // File not found on disk — skip, leave original URL in JSON
+        }
       }
     }
 
@@ -372,7 +386,7 @@ export async function exportBackup(
       for (const ws of wikiSpaceEntries) {
         for (const page of ws.pages) {
           if (page.content) {
-            page.content = rewriteUrls(page.content, urlRewriteMap);
+            page.content = rewriteStorageUrls(page.content, urlRewriteMap);
           }
         }
       }

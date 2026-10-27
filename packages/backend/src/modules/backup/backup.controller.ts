@@ -21,6 +21,7 @@ export async function exportHandler(
     wid,
     body,
     request.server.storage,
+    request.user!.id,
   );
 
   return reply

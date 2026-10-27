@@ -30,7 +30,7 @@
     "bcrypt": "^5.1.1",
     "fastify": "^5.2.1",
     "fastify-plugin": "^5.0.1",
-    "file-type": "^21.3.1",
+    "file-type": "^21.3.2",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^6.10.0",
     "oauth4webapi": "^3.8.5",

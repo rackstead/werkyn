@@ -229,7 +229,8 @@ export function TimeReportsPage({
           totalHours={report.summary.totalHours}
           billableHours={report.summary.billableHours}
           nonBillableHours={report.summary.nonBillableHours}
-          totalCost={report.summary.totalCost}
+          costByCurrency={report.summary.costByCurrency}
+          unratedBillableHours={report.summary.unratedBillableHours}
         />
       )}
 

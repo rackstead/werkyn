@@ -9,6 +9,13 @@ export async function setRate(
 ) {
   const effectiveFrom =
     data.effectiveFrom ?? new Date().toISOString().slice(0, 10);
+  // A new rate without an explicit currency keeps the member's currency in
+  // force on that date, so editing an amount never silently switches currency.
+  const currency = (
+    data.currency ??
+    (await getRate(prisma, workspaceId, userId, effectiveFrom))?.currency ??
+    "USD"
+  ).toUpperCase();
 
   return prisma.userRate.upsert({
     where: {
@@ -22,7 +29,7 @@ export async function setRate(
       workspaceId,
       userId,
       rate: data.rate,
-      currency: data.currency ?? "USD",
+      currency,
       effectiveFrom,
     },
     update: {
@@ -48,6 +55,44 @@ export async function getRate(
     },
     orderBy: { effectiveFrom: "desc" },
   });
+}
+
+/** Rates for several members that start on or before `throughDate`, oldest first per member. */
+export async function listRateHistory(
+  prisma: PrismaClient,
+  workspaceId: string,
+  userIds: string[],
+  throughDate: string,
+) {
+  if (userIds.length === 0) return [];
+  return prisma.userRate.findMany({
+    where: {
+      workspaceId,
+      userId: { in: userIds },
+      effectiveFrom: { lte: throughDate },
+    },
+    select: { userId: true, rate: true, currency: true, effectiveFrom: true },
+    orderBy: [{ userId: "asc" }, { effectiveFrom: "asc" }],
+  });
+}
+
+/**
+ * The rate in force on `date` from one member's oldest-first history: the
+ * latest rate whose effectiveFrom is on or before that date (same semantics as
+ * getRate). Dates are YYYY-MM-DD strings, so string order is date order.
+ */
+export function rateInEffect<T extends { effectiveFrom: string }>(
+  history: readonly T[],
+  date: string,
+): T | null {
+  let low = 0;
+  let high = history.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (history[mid].effectiveFrom <= date) low = mid + 1;
+    else high = mid;
+  }
+  return low === 0 ? null : history[low - 1];
 }
 
 export async function listRates(

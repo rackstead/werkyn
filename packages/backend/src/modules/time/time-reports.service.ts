@@ -3,25 +3,82 @@ import type { TimeReportQuery } from "@pm/shared";
 import * as userRatesService from "./user-rates.service.js";
 import { timeEntryProjectWhere } from "./time-entries.service.js";
 
-interface ReportGroup {
+export interface CurrencyAmount {
+  currency: string;
+  amount: number;
+}
+
+/**
+ * Cost totals for a set of entries. Amounts in different currencies are never
+ * added together: costByCurrency always carries one total per currency, and
+ * totalCost/currency are only set when every priced amount shares a currency.
+ */
+interface CostTotals {
+  /** Priced cost when it is all in one currency (0 when nothing is priced); null when currencies are mixed. */
+  totalCost: number | null;
+  /** Currency of totalCost; null when nothing is priced or currencies are mixed. */
+  currency: string | null;
+  /** Priced billable cost per currency, ordered by currency code. */
+  costByCurrency: CurrencyAmount[];
+  /** Billable hours with no rate in effect on their date; they add no cost. */
+  unratedBillableHours: number;
+}
+
+interface ReportEntry {
+  id: string;
+  date: string;
+  hours: number;
+  billable: boolean;
+  description: string | null;
+  userName: string;
+  projectName: string | null;
+  taskTitle: string | null;
+  /** Rate in effect on the entry's own date, or null when the member had none. */
+  rate: number | null;
+  currency: string | null;
+  /** hours x rate for billable entries, 0 for non-billable ones, null when billable but unrated. */
+  cost: number | null;
+}
+
+interface ReportGroup extends CostTotals {
   key: string;
   label: string;
   totalHours: number;
   billableHours: number;
   nonBillableHours: number;
-  totalCost: number;
-  entries: Array<{
-    id: string;
-    date: string;
-    hours: number;
-    billable: boolean;
-    description: string | null;
-    userName: string;
-    projectName: string | null;
-    taskTitle: string | null;
-    rate: number;
-    cost: number;
-  }>;
+  entries: ReportEntry[];
+}
+
+class CostAccumulator {
+  private readonly amounts = new Map<string, number>();
+  private unratedBillableHours = 0;
+
+  add(entry: ReportEntry) {
+    if (!entry.billable) return;
+    if (entry.cost === null || entry.currency === null) {
+      this.unratedBillableHours += entry.hours;
+      return;
+    }
+    this.amounts.set(
+      entry.currency,
+      (this.amounts.get(entry.currency) ?? 0) + entry.cost,
+    );
+  }
+
+  totals(): CostTotals {
+    const costByCurrency = [...this.amounts]
+      .map(([currency, amount]) => ({ currency, amount }))
+      .sort((a, b) =>
+        a.currency < b.currency ? -1 : a.currency > b.currency ? 1 : 0,
+      );
+    const single = costByCurrency.length === 1 ? costByCurrency[0] : null;
+    return {
+      totalCost: costByCurrency.length > 1 ? null : (single?.amount ?? 0),
+      currency: single?.currency ?? null,
+      costByCurrency,
+      unratedBillableHours: this.unratedBillableHours,
+    };
+  }
 }
 
 export async function generateReport(
@@ -58,16 +115,34 @@ export async function generateReport(
     orderBy: [{ date: "asc" }, { createdAt: "asc" }],
   });
 
-  // Build a rate cache: userId -> rate at each entry date
-  const rateCache = new Map<string, number>();
-  const uniqueUserIds = [...new Set(entries.map((e) => e.userId))];
-  for (const uid of uniqueUserIds) {
-    const rate = await userRatesService.getRate(prisma, workspaceId, uid, query.endDate);
-    rateCache.set(uid, rate?.rate ?? 0);
+  // Price every entry at the rate in effect on its own date. The report end
+  // date only bounds which entries are included, never which rate applies.
+  const rateHistory = new Map<
+    string,
+    Array<{ rate: number; currency: string; effectiveFrom: string }>
+  >();
+  const latestEntryDate = entries.at(-1)?.date;
+  if (latestEntryDate) {
+    const rates = await userRatesService.listRateHistory(
+      prisma,
+      workspaceId,
+      [...new Set(entries.map((e) => e.userId))],
+      latestEntryDate,
+    );
+    for (const rate of rates) {
+      const history = rateHistory.get(rate.userId) ?? [];
+      history.push(rate);
+      rateHistory.set(rate.userId, history);
+    }
   }
 
   // Group entries
-  const groupMap = new Map<string, ReportGroup>();
+  const groupMap = new Map<
+    string,
+    { group: Omit<ReportGroup, keyof CostTotals>; costs: CostAccumulator }
+  >();
+  const summaryCosts = new CostAccumulator();
+  const summary = { totalHours: 0, billableHours: 0, nonBillableHours: 0 };
 
   for (const entry of entries) {
     let key: string;
@@ -91,29 +166,24 @@ export async function generateReport(
 
     if (!groupMap.has(key)) {
       groupMap.set(key, {
-        key,
-        label,
-        totalHours: 0,
-        billableHours: 0,
-        nonBillableHours: 0,
-        totalCost: 0,
-        entries: [],
+        group: {
+          key,
+          label,
+          totalHours: 0,
+          billableHours: 0,
+          nonBillableHours: 0,
+          entries: [],
+        },
+        costs: new CostAccumulator(),
       });
     }
 
-    const group = groupMap.get(key)!;
-    const rate = rateCache.get(entry.userId) ?? 0;
-    const cost = entry.billable ? entry.hours * rate : 0;
-
-    group.totalHours += entry.hours;
-    if (entry.billable) {
-      group.billableHours += entry.hours;
-    } else {
-      group.nonBillableHours += entry.hours;
-    }
-    group.totalCost += cost;
-
-    group.entries.push({
+    const { group, costs } = groupMap.get(key)!;
+    const applied = userRatesService.rateInEffect(
+      rateHistory.get(entry.userId) ?? [],
+      entry.date,
+    );
+    const reportEntry: ReportEntry = {
       id: entry.id,
       date: entry.date,
       hours: entry.hours,
@@ -122,20 +192,34 @@ export async function generateReport(
       userName: entry.user.displayName,
       projectName: entry.project?.name ?? null,
       taskTitle: entry.task?.title ?? null,
-      rate,
-      cost,
-    });
+      rate: applied?.rate ?? null,
+      // Legacy rows may store a lower-case code; one currency is one bucket.
+      currency: applied?.currency.toUpperCase() ?? null,
+      cost: !entry.billable ? 0 : applied ? entry.hours * applied.rate : null,
+    };
+
+    for (const totals of [group, summary]) {
+      totals.totalHours += entry.hours;
+      if (entry.billable) {
+        totals.billableHours += entry.hours;
+      } else {
+        totals.nonBillableHours += entry.hours;
+      }
+    }
+    costs.add(reportEntry);
+    summaryCosts.add(reportEntry);
+    group.entries.push(reportEntry);
   }
 
-  const groups = Array.from(groupMap.values());
-  const summary = {
-    totalHours: groups.reduce((s, g) => s + g.totalHours, 0),
-    billableHours: groups.reduce((s, g) => s + g.billableHours, 0),
-    nonBillableHours: groups.reduce((s, g) => s + g.nonBillableHours, 0),
-    totalCost: groups.reduce((s, g) => s + g.totalCost, 0),
-  };
+  const groups: ReportGroup[] = Array.from(
+    groupMap.values(),
+    ({ group, costs }) => ({
+      ...group,
+      ...costs.totals(),
+    }),
+  );
 
-  return { groups, summary };
+  return { groups, summary: { ...summary, ...summaryCosts.totals() } };
 }
 
 export async function exportReportCSV(
@@ -147,7 +231,7 @@ export async function exportReportCSV(
   const report = await generateReport(prisma, workspaceId, userId, query);
 
   const rows: string[] = [
-    "Date,User,Project,Task,Hours,Billable,Rate,Cost,Description",
+    "Date,User,Project,Task,Hours,Billable,Rate,Currency,Cost,Description",
   ];
 
   for (const group of report.groups) {
@@ -163,8 +247,9 @@ export async function exportReportCSV(
           entry.taskTitle ? `"${entry.taskTitle}"` : "",
           entry.hours.toFixed(2),
           entry.billable ? "Yes" : "No",
-          entry.rate.toFixed(2),
-          entry.cost.toFixed(2),
+          entry.rate === null ? "" : entry.rate.toFixed(2),
+          entry.currency ?? "",
+          entry.cost === null ? "" : entry.cost.toFixed(2),
           desc,
         ].join(","),
       );

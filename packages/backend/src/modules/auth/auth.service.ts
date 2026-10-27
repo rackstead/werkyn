@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@prisma/client";
+import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
   signAccessToken,
@@ -105,41 +106,14 @@ export async function register(
 
   const passwordHash = await hashPassword(data.password);
 
-  // First user becomes instance admin
-  const userCount = await prisma.user.count();
-  const isFirstUser = userCount === 0;
-
-  const user = await prisma.user.create({
-    data: {
-      email: data.email.toLowerCase(),
-      passwordHash,
-      displayName: data.displayName,
-      emailVerified: isFirstUser,
-      isInstanceAdmin: isFirstUser,
-    },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
-  });
-
-  // Create password AuthProvider record
-  await prisma.authProvider.create({
-    data: {
-      userId: user.id,
-      provider: "password",
-      email: user.email,
-    },
+  const { user, isBootstrapAdmin } = await createPasswordAccount(prisma, {
+    email: data.email.toLowerCase(),
+    displayName: data.displayName,
+    passwordHash,
   });
 
   // Skip verification for first user (already verified as instance admin)
-  if (!isFirstUser) {
+  if (!isBootstrapAdmin) {
     const verificationToken = generateSecureToken();
     await prisma.emailVerificationToken.create({
       data: {
@@ -194,6 +168,51 @@ export async function register(
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
   return { user, accessToken, refreshToken, workspaces };
+}
+
+async function createPasswordAccount(
+  prisma: PrismaClient,
+  data: { email: string; displayName: string; passwordHash: string },
+) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // An already committed account permanently rules out bootstrap during
+      // normal runtime operation; no account-deletion endpoint exists.
+      const existingAccountObserved =
+        (await prisma.user.findFirst({ select: { id: true } })) !== null;
+      return await prisma.$transaction(
+        (tx) =>
+          createAccount(
+            tx,
+            {
+              ...data,
+              authProviders: {
+                create: { provider: "password", email: data.email },
+              },
+            },
+            { bootstrapAdminEligible: true, existingAccountObserved },
+          ),
+        {
+          isolationLevel: existingAccountObserved
+            ? "ReadCommitted"
+            : "Serializable",
+        },
+      );
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? error.code
+          : undefined;
+      if (code === "P2002") throw new ConflictError("Email already in use");
+      if (code !== "P2034") throw error;
+      if (attempt === 2)
+        throw new ConflictError(
+          "Concurrent account registration. Please try again.",
+        );
+      await waitForAccountRetry(attempt);
+    }
+  }
+  throw new ConflictError("Concurrent account registration. Please try again.");
 }
 
 export async function login(

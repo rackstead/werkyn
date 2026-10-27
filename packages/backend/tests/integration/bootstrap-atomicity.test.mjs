@@ -350,11 +350,16 @@ test("existing ordinary accounts prevent bootstrap; deliberate administrator pro
     where: { id: created.user.id },
     data: { isInstanceAdmin: true },
   });
-  await local("after-promotion");
+  const secondAdmin = await local("after-promotion");
   assert.deepEqual(
     (await rows()).filter((u) => u.isInstanceAdmin).map((u) => u.id),
     [created.user.id],
   );
+  await prisma.user.update({
+    where: { id: secondAdmin.user.id },
+    data: { isInstanceAdmin: true },
+  });
+  assert.equal((await rows()).filter((u) => u.isInstanceAdmin).length, 2);
 });
 
 for (const [name, create] of [

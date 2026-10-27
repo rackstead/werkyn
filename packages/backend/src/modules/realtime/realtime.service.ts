@@ -8,6 +8,7 @@ interface ConnectionInfo {
   projectIds: Set<string>;
   workspaceIds: Set<string>;
   channelIds: Set<string>;
+  projectAdmissionVersion: number;
   authenticatedAt: number;
   lastActivity: number;
 }
@@ -64,6 +65,7 @@ export function authenticate(
         projectIds: new Set(),
         workspaceIds: new Set(),
         channelIds: new Set(),
+        projectAdmissionVersion: 0,
         authenticatedAt: Date.now(),
         lastActivity: Date.now(),
       });
@@ -84,12 +86,17 @@ export async function subscribe(
 ): Promise<boolean> {
   const conn = connections.get(ws);
   if (!conn) return false;
+  const admissionVersion = conn.projectAdmissionVersion;
 
   try {
     await assertProjectAccess(prisma, projectId, conn.userId);
   } catch {
     return false;
   }
+
+  // A removal can commit while the database authorization read is in flight.
+  // Never restore a revoked subscription from that earlier result.
+  if (connections.get(ws) !== conn || conn.projectAdmissionVersion !== admissionVersion) return false;
 
   conn.projectIds.add(projectId);
   conn.lastActivity = Date.now();
@@ -106,7 +113,10 @@ export function unsubscribe(ws: WebSocket, projectId: string): void {
 
 export function revokeProjectAccess(userId: string, projectId: string): void {
   for (const conn of connections.values()) {
-    if (conn.userId === userId) conn.projectIds.delete(projectId);
+    if (conn.userId === userId) {
+      conn.projectAdmissionVersion++;
+      conn.projectIds.delete(projectId);
+    }
   }
 }
 

@@ -243,6 +243,37 @@ test("stale project membership cannot authorize a removed workspace member", asy
   }
 });
 
+test("project removal invalidates a subscription whose authorization result is already in flight", async () => {
+  const { ws, messages } = await connect("PEER");
+  let releaseAuthorization, authorizationRead;
+  const ready = new Promise((resolve) => { authorizationRead = resolve; });
+  const gate = new Promise((resolve) => { releaseAuthorization = resolve; });
+  // Use the real database result, then hold its delivery while removal commits.
+  const delayedPrisma = { project: { async findUnique(args) {
+    const result = await app.prisma.project.findUnique(args);
+    authorizationRead();
+    await gate;
+    return result;
+  } } };
+  const pending = realtime.subscribe(ws, project.id, delayedPrisma);
+  try {
+    await ready;
+    const removed = await request("ADMIN", "DELETE", `/api/projects/${project.id}/members/${users.PEER.id}`);
+    assert.equal(removed.statusCode, 204, removed.body);
+    releaseAuthorization();
+    assert.equal(await pending, false);
+    realtime.broadcast(project.id, "task_updated", { taskId: assigned.id });
+    assert.deepEqual(messages, []);
+  } finally {
+    releaseAuthorization();
+    await pending;
+    await app.prisma.projectMember.upsert({
+      where: { projectId_userId: { projectId: project.id, userId: users.PEER.id } },
+      create: { projectId: project.id, userId: users.PEER.id }, update: {},
+    });
+  }
+});
+
 test("removing project membership revokes existing and new project subscriptions", async () => {
   const { ws, messages } = await connect("PEER");
   assert.equal(await realtime.subscribe(ws, project.id, app.prisma), true);

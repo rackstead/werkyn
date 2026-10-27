@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { after, before, test } from "node:test";
 import AdmZip from "adm-zip";
 
@@ -23,10 +24,13 @@ const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { exportBackup } =
   await import("../../src/modules/backup/backup.service.ts");
+const { uploadFileStream } =
+  await import("../../src/modules/files/files.service.ts");
 let app, own, foreign, space, otherSpace, foreignSpace, page;
 const users = {},
   tokens = {},
-  reads = [];
+  reads = [],
+  stats = [];
 let requests = 0;
 const bytes = (label) => Buffer.from(`Benign backup fixture: ${label}`);
 const url = (storagePath) => `/storage/${storagePath}`;
@@ -72,6 +76,7 @@ async function content(value) {
     data: { content: value },
   });
   reads.length = 0;
+  stats.length = 0;
 }
 function unpack(response) {
   assert.equal(response.statusCode, 200, response.body);
@@ -154,6 +159,11 @@ before(async () => {
   app.storage.read = async (storagePath) => {
     reads.push(storagePath);
     return read(storagePath);
+  };
+  const exists = app.storage.exists.bind(app.storage);
+  app.storage.exists = async (storagePath) => {
+    stats.push(storagePath);
+    return exists(storagePath);
   };
 });
 after(async () => {
@@ -356,6 +366,113 @@ test("canonical URL spelling permits encoded filename and query suffix without p
   ]);
 });
 
+test("current uploads with literal percent filenames export wiki and Drive bytes through raw and encoded URLs", async () => {
+  const assets = [],
+    refs = [];
+  for (const name of [
+    "progress.100%",
+    "progress.100%25",
+    "progress.20%20",
+    "progress.%complete",
+    "progress.%AB",
+  ]) {
+    const boundary = `backup-percent-${crypto.randomUUID()}`;
+    const wikiBytes = bytes(`wiki ${name}`);
+    const payload = Buffer.concat([
+      Buffer.from(
+        Object.entries({
+          workspaceId: own.id,
+          purpose: "wiki",
+          spaceId: space.id,
+        })
+          .map(
+            ([key, value]) =>
+              `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`,
+          )
+          .join(""),
+      ),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
+      wikiBytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const uploaded = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: {
+        authorization: `Bearer ${tokens.ADMIN}`,
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload,
+    });
+    assert.equal(uploaded.statusCode, 201, uploaded.body);
+    const wikiUrl = uploaded.json().data.url;
+    const driveBytes = bytes(`Drive ${name}`);
+    const drive = await uploadFileStream(
+      app.prisma,
+      app.storage,
+      own.id,
+      users.ADMIN.id,
+      undefined,
+      name,
+      "text/plain",
+      Readable.from([driveBytes]),
+      { workspaceId: own.id, userId: users.ADMIN.id, workspaceRole: "ADMIN" },
+    );
+    for (const [storagePath, expected] of [
+      [wikiUrl.slice("/storage/".length), wikiBytes],
+      [drive.storagePath, driveBytes],
+    ]) {
+      assert.ok(storagePath.endsWith(path.extname(name)));
+      assets.push({ storagePath, expected });
+      refs.push(
+        url(storagePath),
+        url(storagePath.split("/").map(encodeURIComponent).join("/")),
+      );
+    }
+  }
+  await content(refs);
+  const initial = await snapshot();
+  const { zip, json } = unpack(await request());
+  assert.deepEqual(
+    new Set(reads),
+    new Set(assets.map((asset) => asset.storagePath)),
+  );
+  for (const asset of assets)
+    assert.deepEqual(
+      zip.getEntry(`assets/${path.basename(asset.storagePath)}`).getData(),
+      asset.expected,
+    );
+  assert.deepEqual(
+    json.wikiSpaces[0].pages[0].content,
+    assets.flatMap((asset) => [
+      `assets/${path.basename(asset.storagePath)}`,
+      `assets/${path.basename(asset.storagePath)}`,
+    ]),
+  );
+  assert.deepEqual(await snapshot(), initial);
+  // A percent-plus-hex URL can denote a literal filename or its decoded
+  // spelling. A forbidden File identity in either candidate denies the whole
+  // ambiguous reference before even statting the otherwise permitted path.
+  for (const asset of assets.filter((item) =>
+    item.storagePath.endsWith(".20%20"),
+  )) {
+    const otherSpelling = decodeURIComponent(asset.storagePath);
+    await put(otherSpelling);
+    await file(otherSpelling, foreign.id);
+    const denied = [url(asset.storagePath)];
+    await content(denied);
+    const before = await snapshot();
+    const result = unpack(await request());
+    assert.deepEqual(reads, []);
+    assert.deepEqual(stats, []);
+    assert.equal(result.zip.getEntries().length, 1);
+    assert.deepEqual(result.json.wikiSpaces[0].pages[0].content, denied);
+    assert.deepEqual(await snapshot(), before);
+  }
+});
+
 test("includeFiles false performs no asset reads and preserves content", async () => {
   const doc = [
     url(`${own.id}/uploads/wiki/${space.id}/image.png`),
@@ -364,6 +481,7 @@ test("includeFiles false performs no asset reads and preserves content", async (
   await content(doc);
   const { zip, json } = unpack(await request("ADMIN", false));
   assert.deepEqual(reads, []);
+  assert.deepEqual(stats, []);
   assert.equal(zip.getEntries().length, 1);
   assert.deepEqual(json.wikiSpaces[0].pages[0].content, doc);
 });

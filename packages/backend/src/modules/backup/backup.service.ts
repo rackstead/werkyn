@@ -6,7 +6,7 @@ import path from "node:path";
 import { extractStorageUrls, rewriteStorageUrls } from "./backup-assets.js";
 import {
   assertBackupExportAccess,
-  resolveBackupAssetPath,
+  resolveBackupAssetPaths,
 } from "./backup-asset-access.js";
 
 export interface BackupExportResult {
@@ -360,17 +360,24 @@ export async function exportBackup(
 
     for (const url of allStorageUrls) {
       const ctx = await assertBackupExportAccess(prisma, workspaceId, actorId);
-      const storagePath = await resolveBackupAssetPath(prisma, ctx, url);
-      if (!storagePath) continue;
-      const filename = path.basename(storagePath);
-      const assetPath = `assets/${filename}`;
-
-      try {
-        const buffer = await storage.read(storagePath);
-        assetBuffers.set(assetPath, buffer);
-        urlRewriteMap.set(url, assetPath);
-      } catch {
-        // File not found on disk — skip, leave original URL in JSON
+      const storagePaths = await resolveBackupAssetPaths(prisma, ctx, url);
+      for (const storagePath of storagePaths) {
+        try {
+          // Raw upload responses can contain percent text which also spells a
+          // valid URL escape. Stat only independently authorized candidates and
+          // read the existing exact path; storage never decodes it again.
+          if (
+            storagePaths.length > 1 &&
+            !(await storage.exists(storagePath))
+          ) continue;
+          const buffer = await storage.read(storagePath);
+          const assetPath = `assets/${path.basename(storagePath)}`;
+          assetBuffers.set(assetPath, buffer);
+          urlRewriteMap.set(url, assetPath);
+          break;
+        } catch {
+          // File not found on disk — skip, leave original URL in JSON
+        }
       }
     }
 

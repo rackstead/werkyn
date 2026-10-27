@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { User, Bell } from "lucide-react";
+import { User, Bell, KeyRound } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { NotificationSettings } from "@/features/notifications/components/notification-settings";
 import { ProfileSettings } from "@/features/settings/components/profile-settings";
+import { ApiKeySettings } from "@/features/settings/components/api-key-settings";
 
 export const Route = createFileRoute("/_authed/$workspaceSlug/settings")({
   component: SettingsPage,
@@ -12,6 +13,7 @@ export const Route = createFileRoute("/_authed/$workspaceSlug/settings")({
 const tabs = [
   { id: "profile", label: "Profile", icon: User },
   { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "api-keys", label: "API keys", icon: KeyRound },
 ] as const;
 
 type TabId = (typeof tabs)[number]["id"];
@@ -49,6 +51,7 @@ function SettingsPage() {
 
       {activeTab === "profile" && <ProfileSettings />}
       {activeTab === "notifications" && <NotificationSettings />}
+      {activeTab === "api-keys" && <ApiKeySettings />}
     </div>
   );
 }

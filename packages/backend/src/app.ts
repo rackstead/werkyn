@@ -19,6 +19,7 @@ import multipartPlugin from "./plugins/multipart.js";
 import storagePlugin from "./plugins/storage.js";
 import dexProxyPlugin from "./plugins/dex-proxy.js";
 import authRoutes from "./modules/auth/auth.routes.js";
+import apiKeysRoutes from "./modules/api-keys/api-keys.routes.js";
 import usersRoutes from "./modules/users/users.routes.js";
 import workspacesRoutes from "./modules/workspaces/workspaces.routes.js";
 import projectsRoutes from "./modules/projects/projects.routes.js";
@@ -75,6 +76,7 @@ export async function buildApp() {
 
   // Module routes
   await app.register(authRoutes, { prefix: "/api/auth" });
+  await app.register(apiKeysRoutes, { prefix: "/api" });
   await app.register(usersRoutes, { prefix: "/api/users" });
   await app.register(workspacesRoutes, { prefix: "/api/workspaces" });
   await app.register(projectsRoutes, { prefix: "/api" });

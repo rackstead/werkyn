@@ -10,6 +10,7 @@ import type {
 
 function getAccessCtx(request: FastifyRequest) {
   return {
+    workspaceId: (request.params as { wid: string }).wid,
     userId: request.user!.id,
     workspaceRole: request.workspaceMember!.role,
   };
@@ -80,7 +81,7 @@ export async function sharedWithMeHandler(
   const result = await shareService.listSharedWithMe(
     request.server.prisma,
     wid,
-    request.user!.id,
+    getAccessCtx(request),
     query.cursor,
     query.limit,
   );
@@ -98,7 +99,7 @@ export async function sharedByMeHandler(
   const result = await shareService.listSharedByMe(
     request.server.prisma,
     wid,
-    request.user!.id,
+    getAccessCtx(request),
     query.cursor,
     query.limit,
   );
@@ -187,6 +188,7 @@ export async function getFileShareStatusHandler(
     request.server.prisma,
     wid,
     fileIds,
+    getAccessCtx(request),
   );
 
   return reply.send({ data: sharedIds });

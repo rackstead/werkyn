@@ -14,3 +14,4 @@ packages/backend/uploads/
 *.swp
 *.swo
 .DS_Store
+codebase-audit/

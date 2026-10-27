@@ -56,3 +56,6 @@ lerna-debug.log*
 # Temporary files
 *.tmp
 *.temp
+
+# Local codebase audit, evidence, and AI execution plans
+/codebase-audit/

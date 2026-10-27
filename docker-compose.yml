@@ -11,13 +11,13 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://user:password@postgres:5432/projectapp
-      JWT_SECRET: change-me-to-a-secure-random-string-at-least-32-chars
-      COOKIE_SECRET: change-me-to-another-secure-random-string
-      COOKIE_SECURE: "false"
+      DATABASE_URL: postgresql://user:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/projectapp
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env to a random secret}
+      COOKIE_SECRET: ${COOKIE_SECRET:?Set COOKIE_SECRET in .env to a separate random secret}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
       COOKIE_SAMESITE: lax
-      CORS_ORIGIN: http://localhost:3000
-      FRONTEND_URL: http://localhost:3000
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       STORAGE_DIR: /app/storage
       DEX_STORAGE_TYPE: postgres
       DEX_CONFIG_DIR: /app/data/dex
@@ -31,10 +31,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: projectapp
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

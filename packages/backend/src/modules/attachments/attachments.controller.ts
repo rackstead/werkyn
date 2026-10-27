@@ -1,4 +1,5 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
+import { formatContentDisposition } from "../../utils/content-disposition.js";
 import * as attachmentsService from "./attachments.service.js";
 import type { AttachmentQueryInput, LinkAttachmentInput } from "@pm/shared";
 
@@ -31,13 +32,10 @@ export async function downloadAttachmentHandler(
     params.aid,
   );
 
-  const safeName = attachment.name.replace(/"/g, '\\"');
-  const encodedName = encodeURIComponent(attachment.name);
-
   return reply
     .header(
       "Content-Disposition",
-      `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
+      formatContentDisposition(attachment.name),
     )
     .header("Content-Type", "application/octet-stream")
     .send(stream);

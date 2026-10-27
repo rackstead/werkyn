@@ -145,7 +145,12 @@ async function start(options = {}) {
     crypto.createHash("sha256").update(row.codeVerifier).digest("base64url"),
   );
   assert.equal(url.searchParams.get("nonce"), row.nonce);
-  return { state: row, response };
+  const cookie = response.cookies.find((c) => c.name === `oidc_state_${state}`);
+  assert(
+    cookie?.value,
+    "login supplies the browser binding for identity tests",
+  );
+  return { state: row, response, cookie };
 }
 
 function issue(attempt, claims, options = {}) {
@@ -160,7 +165,9 @@ async function callback(attempt, code, options = {}) {
     state: attempt.state.state,
     ...(options.query ?? {}),
   });
-  return request(`/api/auth/oidc/callback?${query}`);
+  return request(`/api/auth/oidc/callback?${query}`, {
+    [attempt.cookie.name]: attempt.cookie.value,
+  });
 }
 
 function expectFailure(response) {

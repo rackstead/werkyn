@@ -1,7 +1,7 @@
 # Multipart parser security release
 
-The production multipart plugin now resolves `@fastify/busboy` 3.2.1 instead
-of 3.2.0. The maintainer's [security release](https://github.com/fastify/busboy/releases/tag/v3.2.1)
+The initial multipart security update selected `@fastify/busboy` 3.2.1 instead
+of 3.2.0. The follow-up described below selects 3.2.2. The maintainer's [security release](https://github.com/fastify/busboy/releases/tag/v3.2.1)
 fixes [GHSA-xjh9-v7x6-24jw](https://github.com/fastify/busboy/security/advisories/GHSA-xjh9-v7x6-24jw)
 and [GHSA-x8mw-p69m-v3mx](https://github.com/fastify/busboy/security/advisories/GHSA-x8mw-p69m-v3mx),
 which affect malformed multipart parsing. Earlier local audit evidence established
@@ -27,8 +27,6 @@ subsequent successful uploads.
 Run `pnpm test` and, after migrating a designated disposable PostgreSQL database,
 `TEST_DATABASE_URL=<disposable-url> pnpm test:integration`.
 
-The separate [GHSA-gxm5-99cw-xjw9](https://github.com/fastify/busboy/security/advisories/GHSA-gxm5-99cw-xjw9)
-requires 3.2.2 or later and remains an immediate follow-up patch. Its override
-must move or be removed when that fix lands. Other dependency advisories,
-multipart resource budgets, active-content serving, and backup correctness
-remain open in their own remediation packages.
+The follow-up [multipart metadata release](multipart-control-characters.md) selects
+3.2.2 and addresses GHSA-gxm5-99cw-xjw9. Other dependency advisories, multipart
+resource budgets, active-content serving and backup correctness remain open.

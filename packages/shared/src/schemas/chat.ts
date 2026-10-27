@@ -40,6 +40,11 @@ export const ChatMessageQuerySchema = z.object({
 });
 export type ChatMessageQueryInput = z.infer<typeof ChatMessageQuerySchema>;
 
+export const ChatBookmarkQuerySchema = ChatMessageQuerySchema.extend({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+export type ChatBookmarkQueryInput = z.infer<typeof ChatBookmarkQuerySchema>;
+
 export const ToggleReactionSchema = z.object({
   emoji: z.string().min(1).max(32),
 });

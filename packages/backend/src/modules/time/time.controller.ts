@@ -93,6 +93,7 @@ export async function getReportHandler(
   const report = await timeReportsService.generateReport(
     request.server.prisma,
     wid,
+    request.user!.id,
     query,
   );
 
@@ -109,6 +110,7 @@ export async function exportCSVHandler(
   const csv = await timeReportsService.exportReportCSV(
     request.server.prisma,
     wid,
+    request.user!.id,
     query,
   );
 

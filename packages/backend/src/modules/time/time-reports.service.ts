@@ -1,6 +1,7 @@
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma, PrismaClient } from "@prisma/client";
 import type { TimeReportQuery } from "@pm/shared";
 import * as userRatesService from "./user-rates.service.js";
+import { timeEntryProjectWhere } from "./time-entries.service.js";
 
 interface ReportGroup {
   key: string;
@@ -26,10 +27,12 @@ interface ReportGroup {
 export async function generateReport(
   prisma: PrismaClient,
   workspaceId: string,
+  userId: string,
   query: TimeReportQuery,
 ) {
-  const where: Record<string, unknown> = {
+  const where: Prisma.TimeEntryWhereInput = {
     workspaceId,
+    ...timeEntryProjectWhere(workspaceId, userId),
     date: { gte: query.startDate, lte: query.endDate },
   };
 
@@ -138,9 +141,10 @@ export async function generateReport(
 export async function exportReportCSV(
   prisma: PrismaClient,
   workspaceId: string,
+  userId: string,
   query: TimeReportQuery,
 ) {
-  const report = await generateReport(prisma, workspaceId, query);
+  const report = await generateReport(prisma, workspaceId, userId, query);
 
   const rows: string[] = [
     "Date,User,Project,Task,Hours,Billable,Rate,Cost,Description",

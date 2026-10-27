@@ -8,6 +8,7 @@ import type {
   ActivityLogQueryInput,
 } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { projectAccessWhere } from "../../utils/project-access.js";
 
 export async function createWorkspace(
   prisma: PrismaClient,
@@ -57,11 +58,11 @@ export async function listWorkspaces(prisma: PrismaClient, userId: string) {
   }));
 }
 
-export async function getWorkspace(prisma: PrismaClient, workspaceId: string) {
+export async function getWorkspace(prisma: PrismaClient, workspaceId: string, userId: string) {
   const workspace = await prisma.workspace.findUnique({
     where: { id: workspaceId },
     include: {
-      _count: { select: { members: true, projects: true } },
+      _count: { select: { members: true, projects: { where: projectAccessWhere(workspaceId, userId) } } },
     },
   });
 
@@ -400,9 +401,14 @@ export async function listWorkspaceActivity(
   prisma: PrismaClient,
   workspaceId: string,
   query: ActivityLogQueryInput,
+  userId: string,
+  userRole: string,
 ) {
   const where = {
-    task: { project: { workspaceId } },
+    task: { project: {
+      workspaceId,
+      ...(userRole === "ADMIN" ? {} : { members: { some: { userId } } }),
+    } },
   };
 
   const [data, total] = await Promise.all([

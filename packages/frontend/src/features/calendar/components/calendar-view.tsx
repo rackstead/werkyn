@@ -244,7 +244,7 @@ export function CalendarView({
     if (!task) return;
     tippy(info.el, {
       content: buildEventTooltip(task),
-      allowHTML: true,
+      allowHTML: false,
       delay: [300, 0],
       placement: "top",
       theme: "pm",

@@ -14,16 +14,20 @@ const PRIORITY_DOT_COLORS: Record<string, string> = {
   LOW: "#9ca3af",
 };
 
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+// Validate persisted colors as well as new API inputs: legacy data and backups
+// can contain values written before the shared schemas enforced hex colors.
+function safeColor(value: string | null | undefined): string {
+  return typeof value === "string" &&
+    /^#(?:[\da-f]{3,4}|[\da-f]{6}|[\da-f]{8})$/i.test(value)
+    ? value
+    : "#9ca3af";
 }
 
 function stripHtml(html: string): string {
-  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function formatShortDate(dateStr: string): string {
@@ -31,75 +35,94 @@ function formatShortDate(dateStr: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-export function buildEventTooltip(task: Task): string {
-  const parts: string[] = [];
+function textRow(text: string, css: string): HTMLDivElement {
+  const row = document.createElement("div");
+  row.style.cssText = css;
+  row.textContent = text;
+  return row;
+}
 
-  // Title
-  parts.push(
-    `<div style="font-weight:600;font-size:13px;margin-bottom:6px">${escapeHtml(task.title)}</div>`,
+function colorRow(
+  text: string,
+  color: string | null | undefined,
+): HTMLDivElement {
+  const row = document.createElement("div");
+  row.style.cssText =
+    "display:flex;align-items:center;gap:6px;margin-bottom:4px";
+  const dot = document.createElement("span");
+  dot.style.cssText = "width:8px;height:8px;border-radius:50%;flex-shrink:0";
+  dot.style.backgroundColor = safeColor(color);
+  const label = document.createElement("span");
+  label.style.fontSize = "12px";
+  label.textContent = text;
+  row.append(dot, label);
+  return row;
+}
+
+export function buildEventTooltip(task: Task): HTMLDivElement {
+  // Tippy accepts an Element as content. Keep every user-controlled string out
+  // of its HTML parsing path, including values already stored in the database.
+  const tooltip = document.createElement("div");
+  tooltip.style.cssText = "max-width:280px;padding:4px 2px";
+
+  tooltip.append(
+    textRow(task.title, "font-weight:600;font-size:13px;margin-bottom:6px"),
+    colorRow(task.status.name, task.status.color),
+    colorRow(
+      `${PRIORITY_LABELS[task.priority] ?? "Medium"} priority`,
+      PRIORITY_DOT_COLORS[task.priority] ?? PRIORITY_DOT_COLORS.MEDIUM,
+    ),
   );
 
-  // Status
-  const statusColor = task.status.color || "#9ca3af";
-  parts.push(
-    `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">` +
-      `<span style="width:8px;height:8px;border-radius:50%;background:${statusColor};flex-shrink:0"></span>` +
-      `<span style="font-size:12px">${escapeHtml(task.status.name)}</span>` +
-      `</div>`,
-  );
-
-  // Priority
-  const priColor = PRIORITY_DOT_COLORS[task.priority] ?? PRIORITY_DOT_COLORS.MEDIUM;
-  const priLabel = PRIORITY_LABELS[task.priority] ?? "Medium";
-  parts.push(
-    `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">` +
-      `<span style="width:8px;height:8px;border-radius:50%;background:${priColor};flex-shrink:0"></span>` +
-      `<span style="font-size:12px">${priLabel} priority</span>` +
-      `</div>`,
-  );
-
-  // Date range
   if (task.startDate || task.dueDate) {
-    let dateText: string;
-    if (task.startDate && task.dueDate && task.startDate !== task.dueDate) {
-      dateText = `${formatShortDate(task.startDate)} – ${formatShortDate(task.dueDate)}`;
-    } else {
-      dateText = formatShortDate((task.startDate ?? task.dueDate)!);
-    }
-    parts.push(
-      `<div style="font-size:12px;margin-bottom:4px;color:hsl(var(--muted-foreground))">${dateText}</div>`,
+    const dateText =
+      task.startDate && task.dueDate && task.startDate !== task.dueDate
+        ? `${formatShortDate(task.startDate)} – ${formatShortDate(task.dueDate)}`
+        : formatShortDate((task.startDate ?? task.dueDate)!);
+    tooltip.append(
+      textRow(
+        dateText,
+        "font-size:12px;margin-bottom:4px;color:hsl(var(--muted-foreground))",
+      ),
     );
   }
 
-  // Assignees
   if (task.assignees.length > 0) {
-    const names = task.assignees.map((a) => escapeHtml(a.user.displayName)).join(", ");
-    parts.push(
-      `<div style="font-size:12px;margin-bottom:4px;color:hsl(var(--muted-foreground))">${names}</div>`,
+    const names = task.assignees.map((a) => a.user.displayName).join(", ");
+    tooltip.append(
+      textRow(
+        names,
+        "font-size:12px;margin-bottom:4px;color:hsl(var(--muted-foreground))",
+      ),
     );
   }
 
-  // Labels
   if (task.labels.length > 0) {
-    const pills = task.labels
-      .map(
-        (l) =>
-          `<span style="display:inline-block;padding:1px 6px;border-radius:9999px;font-size:11px;background:${l.label.color};color:#fff;margin-right:4px">${escapeHtml(l.label.name)}</span>`,
-      )
-      .join("");
-    parts.push(`<div style="margin-bottom:4px">${pills}</div>`);
+    const labels = document.createElement("div");
+    labels.style.marginBottom = "4px";
+    for (const { label } of task.labels) {
+      const pill = document.createElement("span");
+      pill.style.cssText =
+        "display:inline-block;padding:1px 6px;border-radius:9999px;font-size:11px;color:#fff;margin-right:4px";
+      pill.style.backgroundColor = safeColor(label.color);
+      pill.textContent = label.name;
+      labels.append(pill);
+    }
+    tooltip.append(labels);
   }
 
-  // Description (strip HTML, truncate)
   if (task.description) {
     const plain = stripHtml(task.description);
     if (plain) {
       const truncated = plain.length > 100 ? plain.slice(0, 100) + "…" : plain;
-      parts.push(
-        `<div style="font-size:11px;color:hsl(var(--muted-foreground));margin-top:2px">${escapeHtml(truncated)}</div>`,
+      tooltip.append(
+        textRow(
+          truncated,
+          "font-size:11px;color:hsl(var(--muted-foreground));margin-top:2px",
+        ),
       );
     }
   }
 
-  return `<div style="max-width:280px;padding:4px 2px">${parts.join("")}</div>`;
+  return tooltip;
 }

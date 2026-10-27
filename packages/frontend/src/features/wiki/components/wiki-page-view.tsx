@@ -384,6 +384,7 @@ function WikiPageSession({
       <WikiEditor
         key={`${pageId}:${documentVersion}`}
         initialContent={page.content}
+        hasUnsavedChanges={autosave.hasUnsavedChanges}
         recoveredContent={autosave.draft?.content}
         readOnly={readOnly}
         workspaceId={workspaceId}

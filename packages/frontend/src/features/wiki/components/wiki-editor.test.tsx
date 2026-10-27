@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { WikiEditor } from "./wiki-editor";
 
@@ -35,12 +35,51 @@ afterEach(() => {
   state.changed = null;
 });
 
+it("replaces an idle same-page document after restore without resaving the programmatic update", async () => {
+  const onChange = vi.fn();
+  const initial = [{ type: "paragraph", content: "old" }],
+    restored = [{ type: "paragraph", content: "restored" }];
+  const screen = render(
+    <WikiEditor initialContent={initial} onChange={onChange} />,
+  );
+  screen.rerender(<WikiEditor initialContent={restored} onChange={onChange} />);
+  await act(async () => {});
+  expect(state.editor.document).toEqual(restored);
+  expect(onChange).not.toHaveBeenCalled();
+  const edited = [{ type: "paragraph", content: "restored and edited" }];
+  state.editor.document = edited;
+  fireEvent.click(screen.getByText("Local edit"));
+  expect(onChange).toHaveBeenCalledWith(edited);
+});
+
+it("does not replace unsaved local blocks when a query refresh arrives", async () => {
+  const old = [{ type: "paragraph", content: "old" }],
+    remote = [{ type: "paragraph", content: "remote" }];
+  const screen = render(<WikiEditor initialContent={old} hasUnsavedChanges />);
+  const local = [{ type: "paragraph", content: "local draft" }];
+  state.editor.document = local;
+  screen.rerender(<WikiEditor initialContent={remote} hasUnsavedChanges />);
+  await act(async () => {});
+  expect(state.editor.document).toEqual(local);
+  expect(state.editor.replaceBlocks).not.toHaveBeenCalled();
+  screen.rerender(
+    <WikiEditor initialContent={remote} hasUnsavedChanges={false} />,
+  );
+  await act(async () => {});
+  expect(state.editor.document).toEqual(local);
+  const later = [{ type: "paragraph", content: "later idle update" }];
+  screen.rerender(<WikiEditor initialContent={later} />);
+  await act(async () => {});
+  expect(state.editor.document).toEqual(later);
+});
+
 it("initializes from the session's unsaved draft instead of the stored document", () => {
   const recovered = [{ type: "paragraph", content: "recovered draft" }];
   render(
     <WikiEditor
       initialContent={[{ type: "paragraph", content: "server" }]}
       recoveredContent={recovered}
+      hasUnsavedChanges
     />,
   );
   expect(state.editor.document).toEqual(recovered);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -61,6 +61,8 @@ function TaskDescriptionEditor({
       retryFailedAutomatically: false,
     },
   );
+  const appliedSource = useRef(description);
+  const wasDirty = useRef(autosave.hasUnsavedChanges);
 
   const editor = useEditor({
     extensions: [
@@ -87,6 +89,28 @@ function TaskDescriptionEditor({
       editor.setEditable(canEdit, false);
     }
   }, [editor, canEdit]);
+
+  useEffect(() => {
+    if (!editor) return;
+    if (autosave.hasUnsavedChanges) {
+      wasDirty.current = true;
+      return;
+    }
+    if (wasDirty.current) {
+      // The last save may finish before its invalidated detail GET. Do not
+      // replace the saved local document with a source seen while it was dirty.
+      wasDirty.current = false;
+      appliedSource.current = description;
+      return;
+    }
+    if (appliedSource.current === description) return;
+    appliedSource.current = description;
+    const next = DOMPurify.sanitize(description ?? "");
+    // The detail refetch after a save usually returns the text already shown;
+    // replacing an identical document would move the caret to the end.
+    if (editor.getHTML() === next) return;
+    editor.commands.setContent(next, { emitUpdate: false });
+  }, [editor, description, autosave.hasUnsavedChanges]);
 
   if (!canEdit && !description) {
     return (

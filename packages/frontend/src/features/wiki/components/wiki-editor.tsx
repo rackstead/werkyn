@@ -21,6 +21,7 @@ function useIsDark() {
 interface WikiEditorProps {
   initialContent?: unknown;
   recoveredContent?: unknown;
+  hasUnsavedChanges?: boolean;
   readOnly?: boolean;
   workspaceId?: string;
   spaceId?: string;
@@ -30,6 +31,7 @@ interface WikiEditorProps {
 export function WikiEditor({
   initialContent,
   recoveredContent,
+  hasUnsavedChanges = false,
   readOnly = false,
   workspaceId,
   spaceId,
@@ -38,7 +40,10 @@ export function WikiEditor({
   const isDark = useIsDark();
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const applyingContent = useRef(false);
   const initialDocument = recoveredContent ?? initialContent;
+  const appliedSource = useRef(JSON.stringify(initialContent));
+  const wasDirty = useRef(hasUnsavedChanges);
 
   const editor = useCreateBlockNote({
     initialContent:
@@ -90,10 +95,37 @@ export function WikiEditor({
     const serialized = JSON.stringify(editor.document);
     if (serialized === lastDocument.current) return;
     lastDocument.current = serialized;
-    if (onChangeRef.current) {
+    if (!applyingContent.current && onChangeRef.current) {
       onChangeRef.current(editor.document);
     }
   }, [editor]);
+
+  useEffect(() => {
+    const source = JSON.stringify(initialContent);
+    if (hasUnsavedChanges) {
+      wasDirty.current = true;
+      return;
+    }
+    if (wasDirty.current) {
+      wasDirty.current = false;
+      appliedSource.current = source;
+      return;
+    }
+    if (source === appliedSource.current) return;
+    appliedSource.current = source;
+    applyingContent.current = true;
+    editor.replaceBlocks(
+      editor.document,
+      Array.isArray(initialContent) && initialContent.length > 0
+        ? (initialContent as Block[])
+        : [{ type: "paragraph" }],
+    );
+    // A change event for this replacement, even a late one, is not an edit.
+    lastDocument.current = JSON.stringify(editor.document);
+    queueMicrotask(() => {
+      applyingContent.current = false;
+    });
+  }, [editor, initialContent, hasUnsavedChanges]);
 
   // Sync readOnly state
   useEffect(() => {

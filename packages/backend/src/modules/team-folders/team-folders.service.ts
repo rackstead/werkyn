@@ -3,26 +3,8 @@ import type {
   CreateTeamFolderInput,
   UpdateTeamFolderInput,
 } from "@pm/shared";
-import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
-
-export async function hasTeamFolderAccess(
-  prisma: PrismaClient,
-  teamFolderId: string,
-  userId: string,
-): Promise<boolean> {
-  const directMember = await prisma.teamFolderMember.findUnique({
-    where: { teamFolderId_userId: { teamFolderId, userId } },
-  });
-  if (directMember) return true;
-
-  const groupAccess = await prisma.teamFolderGroup.findFirst({
-    where: {
-      teamFolderId,
-      group: { members: { some: { userId } } },
-    },
-  });
-  return !!groupAccess;
-}
+import { NotFoundError } from "../../utils/errors.js";
+import { fileAccessRole, teamFolderAccessWhere } from "../files/file-access.js";
 
 export async function createTeamFolder(
   prisma: PrismaClient,
@@ -89,15 +71,13 @@ export async function listTeamFolders(
   userId: string,
   workspaceRole: string,
 ) {
-  const where: Record<string, unknown> = { workspaceId };
-
-  // Non-admins only see team folders they're members of (direct or via group)
-  if (workspaceRole !== "ADMIN") {
-    where.OR = [
-      { members: { some: { userId } } },
-      { groups: { some: { group: { members: { some: { userId } } } } } },
-    ];
-  }
+  const ctx = { workspaceId, userId, workspaceRole };
+  const role = await fileAccessRole(prisma, ctx);
+  const where = {
+    workspaceId,
+    folder: { workspaceId, isFolder: true, trashedAt: null },
+    ...(role === "ADMIN" ? {} : teamFolderAccessWhere(ctx)),
+  };
 
   return prisma.teamFolder.findMany({
     where,
@@ -118,8 +98,15 @@ export async function getTeamFolder(
   userId: string,
   workspaceRole: string,
 ) {
+  const ctx = { workspaceId, userId, workspaceRole };
+  const role = await fileAccessRole(prisma, ctx);
   const teamFolder = await prisma.teamFolder.findFirst({
-    where: { id: teamFolderId, workspaceId },
+    where: {
+      id: teamFolderId,
+      workspaceId,
+      folder: { workspaceId, isFolder: true, trashedAt: null },
+      ...(role === "ADMIN" ? {} : teamFolderAccessWhere(ctx)),
+    },
     include: {
       folder: { select: { id: true, name: true } },
       members: {
@@ -131,6 +118,7 @@ export async function getTeamFolder(
         orderBy: { addedAt: "asc" },
       },
       groups: {
+        where: { group: { workspaceId } },
         include: {
           group: {
             select: { id: true, name: true, color: true, _count: { select: { members: true } } },
@@ -142,12 +130,6 @@ export async function getTeamFolder(
   });
 
   if (!teamFolder) throw new NotFoundError("Team folder not found");
-
-  // Non-admins must be a direct member or in a group
-  if (workspaceRole !== "ADMIN") {
-    const hasAccess = await hasTeamFolderAccess(prisma, teamFolderId, userId);
-    if (!hasAccess) throw new ForbiddenError("You do not have access to this team folder");
-  }
 
   return teamFolder;
 }

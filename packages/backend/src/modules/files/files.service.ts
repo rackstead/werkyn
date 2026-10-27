@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma, PrismaClient } from "@prisma/client";
 import type { StorageProvider } from "../../services/storage.js";
 import type {
   CreateFolderInput,
@@ -17,6 +17,7 @@ import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import {
   assertFileAccess,
   fileAccessRole,
+  fileReadWhere,
   resolveFileDestination,
   type AccessContext,
 } from "./file-access.js";
@@ -135,7 +136,6 @@ export async function listFiles(
   query: FileQueryInput,
   ctx: AccessContext,
 ) {
-  const role = await fileAccessRole(prisma, { ...ctx, workspaceId });
   const {
     parentId,
     teamFolderId,
@@ -147,68 +147,40 @@ export async function listFiles(
     sortOrder,
   } = query;
 
-  const where: Record<string, unknown> = {
+  const where: Prisma.FileWhereInput = {
+    AND: [await fileReadWhere(prisma, { ...ctx, workspaceId }, trashed)],
     workspaceId,
+    trashedAt: trashed ? { not: null } : null,
   };
-
-  if (trashed) {
-    where.trashedAt = { not: null };
-
-    // Scope trash to personal files + team folder files user can access
-    if (role !== "ADMIN") {
-      const userTeamFolderIds = await getUserTeamFolderIds(prisma, ctx.userId);
-      where.OR = [
-        { ownerId: ctx.userId },
-        ...(userTeamFolderIds.length > 0
-          ? [{ teamFolderId: { in: userTeamFolderIds } }]
-          : []),
-      ];
-    }
-  } else {
-    where.trashedAt = null;
-
-    if (search) {
-      where.name = { contains: search, mode: "insensitive" };
-      // Scope search to accessible files
-      if (role !== "ADMIN") {
-        const userTeamFolderIds = await getUserTeamFolderIds(
-          prisma,
-          ctx.userId,
-        );
-        where.OR = [
-          { ownerId: ctx.userId },
-          ...(userTeamFolderIds.length > 0
-            ? [{ teamFolderId: { in: userTeamFolderIds } }]
-            : []),
-        ];
-      }
-    } else if (parentId || teamFolderId) {
-      let folderId = parentId;
-      if (!folderId && teamFolderId) {
-        const team = await prisma.teamFolder.findFirst({
-          where: { id: teamFolderId, workspaceId },
-          select: { folderId: true },
-        });
-        if (!team) throw new NotFoundError("Team folder not found");
-        folderId = team.folderId;
-      }
-      await assertFileAccess(prisma, folderId!, { ...ctx, workspaceId });
-      const parent = await prisma.file.findFirst({
-        where: { id: folderId!, workspaceId, isFolder: true, trashedAt: null },
-        select: { teamFolderId: true, asTeamFolder: { select: { id: true } } },
+  if (search) {
+    where.name = { contains: search, mode: "insensitive" };
+  } else if (!trashed && (parentId || teamFolderId)) {
+    let folderId = parentId;
+    if (!folderId && teamFolderId) {
+      const team = await prisma.teamFolder.findFirst({
+        where: { id: teamFolderId, workspaceId },
+        select: { folderId: true },
       });
-      if (!parent) throw new NotFoundError("Folder not found");
-      if (
-        teamFolderId &&
-        (parent.asTeamFolder?.id ?? parent.teamFolderId) !== teamFolderId
-      )
-        throw new ForbiddenError("Team folder does not match its parent");
-      where.parentId = folderId;
-    } else {
-      // Root listing — only personal files (team folders shown separately)
-      where.parentId = null;
-      where.ownerId = ctx.userId;
+      if (!team) throw new NotFoundError("Team folder not found");
+      folderId = team.folderId;
     }
+    await assertFileAccess(prisma, folderId!, { ...ctx, workspaceId });
+    const parent = await prisma.file.findFirst({
+      where: { id: folderId!, workspaceId, isFolder: true, trashedAt: null },
+      select: { teamFolderId: true, asTeamFolder: { select: { id: true } } },
+    });
+    if (!parent) throw new NotFoundError("Folder not found");
+    if (
+      teamFolderId &&
+      (parent.asTeamFolder?.id ?? parent.teamFolderId) !== teamFolderId
+    )
+      throw new ForbiddenError(
+        "Destination team folder does not match its parent",
+      );
+    where.parentId = folderId;
+  } else if (!trashed) {
+    where.parentId = null;
+    where.ownerId = ctx.userId;
   }
 
   const orderBy: Record<string, unknown>[] = [{ isFolder: "desc" }];
@@ -514,11 +486,13 @@ export async function listStarredFiles(
   workspaceId: string,
   ctx: AccessContext,
 ) {
-  await fileAccessRole(prisma, { ...ctx, workspaceId });
   const starred = await prisma.starredFile.findMany({
     where: {
       userId: ctx.userId,
-      file: { workspaceId, trashedAt: null },
+      file: {
+        AND: [await fileReadWhere(prisma, { ...ctx, workspaceId })],
+        trashedAt: null,
+      },
     },
     include: {
       file: {
@@ -641,17 +615,6 @@ export async function collectDescendantFiles(
     }
   }
   return result;
-}
-
-async function getUserTeamFolderIds(
-  prisma: PrismaClient,
-  userId: string,
-): Promise<string[]> {
-  const memberships = await prisma.teamFolderMember.findMany({
-    where: { userId },
-    select: { teamFolderId: true },
-  });
-  return memberships.map((m) => m.teamFolderId);
 }
 
 // ── Archive ──────────────────────────────────

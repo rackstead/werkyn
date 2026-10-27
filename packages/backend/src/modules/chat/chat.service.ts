@@ -1,5 +1,6 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -125,6 +126,7 @@ export async function deleteChannel(
   }
 
   await prisma.chatChannel.delete({ where: { id: channelId } });
+  return channel;
 }
 
 export async function joinChannel(
@@ -176,6 +178,7 @@ export async function findOrCreateDm(
   targetUserIds: string[],
 ) {
   const allUserIds = [...new Set([userId, ...targetUserIds])].sort();
+  await assertWorkspaceRecipients(prisma, workspaceId, allUserIds);
 
   // Find existing DM with exact same member set
   const existingChannels = await prisma.chatChannel.findMany({
@@ -494,13 +497,15 @@ export async function addMembers(
 ) {
   const channel = await prisma.chatChannel.findUnique({
     where: { id: channelId },
-    select: { createdById: true, type: true },
+    select: { createdById: true, type: true, workspaceId: true },
   });
   if (!channel) throw new NotFoundError("Channel not found");
   if (channel.type === "DM") throw new ForbiddenError("Cannot add members to DM channels");
   if (channel.type === "PRIVATE" && channel.createdById !== userId && role !== "ADMIN") {
     throw new ForbiddenError("Only the channel creator or admin can add members");
   }
+
+  await assertWorkspaceRecipients(prisma, channel.workspaceId, memberIds);
 
   await prisma.chatChannelMember.createMany({
     data: memberIds.map((uid) => ({ channelId, userId: uid })),
@@ -680,7 +685,13 @@ export async function listBookmarks(
   const bookmarks = await prisma.chatBookmark.findMany({
     where: {
       userId,
-      message: { channel: { workspaceId }, deletedAt: null },
+      message: {
+        channel: {
+          workspaceId,
+          OR: [{ type: "PUBLIC" }, { members: { some: { userId } } }],
+        },
+        deletedAt: null,
+      },
     },
     include: {
       message: {
@@ -799,7 +810,9 @@ export async function searchMessages(
   };
 
   if (channelId) {
+    await assertChannelAccess(prisma, { workspaceId, userId }, channelId);
     where.channelId = channelId;
+    where.channel = { workspaceId };
   } else {
     // Search across all channels user is a member of
     where.channel = {

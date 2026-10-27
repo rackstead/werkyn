@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { authenticate } from "../../middleware/authenticate.js";
-import { authorize } from "../../middleware/authorize.js";
+import { authorizeChat as authorize } from "./chat-authorize.js";
 import { validate, validateQuery } from "../../middleware/validate.js";
 import {
   CreateChannelSchema,

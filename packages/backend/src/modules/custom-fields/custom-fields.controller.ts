@@ -94,6 +94,7 @@ export async function setFieldValueHandler(
     params.tid,
     params.fieldId,
     body,
+    user.id,
   );
 
   await logActivity(request.server.prisma, {

@@ -1,7 +1,7 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { ForbiddenError, NotFoundError } from "./errors.js";
 
-type AccessDatabase = Pick<PrismaClient, "project">;
+type AccessDatabase = Pick<PrismaClient, "project" | "task">;
 
 /** Current workspace membership is required even if a stale project row remains. */
 export function projectAccessWhere(
@@ -41,6 +41,27 @@ export async function assertProjectAccess(
     throw new ForbiddenError("Not a member of this project");
   }
   return { workspaceId: project.workspaceId, role: member.role };
+}
+
+/** Apply the same field-edit policy to direct, bulk and derived task mutations. */
+export async function assertTaskEdit(
+  prisma: AccessDatabase,
+  taskId: string,
+  userId: string,
+) {
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: { id: true, projectId: true, assignees: { select: { userId: true } } },
+  });
+  if (!task) throw new NotFoundError("Task not found");
+  const access = await assertProjectAccess(prisma, task.projectId, userId);
+  if (
+    access.role === "VIEWER" ||
+    (access.role === "MEMBER" && !task.assignees.some((a) => a.userId === userId))
+  ) {
+    throw new ForbiddenError("Members can only edit tasks assigned to them");
+  }
+  return { ...task, ...access };
 }
 
 export async function filterProjectRecipients(

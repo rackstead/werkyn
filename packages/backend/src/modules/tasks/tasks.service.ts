@@ -19,6 +19,7 @@ import {
   ValidationError,
 } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
+import { assertProjectAccess, assertTaskEdit } from "../../utils/project-access.js";
 
 const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   allowedTags: [
@@ -142,6 +143,8 @@ export async function createTask(
   actorRole: string,
   data: CreateTaskInput,
 ) {
+  actorRole = (await assertProjectAccess(prisma, projectId, actorId)).role;
+  if (actorRole === "VIEWER") throw new ForbiddenError("Insufficient permissions");
   // Check project is not archived
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -285,6 +288,7 @@ export async function updateTask(
   actorRole: string,
   data: UpdateTaskInput,
 ) {
+  actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   const existing = await prisma.task.findUnique({
     where: { id: taskId },
     include: { assignees: true },
@@ -387,7 +391,10 @@ export async function updateTask(
 export async function deleteTask(
   prisma: PrismaClient,
   taskId: string,
+  actorId: string,
 ) {
+  const access = await assertTaskEdit(prisma, taskId, actorId);
+  if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can delete tasks");
   await prisma.task.delete({ where: { id: taskId } });
 }
 
@@ -397,6 +404,7 @@ export async function moveTask(
   actorId: string,
   data: MoveTaskInput,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   const task = await prisma.task.findUnique({
     where: { id: taskId },
     select: { projectId: true, statusId: true, position: true },
@@ -537,7 +545,10 @@ export async function archiveTask(
   prisma: PrismaClient,
   taskId: string,
   data: ArchiveInput,
+  actorId: string,
 ) {
+  const access = await assertTaskEdit(prisma, taskId, actorId);
+  if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can archive tasks");
   const task = await prisma.task.findUnique({
     where: { id: taskId },
     select: { statusId: true, projectId: true },
@@ -570,18 +581,18 @@ export async function addAssignee(
   actorRole: string,
   data: TaskAssigneeInput,
 ) {
-  // Members can only add themselves
-  if (actorRole === "MEMBER" && data.userId !== actorId) {
-    throw new ForbiddenError("Members can only assign themselves");
-  }
-
   // Validate user is a workspace member
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    select: { project: { select: { workspaceId: true } } },
+    select: { projectId: true, project: { select: { workspaceId: true } } },
   });
   if (!task) {
     throw new NotFoundError("Task not found");
+  }
+  actorRole = (await assertProjectAccess(prisma, task.projectId, actorId)).role;
+  if (actorRole === "VIEWER") throw new ForbiddenError("Insufficient permissions");
+  if (actorRole === "MEMBER" && data.userId !== actorId) {
+    throw new ForbiddenError("Members can only assign themselves");
   }
 
   const wsMember = await prisma.workspaceMember.findUnique({
@@ -630,6 +641,10 @@ export async function removeAssignee(
   actorId: string,
   actorRole: string,
 ) {
+  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { projectId: true } });
+  if (!task) throw new NotFoundError("Task not found");
+  actorRole = (await assertProjectAccess(prisma, task.projectId, actorId)).role;
+  if (actorRole === "VIEWER") throw new ForbiddenError("Insufficient permissions");
   // Member ownership check: must be self or admin
   if (actorRole === "MEMBER" && targetUserId !== actorId) {
     throw new ForbiddenError("Members can only unassign themselves");
@@ -656,7 +671,9 @@ export async function addLabel(
   prisma: PrismaClient,
   taskId: string,
   data: TaskLabelInput,
+  actorId: string,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   // Validate label belongs to the same project
   const task = await prisma.task.findUnique({
     where: { id: taskId },
@@ -734,13 +751,32 @@ export async function bulkUpdateTasks(
   data: BulkUpdateFieldsInput,
 ) {
   return prisma.$transaction(async (tx) => {
+    const access = await assertProjectAccess(tx, projectId, actorId);
+    if (access.role === "VIEWER") throw new ForbiddenError("Insufficient permissions");
+    if (access.role !== "ADMIN" && data.archived !== undefined) {
+      throw new ForbiddenError("Only administrators can archive tasks");
+    }
     // Validate all tasks belong to this project
     const tasks = await tx.task.findMany({
       where: { id: { in: data.taskIds }, projectId },
-      select: { id: true },
+      select: { id: true, assignees: { select: { userId: true } } },
     });
     if (tasks.length !== data.taskIds.length) {
       throw new ValidationError("Some tasks do not belong to this project");
+    }
+    if (access.role === "MEMBER") {
+      for (const task of tasks) {
+        if (!task.assignees.some((assignee) => assignee.userId === actorId)) {
+          throw new ForbiddenError("Members can only edit tasks assigned to them");
+        }
+        if (data.assigneeIds !== undefined) {
+          const previousOthers = task.assignees.map((a) => a.userId).filter((id) => id !== actorId).sort();
+          const nextOthers = [...new Set(data.assigneeIds)].filter((id) => id !== actorId).sort();
+          if (JSON.stringify(previousOthers) !== JSON.stringify(nextOthers)) {
+            throw new ForbiddenError("Members can only change their own assignment");
+          }
+        }
+      }
     }
 
     // Bulk update status
@@ -838,7 +874,10 @@ export async function bulkDeleteTasks(
   prisma: PrismaClient,
   projectId: string,
   taskIds: string[],
+  actorId: string,
 ) {
+  const access = await assertProjectAccess(prisma, projectId, actorId);
+  if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can delete tasks");
   // Validate all tasks belong to this project
   const tasks = await prisma.task.findMany({
     where: { id: { in: taskIds }, projectId },
@@ -862,6 +901,7 @@ export async function removeLabel(
   actorId: string,
   actorRole: string,
 ) {
+  actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   // Member ownership check
   if (actorRole === "MEMBER") {
     const task = await prisma.task.findUnique({
@@ -903,6 +943,8 @@ export async function duplicateTask(
   if (!source) {
     throw new NotFoundError("Task not found");
   }
+  const access = await assertProjectAccess(prisma, source.projectId, actorId);
+  if (access.role === "VIEWER") throw new ForbiddenError("Insufficient permissions");
 
   // Check project not archived
   const project = await prisma.project.findUnique({
@@ -989,6 +1031,7 @@ export async function addDependency(
   actorId: string,
   data: TaskDependencyInput,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   // No self-dependency
   if (taskId === data.blockingTaskId) {
     throw new ValidationError("A task cannot depend on itself");
@@ -1091,6 +1134,7 @@ export async function removeDependency(
   dependencyId: string,
   actorId: string,
 ) {
+  await assertTaskEdit(prisma, taskId, actorId);
   const dependency = await prisma.taskDependency.findUnique({
     where: { id: dependencyId },
     include: {

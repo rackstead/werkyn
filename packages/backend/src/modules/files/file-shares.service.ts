@@ -329,13 +329,33 @@ export async function getFileShareLinks(
   });
 }
 
+async function assertShareLinkManager(
+  prisma: PrismaClient,
+  linkId: string,
+  ctx: AccessContext,
+) {
+  const link = await prisma.fileShareLink.findFirst({
+    where: { id: linkId, workspaceId: ctx.workspaceId },
+  });
+  if (!link) throw new NotFoundError("Share link not found");
+  const role = await fileAccessRole(prisma, ctx);
+  if (
+    role === "VIEWER" ||
+    (role !== "ADMIN" && link.createdById !== ctx.userId)
+  )
+    throw new ForbiddenError(
+      "Only the share creator or workspace administrator can manage this link",
+    );
+  return link;
+}
+
 export async function updateFileShareLink(
   prisma: PrismaClient,
   linkId: string,
   data: { enabled?: boolean; password?: string | null; expiresAt?: string | null },
+  ctx: AccessContext,
 ) {
-  const existing = await prisma.fileShareLink.findUnique({ where: { id: linkId } });
-  if (!existing) throw new NotFoundError("Share link not found");
+  const existing = await assertShareLinkManager(prisma, linkId, ctx);
 
   const updateData: Record<string, unknown> = {};
   if (data.enabled !== undefined) updateData.enabled = data.enabled;
@@ -349,7 +369,7 @@ export async function updateFileShareLink(
   }
 
   return prisma.fileShareLink.update({
-    where: { id: linkId },
+    where: { id: linkId, workspaceId: ctx.workspaceId },
     data: updateData,
     include: {
       files: {
@@ -367,10 +387,15 @@ export async function updateFileShareLink(
   });
 }
 
-export async function deleteFileShareLink(prisma: PrismaClient, linkId: string) {
-  const existing = await prisma.fileShareLink.findUnique({ where: { id: linkId } });
-  if (!existing) throw new NotFoundError("Share link not found");
-  await prisma.fileShareLink.delete({ where: { id: linkId } });
+export async function deleteFileShareLink(
+  prisma: PrismaClient,
+  linkId: string,
+  ctx: AccessContext,
+) {
+  await assertShareLinkManager(prisma, linkId, ctx);
+  await prisma.fileShareLink.delete({
+    where: { id: linkId, workspaceId: ctx.workspaceId },
+  });
 }
 
 // ─── Public Access (no auth) ────────────────────────────

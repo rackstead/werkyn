@@ -64,7 +64,9 @@ export async function updateRecurringConfig(
   if (data.endDate !== undefined) updateData.endDate = data.endDate;
   if (data.isActive !== undefined) updateData.isActive = data.isActive;
 
-  // Recalculate nextRunDate if frequency or day fields changed
+  // Recalculate nextRunDate if frequency or day fields changed. The calculation
+  // is anchored to the stored startDate, so a BIWEEKLY schedule keeps its
+  // two-week phase across edits.
   if (data.frequency !== undefined || data.dayOfWeek !== undefined || data.dayOfMonth !== undefined) {
     const freq = data.frequency ?? existing.frequency;
     const dow = data.dayOfWeek !== undefined ? data.dayOfWeek : existing.dayOfWeek;
@@ -88,6 +90,26 @@ export async function deleteRecurringConfig(prisma: PrismaClient, projectId: str
 }
 
 // ─── Date Utilities ──────────────────────────────────────
+//
+// startDate, endDate and nextRunDate are calendar dates stored as YYYY-MM-DD,
+// without a time of day or time zone. "Today" is the current UTC date, both
+// here and in the recurring-task scheduler, and all arithmetic uses UTC Date
+// methods so results never depend on the host time zone.
+//
+// A schedule's occurrences are the dates on or after startDate that match:
+// - DAILY: every day.
+// - WEEKLY: dayOfWeek (0 = Sunday) every week.
+// - BIWEEKLY: the first dayOfWeek on or after startDate, then every 14 days.
+//   The two-week phase comes from startDate, never from the day it is saved.
+// - MONTHLY: dayOfMonth in every month, clamped to that month's last day. The
+//   configured day is reapplied each month, so day 31 runs on Jan 31, Feb 28
+//   (Feb 29 in leap years), Mar 31, Apr 30 and so on.
+//
+// calculateNextRunDate returns the first occurrence on or after the later of
+// startDate and today. advanceNextRunDate returns the occurrence following a
+// stored nextRunDate; the scheduler calls it once per generated task.
+
+const DAY_MS = 86_400_000;
 
 function todayUTC(): string {
   const d = new Date();
@@ -109,6 +131,27 @@ function formatDate(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * DAY_MS);
+}
+
+/** First date on or after `date` that falls on `dayOfWeek` (0 = Sunday). */
+function onOrAfterWeekday(date: Date, dayOfWeek: number): Date {
+  return addDays(date, (dayOfWeek - date.getUTCDay() + 7) % 7);
+}
+
+/**
+ * The MONTHLY occurrence in the given month (`month` is zero-based and may be
+ * 12 to mean January of the following year). The day is clamped to the
+ * month's last day before it is applied, so a short month can never overflow
+ * into the month after it.
+ */
+function monthlyOccurrence(year: number, month: number, dayOfMonth: number): Date {
+  // Day 0 of the following month is the last day of this month.
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(year, month, Math.min(dayOfMonth, lastDay)));
+}
+
 export function calculateNextRunDate(
   frequency: string,
   startDate: string,
@@ -116,37 +159,35 @@ export function calculateNextRunDate(
   dayOfMonth?: number | null,
 ): string {
   const today = todayUTC();
-  const start = startDate >= today ? startDate : today;
-  const d = parseDate(start);
+  const earliest = startDate >= today ? startDate : today;
+  const from = parseDate(earliest);
 
   switch (frequency) {
     case "DAILY":
-      return formatDate(d);
+      return formatDate(from);
 
     case "WEEKLY":
+      return formatDate(onOrAfterWeekday(from, dayOfWeek ?? 0));
+
     case "BIWEEKLY": {
-      const targetDay = dayOfWeek ?? 0;
-      const currentDay = d.getUTCDay();
-      let diff = targetDay - currentDay;
-      if (diff < 0) diff += 7;
-      d.setUTCDate(d.getUTCDate() + diff);
-      return formatDate(d);
+      const first = onOrAfterWeekday(parseDate(startDate), dayOfWeek ?? 0);
+      if (first.getTime() >= from.getTime()) return formatDate(first);
+      // Whole two-week periods from the first occurrence, rounded up to reach `from`.
+      const elapsedDays = Math.round((from.getTime() - first.getTime()) / DAY_MS);
+      return formatDate(addDays(first, Math.ceil(elapsedDays / 14) * 14));
     }
 
     case "MONTHLY": {
       const targetDOM = dayOfMonth ?? 1;
-      // If we're past the target day this month, move to next month
-      if (d.getUTCDate() > targetDOM) {
-        d.setUTCMonth(d.getUTCMonth() + 1);
-      }
-      // Clamp to last day of month
-      const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-      d.setUTCDate(Math.min(targetDOM, lastDay));
-      return formatDate(d);
+      const year = from.getUTCFullYear();
+      const month = from.getUTCMonth();
+      const thisMonth = monthlyOccurrence(year, month, targetDOM);
+      if (thisMonth.getTime() >= from.getTime()) return formatDate(thisMonth);
+      return formatDate(monthlyOccurrence(year, month + 1, targetDOM));
     }
 
     default:
-      return start;
+      return earliest;
   }
 }
 
@@ -171,13 +212,10 @@ export function advanceNextRunDate(
       d.setUTCDate(d.getUTCDate() + 14);
       return formatDate(d);
 
-    case "MONTHLY": {
-      const targetDOM = dayOfMonth ?? 1;
-      d.setUTCMonth(d.getUTCMonth() + 1);
-      const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-      d.setUTCDate(Math.min(targetDOM, lastDay));
-      return formatDate(d);
-    }
+    case "MONTHLY":
+      // Reapply the configured day (not the previous, possibly clamped, date)
+      // to the following month.
+      return formatDate(monthlyOccurrence(d.getUTCFullYear(), d.getUTCMonth() + 1, dayOfMonth ?? 1));
 
     default:
       d.setUTCDate(d.getUTCDate() + 1);

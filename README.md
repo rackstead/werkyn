@@ -285,6 +285,12 @@ deliberate administrator promotion remains available. Account/provider creation 
 atomic; invite admission, verification/session token creation and refresh-family
 concurrency have separate transaction boundaries.
 
+After a committed account is observed, ordinary local registration uses a
+transaction without the bootstrap predicate, so concurrent signups do not contend
+for bootstrap. OIDC identity/linking transactions retain serializable isolation.
+The application has no account-deletion endpoint; do not run destructive seeds or
+manual deletion of all users concurrently with registration.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

@@ -81,10 +81,10 @@ function oidc(name, client = prisma, overrides = {}) {
   );
 }
 
-// Both real account-creation operations pause immediately before their INSERT,
+// Real account-creation operations pause immediately before their INSERT,
 // after each caller has performed its reads. The bounded barrier proves overlap;
 // PostgreSQL, rather than a fake delegate, decides which transaction can commit.
-function overlappingClient() {
+function overlappingClient(participants = 2) {
   let arrivals = 0;
   let release;
   const barrier = new Promise((resolve) => {
@@ -96,8 +96,8 @@ function overlappingClient() {
       user: {
         async create({ args, query }) {
           attempts.push(args.data.email);
-          if (++arrivals <= 2) {
-            if (arrivals === 2) release();
+          if (++arrivals <= participants) {
+            if (arrivals === participants) release();
             let timer;
             try {
               await Promise.race([
@@ -248,6 +248,35 @@ for (const [name, first, second, localCount, adminCount] of [
   });
 }
 
+test("four overlapping ordinary registrations commit without bootstrap predicate contention", async () => {
+  const bootstrap = await local("existing-bootstrap");
+  const overlap = overlappingClient(4);
+  const results = await Promise.allSettled(
+    Array.from({ length: 4 }, (_, i) => local(`ordinary-${i}`, overlap.client)),
+  );
+  for (const result of results) {
+    if (result.status === "rejected") throw result.reason;
+  }
+  assert.equal(
+    overlap.attempts.length,
+    4,
+    "ordinary inserts need no serialization retries",
+  );
+  const users = await rows();
+  assert.equal(users.length, 5);
+  assert.deepEqual(
+    users.filter((u) => u.isInstanceAdmin).map((u) => u.id),
+    [bootstrap.user.id],
+  );
+  for (const user of users.filter((u) => u.id !== bootstrap.user.id)) {
+    assert.equal(user.emailVerified, false);
+    assert.equal(user.authProviders.length, 1);
+    assert.equal(user.refreshTokens.length, 1);
+    assert.equal(user.emailVerificationTokens.length, 1);
+  }
+  assert.equal(sent.length, 4);
+});
+
 test("OIDC first account stays ordinary; subsequent local account needs verification", async () => {
   const first = await oidc("oidc-first");
   const second = await local("local-next");
@@ -261,6 +290,24 @@ test("OIDC first account stays ordinary; subsequent local account needs verifica
   });
   assert.equal(user.isInstanceAdmin, false);
   assert.equal(user.emailVerified, false);
+  assert.equal(sent.length, 1);
+});
+
+test("overlapping local and OIDC creation after an ordinary account preserves both ordinary identities", async () => {
+  await oidc("existing-ordinary");
+  const overlap = overlappingClient();
+  const results = await Promise.allSettled([
+    local("ordinary-local", overlap.client),
+    oidc("ordinary-oidc", overlap.client),
+  ]);
+  for (const result of results) {
+    if (result.status === "rejected") throw result.reason;
+  }
+  const users = await rows();
+  assert.equal(users.length, 3);
+  assert.equal(users.filter((u) => u.isInstanceAdmin).length, 0);
+  for (const user of users) assert.equal(user.authProviders.length, 1);
+  assert.equal(users.find((u) => u.passwordHash).emailVerified, false);
   assert.equal(sent.length, 1);
 });
 

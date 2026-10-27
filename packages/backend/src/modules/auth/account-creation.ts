@@ -18,20 +18,29 @@ export const accountUserSelect = {
   emailVerified: true,
 } satisfies Prisma.UserSelect;
 
-// Every automatic account-creation path must call this inside a SERIALIZABLE
-// transaction and retry serialization failures with a fresh transaction. The
-// empty-User predicate and INSERT then conflict across local and OIDC signups;
-// only an eligible first account can receive automatic bootstrap privileges.
+// If no committed existing account was observed before starting the transaction,
+// every automatic creation path must use SERIALIZABLE and retry conflicts with a
+// fresh transaction. The empty-User predicate and INSERT then conflict across
+// local and OIDC signups; only an eligible first account can bootstrap.
+// Once an account exists, local creation can use READ COMMITTED without the
+// predicate: serializing ordinary registrations would cause needless conflicts.
+// Runtime account deletion is not supported; destructive seeds/manual deletion
+// must not run concurrently with signup.
 // Provider creation belongs in the same transaction, so a failed account does
 // not consume bootstrap. Later explicit administrator promotion stays allowed.
 export async function createAccount(
   tx: Prisma.TransactionClient,
   data: Prisma.UserCreateInput,
-  options: { bootstrapAdminEligible: boolean },
+  options: {
+    bootstrapAdminEligible: boolean;
+    existingAccountObserved: boolean;
+  },
 ) {
-  // OIDC accounts remain ineligible, but must participate in the predicate read
-  // so a concurrent local creator cannot bootstrap from a stale empty snapshot.
-  const isFirstUser = (await tx.user.count({ take: 1 })) === 0;
+  // On a potentially empty installation, ineligible OIDC creators must also
+  // predicate-read so a local creator cannot bootstrap from a stale snapshot.
+  const isFirstUser =
+    !options.existingAccountObserved &&
+    (await tx.user.count({ take: 1 })) === 0;
   const isBootstrapAdmin = isFirstUser && options.bootstrapAdminEligible;
   const user = await tx.user.create({
     data: {

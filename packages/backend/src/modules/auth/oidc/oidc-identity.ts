@@ -140,6 +140,8 @@ export async function resolveOidcUser(
   const provider = oidcProviderNamespace(identity.issuer);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      const existingAccountObserved =
+        (await prisma.user.findFirst({ select: { id: true } })) !== null;
       return await prisma.$transaction(
         async (tx) => {
           const config = await assertSsoEnabled(tx, actualConnectorId);
@@ -229,7 +231,7 @@ export async function resolveOidcUser(
                 },
               },
             },
-            { bootstrapAdminEligible: false },
+            { bootstrapAdminEligible: false, existingAccountObserved },
           );
           return user;
         },

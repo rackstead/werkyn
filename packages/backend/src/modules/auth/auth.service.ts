@@ -176,6 +176,10 @@ async function createPasswordAccount(
 ) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      // An already committed account permanently rules out bootstrap during
+      // normal runtime operation; no account-deletion endpoint exists.
+      const existingAccountObserved =
+        (await prisma.user.findFirst({ select: { id: true } })) !== null;
       return await prisma.$transaction(
         (tx) =>
           createAccount(
@@ -186,9 +190,13 @@ async function createPasswordAccount(
                 create: { provider: "password", email: data.email },
               },
             },
-            { bootstrapAdminEligible: true },
+            { bootstrapAdminEligible: true, existingAccountObserved },
           ),
-        { isolationLevel: "Serializable" },
+        {
+          isolationLevel: existingAccountObserved
+            ? "ReadCommitted"
+            : "Serializable",
+        },
       );
     } catch (error) {
       const code =

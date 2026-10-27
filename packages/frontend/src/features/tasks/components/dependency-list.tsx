@@ -98,7 +98,12 @@ export function DependencyList({ task, canEdit }: DependencyListProps) {
                 </div>
                 {canEdit && (
                   <button
-                    onClick={() => removeDep.mutate(dep.id)}
+                    onClick={() =>
+                      removeDep.mutate({
+                        depId: dep.id,
+                        blockingTaskId: dep.blockingTask.id,
+                      })
+                    }
                     className="shrink-0 ml-2 rounded p-0.5 hover:bg-accent transition-colors"
                   >
                     <X className="h-3.5 w-3.5 text-muted-foreground" />

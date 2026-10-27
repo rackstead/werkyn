@@ -14,6 +14,7 @@ export default async function oidcRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/callback",
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     handler: oidcCallbackHandler,
   });
 }

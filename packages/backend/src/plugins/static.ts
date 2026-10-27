@@ -34,9 +34,13 @@ export default fp(async (fastify: FastifyInstance) => {
       const { workspaceId } = request.params;
       const subPath = request.params['*'];
 
-      // Path traversal protection
-      const resolved = path.resolve(storageDir, workspaceId, 'uploads', subPath);
-      if (!resolved.startsWith(storageDir + path.sep)) {
+      // Resolve and serve beneath the same workspace root used for authorization.
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(workspaceId)) {
+        throw new ForbiddenError("Invalid workspace path");
+      }
+      const uploadRoot = path.resolve(storageDir, workspaceId, 'uploads');
+      const resolved = path.resolve(uploadRoot, subPath);
+      if (resolved !== uploadRoot && !resolved.startsWith(uploadRoot + path.sep)) {
         throw new ForbiddenError("Invalid file path");
       }
 
@@ -49,8 +53,8 @@ export default fp(async (fastify: FastifyInstance) => {
       }
 
       return reply.sendFile(
-        path.join(workspaceId, 'uploads', subPath),
-        storageDir,
+        subPath,
+        uploadRoot,
       );
     },
   );

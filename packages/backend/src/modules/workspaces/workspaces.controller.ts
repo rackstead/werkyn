@@ -36,6 +36,7 @@ export async function getWorkspaceHandler(
   const workspace = await workspacesService.getWorkspace(
     request.server.prisma,
     params.wid,
+    request.user!.id,
   );
   return reply.send({ data: workspace });
 }
@@ -169,6 +170,8 @@ export async function listWorkspaceActivityHandler(
     request.server.prisma,
     params.wid,
     query,
+    request.user!.id,
+    request.workspaceMember!.role,
   );
   return reply.send(result);
 }

@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "../utils/errors.js";
-import type { WorkspaceRole } from "@prisma/client";
+import { assertProjectAccess } from "../utils/project-access.js";
 
 type AllowedRole = "ADMIN" | "MEMBER" | "VIEWER";
 
@@ -14,34 +14,45 @@ export function authorize(...allowedRoles: AllowedRole[]) {
 
     // Resolve workspaceId from route params
     let workspaceId: string | undefined = params.wid;
+    let projectId: string | undefined;
+    const referencedProjectIds = new Set<string>();
 
     // If no :wid, try resolving from project (:pid) or task (:tid)
-    if (!workspaceId && params.pid) {
+    if (params.pid) {
       const project = await request.server.prisma.project.findUnique({
         where: { id: params.pid },
         select: { workspaceId: true },
       });
       if (!project) throw new NotFoundError("Project not found");
+      if (workspaceId && workspaceId !== project.workspaceId) throw new NotFoundError("Project not found in this workspace");
       workspaceId = project.workspaceId;
+      projectId = params.pid;
     }
 
-    if (!workspaceId && params.tid) {
+    if (params.tid) {
       const task = await request.server.prisma.task.findUnique({
         where: { id: params.tid },
-        select: { project: { select: { workspaceId: true } } },
+        select: { projectId: true, project: { select: { workspaceId: true } } },
       });
       if (!task) throw new NotFoundError("Task not found");
+      if ((workspaceId && workspaceId !== task.project.workspaceId) || (projectId && projectId !== task.projectId)) {
+        throw new NotFoundError("Task not found in this project");
+      }
       workspaceId = task.project.workspaceId;
+      projectId = task.projectId;
     }
 
     // Resolve from time entry :eid
-    if (!workspaceId && params.eid) {
+    if (params.eid) {
       const timeEntry = await request.server.prisma.timeEntry.findUnique({
         where: { id: params.eid },
-        select: { workspaceId: true },
+        select: { workspaceId: true, projectId: true, task: { select: { projectId: true } } },
       });
       if (!timeEntry) throw new NotFoundError("Time entry not found");
+      if (workspaceId && workspaceId !== timeEntry.workspaceId) throw new NotFoundError("Time entry not found in this workspace");
       workspaceId = timeEntry.workspaceId;
+      if (timeEntry.projectId) referencedProjectIds.add(timeEntry.projectId);
+      if (timeEntry.task) referencedProjectIds.add(timeEntry.task.projectId);
     }
 
     // Resolve from group :gid
@@ -106,19 +117,25 @@ export function authorize(...allowedRoles: AllowedRole[]) {
 
     // Resolve from subtask or comment :id param
     if (!workspaceId && params.id) {
-      const subtask = await request.server.prisma.subtask.findUnique({
+      // IDs are only unique within a table. Do not authorize a comment by an
+      // unrelated subtask with the same ID (or vice versa).
+      const subtask = request.routeOptions.url?.includes("/subtasks/")
+        ? await request.server.prisma.subtask.findUnique({
         where: { id: params.id },
-        select: { task: { select: { project: { select: { workspaceId: true } } } } },
-      });
+        select: { task: { select: { projectId: true, project: { select: { workspaceId: true } } } } },
+      }) : null;
       if (subtask) {
         workspaceId = subtask.task.project.workspaceId;
+        projectId = subtask.task.projectId;
       } else {
-        const comment = await request.server.prisma.comment.findUnique({
+        const comment = request.routeOptions.url?.includes("/comments/")
+          ? await request.server.prisma.comment.findUnique({
           where: { id: params.id },
-          select: { task: { select: { project: { select: { workspaceId: true } } } } },
-        });
+          select: { task: { select: { projectId: true, project: { select: { workspaceId: true } } } } },
+        }) : null;
         if (comment) {
           workspaceId = comment.task.project.workspaceId;
+          projectId = comment.task.projectId;
         } else {
           throw new NotFoundError("Resource not found");
         }
@@ -150,6 +167,12 @@ export function authorize(...allowedRoles: AllowedRole[]) {
 
     if (!allowedRoles.includes(member.role as AllowedRole)) {
       throw new ForbiddenError("Insufficient permissions");
+    }
+
+    if (projectId) referencedProjectIds.add(projectId);
+    for (const referencedProjectId of referencedProjectIds) {
+      const access = await assertProjectAccess(request.server.prisma, referencedProjectId, request.user.id);
+      if (access.workspaceId !== workspaceId) throw new NotFoundError("Project not found in this workspace");
     }
 
     request.workspaceMember = member;

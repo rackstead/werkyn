@@ -14,6 +14,7 @@ import {
   readOidcIdentity,
   resolveOidcUser,
 } from "./oidc-identity.js";
+import { consumeOidcState, OIDC_STATE_TTL_SECONDS } from "./oidc-state.js";
 
 const CLIENT_ID = "werkyn";
 const REDIRECT_URI = () => `${env.FRONTEND_URL}/api/auth/oidc/callback`;
@@ -55,7 +56,7 @@ export async function initiateOidcLogin(
   prisma: PrismaClient,
   connectorId?: string,
   returnUrl?: string,
-): Promise<string> {
+): Promise<{ authorizationUrl: string; state: string }> {
   await assertSsoEnabled(prisma, connectorId);
   const as = await getAuthServer();
   if (!as.authorization_endpoint) {
@@ -74,7 +75,7 @@ export async function initiateOidcLogin(
       nonce,
       returnUrl,
       connectorId,
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+      expiresAt: new Date(Date.now() + OIDC_STATE_TTL_SECONDS * 1000),
     },
   });
 
@@ -92,7 +93,7 @@ export async function initiateOidcLogin(
     authUrl.searchParams.set("connector_id", connectorId);
   }
 
-  return authUrl.toString();
+  return { authorizationUrl: authUrl.toString(), state };
 }
 
 interface OidcCallbackResult {
@@ -126,23 +127,10 @@ export async function handleOidcCallback(
   prisma: PrismaClient,
   code: string,
   stateParam: string,
+  browserState: string | undefined,
+  issuerParam?: string,
 ): Promise<OidcCallbackResult> {
-  // Look up and validate state
-  const oidcState = await prisma.oidcState.findUnique({
-    where: { state: stateParam },
-  });
-
-  if (!oidcState) {
-    throw new UnauthorizedError("Invalid OIDC state");
-  }
-
-  if (oidcState.expiresAt < new Date()) {
-    await prisma.oidcState.delete({ where: { id: oidcState.id } });
-    throw new UnauthorizedError("OIDC state expired");
-  }
-
-  // Delete used state
-  await prisma.oidcState.delete({ where: { id: oidcState.id } });
+  const oidcState = await consumeOidcState(prisma, stateParam, browserState);
   await assertSsoEnabled(prisma, oidcState.connectorId);
 
   const as = await getAuthServer();
@@ -153,7 +141,8 @@ export async function handleOidcCallback(
   const callbackUrl = new URL(REDIRECT_URI());
   callbackUrl.searchParams.set("code", code);
   callbackUrl.searchParams.set("state", stateParam);
-  callbackUrl.searchParams.set("iss", as.issuer);
+  if (issuerParam !== undefined)
+    callbackUrl.searchParams.set("iss", issuerParam);
 
   // validateAuthResponse will throw AuthorizationResponseError on error
   const callbackParams = oauth.validateAuthResponse(

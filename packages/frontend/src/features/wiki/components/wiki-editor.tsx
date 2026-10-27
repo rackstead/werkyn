@@ -20,19 +20,31 @@ function useIsDark() {
 
 interface WikiEditorProps {
   initialContent?: unknown;
+  recoveredContent?: unknown;
   readOnly?: boolean;
   workspaceId?: string;
   spaceId?: string;
   onChange?: (content: Block[]) => void;
 }
 
-export function WikiEditor({ initialContent, readOnly = false, workspaceId, spaceId, onChange }: WikiEditorProps) {
+export function WikiEditor({
+  initialContent,
+  recoveredContent,
+  readOnly = false,
+  workspaceId,
+  spaceId,
+  onChange,
+}: WikiEditorProps) {
   const isDark = useIsDark();
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const initialDocument = recoveredContent ?? initialContent;
 
   const editor = useCreateBlockNote({
-    initialContent: (initialContent as Block[] | undefined) ?? undefined,
+    initialContent:
+      Array.isArray(initialDocument) && initialDocument.length > 0
+        ? (initialDocument as Block[])
+        : undefined,
     uploadFile: async (file: File) => {
       const token = useAuthStore.getState().accessToken;
       const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";

@@ -1,4 +1,10 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "@tanstack/react-router";
+import { toast } from "sonner";
+import { useAuthStore } from "@/stores/auth-store";
+import { useEntityAutosave } from "@/hooks/use-entity-autosave";
+import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
+import type { UpdateWikiPageInput } from "@pm/shared";
 import { ChevronRight, FileText, History, Lock, MessageSquare, Share2, Smile } from "lucide-react";
 import { EmojiPicker } from "@/components/shared/emoji-picker";
 import {
@@ -22,10 +28,44 @@ interface WikiPageViewProps {
 }
 
 export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageViewProps) {
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  return (
+    <WikiPageSession
+      key={`${userId}:${pageId}`}
+      pageId={pageId}
+      workspaceId={workspaceId}
+      onNavigatePage={onNavigatePage}
+    />
+  );
+}
+
+function WikiPageSession({
+  pageId,
+  workspaceId,
+  onNavigatePage,
+}: WikiPageViewProps) {
   const { data: pageData, isLoading } = useWikiPage(pageId);
   const { data: breadcrumbsData } = useWikiPageBreadcrumbs(pageId);
-  const updatePage = useUpdateWikiPage(pageId);
-  const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(pageId);
+  const { mutateAsync: updatePage } = useUpdateWikiPage();
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  const save = useCallback(
+    (patch: UpdateWikiPageInput) => {
+      if (useAuthStore.getState().user?.id !== userId) {
+        return Promise.reject(
+          new Error("Sign in as the author to save these changes"),
+        );
+      }
+      return updatePage({ ...patch, pageId, expectedUserId: userId });
+    },
+    [pageId, updatePage, userId],
+  );
+  const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save);
+  const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(
+    pageId,
+    autosave.flush,
+  );
+  const router = useRouter({ warn: false });
+  const [finishing, setFinishing] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [showShare, setShowShare] = useState(false);
@@ -33,38 +73,43 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
   const page = pageData?.data;
   const breadcrumbs = breadcrumbsData?.data ?? [];
 
-  const readOnly = !isLockedByMe;
-
-  // Debounced auto-save
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const readOnly = !isLockedByMe || finishing || showVersions;
 
   const handleContentChange = useCallback(
     (content: Block[]) => {
-      if (saveTimer.current !== null) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => {
-        updatePage.mutate({ content });
-      }, 800);
+      if (readOnly) return;
+      autosave.schedule({ content: structuredClone(content) });
     },
-    [updatePage],
+    [autosave.schedule, readOnly],
   );
 
-  const handleTitleBlur = useCallback(
-    (e: React.FocusEvent<HTMLHeadingElement>) => {
+  const handleTitleChange = useCallback(
+    (title: string) => {
       if (readOnly) return;
-      const title = e.currentTarget.textContent?.trim();
       if (title && title !== page?.title) {
-        updatePage.mutate({ title });
+        autosave.schedule({ title });
       }
     },
-    [updatePage, page?.title, readOnly],
+    [autosave.schedule, page?.title, readOnly],
   );
 
   const handleStartEditing = () => {
-    acquire();
+    void acquire().catch(() =>
+      toast.error("Could not start editing this page"),
+    );
   };
 
+  const finishEditing = useCallback(async () => {
+    setFinishing(true);
+    try {
+      await release();
+    } finally {
+      setFinishing(false);
+    }
+  }, [release]);
+
   const handleStopEditing = () => {
-    release();
+    void finishEditing().catch(() => {});
   };
 
   if (isLoading) {
@@ -87,6 +132,12 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
 
   return (
     <div className="mx-auto max-w-4xl p-8">
+      {router && (
+        <EditorNavigationGuard
+          beforeLeave={finishEditing}
+          hasUnsavedChanges={autosave.hasUnsavedChanges}
+        />
+      )}
       {/* Breadcrumbs (ancestors only, current page shown as h1 below) */}
       {breadcrumbs.length > 1 && (
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-6">
@@ -94,7 +145,11 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
             <span key={crumb.id} className="flex items-center gap-1">
               {i > 0 && <ChevronRight className="h-3 w-3" />}
               <button
-                onClick={() => onNavigatePage(crumb.id)}
+                onClick={() => {
+                  void finishEditing()
+                    .then(() => onNavigatePage(crumb.id))
+                    .catch(() => {});
+                }}
                 className="hover:text-foreground transition-colors"
               >
                 {crumb.icon ? (
@@ -127,9 +182,33 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
             </Button>
           )}
           {isLockedByMe && (
-            <Button size="sm" variant="outline" onClick={handleStopEditing}>
-              Done Editing
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={finishing}
+              onClick={handleStopEditing}
+            >
+              {finishing ? "Saving…" : "Done Editing"}
             </Button>
+          )}
+        </div>
+        <div aria-live="polite" className="text-xs text-muted-foreground">
+          {autosave.status === "error" ? (
+            <span role="alert">
+              Changes not saved.{" "}
+              <button
+                className="underline"
+                onClick={() => {
+                  void autosave.flush().catch(() => {});
+                }}
+              >
+                Retry save
+              </button>
+            </span>
+          ) : autosave.hasUnsavedChanges ? (
+            "Saving changes…"
+          ) : (
+            "All changes saved"
           )}
         </div>
         <div className="flex items-center gap-1">
@@ -152,7 +231,22 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => { setShowVersions(!showVersions); setShowComments(false); }}
+            disabled={finishing}
+            onClick={() => {
+              if (showVersions) {
+                setShowVersions(false);
+                return;
+              }
+              setFinishing(true);
+              void autosave
+                .flush()
+                .then(() => {
+                  setShowVersions(true);
+                  setShowComments(false);
+                })
+                .catch(() => {})
+                .finally(() => setFinishing(false));
+            }}
           >
             <History className="h-3.5 w-3.5 mr-1" />
             History
@@ -162,10 +256,10 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
 
       {/* Icon */}
       <div className="mb-2 group/icon">
-        {page.icon ? (
+        {page.icon && !readOnly ? (
           <EmojiPicker
             value={page.icon}
-            onChange={(emoji) => updatePage.mutate({ icon: emoji })}
+            onChange={(emoji) => autosave.schedule({ icon: emoji })}
           >
             <button
               type="button"
@@ -174,11 +268,13 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
               {page.icon}
             </button>
           </EmojiPicker>
+        ) : page.icon ? (
+          <span className="text-5xl leading-none p-1">{page.icon}</span>
         ) : (
           !readOnly && (
             <EmojiPicker
               value={null}
-              onChange={(emoji) => emoji && updatePage.mutate({ icon: emoji })}
+              onChange={(emoji) => emoji && autosave.schedule({ icon: emoji })}
             >
               <button
                 type="button"
@@ -193,14 +289,13 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
       </div>
 
       {/* Title */}
-      <h1
-        contentEditable={!readOnly}
-        suppressContentEditableWarning
-        onBlur={handleTitleBlur}
-        className="text-3xl font-bold outline-none mb-1 empty:before:content-['Untitled'] empty:before:text-muted-foreground"
-      >
-        {page.title}
-      </h1>
+      <EditableWikiTitle
+        title={page.title}
+        recoveredTitle={autosave.draft?.title}
+        readOnly={readOnly}
+        hasUnsavedChanges={autosave.hasUnsavedChanges}
+        onChange={handleTitleChange}
+      />
 
       {/* Meta info */}
       <div className="flex items-center gap-2 text-xs text-muted-foreground mb-6">
@@ -218,6 +313,7 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
       <WikiEditor
         key={pageId}
         initialContent={page.content}
+        recoveredContent={autosave.draft?.content}
         readOnly={readOnly}
         workspaceId={workspaceId}
         spaceId={page.spaceId}
@@ -247,5 +343,53 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
         pageId={pageId}
       />
     </div>
+  );
+}
+
+function EditableWikiTitle({
+  title,
+  recoveredTitle,
+  readOnly,
+  hasUnsavedChanges,
+  onChange,
+}: {
+  title: string;
+  recoveredTitle?: string;
+  readOnly: boolean;
+  hasUnsavedChanges: boolean;
+  onChange: (title: string) => void;
+}) {
+  const element = useRef<HTMLHeadingElement>(null);
+  const initialTitle = useRef(recoveredTitle ?? title);
+  const wasDirty = useRef(hasUnsavedChanges);
+  useEffect(() => {
+    if (hasUnsavedChanges) {
+      wasDirty.current = true;
+      return;
+    }
+    if (wasDirty.current) {
+      wasDirty.current = false;
+      return;
+    }
+    if (
+      !hasUnsavedChanges &&
+      element.current &&
+      element.current.textContent !== title
+    ) {
+      element.current.textContent = title;
+    }
+  }, [title, hasUnsavedChanges]);
+  return (
+    <h1
+      ref={element}
+      contentEditable={!readOnly}
+      suppressContentEditableWarning
+      onInput={(event) =>
+        onChange(event.currentTarget.textContent?.trim() ?? "")
+      }
+      className="text-3xl font-bold outline-none mb-1 empty:before:content-['Untitled'] empty:before:text-muted-foreground"
+    >
+      {initialTitle.current}
+    </h1>
   );
 }

@@ -56,13 +56,28 @@ async function parseErrorResponse(response: KyResponse): Promise<ApiError> {
   }
 }
 
+function assertRequestIdentity(context: Record<string, unknown>) {
+  const expectedUserId = context.expectedUserId;
+  if (
+    typeof expectedUserId === "string" &&
+    useAuthStore.getState().user?.id !== expectedUserId
+  ) {
+    throw new ApiError(
+      409,
+      "Identity changed",
+      "Sign in as the author to save these changes",
+    );
+  }
+}
+
 export const api = ky.create({
   prefixUrl: import.meta.env.VITE_API_BASE_URL || "/api",
   timeout: 15000,
   credentials: "include",
   hooks: {
     beforeRequest: [
-      (request) => {
+      (request, options) => {
+        assertRequestIdentity(options.context);
         const token = useAuthStore.getState().accessToken;
         if (token) {
           request.headers.set("Authorization", `Bearer ${token}`);
@@ -71,6 +86,7 @@ export const api = ky.create({
     ],
     afterResponse: [
       async (request, options, response) => {
+        assertRequestIdentity(options.context);
         if (!response.ok) {
           // On 401, try to refresh token (unless it's the refresh endpoint)
           if (
@@ -78,13 +94,32 @@ export const api = ky.create({
             !request.url.includes("/auth/refresh")
           ) {
             const refreshed = await useAuthStore.getState().refresh();
+            assertRequestIdentity(options.context);
             if (refreshed) {
               // Retry the original request with the new token
               request.headers.set(
                 "Authorization",
                 `Bearer ${useAuthStore.getState().accessToken}`,
               );
-              return ky(request, options);
+              // The raw retry deliberately omits this afterResponse hook, so it
+              // cannot refresh indefinitely. Keep the identity guard on the
+              // actual retry dispatch, which may occur after an account switch.
+              const retried = await ky(request, {
+                ...options,
+                hooks: {
+                  beforeRequest: [
+                    (retryRequest, retryOptions) => {
+                      assertRequestIdentity(retryOptions.context);
+                      retryRequest.headers.set(
+                        "Authorization",
+                        `Bearer ${useAuthStore.getState().accessToken}`,
+                      );
+                    },
+                  ],
+                },
+              });
+              assertRequestIdentity(options.context);
+              return retried;
             }
             // Refresh failed — force logout
             useAuthStore.getState().logout();

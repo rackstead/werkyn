@@ -36,6 +36,7 @@ export async function updateRecurringHandler(
   const body = request.body as UpdateRecurringInput;
   const config = await recurringService.updateRecurringConfig(
     request.server.prisma,
+    params.pid,
     params.configId,
     body,
   );
@@ -49,6 +50,7 @@ export async function deleteRecurringHandler(
   const params = request.params as { pid: string; configId: string };
   await recurringService.deleteRecurringConfig(
     request.server.prisma,
+    params.pid,
     params.configId,
   );
   return reply.status(204).send();

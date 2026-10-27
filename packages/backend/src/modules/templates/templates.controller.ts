@@ -22,6 +22,7 @@ export async function getTemplateHandler(
   const params = request.params as { pid: string; templateId: string };
   const template = await templatesService.getTemplate(
     request.server.prisma,
+    params.pid,
     params.templateId,
   );
   return reply.send({ data: template });
@@ -49,6 +50,7 @@ export async function updateTemplateHandler(
   const body = request.body as UpdateTemplateInput;
   const template = await templatesService.updateTemplate(
     request.server.prisma,
+    params.pid,
     params.templateId,
     body,
   );
@@ -62,6 +64,7 @@ export async function deleteTemplateHandler(
   const params = request.params as { pid: string; templateId: string };
   await templatesService.deleteTemplate(
     request.server.prisma,
+    params.pid,
     params.templateId,
   );
   return reply.status(204).send();

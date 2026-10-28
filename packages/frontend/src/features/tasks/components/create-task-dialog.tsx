@@ -179,6 +179,7 @@ export function CreateTaskDialog({
             {/* More options toggle */}
             <button
               type="button"
+              aria-expanded={showMore}
               onClick={() => setShowMore(!showMore)}
               className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
             >
@@ -211,12 +212,17 @@ export function CreateTaskDialog({
 
                 {/* Priority */}
                 <div className="space-y-2">
-                  <Label>Priority</Label>
-                  <div className="flex gap-2">
+                  <Label id="task-priority-label">Priority</Label>
+                  <div
+                    role="group"
+                    aria-labelledby="task-priority-label"
+                    className="flex gap-2"
+                  >
                     {PRIORITIES.map((p) => (
                       <button
                         key={p}
                         type="button"
+                        aria-pressed={priority === p}
                         onClick={() => setPriority(p)}
                         className={cn(
                           "rounded-full px-3 py-1 text-xs font-medium transition-all",
@@ -234,14 +240,14 @@ export function CreateTaskDialog({
 
                 {/* Start date */}
                 <div className="space-y-2">
-                  <Label>Start date</Label>
-                  <DatePicker value={startDate} onChange={setStartDate} />
+                  <Label htmlFor="task-start-date">Start date</Label>
+                  <DatePicker id="task-start-date" value={startDate} onChange={setStartDate} />
                 </div>
 
                 {/* Due date */}
                 <div className="space-y-2">
-                  <Label>Due date</Label>
-                  <DatePicker value={dueDate} onChange={setDueDate} />
+                  <Label htmlFor="task-due-date">Due date</Label>
+                  <DatePicker id="task-due-date" value={dueDate} onChange={setDueDate} />
                 </div>
 
                 {/* Assignees */}
@@ -259,6 +265,7 @@ export function CreateTaskDialog({
                           {user.displayName}
                           <button
                             type="button"
+                            aria-label={`Remove assignee ${user.displayName}`}
                             onClick={() =>
                               setAssigneeIds((prev) =>
                                 prev.filter((a) => a !== id),
@@ -302,6 +309,7 @@ export function CreateTaskDialog({
                           {label.name}
                           <button
                             type="button"
+                            aria-label={`Remove label ${label.name}`}
                             onClick={() =>
                               setLabelIds((prev) =>
                                 prev.filter((l) => l !== id),
@@ -333,7 +341,7 @@ export function CreateTaskDialog({
           </div>
 
           {isError && (
-            <p className="mt-2 text-sm text-destructive">
+            <p role="alert" className="mt-2 text-sm text-destructive">
               Failed to create task. Please try again.
             </p>
           )}

@@ -32,6 +32,7 @@ export function TaskTitle({ taskId, title, canEdit }: TaskTitleProps) {
   return (
     <input
       ref={inputRef}
+      aria-label="Task title"
       value={value}
       onChange={(e) => setValue(e.target.value)}
       onBlur={handleSave}

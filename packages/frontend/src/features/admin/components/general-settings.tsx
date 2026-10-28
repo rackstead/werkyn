@@ -134,9 +134,9 @@ export function GeneralSettings({ workspaceId }: GeneralSettingsProps) {
         ) : (
           <div className="grid gap-4 max-w-md">
             <div className="space-y-2">
-              <Label>Default Role for New Members</Label>
+              <Label htmlFor="default-member-role">Default Role for New Members</Label>
               <Select value={defaultRole} onValueChange={setDefaultRole}>
-                <SelectTrigger>
+                <SelectTrigger id="default-member-role">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

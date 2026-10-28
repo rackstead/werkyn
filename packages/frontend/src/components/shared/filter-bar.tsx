@@ -73,7 +73,7 @@ export function FilterBar({ projectId, filters, onFilterChange, hideDateRange }:
         value={filters.status ?? ALL}
         onValueChange={(v) => updateFilter("status", v === ALL ? undefined : v)}
       >
-        <SelectTrigger className="h-8 w-auto min-w-[130px]">
+        <SelectTrigger aria-label="Filter by status" className="h-8 w-auto min-w-[130px]">
           <SelectValue placeholder="All statuses" />
         </SelectTrigger>
         <SelectContent>
@@ -89,7 +89,7 @@ export function FilterBar({ projectId, filters, onFilterChange, hideDateRange }:
         value={filters.priority ?? ALL}
         onValueChange={(v) => updateFilter("priority", v === ALL ? undefined : v)}
       >
-        <SelectTrigger className="h-8 w-auto min-w-[130px]">
+        <SelectTrigger aria-label="Filter by priority" className="h-8 w-auto min-w-[130px]">
           <SelectValue placeholder="All priorities" />
         </SelectTrigger>
         <SelectContent>
@@ -105,7 +105,7 @@ export function FilterBar({ projectId, filters, onFilterChange, hideDateRange }:
         value={filters.assignee ?? ALL}
         onValueChange={(v) => updateFilter("assignee", v === ALL ? undefined : v)}
       >
-        <SelectTrigger className="h-8 w-auto min-w-[130px]">
+        <SelectTrigger aria-label="Filter by assignee" className="h-8 w-auto min-w-[130px]">
           <SelectValue placeholder="All assignees" />
         </SelectTrigger>
         <SelectContent>
@@ -121,7 +121,7 @@ export function FilterBar({ projectId, filters, onFilterChange, hideDateRange }:
         value={filters.label ?? ALL}
         onValueChange={(v) => updateFilter("label", v === ALL ? undefined : v)}
       >
-        <SelectTrigger className="h-8 w-auto min-w-[130px]">
+        <SelectTrigger aria-label="Filter by label" className="h-8 w-auto min-w-[130px]">
           <SelectValue placeholder="All labels" />
         </SelectTrigger>
         <SelectContent>

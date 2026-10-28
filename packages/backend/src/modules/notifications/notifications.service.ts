@@ -1,4 +1,5 @@
-import type { PrismaClient, NotificationType, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { Notification, PrismaClient, NotificationType } from "@prisma/client";
 import type { NotificationQueryInput, UpdateNotificationPreferenceInput } from "@pm/shared";
 
 const TYPE_TO_PREF_KEY: Record<NotificationType, string> = {
@@ -91,35 +92,78 @@ export async function createNotifications(
     .map((r) => r.value);
 }
 
+// Same rule as projectAccessWhere: current workspace membership, plus ADMIN
+// role or an explicit project membership.
+function projectReadable(projectId: Prisma.Sql, userId: string) {
+  return Prisma.sql`EXISTS (
+    SELECT 1 FROM "Project" p
+    JOIN "WorkspaceMember" wm ON wm."workspaceId" = p."workspaceId" AND wm."userId" = ${userId}
+    WHERE p."id" = ${projectId}
+      AND (wm."role" = 'ADMIN' OR EXISTS (
+        SELECT 1 FROM "ProjectMember" pm WHERE pm."projectId" = p."id" AND pm."userId" = ${userId}
+      ))
+  )`;
+}
+
+// Stored notifications carry titles and snippets from the scope they were
+// created in. They stay readable only while the recipient can still read
+// every scope named in their data, mirroring the recipient filter applied
+// when they were sent, so a removed member keeps no copy of later or earlier
+// project, channel or workspace content in the list or unread count.
+function visibleNotification(userId: string) {
+  return Prisma.sql`
+    (n."data"->>'projectId' IS NULL OR ${projectReadable(Prisma.sql`n."data"->>'projectId'`, userId)})
+    AND (n."data"->>'taskId' IS NULL OR EXISTS (
+      SELECT 1 FROM "Task" t
+      WHERE t."id" = n."data"->>'taskId' AND ${projectReadable(Prisma.sql`t."projectId"`, userId)}
+    ))
+    AND (n."data"->>'channelId' IS NULL OR EXISTS (
+      SELECT 1 FROM "ChatChannel" c
+      JOIN "WorkspaceMember" wm ON wm."workspaceId" = c."workspaceId" AND wm."userId" = ${userId}
+      WHERE c."id" = n."data"->>'channelId'
+        AND (c."type" = 'PUBLIC' OR EXISTS (
+          SELECT 1 FROM "ChatChannelMember" cm WHERE cm."channelId" = c."id" AND cm."userId" = ${userId}
+        ))
+    ))
+    AND (n."data"->>'workspaceId' IS NULL OR EXISTS (
+      SELECT 1 FROM "WorkspaceMember" wm
+      WHERE wm."workspaceId" = n."data"->>'workspaceId' AND wm."userId" = ${userId}
+    ))`;
+}
+
 export async function listNotifications(
   prisma: PrismaClient,
   userId: string,
   query: NotificationQueryInput,
 ) {
   const take = query.limit + 1;
-  const where: Record<string, unknown> = { userId };
-  if (query.unreadOnly) {
-    where.read = false;
-  }
-  if (query.type) {
-    where.type = { in: query.type.split(",") };
-  }
+  const types = query.type ? query.type.split(",") : null;
 
-  let validCursor = query.cursor;
-  if (validCursor) {
-    const cursorExists = await prisma.notification.findUnique({
-      where: { id: validCursor },
-      select: { id: true },
-    });
-    if (!cursorExists) validCursor = undefined;
-  }
+  // An unknown or foreign cursor starts from the first page.
+  const cursor = query.cursor
+    ? await prisma.notification.findFirst({
+        where: { id: query.cursor, userId },
+        select: { id: true },
+      })
+    : null;
 
-  const notifications = await prisma.notification.findMany({
-    where,
-    orderBy: { createdAt: "desc" },
-    take,
-    ...(validCursor ? { cursor: { id: validCursor }, skip: 1 } : {}),
-  });
+  const notifications = await prisma.$queryRaw<Notification[]>`
+    SELECT n."id", n."userId", n."type"::text AS "type", n."title", n."body",
+           n."read", n."data", n."createdAt"
+    FROM "Notification" n
+    WHERE n."userId" = ${userId}
+      ${query.unreadOnly ? Prisma.sql`AND n."read" = false` : Prisma.empty}
+      ${types ? Prisma.sql`AND n."type"::text IN (${Prisma.join(types)})` : Prisma.empty}
+      ${
+        cursor
+          ? Prisma.sql`AND (n."createdAt", n."id") < (
+              SELECT c."createdAt", c."id" FROM "Notification" c WHERE c."id" = ${cursor.id}
+            )`
+          : Prisma.empty
+      }
+      AND ${visibleNotification(userId)}
+    ORDER BY n."createdAt" DESC, n."id" DESC
+    LIMIT ${take}`;
 
   const hasMore = notifications.length > query.limit;
   const data = hasMore ? notifications.slice(0, query.limit) : notifications;
@@ -132,9 +176,11 @@ export async function getUnreadCount(
   prisma: PrismaClient,
   userId: string,
 ) {
-  return prisma.notification.count({
-    where: { userId, read: false },
-  });
+  const [row] = await prisma.$queryRaw<Array<{ count: number }>>`
+    SELECT COUNT(*)::int AS "count"
+    FROM "Notification" n
+    WHERE n."userId" = ${userId} AND n."read" = false AND ${visibleNotification(userId)}`;
+  return row?.count ?? 0;
 }
 
 export async function markNotificationsRead(

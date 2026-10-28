@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { clientFrame, openRawSocket } from "./support/raw-websocket.mjs";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
@@ -58,123 +58,7 @@ after(async () => {
   }
 });
 
-// Minimal RFC 6455 client over a plain TCP socket. It runs on every supported
-// Node.js release (Node 20 has no global WebSocket client) and lets the tests
-// control framing, including fragmented messages.
-async function rawSocket() {
-  const socket = net.connect(port, "127.0.0.1");
-  let buffered = Buffer.alloc(0);
-  let ended = false;
-  const waiters = [];
-  const wake = () => {
-    while (waiters.length) waiters.shift()();
-  };
-  socket.on("data", (chunk) => {
-    buffered = Buffer.concat([buffered, chunk]);
-    wake();
-  });
-  socket.on("close", () => {
-    ended = true;
-    wake();
-  });
-  socket.on("error", () => {});
-  const waitFor = async (check, timeoutMs) => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const result = check();
-      if (result !== undefined) return result;
-      const remaining = deadline - Date.now();
-      if (ended || remaining <= 0) return undefined;
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, remaining);
-        waiters.push(() => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-    }
-  };
-  socket.write(
-    [
-      "GET /api/ws HTTP/1.1",
-      `Host: 127.0.0.1:${port}`,
-      "Upgrade: websocket",
-      "Connection: Upgrade",
-      `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString("base64")}`,
-      "Sec-WebSocket-Version: 13",
-      "",
-      "",
-    ].join("\r\n"),
-  );
-  const head = await waitFor(() => {
-    const end = buffered.indexOf("\r\n\r\n");
-    if (end === -1) return undefined;
-    const text = buffered.subarray(0, end).toString("latin1");
-    buffered = buffered.subarray(end + 4);
-    return text;
-  }, 5000);
-  assert.match(head ?? "", /^HTTP\/1\.1 101 /);
-
-  // Parses the next unmasked server frame once it has fully arrived.
-  const nextFrame = (timeoutMs = 5000) =>
-    waitFor(() => {
-      if (buffered.length < 2) return undefined;
-      let length = buffered[1] & 0x7f;
-      let offset = 2;
-      if (length === 126) {
-        if (buffered.length < 4) return undefined;
-        length = buffered.readUInt16BE(2);
-        offset = 4;
-      }
-      if (buffered.length < offset + length) return undefined;
-      const frame = { opcode: buffered[0] & 0x0f, payload: buffered.subarray(offset, offset + length) };
-      buffered = buffered.subarray(offset + length);
-      return frame;
-    }, timeoutMs);
-
-  const inbox = [];
-  // Resolves the next JSON text message matching predicate.
-  const next = async (predicate, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const index = inbox.findIndex(predicate);
-      if (index !== -1) return inbox.splice(index, 1)[0];
-      const frame = await nextFrame(Math.max(0, deadline - Date.now()));
-      if (!frame) throw new Error(`No matching message; received ${JSON.stringify(inbox)}`);
-      if (frame.opcode === 0x8) throw new Error(`Socket closed with ${frame.payload.readUInt16BE(0)}`);
-      if (frame.opcode === 0x1) inbox.push(JSON.parse(frame.payload.toString("utf8")));
-    }
-  };
-  // Reads up to the server's close frame and returns its status and reason.
-  const closed = async (timeoutMs = 5000) => {
-    for (;;) {
-      const frame = await nextFrame(timeoutMs);
-      if (!frame) return undefined;
-      if (frame.opcode === 0x8) {
-        return { code: frame.payload.readUInt16BE(0), reason: frame.payload.subarray(2).toString("utf8") };
-      }
-    }
-  };
-  const sendJSON = (value) => socket.write(clientFrame(0x1, true, Buffer.from(JSON.stringify(value))));
-  const close = (code) => {
-    const payload = Buffer.alloc(2);
-    payload.writeUInt16BE(code);
-    socket.write(clientFrame(0x8, true, payload));
-  };
-  return { socket, nextFrame, next, closed, sendJSON, close };
-}
-
-function clientFrame(opcode, fin, payload) {
-  assert.ok(payload.length < 65536);
-  const first = (fin ? 0x80 : 0) | opcode;
-  const head =
-    payload.length < 126
-      ? Buffer.from([first, 0x80 | payload.length])
-      : Buffer.from([first, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
-  const mask = crypto.randomBytes(4);
-  const masked = Buffer.from(payload.map((byte, index) => byte ^ mask[index % 4]));
-  return Buffer.concat([head, mask, masked]);
-}
+const rawSocket = () => openRawSocket(port);
 
 test("an authenticated socket subscribes to its own workspace and receives its events", async () => {
   const client = await rawSocket();

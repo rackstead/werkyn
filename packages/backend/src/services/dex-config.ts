@@ -44,10 +44,12 @@ interface DexPostgresSsl {
  * Dex requires TLS whenever Werkyn does. Dex's driver supports only disable,
  * require, verify-ca and verify-full and cannot fall back between plaintext
  * and TLS:
- * - no sslmode, disable or allow: plaintext, as in the bundled Compose setup;
- * - prefer or require: TLS required (verify-full with Prisma's sslaccept=strict);
+ * - no sslmode, disable, allow or prefer: plaintext, since these let Werkyn
+ *   connect without TLS too (the bundled Compose database has none);
+ * - require: TLS required (verify-full with Prisma's sslaccept=strict);
  * - verify-ca or verify-full: TLS required with certificate verification.
- * sslrootcert, sslcert and sslkey become Dex's caFile, certFile and keyFile.
+ * The trusted certificate is sslrootcert or, in Prisma's format, sslcert. A
+ * libpq client certificate (sslcert with sslkey) is passed on as well.
  */
 export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
   const requested = (params.get("sslmode") ?? "disable").toLowerCase();
@@ -55,9 +57,9 @@ export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
   switch (requested) {
     case "disable":
     case "allow":
+    case "prefer":
       mode = "disable";
       break;
-    case "prefer":
     case "require":
       mode =
         params.get("sslaccept")?.toLowerCase() === "strict"
@@ -77,17 +79,30 @@ export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
   const ssl: DexPostgresSsl = { mode };
   if (mode === "disable") return ssl;
 
+  if (params.get("sslidentity")) {
+    throw new Error(
+      "DATABASE_URL sslidentity (a PKCS12 client certificate) cannot be used by Dex; use sslcert and sslkey PEM files",
+    );
+  }
   const file = (name: string) => {
     const value = params.get(name);
     return value ? path.resolve(PRISMA_SCHEMA_DIR, value) : undefined;
   };
+  const rootCert = file("sslrootcert");
+  const cert = file("sslcert");
+  const key = file("sslkey");
+  // Prisma's sslcert is the certificate to trust; libpq's is the client
+  // certificate that goes with sslkey.
+  const clientPair = cert !== undefined && key !== undefined;
   const caFile =
-    params.get("sslrootcert") === "system" ? undefined : file("sslrootcert");
-  const certFile = file("sslcert");
-  const keyFile = file("sslkey");
+    params.get("sslrootcert") === "system"
+      ? undefined
+      : (rootCert ?? (clientPair ? undefined : cert));
   if (caFile) ssl.caFile = caFile;
-  if (certFile) ssl.certFile = certFile;
-  if (keyFile) ssl.keyFile = keyFile;
+  if (clientPair) {
+    ssl.certFile = cert;
+    ssl.keyFile = key;
+  }
   return ssl;
 }
 
@@ -134,7 +149,9 @@ async function writePrivateFile(
 export async function generateDexConfig(prisma: PrismaClient): Promise<string> {
   const ssoConfig = await prisma.ssoConfig.findUnique({
     where: { id: "singleton" },
-    include: { connectors: { where: { enabled: true }, orderBy: { position: "asc" } } },
+    include: {
+      connectors: { where: { enabled: true }, orderBy: { position: "asc" } },
+    },
   });
 
   if (!ssoConfig || !ssoConfig.enabled || ssoConfig.connectors.length === 0) {
@@ -144,7 +161,10 @@ export async function generateDexConfig(prisma: PrismaClient): Promise<string> {
   const storage: Record<string, unknown> =
     env.DEX_STORAGE_TYPE === "postgres"
       ? { type: "postgres", config: parsePostgresUrl(env.DATABASE_URL) }
-      : { type: "sqlite3", config: { file: path.join(env.DEX_CONFIG_DIR, "dex.db") } };
+      : {
+          type: "sqlite3",
+          config: { file: path.join(env.DEX_CONFIG_DIR, "dex.db") },
+        };
 
   const dexConfig: DexConfig = {
     issuer: `${env.FRONTEND_URL}/dex`,

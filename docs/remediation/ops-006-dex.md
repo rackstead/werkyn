@@ -13,16 +13,19 @@ whenever Werkyn is told to:
 
 | `sslmode` in `DATABASE_URL` | Dex `ssl.mode` |
 | --- | --- |
-| none, `disable`, `allow` | `disable` (the bundled Compose database has no TLS) |
-| `prefer`, `require` | `require` (`verify-full` with Prisma's `sslaccept=strict`) |
+| none, `disable`, `allow`, `prefer` | `disable` (the bundled Compose database has no TLS) |
+| `require` | `require` (`verify-full` with Prisma's `sslaccept=strict`) |
 | `verify-ca`, `verify-full` | the same mode |
 | anything else | Dex is not started and the error is logged |
 
-`sslrootcert`, `sslcert` and `sslkey` become Dex's `caFile`, `certFile` and `keyFile`;
-relative paths resolve against `packages/backend/prisma`, as they do for Prisma. Dex's
-driver cannot fall back between TLS and plaintext, so `prefer` is enforced as `require`.
-To require TLS for a remote database, add `sslmode=require` (or a `verify-*` mode) to
-`DATABASE_URL`.
+Dex's driver cannot fall back between TLS and plaintext, so modes that let Werkyn fall
+back to plaintext (`prefer`, or no `sslmode`, which Prisma treats as `prefer`) keep Dex on
+plaintext. To require TLS for a remote database, add `sslmode=require` (or a `verify-*`
+mode) to `DATABASE_URL`. The certificate to trust is `sslrootcert` or, in Prisma's
+format, `sslcert`; it becomes Dex's `caFile`. A libpq client certificate given as
+`sslcert` with `sslkey` becomes Dex's `certFile` and `keyFile`. Prisma's PKCS12
+`sslidentity` cannot be used by Dex and stops it from starting with a logged error.
+Relative paths resolve against `packages/backend/prisma`, as they do for Prisma.
 
 The generated `dex-config.yaml` contains the Dex client secret and, with PostgreSQL
 storage, the database password. It is written to a new owner-only (0600) file and renamed

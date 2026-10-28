@@ -107,7 +107,14 @@ test("Dex keeps plaintext PostgreSQL for a URL without sslmode (local Compose)",
     database: "projectapp",
     ssl: { mode: "disable" },
   });
-  for (const query of ["sslmode=disable", "sslmode=allow"]) {
+  // prefer lets Werkyn fall back to plaintext as well, and Dex cannot fall
+  // back, so only an explicit requirement makes Dex require TLS.
+  for (const query of [
+    "sslmode=disable",
+    "sslmode=allow",
+    "sslmode=prefer",
+    "sslmode=prefer&sslaccept=strict&sslcert=ca.pem",
+  ]) {
     assert.deepEqual(
       (await storageFor(`postgresql://u:p@127.0.0.1:5432/db?${query}`)).ssl,
       { mode: "disable" },
@@ -120,13 +127,29 @@ test("Dex requires TLS whenever DATABASE_URL requires it", async () => {
   for (const [query, ssl] of [
     ["sslmode=require", { mode: "require" }],
     ["sslmode=REQUIRE", { mode: "require" }],
-    // Dex cannot fall back to plaintext, so a stated preference for TLS is
-    // enforced rather than dropped.
-    ["sslmode=prefer", { mode: "require" }],
     ["sslmode=require&sslaccept=strict", { mode: "verify-full" }],
     [
       "sslmode=verify-ca&sslrootcert=/etc/ssl/db-ca.pem",
       { mode: "verify-ca", caFile: "/etc/ssl/db-ca.pem" },
+    ],
+    // Prisma's sslcert names the certificate to trust.
+    [
+      "sslmode=require&sslaccept=strict&sslcert=/etc/ssl/server-ca.pem",
+      { mode: "verify-full", caFile: "/etc/ssl/server-ca.pem" },
+    ],
+    [
+      "sslmode=require&sslcert=/etc/ssl/server-ca.pem",
+      { mode: "require", caFile: "/etc/ssl/server-ca.pem" },
+    ],
+    ["sslmode=verify-full&sslrootcert=system", { mode: "verify-full" }],
+    // libpq's sslcert and sslkey are a client certificate pair.
+    [
+      "sslmode=verify-full&sslcert=/etc/ssl/client.pem&sslkey=/etc/ssl/client.key",
+      {
+        mode: "verify-full",
+        certFile: "/etc/ssl/client.pem",
+        keyFile: "/etc/ssl/client.key",
+      },
     ],
     [
       "sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem&sslcert=/etc/ssl/client.pem&sslkey=/etc/ssl/client.key",
@@ -158,7 +181,10 @@ test("relative certificate paths resolve against the Prisma schema directory, as
   });
 });
 
-test("an sslmode Dex cannot honor is rejected instead of silently downgraded", async () => {
+test("TLS settings Dex cannot honor are rejected instead of silently dropped", async () => {
   env.DATABASE_URL = "postgresql://u:p@db.example.net/werkyn?sslmode=bogus";
   await assert.rejects(generateDexConfig(prisma), /sslmode/);
+  env.DATABASE_URL =
+    "postgresql://u:p@db.example.net/werkyn?sslmode=require&sslidentity=client.p12&sslpassword=x";
+  await assert.rejects(generateDexConfig(prisma), /sslidentity/);
 });

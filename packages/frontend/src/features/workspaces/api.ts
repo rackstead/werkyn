@@ -10,7 +10,7 @@ import type {
   UpdateWorkspaceInput,
   UpdateWorkspaceMemberInput,
   CreateInviteInput,
-  WorkspaceAdmissionResult,
+  WorkspaceAdmissionCheck,
 } from "@pm/shared";
 import type { WorkspaceMembership } from "@/stores/auth-store";
 
@@ -189,8 +189,8 @@ export function useInviteDetails(token: string) {
   });
 }
 
-type AcceptInviteResponse = {
-  data: Exclude<WorkspaceAdmissionResult, { status: "denied" | "unavailable" }> & {
+type AdmissionResponse = {
+  data: Exclude<WorkspaceAdmissionCheck, { status: "denied" | "unavailable" }> & {
     userId: string;
     workspaces?: WorkspaceMembership[];
   };
@@ -200,7 +200,7 @@ type AcceptInviteResponse = {
 export function rememberInviteAdmission(
   userId: string,
   token: string,
-  admission: WorkspaceAdmissionResult,
+  admission: WorkspaceAdmissionCheck,
 ) {
   queryClient.setQueryData(
     queryKeys.inviteAdmission(userId, token),
@@ -211,9 +211,9 @@ export function rememberInviteAdmission(
 /** The current account's latest admission result for an invite, if any. */
 export function useInviteAdmission(token: string) {
   const userId = useAuthStore((s) => s.user?.id ?? "");
-  const { data } = useQuery<WorkspaceAdmissionResult | null>({
+  const { data } = useQuery<WorkspaceAdmissionCheck | null>({
     queryKey: queryKeys.inviteAdmission(userId, token),
-    // Populated by registration and acceptance; never fetched.
+    // Populated by registration, acceptance and status checks; never fetched.
     queryFn: () => null,
     enabled: false,
     staleTime: Infinity,
@@ -221,23 +221,30 @@ export function useInviteAdmission(token: string) {
   return userId ? (data ?? null) : null;
 }
 
-export function useAcceptInvite() {
+// Shared by acceptance (a join attempt) and the read-only status check.
+function useAdmissionMutation(
+  send: (token: string) => Promise<AdmissionResponse>,
+) {
   const navigate = useNavigate();
   return useMutation({
-    mutationFn: (token: string) =>
-      api.post(`invites/${token}/accept`).json<AcceptInviteResponse>(),
+    mutationFn: send,
+    // The account that sends the request owns its result, even if the browser
+    // switches accounts before the response arrives.
+    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
     onSuccess: async (res, token) => {
       const result = res.data;
-      // The response belongs to the account that sent it. If this browser has
-      // since switched or signed out, it must not change the current session.
+      // If this browser has since switched or signed out, the response must
+      // not change the current session.
       if (useAuthStore.getState().user?.id !== result.userId) return;
       rememberInviteAdmission(result.userId, token, result);
       if (result.status !== "joined") return;
-      useAuthStore.setState((state) =>
-        state.user?.id === result.userId && result.workspaces
-          ? { workspaces: result.workspaces }
-          : state,
-      );
+      if (
+        !result.workspaces ||
+        !useAuthStore
+          .getState()
+          .setWorkspacesForUser(result.userId, result.workspaces)
+      )
+        return;
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });
       toast.success(
         result.alreadyMember
@@ -249,9 +256,6 @@ export function useAcceptInvite() {
         params: { workspaceSlug: result.workspace.slug },
       });
     },
-    // The account that sends the request owns its result, even if the browser
-    // switches accounts before the response arrives.
-    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
     onError: (error, token, context) => {
       // A refusal replaces that account's earlier pending or verification
       // state. Busy, server and network failures keep it, with the error
@@ -265,6 +269,24 @@ export function useAcceptInvite() {
         });
     },
   });
+}
+
+/** Attempts to join; may create a pending join request. */
+export function useAcceptInvite() {
+  return useAdmissionMutation((token) =>
+    api.post(`invites/${token}/accept`).json<AdmissionResponse>(),
+  );
+}
+
+/** Reports where the current account stands without creating a request. */
+export function useCheckInviteAdmission() {
+  return useAdmissionMutation((token) =>
+    // An explicit user check: report the answer once rather than letting the
+    // client's default GET retries repeat a refusal.
+    api
+      .get(`invites/${token}/admission`, { retry: 0 })
+      .json<AdmissionResponse>(),
+  );
 }
 
 // ─── Join requests (administrator review) ───────────────

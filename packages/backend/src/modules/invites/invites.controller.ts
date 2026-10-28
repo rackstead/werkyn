@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import type { CreateInviteInput } from "@pm/shared";
 import * as invitesService from "./invites.service.js";
 import * as admissionService from "./admission.service.js";
+import { admissionDenialError } from "./admission.service.js";
 import { getUserWorkspaces } from "../auth/auth.service.js";
 
 export async function createInviteHandler(
@@ -68,7 +69,7 @@ export async function acceptInviteHandler(
     token: params.token,
   });
   if (result.status === "denied") {
-    throw admissionService.admissionDenialError(result.reason);
+    throw admissionDenialError(result.reason);
   }
   if (result.status === "joined") {
     // The requester's committed memberships, so the client can enter the
@@ -78,6 +79,26 @@ export async function acceptInviteHandler(
   }
   // Not a member yet: verification or administrator approval is pending.
   return reply.status(202).send({ data: { ...result, userId } });
+}
+
+export async function checkAdmissionHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const params = request.params as { token: string };
+  const userId = request.user!.id;
+  const result = await admissionService.checkAdmission(request.server.prisma, {
+    userId,
+    token: params.token,
+  });
+  if (result.status === "denied") {
+    throw admissionDenialError(result.reason);
+  }
+  if (result.status === "joined") {
+    const workspaces = await getUserWorkspaces(request.server.prisma, userId);
+    return reply.send({ data: { ...result, userId, workspaces } });
+  }
+  return reply.send({ data: { ...result, userId } });
 }
 
 export async function listAdmissionRequestsHandler(

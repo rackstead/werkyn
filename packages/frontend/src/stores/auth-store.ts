@@ -36,6 +36,10 @@ interface AuthState {
     workspaces: WorkspaceMembership[],
   ) => void;
   setWorkspaces: (workspaces: WorkspaceMembership[]) => void;
+  setWorkspacesForUser: (
+    userId: string,
+    workspaces: WorkspaceMembership[],
+  ) => boolean;
   logout: () => Promise<void>;
   refresh: () => Promise<boolean>;
   hydrate: () => Promise<void>;
@@ -62,6 +66,11 @@ export const useAuthStore = create<AuthState>((set, get) => {
         accessToken: data.accessToken,
         workspaces: data.workspaces,
       });
+    } else if (type === "workspaces") {
+      // Memberships of one account; ignored by tabs signed in as another.
+      set((state) =>
+        state.user?.id === data.userId ? { workspaces: data.workspaces } : state,
+      );
     }
   });
 
@@ -82,6 +91,20 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
     setWorkspaces: (workspaces) => {
       set({ workspaces });
+    },
+
+    // Applies committed memberships returned for one account, only while that
+    // account is signed in here, and shares them with its other open tabs.
+    setWorkspacesForUser: (userId, workspaces) => {
+      let applied = false;
+      set((state) => {
+        if (state.user?.id !== userId) return state;
+        applied = true;
+        return { workspaces };
+      });
+      if (applied)
+        channel?.postMessage({ type: "workspaces", data: { userId, workspaces } });
+      return applied;
     },
 
     logout: async () => {

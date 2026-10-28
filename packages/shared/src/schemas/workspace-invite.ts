@@ -57,3 +57,10 @@ export type WorkspaceAdmissionResult =
       message: string;
     }
   | { status: "unavailable"; message: string };
+
+// Read-only answer to "where does my request stand?". "not_pending" means the
+// account is not a member and has no pending request (for example, an admin
+// declined it); joining again is an explicit new request.
+export type WorkspaceAdmissionCheck =
+  | WorkspaceAdmissionResult
+  | { status: "not_pending"; workspace: WorkspaceAdmissionWorkspace };

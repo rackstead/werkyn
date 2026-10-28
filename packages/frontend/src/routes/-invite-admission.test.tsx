@@ -15,14 +15,22 @@ import { queryClient } from "@/lib/query-client";
 
 const state = vi.hoisted(() => {
   vi.stubEnv("VITE_API_BASE_URL", "http://localhost/api");
+  const broadcasts: unknown[] = [];
+  const listeners: ((event: { data: unknown }) => void)[] = [];
   vi.stubGlobal(
     "BroadcastChannel",
     class {
-      addEventListener() {}
-      postMessage() {}
+      addEventListener(_type: string, listener: (event: { data: unknown }) => void) {
+        listeners.push(listener);
+      }
+      postMessage(message: unknown) {
+        broadcasts.push(message);
+      }
     },
   );
   return {
+    broadcasts,
+    listeners,
     params: { token: "invite-token" } as Record<string, string>,
     search: {} as Record<string, unknown>,
     navigate: vi.fn(),
@@ -127,6 +135,7 @@ beforeEach(() => {
   state.search = {};
   state.navigate.mockClear();
   state.requests.length = 0;
+  state.broadcasts.length = 0;
   state.responses.clear();
   respond("GET", "/api/invites/invite-token", () =>
     json(200, {
@@ -219,7 +228,7 @@ it("shows a pending approval without granting a workspace and rechecks on demand
   expect(await screen.findByText(/waiting for an administrator/)).toBeTruthy();
   expect(useAuthStore.getState().workspaces).toBe(existing);
 
-  respond("POST", "/api/invites/invite-token/accept", () =>
+  respond("GET", "/api/invites/invite-token/admission", () =>
     json(403, { statusCode: 403, error: "Forbidden", message: "Invites are currently disabled for this workspace" }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Check status" }));
@@ -311,7 +320,7 @@ it("keeps a pending explanation when a recheck fails for a transient reason", as
   renderRoute(InviteRoute);
   fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
   await screen.findByText(/waiting for an administrator/);
-  respond("POST", "/api/invites/invite-token/accept", () =>
+  respond("GET", "/api/invites/invite-token/admission", () =>
     json(409, { statusCode: 409, error: "Conflict", message: "The workspace is busy. Please try again." }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Check status" }));
@@ -329,7 +338,7 @@ it("lets the server admit an existing member past an expired public preview", as
   respond("GET", "/api/invites/invite-token", () =>
     json(410, { statusCode: 410, error: "Gone", message: "This invite has expired" }),
   );
-  respond("POST", "/api/invites/invite-token/accept", () =>
+  respond("GET", "/api/invites/invite-token/admission", () =>
     json(200, {
       data: { status: "joined", workspace, role: "MEMBER", alreadyMember: true, userId: "member", workspaces: joined },
     }),
@@ -381,7 +390,7 @@ it("clears only the requesting account's remembered state when a check is refuse
   rememberInviteAdmission("first", "invite-token", pending("first"));
   rememberInviteAdmission("second", "invite-token", pending("second"));
   let refuse!: () => void;
-  respond("POST", "/api/invites/invite-token/accept", () =>
+  respond("GET", "/api/invites/invite-token/admission", () =>
     new Promise<Response>((resolve) => {
       refuse = () =>
         resolve(json(403, { statusCode: 403, error: "Forbidden", message: "Invites are currently disabled for this workspace" }));
@@ -397,4 +406,62 @@ it("clears only the requesting account's remembered state when a check is refuse
   );
   expect(queryClient.getQueryData(["invite-admission", "second", "invite-token"])).toEqual(pending("second"));
   expect(screen.getByText(/waiting for an administrator/)).toBeTruthy();
+});
+
+it("reports a declined request on a status check and only asks again on request", async () => {
+  signIn();
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  rememberInviteAdmission("applicant", "invite-token", {
+    status: "approval_pending",
+    workspace,
+    requestId: "rq-1",
+    requestedAt: "2026-10-27T00:00:00Z",
+  });
+  respond("GET", "/api/invites/invite-token/admission", () =>
+    json(200, { data: { status: "not_pending", workspace, userId: "applicant" } }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+  expect(await screen.findByText(/no longer pending/)).toBeTruthy();
+  expect(state.requests.some((r) => r.method === "POST")).toBe(false);
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(202, {
+      data: { status: "approval_pending", workspace, requestId: "rq-2", requestedAt: "2026-10-28T00:00:00Z", userId: "applicant" },
+    }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Ask again" }));
+  expect(await screen.findByText(/waiting for an administrator/)).toBeTruthy();
+  expect(state.requests.filter((r) => r.method === "POST").map((r) => r.path)).toEqual([
+    "/api/invites/invite-token/accept",
+  ]);
+});
+
+it("shares a committed join with the same account's other tabs only", async () => {
+  signIn();
+  const joined = [membership("acme")];
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: { status: "joined", workspace, role: "MEMBER", alreadyMember: false, userId: "applicant", workspaces: joined },
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await waitFor(() => expect(state.navigate).toHaveBeenCalled());
+  expect(state.broadcasts).toContainEqual({
+    type: "workspaces",
+    data: { userId: "applicant", workspaces: joined },
+  });
+  // A receiving tab signed in as another account ignores the message.
+  const other = [membership("other")];
+  act(() => signIn("someone-else", other));
+  act(() => {
+    for (const listener of state.listeners)
+      listener({ data: { type: "workspaces", data: { userId: "applicant", workspaces: joined } } });
+  });
+  expect(useAuthStore.getState().workspaces).toBe(other);
+  act(() => {
+    for (const listener of state.listeners)
+      listener({ data: { type: "workspaces", data: { userId: "someone-else", workspaces: joined } } });
+  });
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
 });

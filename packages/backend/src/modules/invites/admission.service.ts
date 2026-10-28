@@ -1,5 +1,6 @@
 import type { Prisma, PrismaClient, WorkspaceInvite } from "@prisma/client";
 import type {
+  WorkspaceAdmissionCheck,
   WorkspaceAdmissionDenialReason,
   WorkspaceAdmissionResult,
 } from "@pm/shared";
@@ -90,7 +91,8 @@ export function normalizeAllowedEmailDomains(domains: string[]) {
   return [...new Set(normalized)];
 }
 
-type Mode = "applicant" | "approval";
+// "status" evaluates the same rules read-only and never writes.
+type Mode = "applicant" | "approval" | "status";
 
 /**
  * Evaluates and applies admission for one user through one invite. Must run in
@@ -102,7 +104,7 @@ async function decide(
   invite: WorkspaceInvite,
   userId: string,
   mode: Mode,
-): Promise<WorkspaceAdmissionResult> {
+): Promise<WorkspaceAdmissionCheck> {
   const workspaceId = invite.workspaceId;
   const workspace = await tx.workspace.findUniqueOrThrow({
     where: { id: workspaceId },
@@ -115,9 +117,10 @@ async function decide(
   });
   if (existing) {
     // Idempotent retry: no role change and no additional invitation use.
-    await tx.workspaceAdmissionRequest.deleteMany({
-      where: { userId, workspaceId },
-    });
+    if (mode !== "status")
+      await tx.workspaceAdmissionRequest.deleteMany({
+        where: { userId, workspaceId },
+      });
     return {
       status: "joined",
       workspace,
@@ -173,6 +176,25 @@ async function decide(
     Boolean(invite.email) || policy.allowedEmailDomains.length > 0;
   if (restricted && !user.emailVerified) {
     return { status: "verification_required", workspace, email: user.email };
+  }
+
+  if (mode === "status") {
+    // Report a pending request without creating one; a declined request is
+    // gone and is reported as not pending rather than silently re-created.
+    const request = policy.requireAdminApproval
+      ? await tx.workspaceAdmissionRequest.findUnique({
+          where: { userId_workspaceId: { userId, workspaceId } },
+          select: { id: true, createdAt: true },
+        })
+      : null;
+    return request
+      ? {
+          status: "approval_pending",
+          workspace,
+          requestId: request.id,
+          requestedAt: request.createdAt.toISOString(),
+        }
+      : { status: "not_pending", workspace };
   }
 
   if (mode === "applicant" && policy.requireAdminApproval) {
@@ -248,11 +270,25 @@ export async function admitWithInvite(
         where: { token, workspaceId: discovered.workspaceId },
       });
       if (!invite) return denied("not_found");
-      return decide(tx, invite, userId, "applicant");
+      return (await decide(tx, invite, userId, "applicant")) as WorkspaceAdmissionResult;
     },
     // The workspace, and with it the invite, was deleted after discovery.
     { onMissing: () => denied("not_found") },
   );
+}
+
+/**
+ * Read-only status for the current account: current refusals, verification,
+ * membership or a pending request, using the same rules as admission. It takes
+ * no lock and writes nothing, so checking never creates or revives a request.
+ */
+export async function checkAdmission(
+  prisma: PrismaClient,
+  { userId, token }: { userId: string; token: string },
+): Promise<WorkspaceAdmissionCheck> {
+  const invite = await prisma.workspaceInvite.findUnique({ where: { token } });
+  if (!invite) return denied("not_found");
+  return decide(prisma, invite, userId, "status");
 }
 
 export async function assertCurrentAdmin(

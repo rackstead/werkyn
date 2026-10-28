@@ -5,6 +5,7 @@ import {
   revokeInviteHandler,
   getInviteHandler,
   acceptInviteHandler,
+  checkAdmissionHandler,
   listAdmissionRequestsHandler,
   approveAdmissionRequestHandler,
   rejectAdmissionRequestHandler,
@@ -53,6 +54,14 @@ export default async function invitesRoutes(fastify: FastifyInstance) {
     url: "/invites/:token/accept",
     preHandler: [authenticate],
     handler: acceptInviteHandler,
+  });
+
+  // GET /api/invites/:token/admission (read-only status for the caller)
+  fastify.route({
+    method: "GET",
+    url: "/invites/:token/admission",
+    preHandler: [authenticate],
+    handler: checkAdmissionHandler,
   });
 
   // GET /api/workspaces/:wid/admission-requests (pending join requests)

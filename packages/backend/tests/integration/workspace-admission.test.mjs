@@ -8,21 +8,23 @@ if (!process.env.TEST_DATABASE_URL)
   throw new Error(
     "Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database",
   );
-// At most four admissions/participants wait on PostgreSQL locks at once. Six
-// application connections leave room for their non-transactional reads. The
-// lock holder and pg_stat_activity observer use a separate two-connection pool
-// so blocked actors can never starve the control that must release them.
-const REQUIRED_ACTOR_CONNECTIONS = 6;
+// At most two application transactions wait on PostgreSQL locks at once, so
+// the application pool defaults to five connections and accepts any explicit
+// connection_limit of four or more. The lock holder and pg_stat_activity
+// observer use a separate two-connection pool so blocked actors can never
+// starve the control that must release them.
+const DEFAULT_ACTOR_CONNECTIONS = 5;
+const MINIMUM_ACTOR_CONNECTIONS = 4;
 const actorDatabaseUrl = new URL(process.env.TEST_DATABASE_URL);
 const requestedActorLimit =
   actorDatabaseUrl.searchParams.get("connection_limit");
 const actorConnections =
   requestedActorLimit === null
-    ? REQUIRED_ACTOR_CONNECTIONS
+    ? DEFAULT_ACTOR_CONNECTIONS
     : Number(requestedActorLimit);
 assert(
-  actorConnections >= REQUIRED_ACTOR_CONNECTIONS,
-  `Workspace admission fixture requires connection_limit>=${REQUIRED_ACTOR_CONNECTIONS}`,
+  actorConnections >= MINIMUM_ACTOR_CONNECTIONS,
+  `Workspace admission fixture requires connection_limit>=${MINIMUM_ACTOR_CONNECTIONS}`,
 );
 actorDatabaseUrl.searchParams.set("connection_limit", String(actorConnections));
 const controlDatabaseUrl = new URL(actorDatabaseUrl);
@@ -845,6 +847,60 @@ for (const [name, change, status] of [
     assert.equal(after.invite.useCount, before.invite.useCount);
   });
 }
+
+function check(user, invite) {
+  return inject("GET", `/api/invites/${invite.token}/admission`, {
+    token: user.token,
+  });
+}
+
+test("status checks are read-only: they report a rejection instead of reviving the request", async () => {
+  const fixture = await pendingRequest();
+  const pending = await check(fixture.applicant, fixture.invite);
+  assert.equal(pending.statusCode, 200, pending.body);
+  assert.equal(pending.json().data.status, "approval_pending");
+  assert.equal(pending.json().data.requestId, fixture.requestId);
+  const rejected = await reject(fixture.admin, fixture.workspace, fixture.requestId);
+  assert.equal(rejected.statusCode, 204, rejected.body);
+  for (let i = 0; i < 2; i++) {
+    const after = await check(fixture.applicant, fixture.invite);
+    assert.equal(after.statusCode, 200, after.body);
+    assert.equal(after.json().data.status, "not_pending");
+  }
+  let current = await state(fixture.workspace, fixture.invite);
+  assert.equal(current.requests.length, 0, "checking never re-creates a request");
+  await app.prisma.workspaceSettings.update({
+    where: { workspaceId: fixture.workspace.id },
+    data: { invitesEnabled: false },
+  });
+  const refused = await check(fixture.applicant, fixture.invite);
+  assert.equal(refused.statusCode, 403, refused.body);
+  await app.prisma.workspaceSettings.update({
+    where: { workspaceId: fixture.workspace.id },
+    data: { invitesEnabled: true },
+  });
+  // Asking again is an explicit acceptance, which creates a new request.
+  const again = await accept(fixture.applicant, fixture.invite);
+  assert.equal(again.statusCode, 202, again.body);
+  assert.notEqual(again.json().data.requestId, fixture.requestId);
+  const approved = await approve(fixture.admin, fixture.workspace, again.json().data.requestId);
+  assert.equal(approved.statusCode, 200, approved.body);
+  const joined = await check(fixture.applicant, fixture.invite);
+  assert.equal(joined.statusCode, 200, joined.body);
+  assert.equal(joined.json().data.status, "joined");
+  assert.deepEqual(
+    joined.json().data.workspaces.map((w) => w.workspaceId),
+    [fixture.workspace.id],
+  );
+  current = await state(fixture.workspace, fixture.invite);
+  assert.equal(current.invite.useCount, 1);
+  const stranger = await makeUser({ name: "stranger" });
+  const none = await check(stranger, fixture.invite);
+  assert.equal(none.json().data.status, "not_pending");
+  const unknown = await check(stranger, { token: crypto.randomBytes(32).toString("hex") });
+  assert.equal(unknown.statusCode, 404, unknown.body);
+  assert.equal((await state(fixture.workspace)).requests.length, 0);
+});
 
 test("revoking an invite cancels its pending requests", async () => {
   const fixture = await pendingRequest();

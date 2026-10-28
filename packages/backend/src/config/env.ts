@@ -1,35 +1,24 @@
 import { z } from "zod";
 import { logger } from "../utils/logger.js";
 
-// Treat `NAME=` (common in .env files and Compose `${NAME:-}`) as unset so
-// the documented default applies instead of coercing "" to 0 or false.
-const blankToUndefined = (value: unknown) =>
-  typeof value === "string" && value.trim() === "" ? undefined : value;
-
 function wholeNumber(name: string, fallback: number, min: number, max: number) {
   const range = `${name} must be a whole number from ${min} to ${max}`;
-  return z.preprocess(
-    blankToUndefined,
-    z.coerce
-      .number({ invalid_type_error: range })
-      .int(range)
-      .min(min, range)
-      .max(max, range)
-      .default(fallback),
-  );
+  return z.coerce
+    .number({ invalid_type_error: range })
+    .int(range)
+    .min(min, range)
+    .max(max, range)
+    .default(fallback);
 }
 
 const port = (name: string, fallback: number) => wholeNumber(name, fallback, 1, 65535);
 
 function flag(name: string) {
-  return z.preprocess(
-    blankToUndefined,
-    z
-      .enum(["true", "false"], {
-        errorMap: () => ({ message: `${name} must be "true" or "false"` }),
-      })
-      .optional(),
-  );
+  return z
+    .enum(["true", "false"], {
+      errorMap: () => ({ message: `${name} must be "true" or "false"` }),
+    })
+    .optional();
 }
 
 function parseHttpUrl(value: string): URL | undefined {
@@ -100,7 +89,15 @@ const databaseUrl = z
   .min(1, "DATABASE_URL is required")
   .refine((value) => {
     try {
-      return DATABASE_PROTOCOLS.has(new URL(value).protocol);
+      // Require the hierarchical form with a host and database name; opaque
+      // values such as `postgresql:name` parse as URLs but cannot connect.
+      const url = new URL(value);
+      return (
+        DATABASE_PROTOCOLS.has(url.protocol) &&
+        value.slice(url.protocol.length).startsWith("//") &&
+        url.hostname !== "" &&
+        (url.protocol.startsWith("prisma") || url.pathname.replace(/^\/+/, "") !== "")
+      );
     } catch {
       return false;
     }
@@ -204,7 +201,12 @@ export type EnvParseResult =
  * variable and the expected form but never echo the supplied value.
  */
 export function parseEnvironment(source: NodeJS.ProcessEnv): EnvParseResult {
-  const parsed = envSchema.safeParse(source);
+  // Treat `NAME=` (common in .env files and Compose `${NAME:-}`) as unset so
+  // the documented default applies instead of "" failing or becoming 0/false.
+  const present = Object.fromEntries(
+    Object.entries(source).filter(([, value]) => value === undefined || value.trim() !== ""),
+  );
+  const parsed = envSchema.safeParse(present);
   if (!parsed.success) {
     const errors: Record<string, string[]> = {};
     for (const [name, messages] of Object.entries(parsed.error.flatten().fieldErrors)) {

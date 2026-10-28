@@ -16,6 +16,12 @@ export interface ShutdownOptions {
   exit?: (code: number) => void;
   /** Must stay below the orchestrator's kill grace period (Docker: 10 s). */
   timeoutMs?: number;
+  /**
+   * A repeated signal within this window is a duplicate (a terminal and a
+   * process runner can both deliver one Ctrl+C) and is ignored; a later one
+   * forces exit.
+   */
+  forceAfterMs?: number;
 }
 
 /**
@@ -28,8 +34,9 @@ export function createShutdownHandler({
   steps,
   exit = (code) => process.exit(code),
   timeoutMs = 8000,
+  forceAfterMs = 1000,
 }: ShutdownOptions) {
-  let started = false;
+  let startedAt: number | undefined;
   let exited = false;
   const finish = (code: number) => {
     if (exited) return;
@@ -38,12 +45,13 @@ export function createShutdownHandler({
   };
 
   return async function shutdown(signal?: string): Promise<void> {
-    if (started) {
+    if (startedAt !== undefined) {
+      if (Date.now() - startedAt < forceAfterMs) return;
       log.warn({ signal }, "Shutdown already in progress; forcing exit");
       finish(1);
       return;
     }
-    started = true;
+    startedAt = Date.now();
     log.info({ signal }, "Shutting down...");
 
     const deadline = setTimeout(() => {

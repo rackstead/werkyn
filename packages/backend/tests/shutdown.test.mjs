@@ -64,7 +64,34 @@ test("a hung step hits the deadline and exits 1 instead of waiting forever", asy
   assert.ok(entries.some((entry) => entry.level === "fatal"));
 });
 
-test("a second signal during shutdown forces a non-zero exit", async () => {
+test("a duplicate signal is ignored, while a later one forces a non-zero exit", async () => {
+  const { log, exits, exit } = recorder();
+  let release;
+  const order = [];
+  const shutdown = createShutdownHandler({
+    log,
+    exit,
+    forceAfterMs: 50,
+    steps: [
+      { name: "dex", run: () => new Promise((resolve) => { release = resolve; }) },
+      { name: "http", run: async () => order.push("http") },
+    ],
+  });
+  const first = shutdown("SIGINT");
+  // Terminal and process runner both deliver the same Ctrl+C.
+  await shutdown("SIGINT");
+  assert.deepEqual(exits, [], "a near-simultaneous duplicate must not cut graceful shutdown short");
+
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await shutdown("SIGINT");
+  assert.deepEqual(exits, [1]);
+  release();
+  await first;
+  assert.deepEqual(order, ["http"]);
+  assert.deepEqual(exits, [1], "the first shutdown must not exit again after a forced exit");
+});
+
+test("a duplicate signal does not change a clean exit", async () => {
   const { log, exits, exit } = recorder();
   let release;
   const shutdown = createShutdownHandler({
@@ -72,10 +99,9 @@ test("a second signal during shutdown forces a non-zero exit", async () => {
     exit,
     steps: [{ name: "http", run: () => new Promise((resolve) => { release = resolve; }) }],
   });
-  const first = shutdown("SIGTERM");
+  const first = shutdown("SIGINT");
   await shutdown("SIGINT");
-  assert.deepEqual(exits, [1]);
   release();
   await first;
-  assert.deepEqual(exits, [1], "the first shutdown must not exit again after a forced exit");
+  assert.deepEqual(exits, [0]);
 });

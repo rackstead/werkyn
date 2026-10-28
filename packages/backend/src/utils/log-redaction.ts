@@ -105,10 +105,22 @@ export function serializeError(error: Error): pino.SerializedError {
   return serialized;
 }
 
-/** Redacts string arguments, such as Fastify's "Route GET:<url> not found". */
+/**
+ * Redacts string arguments, such as Fastify's "Route GET:<url> not found".
+ * pino uses `err.message` as the message when a call passes only an Error
+ * (or `{ err }`), so that case gets an explicit redacted message too.
+ */
 export const logMethodHook = {
   logMethod(this: pino.Logger, args: unknown[], method: pino.LogFn) {
     const cleaned = args.map((arg) => (typeof arg === "string" ? redactText(arg) : arg));
+    const [first, second] = cleaned;
+    if (typeof second !== "string" && first && typeof first === "object") {
+      const error = first instanceof Error ? first : (first as { err?: unknown }).err;
+      const ownMessage = !(first instanceof Error) && "msg" in first;
+      if (error instanceof Error && !ownMessage) {
+        cleaned.splice(1, 0, redactText(error.message));
+      }
+    }
     return (method as (...values: unknown[]) => void).apply(this, cleaned);
   },
 };

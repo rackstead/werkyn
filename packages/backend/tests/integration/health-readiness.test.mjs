@@ -30,20 +30,22 @@ after(async () => {
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
-test("a migrated database is ready and liveness stays a cheap distinct check", async () => {
+test("a migrated database is ready, healthy and live", async () => {
   const ready = await app.inject("/api/ready");
   assert.equal(ready.statusCode, 200, ready.body);
   assert.deepEqual(ready.json().checks, { database: "ok", migrations: "ok" });
   assert.equal(ready.json().status, "ready");
 
-  const live = await app.inject("/api/health");
-  assert.equal(live.statusCode, 200);
-  assert.equal(live.json().status, "ok");
+  for (const url of ["/api/live", "/api/health"]) {
+    const response = await app.inject(url);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().status, "ok");
+  }
 });
 
 test("probes are not counted against the client rate limit", async () => {
   for (let i = 0; i < 120; i += 1) {
-    const url = i % 2 ? "/api/health" : "/api/ready";
+    const url = ["/api/live", "/api/health", "/api/ready"][i % 3];
     const response = await app.inject({ url, remoteAddress: "198.51.100.7" });
     assert.equal(response.statusCode, 200, `${url} #${i}: ${response.body}`);
   }

@@ -61,7 +61,21 @@ test("blank optional values keep documented defaults", () => {
     COOKIE_SECURE: "",
     SMTP_SECURE: "",
     COOKIE_DOMAIN: "",
+    FRONTEND_URL: "",
+    CORS_ORIGIN: " ",
+    COOKIE_SAMESITE: "",
+    LOG_LEVEL: "",
+    STORAGE_DIR: "",
+    DEX_CONFIG_DIR: "",
+    DEX_CLIENT_SECRET: "",
   });
+  assert.equal(data.FRONTEND_URL, "http://localhost:5173");
+  assert.equal(data.CORS_ORIGIN, "http://localhost:5173");
+  assert.equal(data.COOKIE_SAMESITE, "lax");
+  assert.equal(data.LOG_LEVEL, "info");
+  assert.equal(data.STORAGE_DIR, "./storage");
+  assert.equal(data.DEX_CONFIG_DIR, "/app/data/dex");
+  assert.equal(data.DEX_CLIENT_SECRET, base.JWT_SECRET);
   assert.equal(data.PORT, 3000);
   assert.equal(data.SMTP_PORT, 587);
   assert.equal(data.MAX_FILE_SIZE, 10737418240);
@@ -94,7 +108,10 @@ test("URL settings must be usable http(s) URLs and origins", () => {
     "https://app.example.com,http://localhost:5173",
   );
 
-  for (const value of ["mysql://u:p@h/db", "werkyn", "file:./dev.db"]) {
+  for (const name of ["DATABASE_URL", "JWT_SECRET", "COOKIE_SECRET"]) {
+    rejects({ [name]: "" }, name, /required/);
+  }
+  for (const value of ["mysql://u:p@h/db", "werkyn", "file:./dev.db", "postgresql:foo", "postgresql:///werkyn", "postgresql://db.internal:5432", "postgresql://db.internal/"]) {
     const result = rejects({ DATABASE_URL: value }, "DATABASE_URL", /PostgreSQL/);
     assert.equal(JSON.stringify(result.errors).includes(value), false);
   }

@@ -97,8 +97,16 @@ test("standalone logger shares the same redaction policy", async () => {
   const log = createLogger(sink.stream);
   log.error({ err: new Error(`request to /api/invites/${SECRET} failed`), smtp: { pass: SECRET } }, `GET /verify-email/${SECRET}?token=${SECRET}`);
   log.warn(`link https://werkyn.example.com/reset-password/${SECRET} expired`);
+  // Error-only calls: pino would copy err.message into msg unredacted.
+  log.error(new Error(`GET /api/invites/${SECRET} failed`));
+  log.error({ err: new Error(`fetch /dex/callback?code=${SECRET}`) });
+  log.error(Object.assign(new Error(`HTTP 500 at /share/${SECRET}`), { statusCode: 500 }));
   const logged = sink.text();
   assert.match(logged, /\/verify-email\/\[REDACTED\]/);
   assert.match(logged, /https:\/\/werkyn\.example\.com\/reset-password\/\[REDACTED\] expired/);
+  const messages = logged.trim().split("\n").map((line) => JSON.parse(line).msg);
+  assert.ok(messages.includes("GET /api/invites/[REDACTED] failed"), messages.join("\n"));
+  assert.ok(messages.includes("fetch /dex/callback?code=[REDACTED]"), messages.join("\n"));
+  assert.ok(messages.includes("HTTP 500 at /share/[REDACTED]"), messages.join("\n"));
   assert.equal(logged.includes(SECRET), false, logged);
 });

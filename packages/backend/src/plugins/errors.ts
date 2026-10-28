@@ -33,10 +33,10 @@ const NOT_FOUND: ErrorBody = {
 };
 
 // Prisma error codes that describe the request rather than the server.
+// Codes about values already stored (P2005, P2023) are server errors.
 // https://www.prisma.io/docs/orm/reference/error-reference
 const PRISMA_REQUEST_ERRORS: Record<string, ErrorBody> = {
   P2000: INVALID_VALUE, // value too long for its column
-  P2005: INVALID_VALUE, // value invalid for its column type
   P2006: INVALID_VALUE, // value not valid for the field
   P2007: INVALID_VALUE, // data validation error
   P2011: INVALID_VALUE, // null constraint violation

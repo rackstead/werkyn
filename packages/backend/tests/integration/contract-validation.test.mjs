@@ -294,7 +294,7 @@ test("database errors map to generic client errors without Prisma internals", as
   const outcomes = { wikiNulContent: [nulContent.statusCode, INTERNALS.test(nulContent.body)] };
   const expected = { wikiNulContent: [400, false] };
 
-  const mapped = { P2002: 409, P2003: 409, P2025: 404, P2000: 400, P2023: 500, validation: 500, unknown: 500 };
+  const mapped = { P2002: 409, P2003: 409, P2025: 404, P2000: 400, P2005: 500, P2023: 500, validation: 500, unknown: 500 };
   for (const [kind, statusCode] of Object.entries(mapped)) {
     const response = await req("GET", `/__contract/prisma/${kind}`);
     outcomes[kind] = [response.statusCode, INTERNALS.test(response.body), Object.keys(response.json()).sort().join()];

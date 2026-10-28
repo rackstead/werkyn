@@ -262,6 +262,7 @@ export async function listMessages(
       channelId,
       parentId: null, // Only top-level messages
     },
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -285,6 +286,14 @@ export async function listMessages(
     nextCursor: hasMore ? messages[messages.length - 1]?.id : undefined,
   };
 }
+
+// Idempotency bookkeeping stays server-side: the sender's key and the
+// fingerprint of the original request (a hash of the pre-edit text) are never
+// returned or broadcast to readers.
+export const chatMessageOmit = {
+  clientMessageId: true,
+  clientMessageHash: true,
+} as const satisfies Prisma.ChatMessageOmit;
 
 export const chatMessageInclude = {
   user: {
@@ -326,12 +335,13 @@ async function findKeyedMessage(
   clientMessageId: string,
   requestHash: string,
 ) {
-  const message = await prisma.chatMessage.findUnique({
+  const stored = await prisma.chatMessage.findUnique({
     where: { userId_clientMessageId: { userId, clientMessageId } },
     include: chatMessageInclude,
   });
-  if (!message) return null;
-  if (message.clientMessageHash !== requestHash) {
+  if (!stored) return null;
+  const { clientMessageId: _key, clientMessageHash, ...message } = stored;
+  if (clientMessageHash !== requestHash) {
     throw new ConflictError("This idempotency key was already used for a different message");
   }
   return message;
@@ -405,6 +415,7 @@ export async function sendMessage(
           clientMessageId,
           clientMessageHash: requestHash,
         },
+        omit: chatMessageOmit,
         include: chatMessageInclude,
       });
 
@@ -452,6 +463,7 @@ export async function updateMessage(
   return prisma.chatMessage.update({
     where: { id: messageId },
     data: { content, editedAt: new Date() },
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -497,6 +509,7 @@ export async function getThreadReplies(
 ) {
   const messages = await prisma.chatMessage.findMany({
     where: { parentId },
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -696,6 +709,7 @@ export async function togglePin(
     data: pinned
       ? { pinnedAt: new Date(), pinnedById: userId }
       : { pinnedAt: null, pinnedById: null },
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -717,6 +731,7 @@ export async function listPinnedMessages(
 ) {
   return prisma.chatMessage.findMany({
     where: { channelId, pinnedAt: { not: null }, deletedAt: null },
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -778,6 +793,7 @@ export async function listBookmarks(
     },
     include: {
       message: {
+        omit: chatMessageOmit,
         include: {
           user: {
             select: { id: true, displayName: true, avatarUrl: true },
@@ -906,6 +922,7 @@ export async function searchMessages(
 
   const messages = await prisma.chatMessage.findMany({
     where,
+    omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },

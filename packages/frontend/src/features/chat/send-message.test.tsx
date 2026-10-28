@@ -87,6 +87,7 @@ describe("useSendMessage", () => {
     expect(retry.retryOnTimeout).toBe(true);
     expect(retry.shouldRetry({ error: new ApiError(503, "down") })).toBe(true);
     expect(retry.shouldRetry({ error: new ApiError(409, "conflict") })).toBe(false);
+    expect(retry.shouldRetry({ error: new ApiError(429, "slow down") })).toBe(false);
     expect(retry.shouldRetry({ error: new ApiError(403, "forbidden") })).toBe(false);
     expect(retry.shouldRetry({ error: new TypeError("Failed to fetch") })).toBeUndefined();
   });

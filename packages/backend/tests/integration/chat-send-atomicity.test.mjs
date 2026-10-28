@@ -493,3 +493,57 @@ test("an attempt whose lease was taken over cannot complete or release the newer
   assert.equal(await delivery.completeChatMessageDelivery(app.prisma, messageId, current), true);
   assert.equal(await app.prisma.chatMessageDelivery.count({ where: { messageId } }), 0);
 });
+
+test("the idempotency key and request fingerprint never reach readers or realtime payloads", async () => {
+  const key = crypto.randomUUID();
+  const marker = crypto.randomUUID();
+  const content = `fingerprint secret ${marker}`;
+  const hash = crypto.createHash("sha256").update(JSON.stringify([channel.id, null, content])).digest("hex");
+  const leaks = (text) => /clientMessage(Id|Hash)/.test(text) || text.includes(key) || text.includes(hash);
+  const call = (actor, method, url, payload) =>
+    app.inject({
+      method,
+      url,
+      payload,
+      headers: { authorization: `Bearer ${sessions[actor]}` },
+      remoteAddress: `10.43.${Math.floor(++requestNumber / 250)}.${requestNumber % 250 + 1}`,
+    });
+  const chat = `/api/chat/${workspace.id}`;
+
+  const first = await send("SENDER", { content }, key);
+  assert.equal(first.statusCode, 201, first.body);
+  const id = first.json().data.id;
+  const stored = await app.prisma.chatMessage.findUniqueOrThrow({ where: { id } });
+  assert.equal(stored.clientMessageId, key, "the key is kept server-side");
+  assert.equal(stored.clientMessageHash, hash, "the fingerprint is kept server-side");
+
+  const responses = {
+    send: first,
+    replay: await send("SENDER", { content }, key),
+    reply: await send("SENDER", { content: `fingerprint reply ${marker}`, parentId: id }, crypto.randomUUID()),
+    pin: await call("SENDER", "POST", `${chat}/messages/${id}/pin`, { pinned: true }),
+    bookmark: await call("PEER", "POST", `${chat}/messages/${id}/bookmark`),
+    edit: await call("SENDER", "PATCH", `${chat}/messages/${id}`, { content: `fingerprint edited ${marker}` }),
+  };
+  Object.assign(responses, {
+    list: await call("PEER", "GET", `${chat}/channels/${channel.id}/messages`),
+    thread: await call("PEER", "GET", `${chat}/messages/${id}/thread`),
+    pins: await call("PEER", "GET", `${chat}/channels/${channel.id}/pins`),
+    bookmarks: await call("PEER", "GET", `${chat}/bookmarks`),
+    channelSearch: await call("PEER", "GET", `${chat}/channels/${channel.id}/messages/search?q=fingerprint`),
+    chatSearch: await call("PEER", "GET", `${chat}/messages/search?q=fingerprint`),
+    workspaceSearch: await call("PEER", "GET", `/api/workspaces/${workspace.id}/search?q=fingerprint`),
+  });
+  for (const [name, response] of Object.entries(responses)) {
+    assert.ok(response.statusCode < 300, `${name}: ${response.statusCode} ${response.body}`);
+    assert.ok(response.body.includes(id) || name === "bookmark", `${name} returns the message`);
+    assert.equal(leaks(response.body), false, `${name} exposes idempotency data: ${response.body}`);
+  }
+  await drain();
+  const events = peerEvents.filter((e) => JSON.stringify(e).includes(id));
+  assert.ok(events.some((e) => e.event === "chat_message_created"));
+  assert.ok(events.some((e) => e.event === "chat_message_updated"));
+  for (const event of events) {
+    assert.equal(leaks(JSON.stringify(event)), false, `${event.event} exposes idempotency data`);
+  }
+});

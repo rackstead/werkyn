@@ -216,7 +216,10 @@ export function useMessages(wid: string, channelId: string) {
   });
 }
 
-const RETRYABLE_SEND_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+// 429 is not retried automatically: the API client does not expose
+// Retry-After, and the rate-limit window outlasts these quick retries. The
+// draft and its key are kept, so a manual resend still cannot duplicate.
+const RETRYABLE_SEND_STATUSES = new Set([408, 500, 502, 503, 504]);
 
 function createClientMessageId() {
   const cryptoApi = globalThis.crypto;
@@ -249,7 +252,10 @@ export function useSendMessage(wid: string, channelId: string) {
           headers: { "Idempotency-Key": attempt.key },
           // Safe to repeat: the key makes the server return the stored message.
           // Network failures, timeouts and transient statuses are retried;
-          // other API errors (conflict, forbidden, validation) are final.
+          // other API errors (rate limit, conflict, forbidden, validation)
+          // are final. Every error is an ApiError from the client's
+          // afterResponse hook, so the predicate must decide them all: an
+          // undefined result would make ky retry any of them.
           retry: {
             limit: 2,
             methods: ["post"],

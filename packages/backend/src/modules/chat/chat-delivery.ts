@@ -1,6 +1,11 @@
 import type { NotificationType, Prisma, PrismaClient } from "@prisma/client";
 import { broadcastToChannel, broadcastToUser } from "../realtime/realtime.service.js";
-import { chatMessageInclude, getThreadSubscribers, parseMentions } from "./chat.service.js";
+import {
+  chatMessageInclude,
+  chatMessageOmit,
+  getThreadSubscribers,
+  parseMentions,
+} from "./chat.service.js";
 
 // Delivers a sent chat message's side effects from its ChatMessageDelivery
 // outbox row, which the send committed together with the message:
@@ -34,6 +39,7 @@ interface DeliveryOptions {
 export type DeliveryResult = "completed" | "pending" | "skipped";
 
 type DeliveryMessage = Prisma.ChatMessageGetPayload<{
+  omit: typeof chatMessageOmit;
   include: typeof chatMessageInclude & {
     channel: { select: { workspaceId: true; type: true } };
   };
@@ -156,6 +162,7 @@ async function broadcastThreadReply(prisma: PrismaClient, message: DeliveryMessa
 async function runSideEffects(prisma: PrismaClient, messageId: string) {
   const loaded = await prisma.chatMessage.findUnique({
     where: { id: messageId },
+    omit: chatMessageOmit,
     include: {
       ...chatMessageInclude,
       channel: { select: { workspaceId: true, type: true } },

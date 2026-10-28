@@ -4,7 +4,11 @@ import type { PrismaClient } from "@prisma/client";
 import { BackupFileSchema, type BackupFile, type RestoreSummary } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import { IdMapper, UserMapper } from "./id-mapper.js";
-import { ForbiddenError, ValidationError } from "../../utils/errors.js";
+import {
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+} from "../../utils/errors.js";
 import { lockWorkspace } from "../../utils/workspace-lock.js";
 import { rewriteUrls } from "./backup-assets.js";
 import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
@@ -216,6 +220,7 @@ export async function executeRestore(
   // ─── Re-upload assets and build URL rewrite map ────────
 
   const assetUrlMap = new Map<string, string>(); // "assets/file.png" → "/storage/new/path"
+  const savedAssets: string[] = [];
 
   if (assets && assets.size > 0 && storage) {
     for (const [assetPath, buffer] of assets) {
@@ -233,6 +238,7 @@ export async function executeRestore(
           ext,
           buffer,
         );
+        savedAssets.push(storagePath);
         assetUrlMap.set(assetPath, `/storage/${storagePath}`);
         counts.images++;
       } catch {
@@ -241,11 +247,21 @@ export async function executeRestore(
     }
   }
 
+  // Assets staged above have no rows when the transaction rolls back (for
+  // example after the role re-check below), so remove them best-effort.
+  const discardStagedAssets = async (error: unknown) => {
+    if (storage)
+      for (const storagePath of savedAssets)
+        await storage.delete(storagePath).catch(() => {});
+    throw error;
+  };
+
   await prisma.$transaction(
     async (tx) => {
       // New wiki spaces/pages are appended under the same workspace lock as
       // runtime wiki writers, with the administrator role re-read after it.
-      await lockWorkspace(tx, workspaceId);
+      if (!(await lockWorkspace(tx, workspaceId)))
+        throw new NotFoundError("Workspace not found");
       const admin = await tx.workspaceMember.findUnique({
         where: { userId_workspaceId: { userId: adminUserId, workspaceId } },
         select: { role: true },
@@ -621,7 +637,7 @@ export async function executeRestore(
       }
     },
     { timeout: 120_000 },
-  );
+  ).catch(discardStagedAssets);
 
   return {
     ...counts,

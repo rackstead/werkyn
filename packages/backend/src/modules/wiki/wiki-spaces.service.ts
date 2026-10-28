@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { CreateWikiSpaceInput, UpdateWikiSpaceInput } from "@pm/shared";
 import { ConflictError, NotFoundError } from "../../utils/errors.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { assertWikiRole } from "./wiki-pages.service.js";
 
 function generateSlug(name: string): string {
   return name
@@ -14,12 +15,14 @@ function generateSlug(name: string): string {
 export async function createSpace(
   prisma: PrismaClient,
   workspaceId: string,
+  actorId: string,
   data: CreateWikiSpaceInput,
 ) {
   let slug = generateSlug(data.name);
 
   // The workspace lock serializes the MAX+1 append with other space writers.
   return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertWikiRole(tx, workspaceId, actorId, ["ADMIN", "MEMBER"]);
     // Ensure slug uniqueness within workspace
     const existing = await tx.wikiSpace.findUnique({
       where: { workspaceId_slug: { workspaceId, slug } },
@@ -72,10 +75,12 @@ export async function getSpace(prisma: PrismaClient, spaceId: string) {
 export async function updateSpace(
   prisma: PrismaClient,
   workspaceId: string,
+  actorId: string,
   spaceId: string,
   data: UpdateWikiSpaceInput,
 ) {
   return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertWikiRole(tx, workspaceId, actorId, ["ADMIN", "MEMBER"]);
     const existing = await tx.wikiSpace.findFirst({
       where: { id: spaceId, workspaceId },
     });
@@ -96,10 +101,12 @@ export async function updateSpace(
 export async function deleteSpace(
   prisma: PrismaClient,
   workspaceId: string,
+  actorId: string,
   spaceId: string,
 ) {
   // Ordered with page moves into or out of the space and with page creates.
   await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertWikiRole(tx, workspaceId, actorId, ["ADMIN"]);
     const existing = await tx.wikiSpace.findFirst({
       where: { id: spaceId, workspaceId },
     });

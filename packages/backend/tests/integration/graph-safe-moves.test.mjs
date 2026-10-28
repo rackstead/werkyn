@@ -10,7 +10,7 @@ if (!process.env.TEST_DATABASE_URL)
   throw new Error(
     "Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database",
   );
-// At most three application requests wait on PostgreSQL locks at once, each
+// At most four application requests wait on PostgreSQL locks at once, each
 // holding one pooled connection, so the actor pool needs at least five. The
 // lock holder and pg_stat_activity observer use a separate two-connection
 // pool so blocked actors can never starve the control that releases them.
@@ -37,6 +37,8 @@ const { PrismaClient } = await import("@prisma/client");
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const restore = await import("../../src/modules/backup/restore.service.ts");
+const { processTrashPurge } =
+  await import("../../src/schedulers/trash-purge.ts");
 // Absent before the fix; the budget test reports that instead of crashing.
 const { graphLimits } = await import("../../src/utils/graph-limits.ts").catch(
   () => ({ graphLimits: null }),
@@ -427,7 +429,7 @@ test("cross-space moves carry the whole subtree, keep identity and renumber both
   await assertWikiForest([s1.id, s2.id]);
 });
 
-test("a queued wiki move re-reads the actor's role after the workspace lock", async () => {
+test("queued wiki writers re-read the actor's role after the workspace lock", async () => {
   const s = await space();
   const p = await page(s);
   const target = await page(s, null, 1);
@@ -435,9 +437,13 @@ test("a queued wiki move re-reads the actor's role after the workspace lock", as
   const membership = {
     userId_workspaceId: { userId: users.MEMBER.id, workspaceId: wsA.id },
   };
-  let response;
+  const spacesBefore = await app.prisma.wikiSpace.findMany({
+    where: { workspaceId: wsA.id },
+    orderBy: { id: "asc" },
+  });
+  let responses;
   try {
-    [response] = await whileLocked(
+    responses = await whileLocked(
       async (tx) => {
         await tx.$queryRaw`SELECT id FROM "Workspace" WHERE id = ${wsA.id} FOR UPDATE`;
         await tx.workspaceMember.update({
@@ -445,7 +451,16 @@ test("a queued wiki move re-reads the actor's role after the workspace lock", as
           data: { role: "VIEWER" },
         });
       },
-      () => [movePage("MEMBER", p, { parentId: target.id, position: 0 })],
+      () => [
+        movePage("MEMBER", p, { parentId: target.id, position: 0 }),
+        req("MEMBER", "POST", `/api/wiki/spaces/${s.id}/pages`, {
+          title: "Queued",
+        }),
+        req("MEMBER", "PATCH", `/api/wiki/spaces/${s.id}`, { name: "Queued" }),
+        req("MEMBER", "POST", `/api/workspaces/${wsA.id}/wiki/spaces`, {
+          name: "Queued",
+        }),
+      ],
     );
   } finally {
     await app.prisma.workspaceMember.update({
@@ -453,8 +468,15 @@ test("a queued wiki move re-reads the actor's role after the workspace lock", as
       data: { role: "MEMBER" },
     });
   }
-  status(response, 403);
+  for (const response of responses) status(response, 403);
   assert.deepEqual(await pages([s.id]), before);
+  assert.deepEqual(
+    await app.prisma.wikiSpace.findMany({
+      where: { workspaceId: wsA.id },
+      orderBy: { id: "asc" },
+    }),
+    spacesBefore,
+  );
 });
 
 test("concurrent opposite wiki moves cannot form a cycle", async () => {
@@ -929,6 +951,38 @@ test("injected depth and size budgets bound graph readers and writers", async ()
   }
 });
 
+test("trash purge skips a tree it cannot validate and still purges the rest", async () => {
+  const expired = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  const malformed = await file("MEMBER", { trashedAt: expired });
+  const hidden = await file("MEMBER", { parentId: malformed.id });
+  const purgeable = await file("MEMBER", { trashedAt: expired });
+  try {
+    await assert.rejects(
+      processTrashPurge(app.prisma, app.storage),
+      (error) => {
+        assert(error instanceof AggregateError, String(error));
+        assert.match(error.message, /skipped [1-9]/);
+        return true;
+      },
+    );
+    assert.equal(
+      await app.prisma.file.findUnique({ where: { id: purgeable.id } }),
+      null,
+    );
+    assert.equal(await exists(purgeable.storagePath), false);
+    const kept = await app.prisma.file.findMany({
+      where: { id: { in: [malformed.id, hidden.id] } },
+    });
+    assert.equal(kept.length, 2, "the unvalidated tree is left for repair");
+    assert.equal(await exists(hidden.storagePath), true);
+  } finally {
+    await app.prisma.file.updateMany({
+      where: { id: hidden.id },
+      data: { parentId: null },
+    });
+  }
+});
+
 // ─── Restore ───────────────────────────────────────────────
 
 function backup(spaces) {
@@ -1014,4 +1068,31 @@ test("restore rejects invalid wiki hierarchies before any side effect", async ()
   });
   assert.equal(restored.length, 2);
   await assertWikiForest(restored.map((s) => s.id));
+
+  // A restore whose transaction is refused removes the assets it staged.
+  const staged = [];
+  const save = app.storage.save;
+  app.storage.save = async (...args) => {
+    const storagePath = await save.apply(app.storage, args);
+    staged.push(storagePath);
+    return storagePath;
+  };
+  try {
+    await assert.rejects(
+      restore.executeRestore(
+        app.prisma,
+        wsA.id,
+        users.MEMBER.id,
+        backup([[["a", null]]]),
+        new Map([["assets/picture.png", Buffer.from("png bytes")]]),
+        app.storage,
+      ),
+      (error) => error.statusCode === 403,
+    );
+  } finally {
+    app.storage.save = save;
+  }
+  assert.equal(staged.length, 1);
+  assert.equal(await exists(staged[0]), false);
+  assert.equal(await count(), before + 2);
 });

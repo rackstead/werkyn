@@ -35,6 +35,7 @@ export async function createSpaceHandler(
   const space = await spacesService.createSpace(
     request.server.prisma,
     wid,
+    request.user!.id,
     body,
   );
 
@@ -75,6 +76,7 @@ export async function updateSpaceHandler(
   const space = await spacesService.updateSpace(
     request.server.prisma,
     request.workspaceMember!.workspaceId,
+    request.user!.id,
     sid,
     body,
   );
@@ -99,6 +101,7 @@ export async function deleteSpaceHandler(
   await spacesService.deleteSpace(
     request.server.prisma,
     request.workspaceMember!.workspaceId,
+    request.user!.id,
     sid,
   );
 

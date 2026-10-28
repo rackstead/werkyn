@@ -14,48 +14,55 @@ export async function processTrashPurge(
   cutoff.setDate(cutoff.getDate() - PURGE_AFTER_DAYS);
 
   let totalPurged = 0;
-  let hasMore = true;
+  let cursor: string | undefined;
+  const skipped: unknown[] = [];
 
-  while (hasMore) {
+  // Pages by id so a candidate that cannot be purged (a malformed or
+  // over-budget tree, or a busy workspace) is skipped for this run instead of
+  // being selected first forever and blocking every other workspace.
+  while (true) {
     const files = await prisma.file.findMany({
       where: {
         trashedAt: { lt: cutoff },
-        workspaceId: { not: undefined },
+        ...(cursor ? { id: { gt: cursor } } : {}),
       },
+      orderBy: { id: "asc" },
       select: { id: true, workspaceId: true },
       take: BATCH_SIZE,
     });
+    if (files.length === 0) break;
+    cursor = files[files.length - 1].id;
 
-    if (files.length === 0) {
-      hasMore = false;
-      break;
-    }
-
-    // One workspace at a time, in id order, without holding any file lock
-    // while waiting for a Workspace lock. Each candidate is re-read after the
-    // lock: it may have been restored, or already removed by a parent cascade.
-    files.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
+    // Each candidate takes only its own workspace lock, never while holding
+    // another, and is re-read after it: it may have been restored, or already
+    // removed by a parent cascade.
     for (const file of files) {
-      const storagePaths = await withWorkspaceLock(
-        prisma,
-        file.workspaceId,
-        async (tx) => {
-          const current = await tx.file.findFirst({
-            where: { id: file.id, trashedAt: { lt: cutoff } },
-            select: { storagePath: true, thumbnailPath: true },
-          });
-          if (!current) return null;
-          const descendants = await collectDescendantFiles(tx, file.id);
-          // Delete DB record (cascade deletes children for folders)
-          await tx.file.delete({ where: { id: file.id } });
-          return [
-            current.storagePath,
-            current.thumbnailPath,
-            ...descendants.map((d) => d.storagePath),
-          ].filter((sp): sp is string => !!sp);
-        },
-        { onMissing: () => null },
-      );
+      let storagePaths: string[] | null;
+      try {
+        storagePaths = await withWorkspaceLock(
+          prisma,
+          file.workspaceId,
+          async (tx) => {
+            const current = await tx.file.findFirst({
+              where: { id: file.id, trashedAt: { lt: cutoff } },
+              select: { storagePath: true, thumbnailPath: true },
+            });
+            if (!current) return null;
+            const descendants = await collectDescendantFiles(tx, file.id);
+            // Delete DB record (cascade deletes children for folders)
+            await tx.file.delete({ where: { id: file.id } });
+            return [
+              current.storagePath,
+              current.thumbnailPath,
+              ...descendants.map((d) => d.storagePath),
+            ].filter((sp): sp is string => !!sp);
+          },
+          { onMissing: () => null },
+        );
+      } catch (error) {
+        skipped.push(error);
+        continue;
+      }
       if (!storagePaths) continue;
 
       // Delete storage files
@@ -65,9 +72,12 @@ export async function processTrashPurge(
 
       totalPurged++;
     }
-
-    hasMore = files.length === BATCH_SIZE;
   }
 
+  if (skipped.length > 0)
+    throw new AggregateError(
+      skipped,
+      `Trash purge removed ${totalPurged} item(s) and skipped ${skipped.length}`,
+    );
   return totalPurged;
 }

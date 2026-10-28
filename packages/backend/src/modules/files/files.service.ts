@@ -18,7 +18,7 @@ import {
   ForbiddenError,
   NotFoundError,
 } from "../../utils/errors.js";
-import { graphLimits } from "../../utils/graph-limits.js";
+import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import {
   assertFileAccess,
@@ -342,14 +342,15 @@ export async function updateFile(
           : {}),
       },
     });
-    if (crossScope && descendants.length > 0)
-      await tx.file.updateMany({
-        where: { id: { in: descendants.map((d) => d.id) }, workspaceId },
-        data: {
-          teamFolderId: destination.teamFolderId,
-          ownerId: destination.ownerId,
-        },
-      });
+    if (crossScope)
+      for (const batch of batches(descendants.map((d) => d.id)))
+        await tx.file.updateMany({
+          where: { id: { in: batch }, workspaceId },
+          data: {
+            teamFolderId: destination.teamFolderId,
+            ownerId: destination.ownerId,
+          },
+        });
     return file;
   });
 }
@@ -636,19 +637,23 @@ export async function collectDescendantFiles(
   const writableScopes = new Set<string>();
   let parents = [parentId];
   for (let depth = 1; parents.length; depth++) {
-    const children = await prisma.file.findMany({
-      where: { parentId: { in: parents } },
-      select: {
-        id: true,
-        parentId: true,
-        workspaceId: true,
-        storagePath: true,
-        isFolder: true,
-        ownerId: true,
-        teamFolderId: true,
-        asTeamFolder: { select: { id: true } },
-      },
-    });
+    const children = [];
+    for (const batch of batches(parents))
+      children.push(
+        ...(await prisma.file.findMany({
+          where: { parentId: { in: batch } },
+          select: {
+            id: true,
+            parentId: true,
+            workspaceId: true,
+            storagePath: true,
+            isFolder: true,
+            ownerId: true,
+            teamFolderId: true,
+            asTeamFolder: { select: { id: true } },
+          },
+        })),
+      );
     if (children.length === 0) break;
     if (depth > graphLimits.maxDepth) graphTooLarge();
     parents = [];

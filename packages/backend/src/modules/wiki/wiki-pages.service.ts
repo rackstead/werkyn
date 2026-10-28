@@ -10,7 +10,7 @@ import {
   NotFoundError,
   ValidationError,
 } from "../../utils/errors.js";
-import { graphLimits } from "../../utils/graph-limits.js";
+import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 
 const pageSelect = {
@@ -44,7 +44,7 @@ function pageTreeTooLarge(): never {
 }
 
 /** Re-reads the actor's current role after the workspace lock. */
-async function assertWikiRole(
+export async function assertWikiRole(
   tx: Tx,
   workspaceId: string,
   actorId: string,
@@ -88,10 +88,14 @@ async function collectSubtree(tx: Tx, rootId: string, spaceId: string) {
   const descendants: string[] = [];
   let parents = [rootId];
   for (let depth = 1; parents.length; depth++) {
-    const children = await tx.wikiPage.findMany({
-      where: { parentId: { in: parents } },
-      select: { id: true, spaceId: true },
-    });
+    const children: Array<{ id: string; spaceId: string }> = [];
+    for (const batch of batches(parents))
+      children.push(
+        ...(await tx.wikiPage.findMany({
+          where: { parentId: { in: batch } },
+          select: { id: true, spaceId: true },
+        })),
+      );
     if (children.length === 0) break;
     if (depth > graphLimits.maxDepth) pageTreeTooLarge();
     parents = [];
@@ -309,11 +313,12 @@ export async function movePage(
     }
 
     const descendants = await collectSubtree(tx, pageId, existing.spaceId);
-    if (targetSpaceId !== existing.spaceId && descendants.length > 0)
-      await tx.wikiPage.updateMany({
-        where: { id: { in: descendants } },
-        data: { spaceId: targetSpaceId },
-      });
+    if (targetSpaceId !== existing.spaceId)
+      for (const batch of batches(descendants))
+        await tx.wikiPage.updateMany({
+          where: { id: { in: batch } },
+          data: { spaceId: targetSpaceId },
+        });
 
     const sameGroup =
       targetSpaceId === existing.spaceId &&

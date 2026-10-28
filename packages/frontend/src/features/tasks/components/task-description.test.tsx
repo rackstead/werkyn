@@ -445,6 +445,30 @@ it("pasted style sheets never reach the document prosemirror-view inlines styles
   });
 });
 
+it("a paste with style- and link- custom elements keeps their text, not their tags", async () => {
+  const id = `task-paste-custom-${++suffix}`;
+  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+    wrapper,
+  });
+  await tick();
+  const clipboard = captureClipboardDocuments();
+  act(() => {
+    currentEditor().view.pasteHTML(
+      '<meta charset="utf-8"><p>See <link-preview data-url="https://example.com/docs" style="color: rgb(0, 0, 0);">the docs</link-preview>' +
+        ' and <style-chip style="font-weight: 400;">a chip</style-chip>, plus <code>&lt;style&gt;x&lt;/style&gt;</code> here</p>',
+    );
+  });
+  clipboard.restore();
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
+    json: {
+      description:
+        "<p>See the docs and a chip, plus <code>&lt;style&gt;x&lt;/style&gt;</code> here</p>",
+    },
+    context: { expectedUserId: "task-editor-user" },
+  });
+});
+
 it("an ordinary rich-text paste is stored as before", async () => {
   const id = `task-paste-plain-${++suffix}`;
   render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {

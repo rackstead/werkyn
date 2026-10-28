@@ -34,6 +34,13 @@ it("removes SVG style elements", () => {
   ).toBe("<svg><rect></rect></svg>");
 });
 
+it("keeps custom elements whose names start with style- or link-", () => {
+  const html =
+    '<p>See <link-preview data-url="https://example.com/docs">the docs</link-preview>' +
+    " and <style-chip>a chip</style-chip>, plus <code>&lt;style&gt;x&lt;/style&gt;</code></p>";
+  expect(stripPastedStyleSheets(`<meta charset="utf-8">${html}`)).toBe(html);
+});
+
 it("keeps a table-row fragment's structure", () => {
   expect(
     stripPastedStyleSheets("<style>td{}</style><tr><td>Cell</td></tr>"),
@@ -53,8 +60,9 @@ it("never lets a style sheet appear when prosemirror-view parses the result agai
   ];
   for (const payload of payloads) {
     const result = stripPastedStyleSheets(payload);
-    // Holds for any parser, whatever it treats as raw text.
-    expect(result, payload).not.toMatch(/<(?:style|link)\b/i);
+    // Holds for any parser, whatever it treats as raw text: no tag name
+    // "style" or "link" ends at a tab, LF, FF, CR, space, "/" or ">".
+    expect(result, payload).not.toMatch(/<(?:style|link)(?:[\t\n\f\r />]|$)/i);
     const doc = reparsed(result);
     expect(doc.querySelectorAll("style, link"), payload).toHaveLength(0);
     for (const template of doc.querySelectorAll("template")) {

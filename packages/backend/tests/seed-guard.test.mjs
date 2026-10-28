@@ -36,6 +36,23 @@ test("data the seed did not create is never mixed with or deleted by the seed", 
   }
 });
 
+test("a seed address is seed data only while it still has the published seed password", async () => {
+  const { default: bcrypt } = await import("bcrypt");
+  const users = [
+    { passwordHash: await bcrypt.hash(guard.SEED_PASSWORD, 4) },
+    // A real account registered at a seed address, or a demo password changed.
+    { passwordHash: await bcrypt.hash("a-real-users-own-password", 4) },
+    // An SSO-only account at a seed address.
+    { passwordHash: null },
+  ];
+  const verified = await guard.countVerifiedSeedUsers(users, bcrypt.compare);
+  assert.equal(verified, 1);
+  // The two unverified accounts count as foreign data, so force is refused.
+  const decision = guard.decideSeed({ users: 3, seedUsers: verified, workspaces: 0, seedWorkspaces: 0 }, true);
+  assert.equal(decision.action, "refuse");
+  assert.match(decision.reason, /2 account\(s\)/);
+});
+
 test("seed identities match the accounts and workspaces the script creates", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../prisma/seed.ts", import.meta.url), "utf8");

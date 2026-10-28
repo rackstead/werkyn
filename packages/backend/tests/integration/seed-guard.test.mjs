@@ -8,7 +8,7 @@ process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
 const { PrismaClient } = await import("@prisma/client");
 const prisma = new PrismaClient();
 const email = `seed-guard-${crypto.randomUUID()}@example.test`;
-let fixture;
+let fixture, impostor;
 
 function seed(extra) {
   return spawnSync(process.execPath, ["--import", "tsx", "prisma/seed.ts"], {
@@ -30,12 +30,14 @@ async function snapshot() {
 
 before(async () => {
   assert.equal(await prisma.user.count({ where: { email: "alice@test.com" } }), 0, "test database already contains seed data");
+  assert.equal(await prisma.user.count({ where: { email: "bob@test.com" } }), 0, "test database already contains a seed address");
   fixture = await prisma.user.create({ data: { email, displayName: "Existing account", emailVerified: true } });
 });
 
 after(async () => {
   try {
-    if (fixture) await prisma.user.deleteMany({ where: { id: fixture.id } });
+    const ids = [fixture?.id, impostor?.id].filter(Boolean);
+    if (ids.length) await prisma.user.deleteMany({ where: { id: { in: ids } } });
   } finally {
     await prisma.$disconnect();
   }
@@ -59,4 +61,22 @@ test("production is refused against a real database without writing", async () =
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(result.stderr, /production/);
   assert.deepEqual(await snapshot(), initial);
+});
+
+test("a real account at a seed address is not treated as seed data by SEED_FORCE", async () => {
+  const { default: bcrypt } = await import("bcrypt");
+  // Leave the seed address as the only reason to refuse.
+  await prisma.user.deleteMany({ where: { id: fixture.id } });
+  fixture = undefined;
+  impostor = await prisma.user.create({
+    data: { email: "bob@test.com", displayName: "Real Bob", emailVerified: true, passwordHash: await bcrypt.hash("bobs-own-password", 4) },
+  });
+  const initial = await snapshot();
+  const result = seed({ SEED_FORCE: "true" });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /Seed refused/);
+  if (initial.users === 1) assert.match(result.stderr, /contains 1 account\(s\)/);
+  assert.equal(result.stderr.includes("bob@test.com"), false);
+  assert.deepEqual(await snapshot(), initial);
+  assert.ok(await prisma.user.findUnique({ where: { id: impostor.id } }), "SEED_FORCE deleted a real account at a seed address");
 });

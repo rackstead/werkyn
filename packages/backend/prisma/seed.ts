@@ -1,8 +1,10 @@
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcrypt";
 import {
+  SEED_PASSWORD,
   SEED_USER_EMAILS,
   SEED_WORKSPACE_SLUGS,
+  countVerifiedSeedUsers,
   decideSeed,
   environmentRefusal,
 } from "./seed-guard.js";
@@ -18,12 +20,16 @@ async function main() {
   const refusal = environmentRefusal(process.env.NODE_ENV);
   if (refusal) throw new SeedRefused(refusal);
 
-  const [users, seedUsers, workspaces, seedWorkspaces] = await Promise.all([
+  const [users, seedAddressUsers, workspaces, seedWorkspaces] = await Promise.all([
     prisma.user.count(),
-    prisma.user.count({ where: { email: { in: [...SEED_USER_EMAILS] } } }),
+    prisma.user.findMany({
+      where: { email: { in: [...SEED_USER_EMAILS] } },
+      select: { passwordHash: true },
+    }),
     prisma.workspace.count(),
     prisma.workspace.count({ where: { slug: { in: [...SEED_WORKSPACE_SLUGS] } } }),
   ]);
+  const seedUsers = await countVerifiedSeedUsers(seedAddressUsers, bcrypt.compare);
   const decision = decideSeed(
     { users, seedUsers, workspaces, seedWorkspaces },
     process.env.SEED_FORCE === "true",
@@ -36,7 +42,9 @@ async function main() {
   }
 
   if (decision.action === "reseed") {
-    // decideSeed only allows this when every account and workspace is seed data.
+    // decideSeed only allows this when every account is a seed address that
+    // still has the published seed password and every workspace is a seed
+    // workspace, so all remaining data belongs to the demo accounts.
     console.log("SEED_FORCE=true: Cleaning existing seed data...");
     // Delete in order respecting constraints
     // Wiki tables (best-effort — may not exist if migrations haven't been applied)
@@ -68,7 +76,7 @@ async function main() {
     await prisma.user.deleteMany();
   }
 
-  const passwordHash = await bcrypt.hash("password123", SALT_ROUNDS);
+  const passwordHash = await bcrypt.hash(SEED_PASSWORD, SALT_ROUNDS);
 
   // ─── Users ───────────────────────────────────────────
   console.log("Creating users...");

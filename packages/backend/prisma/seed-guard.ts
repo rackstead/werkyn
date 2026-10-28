@@ -12,8 +12,28 @@ export const SEED_USER_EMAILS = [
 
 export const SEED_WORKSPACE_SLUGS = ["acme-corp", "side-project"] as const;
 
+/** The published sample password every seed account is created with. */
+export const SEED_PASSWORD = "password123";
+
+/**
+ * Counts accounts that are verifiably seed-created: a seed address alone is
+ * not proof, so the account must still have the published seed password.
+ * Anyone can register such an address, and a real user may have changed it.
+ */
+export async function countVerifiedSeedUsers(
+  users: { passwordHash: string | null }[],
+  compare: (password: string, hash: string) => Promise<boolean>,
+): Promise<number> {
+  let verified = 0;
+  for (const user of users) {
+    if (user.passwordHash && (await compare(SEED_PASSWORD, user.passwordHash))) verified += 1;
+  }
+  return verified;
+}
+
 export interface SeedInventory {
   users: number;
+  /** Seed-address accounts that still have the seed password. */
   seedUsers: number;
   workspaces: number;
   seedWorkspaces: number;

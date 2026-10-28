@@ -178,15 +178,13 @@ async function decide(
     return { status: "verification_required", workspace, email: user.email };
   }
 
-  if (mode === "status") {
+  if (mode === "status" && policy.requireAdminApproval) {
     // Report a pending request without creating one; a declined request is
     // gone and is reported as not pending rather than silently re-created.
-    const request = policy.requireAdminApproval
-      ? await tx.workspaceAdmissionRequest.findUnique({
-          where: { userId_workspaceId: { userId, workspaceId } },
-          select: { id: true, createdAt: true },
-        })
-      : null;
+    const request = await tx.workspaceAdmissionRequest.findUnique({
+      where: { userId_workspaceId: { userId, workspaceId } },
+      select: { id: true, createdAt: true },
+    });
     return request
       ? {
           status: "approval_pending",
@@ -198,11 +196,18 @@ async function decide(
   }
 
   if (mode === "applicant" && policy.requireAdminApproval) {
+    // A request is bound to the exact invitation the administrator reviews.
+    // Asking through a different invitation replaces the request under a new
+    // id, so a decision taken on the earlier one (and the role it showed) can
+    // no longer apply. The same invitation keeps its request and position.
     // A pending request reserves neither a seat nor an invitation use.
+    await tx.workspaceAdmissionRequest.deleteMany({
+      where: { userId, workspaceId, inviteId: { not: invite.id } },
+    });
     const request = await tx.workspaceAdmissionRequest.upsert({
       where: { userId_workspaceId: { userId, workspaceId } },
       create: { userId, workspaceId, inviteId: invite.id },
-      update: { inviteId: invite.id },
+      update: {},
       select: { id: true, createdAt: true },
     });
     return {
@@ -217,6 +222,10 @@ async function decide(
     const members = await tx.workspaceMember.count({ where: { workspaceId } });
     if (members >= policy.maxMembers) return denied("member_limit");
   }
+
+  // Without required approval, every rule above admits this account now
+  // (a request left from an earlier approval policy no longer applies).
+  if (mode === "status") return { status: "ready", workspace };
 
   const used = await tx.workspaceInvite.updateMany({
     where:

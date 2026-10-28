@@ -75,7 +75,8 @@ export function InviteSettings({ workspaceId }: InviteSettingsProps) {
                 </div>
                 <div className="text-xs text-muted-foreground">
                   Role: {inv.role}
-                  {inv.maxUses && ` · Uses: ${inv.useCount}/${inv.maxUses}`}
+                  {inv.maxUses !== null &&
+                    ` · Uses: ${inv.useCount}/${inv.maxUses}`}
                   {inv.expiresAt &&
                     ` · Expires: ${new Date(inv.expiresAt).toLocaleDateString()}`}
                 </div>

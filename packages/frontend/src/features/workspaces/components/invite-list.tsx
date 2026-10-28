@@ -51,7 +51,7 @@ export function InviteList({ workspaceId }: InviteListProps) {
               <span className="text-sm truncate">{invite.email}</span>
             )}
             <span className="text-xs text-muted-foreground">
-              {invite.maxUses
+              {invite.maxUses !== null
                 ? `${invite.useCount}/${invite.maxUses} uses`
                 : `${invite.useCount} uses`}
             </span>

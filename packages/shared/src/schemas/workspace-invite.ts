@@ -58,9 +58,12 @@ export type WorkspaceAdmissionResult =
     }
   | { status: "unavailable"; message: string };
 
-// Read-only answer to "where does my request stand?". "not_pending" means the
-// account is not a member and has no pending request (for example, an admin
-// declined it); joining again is an explicit new request.
+// Read-only answer to "where does my request stand?". "not_pending" means
+// approval is required and the account is not a member and has no pending
+// request (for example, an admin declined it); joining again is an explicit
+// new request. "ready" means approval is not required and every current rule
+// admits the account; joining is still an explicit acceptance.
 export type WorkspaceAdmissionCheck =
   | WorkspaceAdmissionResult
-  | { status: "not_pending"; workspace: WorkspaceAdmissionWorkspace };
+  | { status: "not_pending"; workspace: WorkspaceAdmissionWorkspace }
+  | { status: "ready"; workspace: WorkspaceAdmissionWorkspace };

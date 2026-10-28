@@ -100,12 +100,14 @@ export async function getInviteByToken(
     throw new NotFoundError("Invite not found or has been revoked");
   }
 
+  // The same expiry and use limits as the admission gate: a legacy zero
+  // limit is exhausted, not unlimited.
   const now = new Date();
-  if (invite.expiresAt && invite.expiresAt < now) {
+  if (invite.expiresAt && invite.expiresAt <= now) {
     throw new GoneError("This invite has expired");
   }
 
-  if (invite.maxUses && invite.useCount >= invite.maxUses) {
+  if (invite.maxUses !== null && invite.useCount >= invite.maxUses) {
     throw new GoneError("This invite has reached its usage limit");
   }
 

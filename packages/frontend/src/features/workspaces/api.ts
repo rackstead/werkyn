@@ -221,6 +221,14 @@ export function useInviteAdmission(token: string) {
   return userId ? (data ?? null) : null;
 }
 
+// Counts sign-in changes in this tab (sign-out, sign-in, account switch). A
+// reply to a request sent before such a change belongs to an earlier session,
+// even when the same account has signed in again since.
+let sessionGeneration = 0;
+useAuthStore.subscribe((current, previous) => {
+  if (current.user?.id !== previous.user?.id) sessionGeneration++;
+});
+
 // Shared by acceptance (a join attempt) and the read-only status check.
 function useAdmissionMutation(
   send: (token: string) => Promise<AdmissionResponse>,
@@ -230,12 +238,19 @@ function useAdmissionMutation(
     mutationFn: send,
     // The account that sends the request owns its result, even if the browser
     // switches accounts before the response arrives.
-    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
-    onSuccess: async (res, token) => {
+    onMutate: () => ({
+      requesterId: useAuthStore.getState().user?.id,
+      generation: sessionGeneration,
+    }),
+    onSuccess: async (res, token, context) => {
       const result = res.data;
-      // If this browser has since switched or signed out, the response must
-      // not change the current session.
-      if (useAuthStore.getState().user?.id !== result.userId) return;
+      // If this browser has since signed out, switched or signed in again,
+      // the response must not change the current session.
+      if (
+        context?.generation !== sessionGeneration ||
+        useAuthStore.getState().user?.id !== result.userId
+      )
+        return;
       rememberInviteAdmission(result.userId, token, result);
       if (result.status !== "joined") return;
       if (

@@ -715,11 +715,12 @@ test("required approval deduplicates pending requests and a later policy change 
   assert.equal(current.requests.length, 1);
   assert.equal(current.invite.useCount, 0);
   const switched = await accept(user, second);
-  assert.equal(switched.json().data.requestId, one.json().data.requestId);
+  assert.equal(switched.statusCode, 202, switched.body);
+  assert.notEqual(switched.json().data.requestId, one.json().data.requestId);
   current = await state(workspace, second);
   assert.deepEqual(
-    current.requests.map((r) => r.inviteId),
-    [second.id],
+    current.requests.map((r) => [r.id, r.inviteId]),
+    [[switched.json().data.requestId, second.id]],
   );
   assert.equal(await subscribeWorkspace(user, workspace), false);
   const disabled = await inject("PATCH", `/api/workspaces/${workspace.id}/settings`, {
@@ -900,6 +901,230 @@ test("status checks are read-only: they report a rejection instead of reviving t
   const unknown = await check(stranger, { token: crypto.randomBytes(32).toString("hex") });
   assert.equal(unknown.statusCode, 404, unknown.body);
   assert.equal((await state(fixture.workspace)).requests.length, 0);
+});
+
+// ─── A request stays bound to the invitation an administrator reviews ───
+
+async function listedRequests(fixture) {
+  const list = await inject("GET", requestsPath(fixture.workspace), {
+    token: fixture.admin.token,
+  });
+  assert.equal(list.statusCode, 200, list.body);
+  return list.json().data.map((r) => [r.id, r.invite.id, r.invite.role]);
+}
+
+test("asking through a different invitation replaces the request, so a decision on the reviewed one cannot grant the new role", async () => {
+  const fixture = await pendingRequest();
+  const elevated = await makeInvite(fixture.workspace, { role: "ADMIN" });
+  // The administrator reviews the request as a VIEWER request.
+  assert.deepEqual(await listedRequests(fixture), [
+    [fixture.requestId, fixture.invite.id, "VIEWER"],
+  ]);
+  // Asking again through the same invitation keeps the request.
+  const same = await accept(fixture.applicant, fixture.invite);
+  assert.equal(same.json().data.requestId, fixture.requestId);
+  const switched = await accept(fixture.applicant, elevated);
+  assert.equal(switched.statusCode, 202, switched.body);
+  const newId = switched.json().data.requestId;
+  assert.notEqual(newId, fixture.requestId);
+  // Decisions on the reviewed request no longer apply to anything.
+  for (const decide of [approve, reject]) {
+    const stale = await decide(fixture.admin, fixture.workspace, fixture.requestId);
+    assert.equal(stale.statusCode, 404, stale.body);
+  }
+  let current = await state(fixture.workspace);
+  assert.equal(member(current, fixture.applicant), undefined);
+  assert.deepEqual(
+    current.requests.map((r) => [r.id, r.inviteId]),
+    [[newId, elevated.id]],
+  );
+  const status = await check(fixture.applicant, fixture.invite);
+  assert.equal(status.json().data.requestId, newId);
+  // The queue shows the replacement with its own role; approving it is an
+  // explicit decision on that role.
+  assert.deepEqual(await listedRequests(fixture), [[newId, elevated.id, "ADMIN"]]);
+  const approved = await approve(fixture.admin, fixture.workspace, newId);
+  assert.equal(approved.statusCode, 200, approved.body);
+  current = await state(fixture.workspace);
+  assert.equal(member(current, fixture.applicant).role, "ADMIN");
+  assert.equal(current.requests.length, 0);
+  const uses = await app.prisma.workspaceInvite.findMany({
+    where: { id: { in: [fixture.invite.id, elevated.id] } },
+    orderBy: { role: "asc" },
+    select: { role: true, useCount: true },
+  });
+  assert.deepEqual(
+    uses.map((i) => [i.role, i.useCount]),
+    [["ADMIN", 1], ["VIEWER", 0]],
+  );
+});
+
+// One transaction holds the workspace lock while paused at its write; the
+// other then waits behind it, so each queue order is forced in PostgreSQL.
+const requestWriteLock = (tx) =>
+  tx.$executeRawUnsafe(
+    'LOCK TABLE "WorkspaceAdmissionRequest" IN SHARE ROW EXCLUSIVE MODE',
+  );
+
+for (const [order, pauseFirst, first] of [
+  ["approval first", memberInsertLock, "approve"],
+  ["the new request first", requestWriteLock, "ask"],
+]) {
+  test(`concurrent approval and a request through a higher-role invitation (${order}) never grant the unreviewed role`, async () => {
+    const fixture = await pendingRequest();
+    const elevated = await makeInvite(fixture.workspace, { role: "ADMIN" });
+    const actors = {
+      approve: () => approve(fixture.admin, fixture.workspace, fixture.requestId),
+      ask: () => accept(fixture.applicant, elevated),
+    };
+    const second = first === "approve" ? "ask" : "approve";
+    let secondPending;
+    let responses;
+    try {
+      responses = await whileLocked(pauseFirst, () => [actors[first]()], {
+        waiters: 1,
+        beforeRelease: async () => {
+          secondPending = Promise.resolve(actors[second]());
+          await waitForLockWaiters(2, { behindActors: 1 });
+        },
+      });
+    } finally {
+      await Promise.allSettled([secondPending]);
+    }
+    const byActor = { [first]: responses[0], [second]: await secondPending };
+    const current = await state(fixture.workspace);
+    const invites = await app.prisma.workspaceInvite.findMany({
+      where: { workspaceId: fixture.workspace.id },
+      select: { role: true, useCount: true },
+    });
+    const uses = Object.fromEntries(invites.map((i) => [i.role, i.useCount]));
+    if (first === "approve") {
+      // The reviewed VIEWER request is approved; the later ask finds a member.
+      assert.equal(byActor.approve.statusCode, 200, byActor.approve.body);
+      assert.equal(byActor.approve.json().data.role, "VIEWER");
+      assert.equal(byActor.ask.statusCode, 200, byActor.ask.body);
+      assert.equal(byActor.ask.json().data.alreadyMember, true);
+      assert.equal(byActor.ask.json().data.role, "VIEWER");
+      assert.equal(member(current, fixture.applicant).role, "VIEWER");
+      assert.equal(current.requests.length, 0);
+      assert.deepEqual(uses, { VIEWER: 1, ADMIN: 0 });
+    } else {
+      // The replacement request has a new id; the stale approval finds nothing.
+      assert.equal(byActor.ask.statusCode, 202, byActor.ask.body);
+      const newId = byActor.ask.json().data.requestId;
+      assert.notEqual(newId, fixture.requestId);
+      assert.equal(byActor.approve.statusCode, 404, byActor.approve.body);
+      assert.equal(member(current, fixture.applicant), undefined);
+      assert.deepEqual(
+        current.requests.map((r) => [r.id, r.inviteId]),
+        [[newId, elevated.id]],
+      );
+      assert.deepEqual(uses, { VIEWER: 0, ADMIN: 0 });
+    }
+  });
+}
+
+test("racing approval against requests through a higher-role invitation never grants the unreviewed role", async () => {
+  const outcomes = new Set();
+  for (let round = 0; round < 4; round++) {
+    const fixture = await pendingRequest();
+    const elevated = await makeInvite(fixture.workspace, { role: "ADMIN" });
+    // Both actors start together and queue on the real workspace lock.
+    const [approved, asked] = await whileLocked(
+      workspaceRowLock(fixture.workspace),
+      () => [
+        approve(fixture.admin, fixture.workspace, fixture.requestId),
+        accept(fixture.applicant, elevated),
+      ],
+    );
+    const current = await state(fixture.workspace);
+    const joined = member(current, fixture.applicant);
+    if (approved.statusCode === 200) {
+      outcomes.add("approved");
+      assert.equal(joined.role, "VIEWER");
+      assert.equal(asked.statusCode, 200, asked.body);
+      assert.equal(asked.json().data.role, "VIEWER");
+      assert.equal(current.requests.length, 0);
+    } else {
+      outcomes.add("replaced");
+      assert.equal(approved.statusCode, 404, approved.body);
+      assert.equal(joined, undefined);
+      assert.equal(asked.statusCode, 202, asked.body);
+      assert.deepEqual(
+        current.requests.map((r) => [r.id, r.inviteId]),
+        [[asked.json().data.requestId, elevated.id]],
+      );
+    }
+  }
+  console.info("approval/re-request race outcomes", [...outcomes]);
+});
+
+// ─── Status reports the current state ──────────────────────
+
+test("status reports a direct join or the current refusal when approval is no longer required", async () => {
+  const fixture = await pendingRequest();
+  const settingsPath = `/api/workspaces/${fixture.workspace.id}/settings`;
+  const off = await inject("PATCH", settingsPath, {
+    token: fixture.admin.token,
+    payload: { requireAdminApproval: false },
+  });
+  assert.equal(off.statusCode, 200, off.body);
+  const ready = await check(fixture.applicant, fixture.invite);
+  assert.equal(ready.statusCode, 200, ready.body);
+  assert.deepEqual(ready.json().data, {
+    status: "ready",
+    workspace: {
+      id: fixture.workspace.id,
+      name: fixture.workspace.name,
+      slug: fixture.workspace.slug,
+    },
+    userId: fixture.applicant.id,
+  });
+  const stranger = await makeUser({ name: "stranger" });
+  assert.equal((await check(stranger, fixture.invite)).json().data.status, "ready");
+  // A full workspace is reported as full, not as a declined request.
+  const full = await inject("PATCH", settingsPath, {
+    token: fixture.admin.token,
+    payload: { maxMembers: 1 },
+  });
+  assert.equal(full.statusCode, 200, full.body);
+  const refused = await check(fixture.applicant, fixture.invite);
+  assert.equal(refused.statusCode, 403, refused.body);
+  assert.equal(refused.json().message, "This workspace has reached its member limit");
+  // Checking is read-only throughout.
+  let current = await state(fixture.workspace, fixture.invite);
+  assert.deepEqual(current.requests.map((r) => r.id), [fixture.requestId]);
+  assert.equal(current.invite.useCount, 0);
+  assert.equal(current.members.length, 1);
+  const open = await inject("PATCH", settingsPath, {
+    token: fixture.admin.token,
+    payload: { maxMembers: null },
+  });
+  assert.equal(open.statusCode, 200, open.body);
+  const joined = await accept(fixture.applicant, fixture.invite);
+  assert.equal(joined.statusCode, 200, joined.body);
+  current = await state(fixture.workspace, fixture.invite);
+  assert.equal(member(current, fixture.applicant).role, "VIEWER");
+  assert.equal(current.requests.length, 0);
+  assert.equal(current.invite.useCount, 1);
+});
+
+// ─── Public preview ────────────────────────────────────────
+
+test("the public invite preview applies the admission gate's expiry and use limits", async () => {
+  const { workspace } = await makeWorkspace();
+  for (const [name, data, status] of [
+    ["open", {}, 200],
+    ["remaining use", { maxUses: 2, useCount: 1 }, 200],
+    ["legacy zero limit", { maxUses: 0 }, 410],
+    ["used up", { maxUses: 1, useCount: 1 }, 410],
+    ["expired", { expiresAt: new Date(Date.now() - 1000) }, 410],
+  ]) {
+    const invite = await makeInvite(workspace, data);
+    const preview = await inject("GET", `/api/invites/${invite.token}`);
+    assert.equal(preview.statusCode, status, `${name}: ${preview.body}`);
+    if (status === 200) assert.equal(preview.json().data.id, invite.id);
+  }
 });
 
 test("revoking an invite cancels its pending requests", async () => {

@@ -130,6 +130,21 @@ function InvitePage() {
         {goHome}
       </>
     );
+  } else if (admission?.status === "ready") {
+    signedInContent = (
+      <>
+        <p className="text-sm text-center">
+          You can join{" "}
+          <span className="font-medium">{admission.workspace.name}</span> now.
+          Administrator approval is not required.
+        </p>
+        <Button className="w-full" onClick={accept} disabled={busy}>
+          {acceptInvite.isPending ? "Joining..." : "Join now"}
+        </Button>
+        {acceptError}
+        {goHome}
+      </>
+    );
   } else if (
     admission?.status === "denied" ||
     admission?.status === "unavailable"

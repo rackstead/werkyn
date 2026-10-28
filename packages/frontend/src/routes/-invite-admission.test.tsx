@@ -465,3 +465,87 @@ it("shares a committed join with the same account's other tabs only", async () =
   });
   expect(useAuthStore.getState().workspaces).toEqual(joined);
 });
+
+it("reports that approval is no longer required on a status check and joins only on request", async () => {
+  signIn();
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  rememberInviteAdmission("applicant", "invite-token", {
+    status: "approval_pending",
+    workspace,
+    requestId: "rq-1",
+    requestedAt: "2026-10-27T00:00:00Z",
+  });
+  respond("GET", "/api/invites/invite-token/admission", () =>
+    json(200, { data: { status: "ready", workspace, userId: "applicant" } }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+  expect(await screen.findByText(/Administrator approval is not required/)).toBeTruthy();
+  expect(screen.queryByText(/declined/)).toBeNull();
+  expect(state.requests.some((r) => r.method === "POST")).toBe(false);
+  const joined = [membership("acme")];
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: { status: "joined", workspace, role: "MEMBER", alreadyMember: false, userId: "applicant", workspaces: joined },
+    }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Join now" }));
+  await waitFor(() =>
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: "/$workspaceSlug",
+      params: { workspaceSlug: "acme" },
+    }),
+  );
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+});
+
+it("reports a full workspace on a status check instead of a declined request", async () => {
+  signIn();
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  rememberInviteAdmission("applicant", "invite-token", {
+    status: "approval_pending",
+    workspace,
+    requestId: "rq-1",
+    requestedAt: "2026-10-27T00:00:00Z",
+  });
+  respond("GET", "/api/invites/invite-token/admission", () =>
+    json(403, { statusCode: 403, error: "Forbidden", message: "This workspace has reached its member limit" }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+  expect(await screen.findByRole("alert")).toHaveProperty(
+    "textContent",
+    "This workspace has reached its member limit",
+  );
+  expect(screen.queryByText(/declined/)).toBeNull();
+  expect(screen.queryByText(/waiting for an administrator/)).toBeNull();
+});
+
+it("ignores a reply to a request sent before the same account signed out and in again", async () => {
+  signIn("first");
+  let release!: () => void;
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    new Promise<Response>((resolve) => {
+      release = () =>
+        resolve(
+          json(200, {
+            data: { status: "joined", workspace, role: "MEMBER", alreadyMember: false, userId: "first", workspaces: [membership("acme")] },
+          }),
+        );
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await waitFor(() => expect(release).toBeTypeOf("function"));
+  act(() => useAuthStore.setState({ user: null, accessToken: null, workspaces: [] }));
+  const later = [membership("later")];
+  act(() => signIn("first", later));
+  await act(async () => release());
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Accept invite" })).toHaveProperty("disabled", false),
+  );
+  expect(useAuthStore.getState().workspaces).toBe(later);
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(state.broadcasts.some((m) => (m as { type: string }).type === "workspaces")).toBe(false);
+  expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
+});

@@ -13,7 +13,13 @@ import path from "node:path";
 import sharp from "sharp";
 import archiver from "archiver";
 import { env } from "../../config/env.js";
-import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import {
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+} from "../../utils/errors.js";
+import { batches, graphLimits } from "../../utils/graph-limits.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import {
   assertFileAccess,
   fileAccessRole,
@@ -77,25 +83,33 @@ export async function uploadFileStream(
     }
   }
 
-  // Create DB record — clean up file on failure
+  // Create DB record — clean up file on failure. The destination is resolved
+  // again under the workspace graph lock: while bytes streamed, the parent may
+  // have been moved to another scope, trashed or deleted, or the uploader's
+  // rights may have changed. Stored blob paths are immutable either way.
   try {
-    const file = await prisma.file.create({
-      data: {
-        workspaceId,
-        parentId: destination.parentId,
-        name: fileName,
-        mimeType,
-        size,
-        storagePath,
-        isFolder: false,
-        uploadedById,
-        ownerId: destination.ownerId,
-        teamFolderId: teamFolderId,
-        thumbnailPath,
-      },
+    return await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+      const current = await resolveFileDestination(
+        tx,
+        { ...ctx, workspaceId },
+        parentId,
+      );
+      return tx.file.create({
+        data: {
+          workspaceId,
+          parentId: current.parentId,
+          name: fileName,
+          mimeType,
+          size,
+          storagePath,
+          isFolder: false,
+          uploadedById,
+          ownerId: current.ownerId,
+          teamFolderId: current.teamFolderId,
+          thumbnailPath,
+        },
+      });
     });
-
-    return file;
   } catch (err) {
     await storage.delete(storagePath);
     if (thumbnailPath) await storage.delete(thumbnailPath).catch(() => {});
@@ -110,24 +124,25 @@ export async function createFolder(
   input: CreateFolderInput,
   ctx: AccessContext,
 ) {
-  const destination = await resolveFileDestination(
-    prisma,
-    { ...ctx, workspaceId },
-    input.parentId,
-    input.teamFolderId,
-  );
-
-  const folder = await prisma.file.create({
-    data: {
-      workspaceId,
-      ...destination,
-      name: input.name,
-      isFolder: true,
-      uploadedById,
-    },
+  // New children take the workspace graph lock so they cannot escape a
+  // concurrent move's scope propagation or land under a deleted parent.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const destination = await resolveFileDestination(
+      tx,
+      { ...ctx, workspaceId },
+      input.parentId,
+      input.teamFolderId,
+    );
+    return tx.file.create({
+      data: {
+        workspaceId,
+        ...destination,
+        name: input.name,
+        isFolder: true,
+        uploadedById,
+      },
+    });
   });
-
-  return folder;
 }
 
 export async function listFiles(
@@ -276,84 +291,98 @@ export async function updateFile(
   input: UpdateFileInput,
   ctx: AccessContext,
 ) {
-  const existing = await prisma.file.findFirst({
-    where: { id: fileId, workspaceId },
-    include: { asTeamFolder: { select: { id: true } } },
-  });
-  if (!existing) throw new NotFoundError("File not found");
+  const access = { ...ctx, workspaceId };
+  // Every authorization, ancestry, subtree and scope read is repeated after
+  // the workspace graph lock, so concurrent moves, deletes and new children
+  // commit in a single order and the subtree update is atomic.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const existing = await tx.file.findFirst({
+      where: { id: fileId, workspaceId },
+      include: { asTeamFolder: { select: { id: true } } },
+    });
+    if (!existing) throw new NotFoundError("File not found");
 
-  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true, true);
+    await assertFileAccess(tx, fileId, access, true, true);
 
-  if (input.parentId !== undefined || input.teamFolderId !== undefined) {
-    if (existing.asTeamFolder)
-      throw new ForbiddenError("Team folder roots cannot be moved");
-    const destination = await resolveFileDestination(
-      prisma,
-      { ...ctx, workspaceId },
-      input.parentId,
-      input.teamFolderId,
-    );
-    if (destination.parentId === fileId)
-      throw new ForbiddenError("A folder cannot contain itself");
-    // Reject descendant destinations with a visited set, including legacy cycles.
-    const visited = new Set<string>([fileId]);
-    let ancestor = destination.parentId;
-    while (ancestor) {
-      if (visited.has(ancestor))
-        throw new ForbiddenError("Invalid folder ancestry");
-      visited.add(ancestor);
-      const row = await prisma.file.findFirst({
-        where: { id: ancestor, workspaceId },
-        select: { parentId: true },
-      });
-      if (!row) throw new NotFoundError("Destination folder not found");
-      ancestor = row.parentId;
-    }
-    const destTeamFolderId = destination.teamFolderId;
-    const crossScope =
-      existing.teamFolderId !== destTeamFolderId ||
-      existing.ownerId !== destination.ownerId;
-    const updateData = destination;
-
-    const descendants = existing.isFolder
-      ? await collectDescendantFiles(prisma, fileId, { ...ctx, workspaceId })
-      : [];
-    const [file] = await prisma.$transaction([
-      prisma.file.update({
-        where: { id: fileId, workspaceId },
+    if (input.parentId === undefined && input.teamFolderId === undefined) {
+      return tx.file.update({
+        where: { id: fileId },
         data: {
           ...(input.name !== undefined ? { name: input.name } : {}),
-          ...updateData,
           ...(input.trashedAt !== undefined
             ? { trashedAt: input.trashedAt }
             : {}),
         },
-      }),
-      ...(crossScope && descendants.length > 0
-        ? [
-            prisma.file.updateMany({
-              where: { id: { in: descendants.map((d) => d.id) }, workspaceId },
-              data: {
-                teamFolderId: destTeamFolderId,
-                ownerId: destination.ownerId,
-              },
-            }),
-          ]
-        : []),
-    ]);
+      });
+    }
 
+    if (existing.asTeamFolder)
+      throw new ForbiddenError("Team folder roots cannot be moved");
+    const destination = await resolveFileDestination(
+      tx,
+      access,
+      input.parentId,
+      input.teamFolderId,
+    );
+    await assertNotOwnDescendant(tx, workspaceId, fileId, destination.parentId);
+    const crossScope =
+      existing.teamFolderId !== destination.teamFolderId ||
+      existing.ownerId !== destination.ownerId;
+    // Walks every child edge (not only folders) so legacy malformed rows are
+    // rejected instead of being left in the previous scope.
+    const descendants = await collectDescendantFiles(tx, fileId, access);
+
+    const file = await tx.file.update({
+      where: { id: fileId, workspaceId },
+      data: {
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        ...destination,
+        ...(input.trashedAt !== undefined
+          ? { trashedAt: input.trashedAt }
+          : {}),
+      },
+    });
+    if (crossScope)
+      for (const batch of batches(descendants.map((d) => d.id)))
+        await tx.file.updateMany({
+          where: { id: { in: batch }, workspaceId },
+          data: {
+            teamFolderId: destination.teamFolderId,
+            ownerId: destination.ownerId,
+          },
+        });
     return file;
-  }
-
-  const file = await prisma.file.update({
-    where: { id: fileId },
-    data: {
-      ...(input.name !== undefined ? { name: input.name } : {}),
-      ...(input.trashedAt !== undefined ? { trashedAt: input.trashedAt } : {}),
-    },
   });
+}
 
-  return file;
+function graphTooLarge(): never {
+  throw new ConflictError("Folder tree exceeds the supported depth or size");
+}
+
+/** Rejects a destination that is the file itself or inside its subtree,
+ * including legacy cycles, with a bounded ancestor walk. */
+async function assertNotOwnDescendant(
+  tx: Prisma.TransactionClient,
+  workspaceId: string,
+  fileId: string,
+  parentId: string | null,
+) {
+  if (parentId === fileId)
+    throw new ForbiddenError("A folder cannot contain itself");
+  const visited = new Set<string>([fileId]);
+  let ancestor = parentId;
+  while (ancestor) {
+    if (visited.has(ancestor))
+      throw new ForbiddenError("Invalid folder ancestry");
+    if (visited.size > graphLimits.maxDepth) graphTooLarge();
+    visited.add(ancestor);
+    const row: { parentId: string | null } | null = await tx.file.findFirst({
+      where: { id: ancestor, workspaceId },
+      select: { parentId: true },
+    });
+    if (!row) throw new NotFoundError("Destination folder not found");
+    ancestor = row.parentId;
+  }
 }
 
 export async function getFileBreadcrumbs(
@@ -368,7 +397,12 @@ export async function getFileBreadcrumbs(
   let currentId: string | null = fileId;
 
   const visited = new Set<string>();
-  while (currentId && !visited.has(currentId)) {
+  // The visited set stops legacy cycles; the depth budget bounds the queries.
+  while (
+    currentId &&
+    !visited.has(currentId) &&
+    visited.size < graphLimits.maxDepth
+  ) {
     visited.add(currentId);
     try {
       await assertFileAccess(prisma, currentId, { ...ctx, workspaceId });
@@ -398,29 +432,23 @@ export async function deleteFile(
   fileId: string,
   ctx: AccessContext,
 ) {
-  const file = await prisma.file.findFirst({
-    where: { id: fileId, workspaceId },
-  });
-  if (!file) throw new NotFoundError("File not found");
-
-  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true, true);
-
-  if (file.isFolder) {
-    const descendants = await collectDescendantFiles(prisma, fileId, {
-      ...ctx,
-      workspaceId,
+  const access = { ...ctx, workspaceId };
+  // Validate the complete current subtree (rights, cycles, foreign or
+  // non-folder child edges, budgets) under the graph lock before the cascade.
+  const removed = await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const file = await tx.file.findFirst({
+      where: { id: fileId, workspaceId },
+      select: { storagePath: true },
     });
-    await prisma.file.delete({ where: { id: fileId } });
-    for (const desc of descendants) {
-      if (desc.storagePath) {
-        await storage.delete(desc.storagePath);
-      }
-    }
-  } else {
-    await prisma.file.delete({ where: { id: fileId } });
-    if (file.storagePath) {
-      await storage.delete(file.storagePath);
-    }
+    if (!file) throw new NotFoundError("File not found");
+
+    await assertFileAccess(tx, fileId, access, true, true);
+    const descendants = await collectDescendantFiles(tx, fileId, access);
+    await tx.file.delete({ where: { id: fileId } });
+    return [file, ...descendants];
+  });
+  for (const row of removed) {
+    if (row.storagePath) await storage.delete(row.storagePath);
   }
 }
 
@@ -556,62 +584,97 @@ export async function copyFile(
     { maxSize: env.MAX_FILE_SIZE },
   );
 
-  // Create DB record — clean up on failure
+  // Create DB record — clean up on failure. Source read access and the
+  // destination are checked again under the workspace graph lock.
   try {
-    const file = await prisma.file.create({
-      data: {
-        workspaceId,
-        ...destination,
-        name: copyName,
-        mimeType: source.mimeType,
-        size,
-        storagePath,
-        isFolder: false,
-        uploadedById: ctx.userId,
-        ownerId: destination.ownerId,
-        teamFolderId: destTeamFolderId,
-      },
+    return await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+      await assertFileAccess(tx, fileId, { ...ctx, workspaceId });
+      const current = await resolveFileDestination(
+        tx,
+        { ...ctx, workspaceId },
+        input.parentId,
+        input.teamFolderId,
+      );
+      return tx.file.create({
+        data: {
+          workspaceId,
+          ...current,
+          name: copyName,
+          mimeType: source.mimeType,
+          size,
+          storagePath,
+          isFolder: false,
+          uploadedById: ctx.userId,
+        },
+      });
     });
-
-    return file;
   } catch (err) {
     await storage.delete(storagePath);
     throw err;
   }
 }
 
+/**
+ * Collects every descendant row with bounded, level-by-level queries. Any
+ * cycle, cross-workspace child or child of a non-folder rejects the whole
+ * operation, so callers never act on (or let a cascade delete) rows they did
+ * not validate. Pass the locked transaction client when the result drives a
+ * write.
+ */
 export async function collectDescendantFiles(
-  prisma: PrismaClient,
+  prisma: Prisma.TransactionClient,
   parentId: string,
   ctx?: AccessContext,
 ): Promise<Array<{ id: string; storagePath: string | null }>> {
   const root = await prisma.file.findUnique({
     where: { id: parentId },
-    select: { workspaceId: true },
+    select: { workspaceId: true, isFolder: true },
   });
   if (!root || (ctx && root.workspaceId !== ctx.workspaceId))
     throw new NotFoundError("Folder not found");
   const result: Array<{ id: string; storagePath: string | null }> = [];
-  const visited = new Set([parentId]);
+  const isFolder = new Map([[parentId, root.isFolder]]);
+  const writableScopes = new Set<string>();
   let parents = [parentId];
-  while (parents.length) {
-    const children = await prisma.file.findMany({
-      where: { parentId: { in: parents } },
-      select: {
-        id: true,
-        workspaceId: true,
-        storagePath: true,
-        isFolder: true,
-      },
-    });
+  for (let depth = 1; parents.length; depth++) {
+    const children = [];
+    for (const batch of batches(parents))
+      children.push(
+        ...(await prisma.file.findMany({
+          where: { parentId: { in: batch } },
+          select: {
+            id: true,
+            parentId: true,
+            workspaceId: true,
+            storagePath: true,
+            isFolder: true,
+            ownerId: true,
+            teamFolderId: true,
+            asTeamFolder: { select: { id: true } },
+          },
+        })),
+      );
+    if (children.length === 0) break;
+    if (depth > graphLimits.maxDepth) graphTooLarge();
     parents = [];
     for (const child of children) {
-      if (visited.has(child.id) || child.workspaceId !== root.workspaceId)
+      if (
+        isFolder.has(child.id) ||
+        child.workspaceId !== root.workspaceId ||
+        !isFolder.get(child.parentId!)
+      )
         throw new ForbiddenError("Invalid folder ancestry");
-      visited.add(child.id);
-      if (ctx) await assertFileAccess(prisma, child.id, ctx, true, true);
+      if (result.length >= graphLimits.maxNodes) graphTooLarge();
+      isFolder.set(child.id, child.isFolder);
+      // A write check depends only on the effective team and owner, so one
+      // check per distinct scope is exact and keeps the locked walk short.
+      const scope = `${child.asTeamFolder?.id ?? child.teamFolderId}:${child.ownerId}`;
+      if (ctx && !writableScopes.has(scope)) {
+        await assertFileAccess(prisma, child.id, ctx, true, true);
+        writableScopes.add(scope);
+      }
       result.push({ id: child.id, storagePath: child.storagePath });
-      if (child.isFolder) parents.push(child.id);
+      parents.push(child.id);
     }
   }
   return result;
@@ -630,7 +693,9 @@ async function collectFolderEntries(
   parentId: string,
   prefix: string,
   ctx: AccessContext,
+  budget: { nodes: number },
   visited = new Set<string>(),
+  depth = 0,
 ): Promise<ArchiveEntry[]> {
   if (visited.has(parentId))
     throw new ForbiddenError("Invalid folder ancestry");
@@ -639,9 +704,11 @@ async function collectFolderEntries(
     where: { parentId, trashedAt: null },
     select: { id: true, name: true, isFolder: true, storagePath: true },
   });
+  if (children.length > 0 && depth >= graphLimits.maxDepth) graphTooLarge();
 
   const entries: ArchiveEntry[] = [];
   for (const child of children) {
+    if (++budget.nodes > graphLimits.maxNodes) graphTooLarge();
     await assertFileAccess(prisma, child.id, ctx);
     if (child.isFolder) {
       const nested = await collectFolderEntries(
@@ -650,7 +717,9 @@ async function collectFolderEntries(
         child.id,
         `${prefix}${child.name}/`,
         ctx,
+        budget,
         visited,
+        depth + 1,
       );
       entries.push(...nested);
     } else if (child.storagePath) {
@@ -684,8 +753,10 @@ export async function archiveFiles(
     await assertFileAccess(prisma, file.id, { ...ctx, workspaceId });
   }
 
-  // Collect all entries, expanding folders recursively
+  // Collect all entries, expanding folders within one depth/size budget
+  // before any stored bytes are opened.
   const entries: ArchiveEntry[] = [];
+  const budget = { nodes: 0 };
   for (const file of files) {
     if (file.isFolder) {
       const nested = await collectFolderEntries(
@@ -694,6 +765,7 @@ export async function archiveFiles(
         file.id,
         `${file.name}/`,
         { ...ctx, workspaceId },
+        budget,
       );
       entries.push(...nested);
     } else if (file.storagePath) {

@@ -1,4 +1,8 @@
-import type { Prisma, PrismaClient } from "@prisma/client";
+import type { Prisma } from "@prisma/client";
+
+// Accepts the global client or an interactive transaction client, so graph
+// writers can repeat every check inside their workspace-locked transaction.
+type Db = Prisma.TransactionClient;
 import {
   ForbiddenError,
   NotFoundError,
@@ -11,7 +15,7 @@ export interface AccessContext {
   workspaceRole: string;
 }
 
-export async function fileAccessRole(prisma: PrismaClient, ctx: AccessContext) {
+export async function fileAccessRole(prisma: Db, ctx: AccessContext) {
   const member = await prisma.workspaceMember.findUnique({
     where: {
       userId_workspaceId: { userId: ctx.userId, workspaceId: ctx.workspaceId },
@@ -48,7 +52,7 @@ export function teamFolderAccessWhere(
  * Revoking a group does not revoke a separate explicit grant; both are checked
  * from current database state on every request.
  */
-async function sharedFileIds(prisma: PrismaClient, ctx: AccessContext) {
+async function sharedFileIds(prisma: Db, ctx: AccessContext) {
   const files = await prisma.$queryRaw<{ id: string }[]>`
     WITH RECURSIVE scoped AS (
       SELECT f.id, f."parentId", f."ownerId", f."isFolder",
@@ -80,7 +84,7 @@ async function sharedFileIds(prisma: PrismaClient, ctx: AccessContext) {
 }
 
 export async function fileReadWhere(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: AccessContext,
   allowTrashed = false,
 ): Promise<Prisma.FileWhereInput> {
@@ -119,7 +123,7 @@ export async function fileReadWhere(
 
 /** Resolve the resource workspace and current role before any access shortcut. */
 export async function assertFileAccess(
-  prisma: PrismaClient,
+  prisma: Db,
   fileId: string,
   ctx: AccessContext,
   requireWrite = false,
@@ -187,7 +191,7 @@ export async function assertFileAccess(
 
 /** Authorize the actual destination before storage or database writes. */
 export async function resolveFileDestination(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: AccessContext,
   parentId?: string | null,
   requestedTeamFolderId?: string | null,

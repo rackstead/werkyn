@@ -708,6 +708,7 @@ model File {
   shareLinkFiles FileShareLinkFile[]
 
   @@index([workspaceId, parentId])
+  @@index([parentId])
   @@index([workspaceId, trashedAt])
   @@index([uploadedById])
   @@index([ownerId])
@@ -948,6 +949,7 @@ model WikiPage {
   share        WikiPageShare?
 
   @@index([spaceId, parentId, position])
+  @@index([parentId])
   @@index([createdById])
 }
 

@@ -4,7 +4,12 @@ import type { PrismaClient } from "@prisma/client";
 import { BackupFileSchema, type BackupFile, type RestoreSummary } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import { IdMapper, UserMapper } from "./id-mapper.js";
-import { ValidationError } from "../../utils/errors.js";
+import {
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+} from "../../utils/errors.js";
+import { lockWorkspace } from "../../utils/workspace-lock.js";
 import { rewriteUrls } from "./backup-assets.js";
 import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
@@ -22,7 +27,53 @@ function parseBackupFile(buffer: Buffer): BackupFile {
     const issues = result.error.issues.slice(0, 5).map((i) => i.message).join("; ");
     throw new ValidationError(`Invalid backup file format: ${issues}`);
   }
+  validateWikiGraph(result.data);
   return result.data;
+}
+
+/**
+ * Preview and restore share this check, so an invalid page hierarchy is
+ * rejected before any asset or database write. A parent must be another page
+ * of the same space and the parent chain must end at a root. A parent that is
+ * absent from the whole backup keeps the existing skip-with-warning behavior.
+ */
+function validateWikiGraph(backup: BackupFile) {
+  const spaceOf = new Map<string, number>();
+  backup.wikiSpaces.forEach((ws, index) => {
+    for (const p of ws.pages) spaceOf.set(p._originalId, index);
+  });
+  backup.wikiSpaces.forEach((ws, index) => {
+    const parents = new Map<string, string | null>();
+    for (const p of ws.pages) {
+      if (parents.has(p._originalId))
+        throw new ValidationError(
+          "Invalid backup file: duplicate wiki page id",
+        );
+      parents.set(p._originalId, p.parentRef ?? null);
+    }
+    for (const p of ws.pages) {
+      if (!p.parentRef) continue;
+      if (!parents.has(p.parentRef) && spaceOf.has(p.parentRef))
+        throw new ValidationError(
+          "Invalid backup file: wiki page parent is in another space",
+        );
+    }
+    // Every chain is walked at most once (`done`), so this is linear.
+    const done = new Set<string>();
+    for (const start of parents.keys()) {
+      const path = new Set<string>();
+      let current: string | null | undefined = start;
+      while (current && parents.has(current) && !done.has(current)) {
+        if (path.has(current))
+          throw new ValidationError(
+            "Invalid backup file: wiki page hierarchy contains a cycle",
+          );
+        path.add(current);
+        current = parents.get(current);
+      }
+      for (const id of path) done.add(id);
+    }
+  });
 }
 
 /** Build a UserMapper from backup metadata + workspace members. */
@@ -169,6 +220,7 @@ export async function executeRestore(
   // ─── Re-upload assets and build URL rewrite map ────────
 
   const assetUrlMap = new Map<string, string>(); // "assets/file.png" → "/storage/new/path"
+  const savedAssets: string[] = [];
 
   if (assets && assets.size > 0 && storage) {
     for (const [assetPath, buffer] of assets) {
@@ -186,6 +238,7 @@ export async function executeRestore(
           ext,
           buffer,
         );
+        savedAssets.push(storagePath);
         assetUrlMap.set(assetPath, `/storage/${storagePath}`);
         counts.images++;
       } catch {
@@ -194,8 +247,28 @@ export async function executeRestore(
     }
   }
 
+  // Assets staged above have no rows when the transaction rolls back (for
+  // example after the role re-check below), so remove them best-effort.
+  const discardStagedAssets = async (error: unknown) => {
+    if (storage)
+      for (const storagePath of savedAssets)
+        await storage.delete(storagePath).catch(() => {});
+    throw error;
+  };
+
   await prisma.$transaction(
     async (tx) => {
+      // New wiki spaces/pages are appended under the same workspace lock as
+      // runtime wiki writers, with the administrator role re-read after it.
+      if (!(await lockWorkspace(tx, workspaceId)))
+        throw new NotFoundError("Workspace not found");
+      const admin = await tx.workspaceMember.findUnique({
+        where: { userId_workspaceId: { userId: adminUserId, workspaceId } },
+        select: { role: true },
+      });
+      if (admin?.role !== "ADMIN")
+        throw new ForbiddenError("Insufficient permissions");
+
       // ─── Restore Projects ───────────────────────────────
 
       for (const pEntry of backup.projects) {
@@ -500,6 +573,10 @@ export async function executeRestore(
         });
         counts.wikiSpaces++;
 
+        // Parent references resolve only to pages of this space; a global
+        // id lookup could match an unrelated restored entity.
+        const spacePageIds = new Map<string, string>();
+
         // First pass: create all pages with parentId = null
         for (const p of wsEntry.pages) {
           // Rewrite asset URLs in page content if we have re-uploaded assets
@@ -520,6 +597,7 @@ export async function executeRestore(
             },
           });
           idMapper.set(p._originalId, newPage.id);
+          spacePageIds.set(p._originalId, newPage.id);
           counts.wikiPages++;
 
           // Comments
@@ -543,8 +621,8 @@ export async function executeRestore(
         // Second pass: set parentId for pages that have a parentRef
         for (const p of wsEntry.pages) {
           if (!p.parentRef) continue;
-          const newPageId = idMapper.get(p._originalId);
-          const newParentId = idMapper.get(p.parentRef);
+          const newPageId = spacePageIds.get(p._originalId);
+          const newParentId = spacePageIds.get(p.parentRef);
           if (!newPageId || !newParentId) {
             warnings.push(
               `Skipped parent link for wiki page "${p.title}" — parent ref ${p.parentRef} not found`,
@@ -559,7 +637,7 @@ export async function executeRestore(
       }
     },
     { timeout: 120_000 },
-  );
+  ).catch(discardStagedAssets);
 
   return {
     ...counts,

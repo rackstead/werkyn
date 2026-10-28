@@ -231,6 +231,7 @@ export function TimeReportsPage({
           nonBillableHours={report.summary.nonBillableHours}
           costByCurrency={report.summary.costByCurrency}
           unratedBillableHours={report.summary.unratedBillableHours}
+          skippedEntries={report.summary.skippedEntries}
         />
       )}
 

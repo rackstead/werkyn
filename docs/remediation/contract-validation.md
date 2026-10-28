@@ -57,8 +57,11 @@ is still logged.
 `TimeEntry.hours` and `UserRate.rate` are `double precision` columns, which can
 hold NaN and ±Infinity through direct database writes. Prisma cannot read
 those values and used to fail the whole report. The report now leaves such
-entries out and counts them in `summary.skippedEntries`; a non-finite rate
-prices nothing, so the dates it covers count as unrated. The bound used for
+entries out and counts them in `summary.skippedEntries`; the CSV export sends
+the same count in an `X-Skipped-Entries` header, the report page shows a
+warning when it is not zero, and the server logs a warning with the workspace
+and date range. A non-finite rate prices nothing, so the dates it covers count
+as unrated. The bound used for
 "finite" is ±1e308 because Prisma sends query numbers with 16 significant
 digits; the few finite values beyond it are treated the same way. Other reads
 of such rows (the time entry list, rate list) still fail, now with a generic

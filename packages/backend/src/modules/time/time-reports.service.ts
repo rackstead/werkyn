@@ -279,5 +279,8 @@ export async function exportReportCSV(
     ]),
   );
 
-  return encodeCsv(header, records);
+  return {
+    csv: encodeCsv(header, records),
+    skippedEntries: report.summary.skippedEntries,
+  };
 }

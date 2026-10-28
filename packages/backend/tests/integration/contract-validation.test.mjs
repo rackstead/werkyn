@@ -326,6 +326,7 @@ test("time reports skip legacy non-finite hours and treat non-finite rates as un
     }
     const csv = await req("GET", exportUrl(query));
     assert.equal(csv.statusCode, 200, csv.body);
+    assert.equal(csv.headers["x-skipped-entries"], "3");
     const rows = csv.body.replace(/^﻿/, "").trim().split("\r\n");
     assert.equal(rows.length, 3, csv.body);
     assert.doesNotMatch(csv.body, /NaN|Infinity/);

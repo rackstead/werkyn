@@ -36,7 +36,9 @@ test("single-line text allows tab; multi-line text also allows line breaks; neit
     assert.equal(single.safeParse(ok).success, true, ok);
     assert.equal(multi.safeParse(ok).success, true, ok);
   }
-  for (const lineBreak of ["a\nb", "a\rb", "a\r\nb"]) {
+  // JavaScript's `$` (without the m flag) only matches at the very end, so a
+  // trailing line break is part of the checked value.
+  for (const lineBreak of ["a\nb", "a\rb", "a\r\nb", "Name\n", "\n", "\r\n"]) {
     assert.equal(single.safeParse(lineBreak).success, false, JSON.stringify(lineBreak));
     assert.equal(multi.safeParse(lineBreak).success, true, JSON.stringify(lineBreak));
   }

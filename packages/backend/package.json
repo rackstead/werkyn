@@ -27,7 +27,7 @@
     "@fastify/websocket": "^11.0.2",
     "@pm/shared": "workspace:*",
     "@prisma/client": "^6.3.1",
-    "bcrypt": "^5.1.1",
+    "bcrypt": "^6.0.0",
     "fastify": "^5.12.7",
     "fastify-plugin": "^5.0.1",
     "file-type": "^21.3.2",

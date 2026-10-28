@@ -18,7 +18,7 @@ import {
 //
 // The send request runs the first attempt right after its commit. A delivered
 // message's row is deleted. Any failure leaves the row with a backoff, and
-// processDueChatMessageDeliveries (scheduled in server.ts) retries it. A
+// the worker started in server.ts (startChatMessageDeliveryWorker) retries it. A
 // crashed attempt's lease expires and the row is picked up again.
 
 const LEASE_MS = 60_000;
@@ -353,4 +353,45 @@ export async function processDueChatMessageDeliveries(
     results[await deliverChatMessage(prisma, messageId, { ...options, now })] += 1;
   }
   return results;
+}
+
+export interface ChatMessageDeliveryWorker {
+  run(): Promise<void>;
+  /** Stops scheduling passes and waits for the one in progress, if any. */
+  stop(): Promise<void>;
+}
+
+/**
+ * Runs a retry pass every intervalMs. Passes never overlap; one stopped
+ * mid-way loses nothing, because unfinished rows are retried after their
+ * lease expires.
+ */
+export function startChatMessageDeliveryWorker(
+  app: { prisma: PrismaClient; log: DeliveryLogger },
+  options: { intervalMs?: number } = {},
+): ChatMessageDeliveryWorker {
+  const { intervalMs = 30_000 } = options;
+  let stopped = false;
+  let running: Promise<void> | undefined;
+
+  const run = () => {
+    if (stopped) return running ?? Promise.resolve();
+    running ??= processDueChatMessageDeliveries(app.prisma, { log: app.log })
+      .then(() => undefined)
+      .catch((err) => app.log.error(err, "Failed to run chat message delivery retries"))
+      .finally(() => {
+        running = undefined;
+      });
+    return running;
+  };
+
+  const interval = setInterval(run, intervalMs);
+  return {
+    run,
+    async stop() {
+      stopped = true;
+      clearInterval(interval);
+      await running;
+    },
+  };
 }

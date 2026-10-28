@@ -284,13 +284,16 @@ export function useUpdateWikiPage() {
         .patch(`wiki/pages/${pageId}`, { json: data, ...(expectedUserId ? { context: { expectedUserId } } : {}) })
         .json<{ data: WikiPage }>();
     },
-    onSuccess: async (result, { pageId, expectedUserId }) => {
+    onSuccess: async (result, { pageId, expectedUserId, ...data }) => {
       if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
       // PATCH returns the full page. Prevent an older GET from replacing it.
       await qc.cancelQueries({ queryKey: queryKeys.wikiPage(pageId) });
       if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
       qc.setQueryData(queryKeys.wikiPage(pageId), result);
-      qc.invalidateQueries({ queryKey: ["wiki-pages"] });
+      // A content save is already in the cache; a new title or icon also
+      // shows in the page tree and breadcrumbs.
+      if ("title" in data || "icon" in data)
+        qc.invalidateQueries({ queryKey: ["wiki-pages"] });
     },
     onError: (error, { expectedUserId }) => {
       // Editor autosaves report failures through their own retry notice.

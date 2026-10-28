@@ -145,6 +145,13 @@ function WikiPageSession({
     }
   }, [release]);
 
+  // Leaving needs every change stored. If only the lock release fails after
+  // that, the lock simply expires, so it does not hold the user on the page.
+  const leaveEditing = useCallback(async () => {
+    await autosave.flush();
+    await finishEditing().catch(() => {});
+  }, [autosave.flush, finishEditing]);
+
   const handleStopEditing = () => {
     void finishEditing().catch(() => {});
   };
@@ -171,7 +178,7 @@ function WikiPageSession({
     <div className="mx-auto max-w-4xl p-8">
       {router && (
         <EditorNavigationGuard
-          beforeLeave={finishEditing}
+          beforeLeave={leaveEditing}
           hasUnsavedChanges={autosave.hasUnsavedChanges}
         />
       )}
@@ -182,11 +189,7 @@ function WikiPageSession({
             <span key={crumb.id} className="flex items-center gap-1">
               {i > 0 && <ChevronRight className="h-3 w-3" />}
               <button
-                onClick={() => {
-                  void finishEditing()
-                    .then(() => onNavigatePage(crumb.id))
-                    .catch(() => {});
-                }}
+                onClick={() => onNavigatePage(crumb.id)}
                 className="hover:text-foreground transition-colors"
               >
                 {crumb.icon ? (

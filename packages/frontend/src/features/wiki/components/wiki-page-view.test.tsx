@@ -529,6 +529,24 @@ describe("entity-bound Wiki autosave", () => {
     expect(http.delete).toHaveBeenCalledTimes(1);
   });
 
+  it("a content save refreshes no other wiki queries; a title save refreshes the tree", async () => {
+    const id = `refresh-${++suffix}`;
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const screen = render(view(id), { wrapper });
+    fireEvent.change(screen.getByLabelText("Page body"), {
+      target: { value: "body only" },
+    });
+    await tick(801);
+    expect(written).toHaveLength(1);
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["wiki-pages"] });
+    const heading = screen.getByRole("heading");
+    heading.textContent = `${id} renamed`;
+    fireEvent.input(heading);
+    await tick(801);
+    expect(written).toHaveLength(2);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["wiki-pages"] });
+  });
+
   it("reverting or clearing an unsent title edit sends nothing", async () => {
     const id = `title-revert-${++suffix}`;
     const screen = render(view(id), { wrapper });

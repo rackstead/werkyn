@@ -452,6 +452,7 @@ test("current project membership is rechecked on every attachment operation", as
   await assert.rejects(
     service.deleteAttachment(
       app.prisma,
+      app.storage,
       workspace.id,
       attachment.id,
       ctx("MEMBER"),
@@ -630,6 +631,7 @@ test("VIEWER reads require both authorities and stale ADMIN context cannot enabl
   await assert.rejects(
     service.deleteAttachment(
       app.prisma,
+      app.storage,
       workspace.id,
       attachment.id,
       ctx("VIEWER"),
@@ -648,6 +650,7 @@ test("delete requires the current uploader or local admin rather than a supplied
   await assert.rejects(
     service.deleteAttachment(
       app.prisma,
+      app.storage,
       workspace.id,
       attachment.id,
       ctx("MEMBER"),
@@ -672,6 +675,7 @@ test("delete requires the current uploader or local admin rather than a supplied
     await assert.rejects(
       service.deleteAttachment(
         app.prisma,
+        app.storage,
         workspace.id,
         attachment.id,
         ctx("ADMIN"),
@@ -693,6 +697,7 @@ test("delete requires the current uploader or local admin rather than a supplied
   const before = { ...effects };
   await service.deleteAttachment(
     app.prisma,
+    app.storage,
     workspace.id,
     attachment.id,
     ctx("ADMIN", "VIEWER"),
@@ -743,6 +748,7 @@ test("removed workspace membership overrides retained project and source grants 
       () =>
         service.deleteAttachment(
           app.prisma,
+          app.storage,
           workspace.id,
           attachment.id,
           ctx("MEMBER"),

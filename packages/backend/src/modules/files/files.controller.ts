@@ -116,6 +116,8 @@ export async function downloadFileHandler(
   const params = request.params as { wid: string; fid: string };
   const query = request.query as { inline?: string };
 
+  // Set before the blob is opened so a missing-content error keeps it too.
+  applyUntrustedContentPolicy(reply);
   const { stream, file } = await filesService.downloadFile(
     request.server.storage,
     request.server.prisma,
@@ -126,7 +128,6 @@ export async function downloadFileHandler(
 
   const isInline =
     query.inline === "true" && isSafeInlineContentType(file.mimeType);
-  applyUntrustedContentPolicy(reply);
 
   return reply
     .header(
@@ -159,12 +160,12 @@ export async function downloadThumbnailHandler(
     getAccessCtx(request),
   );
 
-  const stream = request.server.storage.readStream(file.thumbnailPath);
+  reply.header("Cache-Control", "private, no-store");
+  const stream = await request.server.storage.openReadStream(
+    file.thumbnailPath,
+  );
 
-  return reply
-    .header("Content-Type", "image/webp")
-    .header("Cache-Control", "private, no-store")
-    .send(stream);
+  return reply.header("Content-Type", "image/webp").send(stream);
 }
 
 export async function updateFileHandler(

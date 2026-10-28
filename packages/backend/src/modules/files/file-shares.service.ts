@@ -3,6 +3,7 @@ import {
   updateShareRevision,
 } from "../../utils/share-grants.js";
 import type { PrismaClient } from "@prisma/client";
+import type { StorageProvider } from "../../services/storage.js";
 import type { FastifyInstance } from "fastify";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
@@ -512,7 +513,7 @@ export async function validateShareLinkAccess(
 
 export async function downloadPublicFile(
   prisma: PrismaClient,
-  storage: { readStream: (path: string) => NodeJS.ReadableStream },
+  storage: Pick<StorageProvider, "openReadStream">,
   token: string,
   fileId: string,
   grant?: string,
@@ -548,7 +549,7 @@ export async function downloadPublicFile(
     throw new NotFoundError("File content not available");
   }
 
-  const stream = storage.readStream(file.storagePath);
+  const stream = await storage.openReadStream(file.storagePath);
   return { stream, file };
 }
 

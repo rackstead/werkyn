@@ -1,7 +1,26 @@
 import fs from "node:fs/promises";
 import fss from "node:fs";
+import { once } from "node:events";
 import path from "node:path";
 import type { Readable } from "node:stream";
+import { GoneError } from "../utils/errors.js";
+
+/**
+ * A record exists but its stored bytes do not (for example a blob removed
+ * outside the application or lost in a restore). Reported as 410 JSON before
+ * any response headers are written, never as an unhandled stream error.
+ */
+export class MissingBlobError extends GoneError {
+  constructor() {
+    super("File content is no longer available");
+  }
+}
+
+/** ENOENT/ENOTDIR: the blob (or a parent directory) does not exist. */
+export function isMissingBlobError(error: unknown) {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
 
 export interface StorageProvider {
   save(
@@ -21,6 +40,12 @@ export interface StorageProvider {
   ): Promise<{ storagePath: string; size: number }>;
   read(storagePath: string): Promise<Buffer>;
   readStream(storagePath: string): fss.ReadStream;
+  /** Opens the blob first; a missing blob rejects with MissingBlobError. */
+  openReadStream(storagePath: string): Promise<fss.ReadStream>;
+  /**
+   * Idempotent: a blob that is already gone counts as deleted. Any other
+   * storage failure is thrown so durable cleanup can retry it.
+   */
   delete(storagePath: string): Promise<void>;
   exists(storagePath: string): Promise<boolean>;
 }
@@ -135,11 +160,25 @@ export class LocalStorageProvider implements StorageProvider {
     return fss.createReadStream(fullPath);
   }
 
+  async openReadStream(storagePath: string): Promise<fss.ReadStream> {
+    const stream = this.readStream(storagePath);
+    try {
+      await once(stream, "open");
+    } catch (error) {
+      stream.destroy();
+      if (isMissingBlobError(error)) throw new MissingBlobError();
+      throw error;
+    }
+    return stream;
+  }
+
   async delete(storagePath: string): Promise<void> {
     const fullPath = this.safePath(storagePath);
-    await fs.unlink(fullPath).catch(() => {
-      // Ignore if file already deleted
-    });
+    try {
+      await fs.unlink(fullPath);
+    } catch (error) {
+      if (!isMissingBlobError(error)) throw error;
+    }
   }
 
   async exists(storagePath: string): Promise<boolean> {

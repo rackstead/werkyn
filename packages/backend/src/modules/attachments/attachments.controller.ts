@@ -59,6 +59,7 @@ export async function deleteAttachmentHandler(
 
   await attachmentsService.deleteAttachment(
     request.server.prisma,
+    request.server.storage,
     params.wid,
     params.aid,
     getAccessCtx(request),

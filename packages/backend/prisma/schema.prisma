@@ -713,6 +713,23 @@ model File {
   @@index([uploadedById])
   @@index([ownerId])
   @@index([teamFolderId])
+  @@index([storagePath])
+  @@index([thumbnailPath])
+}
+
+// Stored blobs whose owning row is gone. Database triggers (see the
+// add_blob_cleanup_queue migration) insert a row in the same transaction that
+// deletes a File, a legacy Attachment or the Task/Comment that cascades it, so
+// a crash or storage failure after the commit never loses cleanup work.
+// services/blob-cleanup.ts removes the blob and then this row, idempotently.
+model BlobCleanup {
+  storagePath String   @id
+  attempts    Int      @default(0)
+  lastError   String?
+  availableAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([availableAt])
 }
 
 model StarredFile {

@@ -4,6 +4,7 @@ import { cleanupExpiredTokensAndAttempts } from "./modules/auth/auth.service.js"
 import { processDueDateReminders } from "./schedulers/due-date-reminders.js";
 import { processRecurringTasks } from "./schedulers/recurring-tasks.js";
 import { processTrashPurge } from "./schedulers/trash-purge.js";
+import { startBlobCleanupWorker } from "./services/blob-cleanup.js";
 import { dexManager } from "./services/dex-manager.js";
 
 async function start() {
@@ -79,6 +80,9 @@ async function start() {
       24 * 60 * 60 * 1000,
     );
 
+    // Remove queued stored blobs after 30s, then every 5 minutes
+    const blobCleanup = startBlobCleanupWorker(app);
+
     // Start embedded Dex (SSO identity provider)
     dexManager.start(app.prisma, app.log).catch((err) => {
       app.log.error(err, "Failed to start Dex");
@@ -87,6 +91,7 @@ async function start() {
     // Graceful shutdown
     const shutdown = async () => {
       app.log.info("Shutting down...");
+      await blobCleanup.stop();
       await dexManager.stop();
       await app.close();
       process.exit(0);

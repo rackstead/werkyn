@@ -130,15 +130,6 @@ export function useChatRealtime(
           }
           break;
 
-        case "notification_created":
-          queryClient.invalidateQueries({
-            queryKey: queryKeys.notificationUnreadCount,
-          });
-          queryClient.invalidateQueries({
-            queryKey: queryKeys.notifications,
-          });
-          break;
-
         case "presence_online":
         case "presence_offline":
           if (workspaceId) {
@@ -213,15 +204,6 @@ export function useChatRealtime(
           });
           break;
 
-        case "notification_created":
-          queryClient.invalidateQueries({
-            queryKey: queryKeys.notificationUnreadCount,
-          });
-          queryClient.invalidateQueries({
-            queryKey: queryKeys.notifications,
-          });
-          break;
-
         case "chat_thread_reply":
           if (data.parentId) {
             queryClient.invalidateQueries({
@@ -238,7 +220,6 @@ export function useChatRealtime(
     client.on("chat_channel_unarchived", handleWorkspaceEvent);
     client.on("presence_online", handleWorkspaceEvent);
     client.on("presence_offline", handleWorkspaceEvent);
-    client.on("notification_created", handleWorkspaceEvent);
     client.on("chat_thread_reply", handleWorkspaceEvent);
 
     return () => {
@@ -248,7 +229,6 @@ export function useChatRealtime(
       client.off("chat_channel_unarchived", handleWorkspaceEvent);
       client.off("presence_online", handleWorkspaceEvent);
       client.off("presence_offline", handleWorkspaceEvent);
-      client.off("notification_created", handleWorkspaceEvent);
       client.off("chat_thread_reply", handleWorkspaceEvent);
     };
   }, [client, workspaceId]);

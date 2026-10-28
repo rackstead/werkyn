@@ -278,13 +278,19 @@ describe("entity-bound Wiki autosave", () => {
     expect(written).toHaveLength(1);
     expect(http.delete).not.toHaveBeenCalled();
     const reopened = render(view(id), { wrapper });
+    await tick();
+    // Reopening shows the stored page and offers the draft instead of resending it.
+    expect(
+      (reopened.getByLabelText("Page body") as HTMLTextAreaElement).value,
+    ).not.toContain("closed draft");
+    expect(written).toHaveLength(1);
+    nextPatch = undefined;
+    fireEvent.click(reopened.getByText("Restore changes"));
+    await tick();
+    expect(written[1]).toEqual(written[0]);
     expect(
       (reopened.getByLabelText("Page body") as HTMLTextAreaElement).value,
     ).toContain("closed draft");
-    nextPatch = undefined;
-    fireEvent.click(reopened.getByText("Retry save"));
-    await tick();
-    expect(written[1]).toEqual(written[0]);
   });
 
   it("queues title input before blur so navigation cannot silently drop it", async () => {
@@ -317,18 +323,21 @@ describe("entity-bound Wiki autosave", () => {
     expect(
       (screen.getByLabelText("Page body") as HTMLTextAreaElement).value,
     ).not.toContain("Alice private draft");
-    const retry = notices.error.mock.calls.at(-1)?.[1]?.action?.onClick;
-    expect(retry).toBeTypeOf("function");
-    retry();
-    await tick();
-    expect(written).toHaveLength(0);
+    // Alice's notice is not left on screen (or retryable) for Bob.
+    expect(notices.dismiss).toHaveBeenCalledWith(
+      `autosave:wiki:editor-user:${id}`,
+    );
+    expect(
+      notices.error.mock.calls.filter(([, options]) => options?.action),
+    ).toHaveLength(0);
     act(() => {
       useAuthStore.setState({
         user: { ...useAuthStore.getState().user!, id: "editor-user" },
       });
     });
     await tick();
-    fireEvent.click(screen.getByText("Retry save"));
+    expect(written).toHaveLength(0);
+    fireEvent.click(screen.getByText("Restore changes"));
     await tick();
     expect(written[0].path).toBe(`wiki/pages/${id}`);
     expect(JSON.stringify(written[0].body)).toContain("Alice private draft");
@@ -641,6 +650,11 @@ describe("entity-bound Wiki autosave", () => {
 
   it("repeated save failures share one notice that a successful save clears", async () => {
     const id = `notice-${++suffix}`;
+    const generic = vi.fn();
+    client.setDefaultOptions({
+      ...client.getDefaultOptions(),
+      mutations: { retry: false, onError: generic },
+    });
     nextPatch = () => Promise.reject(new Error("Offline"));
     const screen = render(view(id), { wrapper });
     fireEvent.change(screen.getByLabelText("Page body"), {
@@ -660,5 +674,169 @@ describe("entity-bound Wiki autosave", () => {
     fireEvent.click(screen.getByText("Retry save"));
     await tick();
     expect(notices.dismiss).toHaveBeenCalledWith(notice);
+    // No generic per-attempt error toast alongside the autosave notice.
+    expect(generic).not.toHaveBeenCalled();
+  });
+
+  describe("retained drafts never overwrite another editor's work (R1)", () => {
+    function lockState() {
+      const state = { owner: "editor-user" as string | null, offline: false };
+      const refetch = vi.fn();
+      vi.mocked(wiki.useWikiPageLock).mockImplementation(
+        (id) =>
+          ({
+            data: {
+              data: state.owner
+                ? {
+                    id: `lock-${id}`,
+                    pageId: id,
+                    userId: state.owner,
+                    user: {
+                      displayName: state.owner === "bob" ? "Bob" : "Editor",
+                    },
+                  }
+                : null,
+            },
+            refetch,
+          }) as any,
+      );
+      const patch = http.patch.getMockImplementation()!;
+      http.patch.mockImplementation((path: string, options: any) => {
+        if (path.endsWith("/heartbeat")) {
+          if (state.offline)
+            return Promise.reject(new TypeError("Failed to fetch"));
+          return state.owner === "editor-user"
+            ? Promise.resolve(undefined)
+            : Promise.reject(
+                Object.assign(new Error("No active lock found"), {
+                  statusCode: 404,
+                }),
+              );
+        }
+        if (!state.offline) return patch(path, options);
+        return {
+          json: async () => {
+            written.push({ path, body: options.json });
+            throw new TypeError("Failed to fetch");
+          },
+        };
+      });
+      http.post.mockImplementation(() => {
+        state.owner = "editor-user";
+        return { json: async () => ({ data: {} }) };
+      });
+      return state;
+    }
+    const writesTo = (id: string) =>
+      written.filter((entry) => entry.path === `wiki/pages/${id}`);
+    const body = (screen: ReturnType<typeof render>) =>
+      screen.getByLabelText("Page body") as HTMLTextAreaElement;
+
+    it("R1a: a draft that failed while the lock lapsed is not sent once another user holds it", async () => {
+      const a = `r1a-a-${++suffix}`,
+        b = `r1a-b-${suffix}`;
+      const state = lockState();
+      const screen = render(view(a), { wrapper });
+      await tick();
+      state.offline = true;
+      fireEvent.change(body(screen), {
+        target: { value: "Alice offline draft" },
+      });
+      await tick(801);
+      expect(writesTo(a)).toHaveLength(1);
+      // Renewals keep failing until the server could have let the lock lapse.
+      await tick(125_000);
+      // Soft checks keep the run going to the decisive write check below.
+      expect.soft(body(screen).disabled).toBe(true);
+      expect.soft(body(screen).value).not.toContain("Alice offline draft");
+      // Bob takes the expired lock and saves; Alice's network comes back.
+      state.owner = "bob";
+      page(a).content = [{ type: "paragraph", content: "Bob's edit" }];
+      state.offline = false;
+      await tick(30_001);
+      expect.soft(screen.queryByText(/Being edited by Bob/)).not.toBeNull();
+      expect
+        .soft(
+          (screen.queryByText("Restore changes") as HTMLButtonElement | null)
+            ?.disabled,
+        )
+        .toBe(true);
+      // Leaving the page (no Retry) must not send the retained draft.
+      screen.rerender(view(b));
+      await tick(801);
+      expect(writesTo(a)).toHaveLength(1);
+      screen.rerender(view(a));
+      await tick(801);
+      expect(writesTo(a)).toHaveLength(1);
+    });
+
+    it("R1b: a draft left by 'Leave anyway' is offered on reopen, not shown or replayed over newer work", async () => {
+      const a = `r1b-a-${++suffix}`,
+        b = `r1b-b-${suffix}`;
+      const state = lockState();
+      const screen = render(view(a), { wrapper });
+      await tick();
+      state.offline = true;
+      fireEvent.change(body(screen), {
+        target: { value: "Alice stale draft" },
+      });
+      screen.rerender(view(b));
+      await tick();
+      expect(writesTo(a)).toHaveLength(1);
+      // Later, Bob edits page A and finishes; Alice's network is back.
+      state.offline = false;
+      state.owner = null;
+      page(a).content = [{ type: "paragraph", content: "Bob finished edit" }];
+      screen.rerender(view(a));
+      await tick();
+      expect.soft(body(screen).value).toContain("Bob finished edit");
+      expect
+        .soft(
+          (screen.queryByText("Restore changes") as HTMLButtonElement | null)
+            ?.disabled,
+        )
+        .toBe(true);
+      screen.rerender(view(b));
+      await tick(801);
+      expect(writesTo(a)).toHaveLength(1);
+      // Starting to edit alone sends nothing; restoring is an explicit choice.
+      screen.rerender(view(a));
+      await tick();
+      fireEvent.click(screen.getByText("Start Editing"));
+      await tick();
+      await tick(801);
+      expect(writesTo(a)).toHaveLength(1);
+      fireEvent.click(screen.getByText("Restore changes"));
+      await tick();
+      expect(writesTo(a)).toHaveLength(2);
+      expect(JSON.stringify(writesTo(a)[1].body)).toContain(
+        "Alice stale draft",
+      );
+      expect(body(screen).value).toContain("Alice stale draft");
+    });
+
+    it("discarding a retained draft forgets it", async () => {
+      const a = `discard-a-${++suffix}`,
+        b = `discard-b-${suffix}`;
+      const state = lockState();
+      const screen = render(view(a), { wrapper });
+      await tick();
+      state.offline = true;
+      fireEvent.change(body(screen), { target: { value: "unwanted" } });
+      screen.rerender(view(b));
+      await tick();
+      state.offline = false;
+      screen.rerender(view(a));
+      await tick();
+      fireEvent.click(screen.getByText("Discard"));
+      await tick();
+      expect(screen.queryByText("Restore changes")).toBeNull();
+      screen.rerender(view(b));
+      await tick(801);
+      screen.rerender(view(a));
+      await tick();
+      expect(screen.queryByText("Restore changes")).toBeNull();
+      expect(writesTo(a)).toHaveLength(1);
+    });
   });
 });

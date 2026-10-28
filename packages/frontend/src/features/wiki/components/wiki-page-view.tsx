@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
@@ -59,11 +61,24 @@ function WikiPageSession({
     },
     [pageId, updatePage, userId],
   );
-  const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save);
+  // Only a session that currently holds the page lock may write. The backend
+  // does not enforce locks, so this is what keeps a retained draft from being
+  // replayed over another editor's work.
+  const holdsLock = useRef(false);
+  const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save, {
+    author: userId,
+    canSave: () =>
+      holdsLock.current ? null : "Start editing to save these changes",
+    retryFailedAutomatically: true,
+  });
   const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(
     pageId,
     autosave.flush,
   );
+  holdsLock.current = isLockedByMe;
+  const queryClient = useQueryClient();
+  // Remounts the editor and title when their document is replaced wholesale.
+  const [documentVersion, setDocumentVersion] = useState(0);
   const router = useRouter({ warn: false });
   const [finishing, setFinishing] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
@@ -74,6 +89,24 @@ function WikiPageSession({
   const breadcrumbs = breadcrumbsData?.data ?? [];
 
   const readOnly = !isLockedByMe || finishing || showVersions;
+
+  // Losing the lock (or no longer being able to confirm it) sets unsaved
+  // changes aside: the page shows the stored document again, and the changes
+  // are only sent if the user restores them while holding the lock.
+  useEffect(() => {
+    if (isLockedByMe) return;
+    if (autosave.status !== "error" && autosave.status !== "pending") return;
+    autosave.park();
+    setDocumentVersion((version) => version + 1);
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.wikiPage(pageId),
+    });
+  }, [isLockedByMe, autosave.status, autosave.park, queryClient, pageId]);
+
+  const restoreParked = () => {
+    void autosave.restoreParked().catch(() => {});
+    setDocumentVersion((version) => version + 1);
+  };
 
   const handleContentChange = useCallback(
     (content: Block[]) => {
@@ -176,6 +209,30 @@ function WikiPageSession({
         </div>
       )}
 
+      {/* Changes set aside after a failed save or a lost lock */}
+      {autosave.parked && (
+        <div
+          role="status"
+          className="mb-4 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-2 text-sm text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
+        >
+          <span className="flex-1">
+            Earlier changes to this page were not saved.
+            {!isLockedByMe && " Start editing to restore them."}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!isLockedByMe}
+            onClick={restoreParked}
+          >
+            Restore changes
+          </Button>
+          <Button size="sm" variant="ghost" onClick={autosave.discardParked}>
+            Discard
+          </Button>
+        </div>
+      )}
+
       {/* Toolbar */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
@@ -201,9 +258,15 @@ function WikiPageSession({
             <span role="alert">
               Changes not saved.{" "}
               <button
-                className="underline"
+                className="underline disabled:no-underline disabled:opacity-60"
+                disabled={!isLockedByMe}
+                title={
+                  isLockedByMe
+                    ? undefined
+                    : "Saving needs the editing lock for this page"
+                }
                 onClick={() => {
-                  void autosave.flush().catch(() => {});
+                  void autosave.retry().catch(() => {});
                 }}
               >
                 Retry save
@@ -211,7 +274,7 @@ function WikiPageSession({
             </span>
           ) : autosave.hasUnsavedChanges ? (
             "Saving changes…"
-          ) : (
+          ) : autosave.parked ? null : (
             "All changes saved"
           )}
         </div>
@@ -294,6 +357,7 @@ function WikiPageSession({
 
       {/* Title */}
       <EditableWikiTitle
+        key={documentVersion}
         title={page.title}
         recoveredTitle={autosave.draft?.title}
         readOnly={readOnly}
@@ -315,7 +379,7 @@ function WikiPageSession({
 
       {/* Editor */}
       <WikiEditor
-        key={pageId}
+        key={`${pageId}:${documentVersion}`}
         initialContent={page.content}
         recoveredContent={autosave.draft?.content}
         readOnly={readOnly}

@@ -127,10 +127,17 @@ it("does not persist a prior identity's pending task description under a new ide
     });
   });
   await tick();
-  expect(currentEditor().getHTML()).toBe("<p>Alice draft</p>");
-  // Closing as the original identity retries the retained draft immediately.
-  screen.unmount();
+  // The draft returns only as an explicit offer; the editor shows the server text.
+  expect(currentEditor().getHTML()).toBe("<p>Server</p>");
+  expect(screen.getByRole("status").textContent).toContain(
+    "Earlier changes to this description were not saved",
+  );
+  expect(http.patch).not.toHaveBeenCalled();
+  act(() => {
+    screen.getByText("Restore changes").click();
+  });
   await tick();
+  expect(currentEditor().getHTML()).toBe("<p>Alice draft</p>");
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
     json: { description: "<p>Alice draft</p>" },
     context: { expectedUserId: "task-editor-user" },
@@ -160,4 +167,74 @@ it("a failing autosave shows only its retry notice, not a generic error per atte
   expect(messages).toEqual([
     "Your changes couldn't be saved. Retry before closing this tab.",
   ]);
+});
+
+it("R1c: a failed description draft is offered on reopen, not shown or replayed over a newer description", async () => {
+  const id = `task-r1c-${++suffix}`;
+  let offline = true;
+  const patch = http.patch.getMockImplementation()!;
+  http.patch.mockImplementation((path: string, options: any) =>
+    offline
+      ? {
+          json: async () => {
+            throw new TypeError("Failed to fetch");
+          },
+        }
+      : patch(path, options),
+  );
+  const first = render(
+    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  act(() => {
+    currentEditor().commands.setContent("<p>Alice stale</p>");
+  });
+  // Closing inside the debounce saves immediately; that save fails.
+  first.unmount();
+  await tick();
+  expect(http.patch).toHaveBeenCalledTimes(1);
+  offline = false;
+  // Someone else has since saved a newer description.
+  const reopened = render(
+    <TaskDescription taskId={id} description="<p>Bob newer</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  expect(currentEditor().getHTML()).toBe("<p>Bob newer</p>");
+  expect(reopened.getByRole("status").textContent).toContain(
+    "Earlier changes to this description were not saved",
+  );
+  reopened.unmount();
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
+});
+
+it("a failed description is only resent when the user retries it", async () => {
+  const id = `task-retry-${++suffix}`;
+  let offline = true;
+  const patch = http.patch.getMockImplementation()!;
+  http.patch.mockImplementation((path: string, options: any) =>
+    offline
+      ? {
+          json: async () => {
+            throw new TypeError("Failed to fetch");
+          },
+        }
+      : patch(path, options),
+  );
+  const screen = render(
+    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  act(() => {
+    currentEditor().commands.setContent("<p>Draft</p>");
+  });
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
+  offline = false;
+  screen.unmount();
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
 });

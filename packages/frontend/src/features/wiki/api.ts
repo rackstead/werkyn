@@ -292,6 +292,11 @@ export function useUpdateWikiPage() {
       qc.setQueryData(queryKeys.wikiPage(pageId), result);
       qc.invalidateQueries({ queryKey: ["wiki-pages"] });
     },
+    onError: (error, { expectedUserId }) => {
+      // Editor autosaves report failures through their own retry notice.
+      if (expectedUserId) return;
+      toast.error(error.message || "Something went wrong");
+    },
   });
 }
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { AutosaveQueue } from "@/lib/autosave-queue";
+import { useAuthStore } from "@/stores/auth-store";
 
 const queues = new Map<
   string,
@@ -21,20 +22,44 @@ if (typeof window !== "undefined") {
   });
 }
 
+function retained<T extends object>(queue: AutosaveQueue<T>) {
+  const snapshot = queue.getSnapshot();
+  return snapshot.hasUnsavedChanges || snapshot.parked !== undefined;
+}
+
+export interface EntityAutosaveOptions {
+  /** The signed-in user whose edits this queue holds. */
+  author: string;
+  /** Why nothing may be sent right now (for example, no page lock), or null. */
+  canSave?: () => string | null;
+  /** Whether automatic flushes may resend a draft whose last attempt failed. */
+  retryFailedAutomatically: boolean;
+  delay?: number;
+}
+
 export function useEntityAutosave<T extends object>(
   entityKey: string,
   save: (patch: T) => Promise<unknown>,
-  delay = 800,
+  {
+    author,
+    canSave = () => null,
+    retryFailedAutomatically,
+    delay = 800,
+  }: EntityAutosaveOptions,
 ) {
   const queue = useMemo(() => {
     let existing = queues.get(entityKey)?.queue as AutosaveQueue<T> | undefined;
     if (!existing) {
-      // One notice per entity: repeated failures update it, a save clears it.
+      // One notice per entity: repeated failures update it, a save clears it,
+      // and it never stays on screen for a different signed-in user.
       const notice = `autosave:${entityKey}`;
-      const created = new AutosaveQueue<T>(
-        save,
-        delay,
-        (_error, retry) => {
+      const authorSignedIn = () => useAuthStore.getState().user?.id === author;
+      const created = new AutosaveQueue<T>(save, delay, {
+        onError: (_error, retry) => {
+          if (!authorSignedIn()) {
+            toast.dismiss(notice);
+            return;
+          }
           toast.error(
             "Your changes couldn't be saved. Retry before closing this tab.",
             {
@@ -49,28 +74,37 @@ export function useEntityAutosave<T extends object>(
             },
           );
         },
-        () => {
+        onIdle: () => {
           if (queues.get(entityKey)?.queue === created)
             queues.delete(entityKey);
         },
-        () => toast.dismiss(notice),
-      );
+        onSaved: () => toast.dismiss(notice),
+        onParked: (closed) => {
+          toast.dismiss(notice);
+          if (!closed || !authorSignedIn()) return;
+          toast.error(
+            "Some changes couldn't be saved. Reopen the item in this tab to restore or discard them.",
+            { id: notice, duration: Infinity },
+          );
+        },
+      });
       existing = created;
       queues.set(entityKey, {
         queue: created,
-        hasUnsavedChanges: () => created.getSnapshot().hasUnsavedChanges,
+        hasUnsavedChanges: () => retained(created),
       });
     }
     return existing;
   }, [entityKey]);
   queue.setSave(save);
+  queue.setPolicy({ canSave, retryFailedAutomatically });
   const subscribe = useCallback(
     (listener: () => void) => {
       // React can unsubscribe/re-subscribe the same mounted queue (StrictMode).
       // Re-register it so failed drafts retain unload protection and recovery.
       queues.set(entityKey, {
         queue,
-        hasUnsavedChanges: () => queue.getSnapshot().hasUnsavedChanges,
+        hasUnsavedChanges: () => retained(queue),
       });
       return queue.subscribe(listener);
     },
@@ -94,6 +128,10 @@ export function useEntityAutosave<T extends object>(
     ...snapshot,
     schedule: queue.schedule,
     flush: queue.flush,
+    retry: queue.retry,
     discard: queue.discard,
+    park: queue.park,
+    restoreParked: queue.restoreParked,
+    discardParked: queue.discardParked,
   };
 }

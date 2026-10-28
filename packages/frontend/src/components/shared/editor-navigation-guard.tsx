@@ -13,9 +13,9 @@ export function EditorNavigationGuard({
         await beforeLeave();
         return false;
       } catch {
-        // The draft stays queued in this tab for retry; never trap the user.
+        // The draft stays in this tab to restore later; never trap the user.
         return !window.confirm(
-          "Your changes could not be saved. Leave anyway? You can retry the unsaved changes when you reopen this item in this tab.",
+          "Your changes could not be saved. Leave anyway? They stay in this tab, and you can restore them when you reopen this item.",
         );
       }
     },

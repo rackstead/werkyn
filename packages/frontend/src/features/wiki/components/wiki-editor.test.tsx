@@ -35,7 +35,7 @@ afterEach(() => {
   state.changed = null;
 });
 
-it("initializes from a retained failed draft instead of a stale server document", () => {
+it("initializes from the session's unsaved draft instead of the stored document", () => {
   const recovered = [{ type: "paragraph", content: "recovered draft" }];
   render(
     <WikiEditor
@@ -44,4 +44,28 @@ it("initializes from a retained failed draft instead of a stale server document"
     />,
   );
   expect(state.editor.document).toEqual(recovered);
+});
+
+it("an editability toggle that leaves the document unchanged is not reported as an edit", () => {
+  const onChange = vi.fn();
+  const screen = render(
+    <WikiEditor
+      initialContent={[{ type: "paragraph", content: "stored" }]}
+      readOnly
+      onChange={onChange}
+    />,
+  );
+  screen.rerender(
+    <WikiEditor
+      initialContent={[{ type: "paragraph", content: "stored" }]}
+      onChange={onChange}
+    />,
+  );
+  // BlockNote reports a change when editability flips, with the same document.
+  state.changed?.();
+  expect(onChange).not.toHaveBeenCalled();
+  const edited = [{ type: "paragraph", content: "typed" }];
+  state.editor.document = edited;
+  state.changed?.();
+  expect(onChange).toHaveBeenCalledWith(edited);
 });

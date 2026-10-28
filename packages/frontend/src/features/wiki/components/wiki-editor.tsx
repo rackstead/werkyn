@@ -73,7 +73,23 @@ export function WikiEditor({
     },
   });
 
+  // Toggling editability (Start/Done Editing) makes BlockNote report a change
+  // for an unchanged document. Only real edits may reach autosave, or opening
+  // the editor would save (and mark as edited) the page as it was.
+  const lastDocument = useRef<string | null>(null);
+  if (lastDocument.current === null) {
+    lastDocument.current = JSON.stringify(editor.document);
+  }
+
+  // BlockNote may normalize the document while mounting; compare against that.
+  useEffect(() => {
+    lastDocument.current = JSON.stringify(editor.document);
+  }, [editor]);
+
   const handleChange = useCallback(() => {
+    const serialized = JSON.stringify(editor.document);
+    if (serialized === lastDocument.current) return;
+    lastDocument.current = serialized;
     if (onChangeRef.current) {
       onChangeRef.current(editor.document);
     }

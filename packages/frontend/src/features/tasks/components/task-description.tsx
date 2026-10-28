@@ -54,6 +54,12 @@ function TaskDescriptionEditor({
   const autosave = useEntityAutosave(
     `task-description:${userId}:${taskId}`,
     save,
+    {
+      author: userId,
+      // Tasks have no edit lock, so a description that failed to save is only
+      // sent again when the user asks; it could otherwise replace a newer one.
+      retryFailedAutomatically: false,
+    },
   );
 
   const editor = useEditor({
@@ -105,6 +111,31 @@ function TaskDescriptionEditor({
           hasUnsavedChanges={autosave.hasUnsavedChanges}
         />
       )}
+      {autosave.parked && (
+        <div
+          role="status"
+          className="mb-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
+        >
+          <span className="flex-1">
+            Earlier changes to this description were not saved.
+          </span>
+          <button
+            className="underline"
+            onClick={() => {
+              const restored = autosave.parked?.description ?? "";
+              editor?.commands.setContent(DOMPurify.sanitize(restored), {
+                emitUpdate: false,
+              });
+              void autosave.restoreParked().catch(() => {});
+            }}
+          >
+            Restore changes
+          </button>
+          <button className="underline" onClick={autosave.discardParked}>
+            Discard
+          </button>
+        </div>
+      )}
       <EditorContent editor={editor} className="text-sm" />
       <div className="mt-2 text-xs text-muted-foreground" aria-live="polite">
         {autosave.status === "error" ? (
@@ -113,7 +144,7 @@ function TaskDescriptionEditor({
             <button
               className="underline"
               onClick={() => {
-                void autosave.flush().catch(() => {});
+                void autosave.retry().catch(() => {});
               }}
             >
               Retry save

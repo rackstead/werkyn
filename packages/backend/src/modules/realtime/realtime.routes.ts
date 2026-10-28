@@ -19,6 +19,7 @@ export default async function realtimeRoutes(fastify: FastifyInstance) {
     },
     wsHandler: (socket: WebSocket) => {
       let authenticated = false;
+      let authenticating = false;
 
       // Auth timeout: close if not authenticated within 5s
       const authTimer = setTimeout(() => {
@@ -45,14 +46,17 @@ export default async function realtimeRoutes(fastify: FastifyInstance) {
           const text = typeof raw === "string" ? raw : raw.toString();
           const msg = JSON.parse(text);
 
-          // First message must be auth
+          // First message must be auth. Anything sent while it is being
+          // checked is ignored, so one socket can never register twice.
           if (!authenticated) {
-            if (msg.type === "auth" && typeof msg.token === "string") {
+            if (!authenticating && msg.type === "auth" && typeof msg.token === "string") {
+              authenticating = true;
               const userId = await realtimeService.authenticate(
                 socket,
                 msg.token,
                 fastify.prisma,
               );
+              authenticating = false;
               if (userId) {
                 authenticated = true;
                 clearTimeout(authTimer);

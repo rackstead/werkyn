@@ -12,6 +12,10 @@ import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { scopeTaskRelations } from "../../utils/task-scope.js";
 import {
+  revokeWorkspaceAccess,
+  revokeWorkspaceProjects,
+} from "../realtime/realtime.service.js";
+import {
   assertCurrentAdmin,
   normalizeAllowedEmailDomains,
 } from "../invites/admission.service.js";
@@ -136,7 +140,7 @@ export async function updateMemberRole(
   actorId: string,
   data: UpdateWorkspaceMemberInput,
 ) {
-  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+  const result = await withWorkspaceLock(prisma, workspaceId, async (tx) => {
     await assertCurrentAdmin(tx, workspaceId, actorId);
     const member = await tx.workspaceMember.findUnique({
       where: { userId_workspaceId: { userId: targetUserId, workspaceId } },
@@ -156,7 +160,7 @@ export async function updateMemberRole(
       }
     }
 
-    return tx.workspaceMember.update({
+    const updated = await tx.workspaceMember.update({
       where: { id: member.id },
       data: { role: data.role },
       include: {
@@ -170,7 +174,27 @@ export async function updateMemberRole(
         },
       },
     });
+
+    // Administrators read every project; after a demotion only explicit
+    // project memberships still grant access.
+    const retainedProjects =
+      member.role === "ADMIN" && data.role !== "ADMIN"
+        ? await tx.projectMember.findMany({
+            where: { userId: targetUserId, project: { workspaceId } },
+            select: { projectId: true },
+          })
+        : null;
+    return { updated, retainedProjects };
   });
+
+  if (result.retainedProjects) {
+    revokeWorkspaceProjects(
+      targetUserId,
+      workspaceId,
+      new Set(result.retainedProjects.map((p) => p.projectId)),
+    );
+  }
+  return result.updated;
 }
 
 export async function removeMember(
@@ -186,7 +210,7 @@ export async function removeMember(
     throw new ForbiddenError("Only admins can remove other members");
   }
 
-  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
     if (!isSelf) {
       await assertCurrentAdmin(
         tx,
@@ -214,7 +238,26 @@ export async function removeMember(
     }
 
     await tx.workspaceMember.delete({ where: { id: member.id } });
+
+    // Memberships inside the workspace end with it, so a later re-admission
+    // starts clean instead of silently restoring old private access. DM rows
+    // are kept with their history; every DM read requires the workspace
+    // membership again.
+    await tx.projectMember.deleteMany({
+      where: { userId: targetUserId, project: { workspaceId } },
+    });
+    await tx.chatChannelMember.deleteMany({
+      where: { userId: targetUserId, channel: { workspaceId, type: { not: "DM" } } },
+    });
+    await tx.teamFolderMember.deleteMany({
+      where: { userId: targetUserId, teamFolder: { workspaceId } },
+    });
+    await tx.groupMember.deleteMany({
+      where: { userId: targetUserId, group: { workspaceId } },
+    });
   });
+
+  revokeWorkspaceAccess(targetUserId, workspaceId);
 }
 
 export async function getDashboard(

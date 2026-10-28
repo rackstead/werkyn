@@ -1,6 +1,7 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
+import { revokeChannelAccess } from "../realtime/realtime.service.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -167,6 +168,7 @@ export async function leaveChannel(
   await prisma.chatChannelMember.deleteMany({
     where: { channelId, userId },
   });
+  revokeChannelAccess(userId, channelId);
 }
 
 // ─── DMs ───────────────────────────────────────────────
@@ -533,6 +535,7 @@ export async function removeMembers(
   await prisma.chatChannelMember.deleteMany({
     where: { channelId, userId: targetUserId },
   });
+  revokeChannelAccess(targetUserId, channelId);
 }
 
 export async function listMembers(

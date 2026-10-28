@@ -14,8 +14,9 @@ import type {
   SearchMessagesInput,
 } from "@pm/shared";
 import * as chatService from "./chat.service.js";
-import { createNotifications } from "../notifications/notifications.service.js";
-import { broadcastToChannel, broadcastToWorkspace, broadcastToUser } from "../realtime/realtime.service.js";
+import { deliverChatMessage } from "./chat-delivery.js";
+import { broadcastToChannel, broadcastToWorkspace } from "../realtime/realtime.service.js";
+import { ValidationError } from "../../utils/errors.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -232,96 +233,40 @@ export async function listMessagesHandler(
   return reply.send(result);
 }
 
+function readClientMessageId(request: FastifyRequest) {
+  const header = request.headers["idempotency-key"];
+  if (header === undefined) return undefined;
+  if (typeof header !== "string" || !chatService.CLIENT_MESSAGE_ID_PATTERN.test(header)) {
+    throw new ValidationError(
+      "Idempotency-Key must be 1-128 letters, digits, '.', '_', ':' or '-'",
+    );
+  }
+  return header;
+}
+
 export async function sendMessageHandler(
   request: FastifyRequest,
   reply: FastifyReply,
 ) {
-  const { wid, channelId } = request.params as { wid: string; channelId: string };
+  const { channelId } = request.params as { channelId: string };
   const body = request.body as SendMessageInput;
-  const userId = request.user!.id;
-  const displayName = request.user!.displayName;
 
-  const message = await chatService.sendMessage(
+  const { message, replayed } = await chatService.sendMessage(
     request.server.prisma,
     channelId,
-    userId,
+    request.user!.id,
     body.content,
     body.parentId,
+    readClientMessageId(request),
   );
 
-  broadcastToChannel(channelId, "chat_message_created", {
-    message,
-    channelId,
-  });
+  // The message and its delivery outbox row are committed: the send has
+  // succeeded. Notifications and realtime events are delivered from the
+  // outbox; a failure there is recorded and retried in the background rather
+  // than reported as a failed send. A replay retries a delivery that is due.
+  await deliverChatMessage(request.server.prisma, message.id, { log: request.log });
 
-  // Notification payloads include private message snippets. A mentioned global
-  // user ID or stale membership must never become an alternate content reader.
-  const currentMembers = await request.server.prisma.chatChannelMember.findMany({
-    where: {
-      channelId,
-      user: { workspaces: { some: { workspaceId: wid } } },
-    },
-    select: { userId: true },
-  });
-  const recipientIds = new Set(currentMembers.map((member) => member.userId));
-
-  // Mention notifications
-  const mentionedIds = chatService.parseMentions(body.content);
-  if (mentionedIds.length > 0) {
-    const mentionNotifs = mentionedIds
-      .filter((id) => id !== userId && recipientIds.has(id))
-      .map((mentionedUserId) => ({
-        userId: mentionedUserId,
-        type: "CHAT_MENTION" as const,
-        title: `${displayName} mentioned you in chat`,
-        body: body.content.slice(0, 200),
-        data: { channelId, messageId: message.id },
-      }));
-    const created = await createNotifications(request.server.prisma, mentionNotifs);
-    for (const notif of created) {
-      broadcastToUser(notif.userId, "notification_created", notif);
-    }
-  }
-
-  // DM notifications
-  const channel = await request.server.prisma.chatChannel.findUnique({
-    where: { id: channelId },
-    select: { type: true, members: { select: { userId: true } } },
-  });
-  if (channel?.type === "DM") {
-    const dmNotifs = channel.members
-      .filter((m) => m.userId !== userId && recipientIds.has(m.userId))
-      .map((m) => ({
-        userId: m.userId,
-        type: "CHAT_DM_MESSAGE" as const,
-        title: `${displayName} sent you a message`,
-        body: body.content.slice(0, 200),
-        data: { channelId, messageId: message.id },
-      }));
-    const created = await createNotifications(request.server.prisma, dmNotifs);
-    for (const notif of created) {
-      broadcastToUser(notif.userId, "notification_created", notif);
-    }
-  }
-
-  // Thread subscription notifications
-  if (body.parentId) {
-    const subscribers = await chatService.getThreadSubscribers(
-      request.server.prisma,
-      body.parentId,
-    );
-    for (const subUserId of subscribers) {
-      if (subUserId !== userId && recipientIds.has(subUserId)) {
-        broadcastToUser(subUserId, "chat_thread_reply", {
-          channelId,
-          messageId: message.id,
-          parentId: body.parentId,
-        });
-      }
-    }
-  }
-
-  return reply.status(201).send({ data: message });
+  return reply.status(replayed ? 200 : 201).send({ data: message });
 }
 
 export async function updateMessageHandler(

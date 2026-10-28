@@ -5,7 +5,8 @@ import { SendHorizontal } from "lucide-react";
 import { MentionDropdown, type MemberOption } from "@/features/comments/components/mention-dropdown";
 
 interface MentionInputProps {
-  onSend: (content: string) => void;
+  /** A returned promise keeps the draft until it resolves; on rejection the draft stays for a retry. */
+  onSend: (content: string) => void | Promise<unknown>;
   onTyping?: () => void;
   members: MemberOption[];
   placeholder?: string;
@@ -37,10 +38,20 @@ export function MentionInput({
   const handleSubmit = useCallback(() => {
     const stored = buildStoredContent(displayContent).trim();
     if (!stored) return;
-    onSend(stored);
-    setDisplayContent("");
-    mentionMapRef.current.clear();
-    textareaRef.current?.focus();
+    const submitted = displayContent;
+    Promise.resolve(onSend(stored)).then(
+      () => {
+        setDisplayContent((current) => {
+          if (current !== submitted) return current;
+          mentionMapRef.current.clear();
+          return "";
+        });
+        textareaRef.current?.focus();
+      },
+      () => {
+        // Not confirmed as sent: keep the draft so it can be resent.
+      },
+    );
   }, [displayContent, onSend, buildStoredContent]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {

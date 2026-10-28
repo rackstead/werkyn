@@ -182,14 +182,14 @@ export function ChatLayout({
   );
 
   const handleSend = useCallback(
-    (content: string) => {
-      sendMessage.mutate(
-        { content },
-        {
-          onSuccess: () => markRead.mutate(),
+    (content: string) =>
+      sendMessage.mutateAsync({ content }).then(
+        () => markRead.mutate(),
+        (err: Error) => {
+          toast.error(`Message not sent: ${err.message}. Your draft was kept.`);
+          throw err;
         },
-      );
-    },
+      ),
     [sendMessage, markRead],
   );
 

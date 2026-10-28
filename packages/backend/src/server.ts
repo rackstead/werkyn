@@ -1,6 +1,7 @@
 import { env } from "./config/env.js";
 import { buildApp } from "./app.js";
 import { cleanupExpiredTokensAndAttempts } from "./modules/auth/auth.service.js";
+import { processDueChatMessageDeliveries } from "./modules/chat/chat-delivery.js";
 import { processDueDateReminders } from "./schedulers/due-date-reminders.js";
 import { processRecurringTasks } from "./schedulers/recurring-tasks.js";
 import { processTrashPurge } from "./schedulers/trash-purge.js";
@@ -84,6 +85,16 @@ async function start() {
 
     // Remove queued stored blobs after 30s, then every 5 minutes
     const blobCleanup = startBlobCleanupWorker(app);
+
+    // Retry chat notifications/realtime events whose first delivery failed
+    setInterval(
+      () => {
+        processDueChatMessageDeliveries(app.prisma, { log: app.log }).catch((err) => {
+          app.log.error(err, "Failed to run chat message delivery retries");
+        });
+      },
+      30 * 1000,
+    );
 
     // Start embedded Dex (SSO identity provider)
     dexManager.start(app.prisma, app.log).catch((err) => {

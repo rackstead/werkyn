@@ -4,7 +4,8 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { api } from "@/lib/api-client";
+import { useRef } from "react";
+import { ApiError, api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import type {
   CreateChannelInput,
@@ -215,13 +216,55 @@ export function useMessages(wid: string, channelId: string) {
   });
 }
 
+const RETRYABLE_SEND_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function createClientMessageId() {
+  const cryptoApi = globalThis.crypto;
+  // randomUUID is missing outside secure contexts (plain-HTTP self-hosting).
+  if (typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+  return Array.from(cryptoApi.getRandomValues(new Uint8Array(16)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+/**
+ * Sends a message with an Idempotency-Key. Resending the same text to the same
+ * place after a failed or unanswered attempt reuses that attempt's key, so the
+ * server returns the message it may already have stored instead of a
+ * duplicate. A successful send, or different text, starts a new key.
+ */
 export function useSendMessage(wid: string, channelId: string) {
   const qc = useQueryClient();
+  const unconfirmed = useRef<{ target: string; key: string } | null>(null);
   return useMutation({
-    mutationFn: (data: SendMessageInput) =>
-      api
-        .post(`chat/${wid}/channels/${channelId}/messages`, { json: data })
-        .json<{ data: ChatMessage }>(),
+    mutationFn: (data: SendMessageInput) => {
+      const target = JSON.stringify([wid, channelId, data.parentId ?? null, data.content]);
+      if (unconfirmed.current?.target !== target) {
+        unconfirmed.current = { target, key: createClientMessageId() };
+      }
+      const attempt = unconfirmed.current;
+      return api
+        .post(`chat/${wid}/channels/${channelId}/messages`, {
+          json: data,
+          headers: { "Idempotency-Key": attempt.key },
+          // Safe to repeat: the key makes the server return the stored message.
+          // Network failures and transient statuses are retried; other API
+          // errors (conflict, forbidden, validation) are final.
+          retry: {
+            limit: 2,
+            methods: ["post"],
+            shouldRetry: ({ error }) =>
+              error instanceof ApiError
+                ? RETRYABLE_SEND_STATUSES.has(error.statusCode)
+                : undefined,
+          },
+        })
+        .json<{ data: ChatMessage }>()
+        .then((res) => {
+          if (unconfirmed.current === attempt) unconfirmed.current = null;
+          return res;
+        });
+    },
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: queryKeys.chatMessages(channelId) });
       // If this was a thread reply, also refresh the thread panel

@@ -1,5 +1,5 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
-import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { Prisma, type PrismaClient } from "@prisma/client";
+import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
 
@@ -285,72 +285,148 @@ export async function listMessages(
   };
 }
 
+export const chatMessageInclude = {
+  user: {
+    select: { id: true, displayName: true, avatarUrl: true },
+  },
+  _count: { select: { replies: true } },
+  reactions: {
+    select: { id: true, emoji: true, userId: true },
+    orderBy: { createdAt: "asc" as const },
+  },
+} satisfies Prisma.ChatMessageInclude;
+
+// A key the sender reuses for a retry of the same logical send.
+export const CLIENT_MESSAGE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+async function assertSendMembership(
+  db: PrismaClient | Prisma.TransactionClient,
+  channelId: string,
+  userId: string,
+) {
+  const membership = await db.chatChannelMember.findUnique({
+    where: { channelId_userId: { channelId, userId } },
+    select: { id: true },
+  });
+  if (!membership) throw new ForbiddenError("Not a member of this channel");
+}
+
+// Returns the message an earlier send with this key stored, after checking
+// that the retry describes the same message.
+async function findKeyedMessage(
+  prisma: PrismaClient,
+  channelId: string,
+  userId: string,
+  clientMessageId: string,
+  content: string,
+  parentId: string | undefined,
+) {
+  const message = await prisma.chatMessage.findUnique({
+    where: { userId_clientMessageId: { userId, clientMessageId } },
+    include: chatMessageInclude,
+  });
+  if (!message) return null;
+  const sameMessage =
+    message.channelId === channelId &&
+    (message.parentId ?? undefined) === parentId &&
+    // An edit after the original send changes the stored content.
+    (message.editedAt !== null || message.content === content);
+  if (!sameMessage) {
+    throw new ConflictError("This idempotency key was already used for a different message");
+  }
+  return message;
+}
+
+function isClientMessageIdConflict(err: unknown) {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== "P2002") {
+    return false;
+  }
+  return JSON.stringify(err.meta?.target ?? "").includes("clientMessageId");
+}
+
+/**
+ * Stores a message together with every write the send requires: the channel
+ * ordering touch, the author's thread subscription and the delivery outbox
+ * row. Either all of them commit or none do. Notifications and realtime events
+ * are delivered from the outbox afterwards (see chat-delivery.ts).
+ *
+ * With a clientMessageId, a retry of a send that already committed returns the
+ * stored message with replayed=true instead of storing a duplicate.
+ */
 export async function sendMessage(
   prisma: PrismaClient,
   channelId: string,
   userId: string,
   content: string,
   parentId?: string,
+  clientMessageId?: string,
 ) {
-  // Verify membership
-  const membership = await prisma.chatChannelMember.findUnique({
-    where: { channelId_userId: { channelId, userId } },
-  });
-  if (!membership) throw new ForbiddenError("Not a member of this channel");
+  if (clientMessageId) {
+    // Replays are still sends: only a current member gets the stored message.
+    await assertSendMembership(prisma, channelId, userId);
+    const existing = await findKeyedMessage(prisma, channelId, userId, clientMessageId, content, parentId);
+    if (existing) return { message: existing, replayed: true };
+  }
 
-  // Check if channel is archived
-  const channel = await prisma.chatChannel.findUnique({
-    where: { id: channelId },
-    select: { archivedAt: true },
-  });
-  if (channel?.archivedAt) throw new ForbiddenError("Cannot send messages to an archived channel");
+  try {
+    const message = await prisma.$transaction(async (tx) => {
+      await assertSendMembership(tx, channelId, userId);
 
-  // If replying, verify parent exists in same channel
-  if (parentId) {
-    const parent = await prisma.chatMessage.findUnique({
-      where: { id: parentId },
-      select: { channelId: true },
+      // Touch updatedAt for sorting. The archived guard and the row lock make
+      // a concurrent archive either precede this send or wait for it.
+      const touched = await tx.chatChannel.updateMany({
+        where: { id: channelId, archivedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (touched.count === 0) {
+        throw new ForbiddenError("Cannot send messages to an archived channel");
+      }
+
+      // If replying, verify parent exists in same channel
+      if (parentId) {
+        const parent = await tx.chatMessage.findUnique({
+          where: { id: parentId },
+          select: { channelId: true },
+        });
+        if (!parent || parent.channelId !== channelId) {
+          throw new NotFoundError("Parent message not found in this channel");
+        }
+      }
+
+      const created = await tx.chatMessage.create({
+        data: {
+          channelId,
+          userId,
+          content,
+          parentId,
+          clientMessageId,
+        },
+        include: chatMessageInclude,
+      });
+
+      // Auto-subscribe to thread if replying
+      if (parentId) {
+        await tx.chatThreadSubscription.createMany({
+          data: [{ messageId: parentId, userId }],
+          skipDuplicates: true,
+        });
+      }
+
+      await tx.chatMessageDelivery.create({
+        data: { messageId: created.id, nextAttemptAt: new Date() },
+      });
+
+      return created;
     });
-    if (!parent || parent.channelId !== channelId) {
-      throw new NotFoundError("Parent message not found in this channel");
+    return { message, replayed: false };
+  } catch (err) {
+    // A concurrent send with the same key committed first.
+    if (clientMessageId && isClientMessageIdConflict(err)) {
+      const existing = await findKeyedMessage(prisma, channelId, userId, clientMessageId, content, parentId);
+      if (existing) return { message: existing, replayed: true };
     }
+    throw err;
   }
-
-  const message = await prisma.chatMessage.create({
-    data: {
-      channelId,
-      userId,
-      content,
-      parentId,
-    },
-    include: {
-      user: {
-        select: { id: true, displayName: true, avatarUrl: true },
-      },
-      _count: { select: { replies: true } },
-      reactions: {
-        select: { id: true, emoji: true, userId: true },
-        orderBy: { createdAt: "asc" },
-      },
-    },
-  });
-
-  // Touch channel updatedAt for sorting
-  await prisma.chatChannel.update({
-    where: { id: channelId },
-    data: { updatedAt: new Date() },
-  });
-
-  // Auto-subscribe to thread if replying
-  if (parentId) {
-    await prisma.chatThreadSubscription.upsert({
-      where: { messageId_userId: { messageId: parentId, userId } },
-      update: {},
-      create: { messageId: parentId, userId },
-    });
-  }
-
-  return message;
 }
 
 export async function updateMessage(

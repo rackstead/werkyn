@@ -4,7 +4,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { SendHorizontal } from "lucide-react";
 
 interface MessageInputProps {
-  onSend: (content: string) => void;
+  /** A returned promise keeps the draft until it resolves; on rejection the draft stays for a retry. */
+  onSend: (content: string) => void | Promise<unknown>;
   onTyping?: () => void;
   placeholder?: string;
   disabled?: boolean;
@@ -22,9 +23,15 @@ export function MessageInput({
   const handleSubmit = useCallback(() => {
     const trimmed = content.trim();
     if (!trimmed) return;
-    onSend(trimmed);
-    setContent("");
-    textareaRef.current?.focus();
+    Promise.resolve(onSend(trimmed)).then(
+      () => {
+        setContent((current) => (current === content ? "" : current));
+        textareaRef.current?.focus();
+      },
+      () => {
+        // Not confirmed as sent: keep the draft so it can be resent.
+      },
+    );
   }, [content, onSend]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

@@ -57,11 +57,34 @@ let lastRefreshTime = 0;
 // answers 409 without minting or revoking anything (as it does for a session
 // busy past its transaction budget). The winning tab's response replaces the
 // cookie and normally broadcasts the new access token: adopt that broadcast as
-// soon as it arrives, or retry with the replaced cookie. The schedule (about
-// 16 s) ends well inside the server's 30 s window, during which the old cookie
-// is answered 409 rather than treated as reuse that revokes the session.
-const SUPERSEDED_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+// soon as it arrives, or retry with the replaced cookie.
+//
+// The server answers the old cookie 409 for 30 s after its rotation and then
+// treats it as reuse, revoking the session. A run of 409s is therefore tracked
+// across refresh calls (hydration repeats them): 15 s after the first one,
+// the winning response is treated as lost and the old cookie is not sent
+// again until another tab broadcasts a refresh or this tab signs in.
+const SUPERSEDED_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 6000];
+const SUPERSEDED_BUDGET_MS = 15_000;
+let supersededSince: number | null = null;
 const broadcastWaiters = new Set<() => void>();
+
+function supersededTooLong() {
+  return (
+    supersededSince !== null &&
+    Date.now() - supersededSince >= SUPERSEDED_BUDGET_MS
+  );
+}
+
+async function requestRefresh() {
+  const res = await fetch("/api/auth/refresh", {
+    method: "POST",
+    credentials: "include",
+  });
+  if (res.status === 409) supersededSince ??= Date.now();
+  else supersededSince = null;
+  return res;
+}
 
 function waitForBroadcast(ms: number) {
   return new Promise<void>((resolve) => {
@@ -83,6 +106,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
       set({ user: null, accessToken: null, workspaces: [], isHydrated: true });
     } else if (type === "refresh") {
       lastRefreshTime = Date.now();
+      supersededSince = null;
       set({
         user: data.user,
         accessToken: data.accessToken,
@@ -105,6 +129,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
     _refreshPromise: null,
 
     setAuth: (user, accessToken, workspaces) => {
+      supersededSince = null;
       set({ user, accessToken, workspaces });
       channel?.postMessage({
         type: "refresh",
@@ -155,22 +180,20 @@ export const useAuthStore = create<AuthState>((set, get) => {
       // Mutex: reuse existing refresh promise
       const existing = get()._refreshPromise;
       if (existing) return existing;
+      // Checked before the mutex promise exists: a synchronous result inside
+      // it would leave a settled promise behind as the "pending" refresh.
+      if (supersededTooLong()) return false;
 
       const promise = (async () => {
         try {
           const startedAt = Date.now();
-          let res = await fetch("/api/auth/refresh", {
-            method: "POST",
-            credentials: "include",
-          });
+          let res = await requestRefresh();
           for (const delay of SUPERSEDED_RETRY_DELAYS_MS) {
             if (res.status !== 409) break;
             await waitForBroadcast(delay);
             if (lastRefreshTime > startedAt && get().accessToken) return true;
-            res = await fetch("/api/auth/refresh", {
-              method: "POST",
-              credentials: "include",
-            });
+            if (supersededTooLong()) return false;
+            res = await requestRefresh();
           }
 
           if (!res.ok) return false;

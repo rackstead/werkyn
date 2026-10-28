@@ -30,12 +30,9 @@ beforeEach(() => {
   clock += 10 * 60 * 1000;
   vi.useFakeTimers({ now: clock, toFake: ["setTimeout", "Date"] });
   otherTab = new BroadcastChannel("pm-auth");
-  useAuthStore.setState({
-    user,
-    accessToken: "expired",
-    workspaces: [],
-    _refreshPromise: null,
-  });
+  // Signing in also ends any superseded run a previous case left behind.
+  useAuthStore.getState().setAuth(user, "expired", []);
+  useAuthStore.setState({ _refreshPromise: null, isHydrated: false });
 });
 
 afterEach(() => {
@@ -95,12 +92,46 @@ it("a refresh that stays superseded fails after bounded retries", async () => {
   const fetch = vi.fn(async () => status(409));
   vi.stubGlobal("fetch", fetch);
   const result = useAuthStore.getState().refresh();
-  await vi.advanceTimersByTimeAsync(15_749);
+  await vi.advanceTimersByTimeAsync(13_749);
   expect(fetch).toHaveBeenCalledTimes(6);
   await vi.advanceTimersByTimeAsync(1);
   await expect(result).resolves.toBe(false);
   expect(fetch).toHaveBeenCalledTimes(7);
   expect(useAuthStore.getState().accessToken).toBe("expired");
+});
+
+it("hydration stops sending a superseded cookie 15 s after the first 409", async () => {
+  const sentAt: number[] = [];
+  const fetch = vi.fn(async () => {
+    sentAt.push(Date.now());
+    return status(409);
+  });
+  vi.stubGlobal("fetch", fetch);
+  const hydrated = useAuthStore.getState().hydrate();
+  await vi.advanceTimersByTimeAsync(60_000);
+  await hydrated;
+  expect(useAuthStore.getState().isHydrated).toBe(true);
+  // Three refresh attempts, yet nothing is sent once the run is 15 s old,
+  // well before the server would treat the old cookie as reuse at 30 s.
+  expect(fetch).toHaveBeenCalledTimes(8);
+  expect(sentAt[sentAt.length - 1] - sentAt[0]).toBeLessThan(15_000);
+});
+
+it("a tab that gave up refreshes again after another tab's broadcast", async () => {
+  const fetch = vi.fn(async () => status(409));
+  vi.stubGlobal("fetch", fetch);
+  const first = useAuthStore.getState().refresh();
+  await vi.advanceTimersByTimeAsync(15_000);
+  await expect(first).resolves.toBe(false);
+  await expect(useAuthStore.getState().refresh()).resolves.toBe(false);
+  expect(fetch).toHaveBeenCalledTimes(7);
+
+  await broadcastFromOtherTab("winner");
+  await vi.advanceTimersByTimeAsync(6_000);
+  fetch.mockImplementation(async () => refreshed("after-broadcast"));
+  await expect(useAuthStore.getState().refresh()).resolves.toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(8);
+  expect(useAuthStore.getState().accessToken).toBe("after-broadcast");
 });
 
 it("a rejected refresh fails at once without retrying", async () => {

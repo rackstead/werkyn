@@ -1,6 +1,10 @@
 import type { PrismaClient } from "@prisma/client";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
+  refreshTransactionOptions,
+  revokeUserRefreshSessions,
+} from "../auth/refresh-sessions.js";
+import {
   ForbiddenError,
   NotFoundError,
   ValidationError,
@@ -87,15 +91,13 @@ export async function changePassword(
 
   const passwordHash = await hashPassword(data.newPassword);
 
-  await prisma.$transaction([
-    prisma.user.update({
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
       where: { id: userId },
       data: { passwordHash },
-    }),
-    prisma.refreshToken.deleteMany({
-      where: { userId },
-    }),
-  ]);
+    });
+    await revokeUserRefreshSessions(tx, userId, "password_change");
+  }, refreshTransactionOptions);
 
   return { message: "Password updated" };
 }

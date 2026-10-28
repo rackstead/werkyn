@@ -4,12 +4,14 @@ import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { admitWithInvite } from "../invites/admission.service.js";
 import { logger } from "../../utils/logger.js";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
+import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
 import {
-  signAccessToken,
-  generateRefreshToken,
-  generateSecureToken,
-  hashToken,
-} from "../../utils/tokens.js";
+  createRefreshSession,
+  refreshTransactionOptions,
+  revokeRefreshFamily,
+  revokeUserRefreshSessions,
+  rotateRefreshToken,
+} from "./refresh-sessions.js";
 import {
   sendVerificationEmail,
   sendPasswordResetEmail,
@@ -21,6 +23,11 @@ import {
   GoneError,
   LockedError,
 } from "../../utils/errors.js";
+
+export {
+  REFRESH_REUSE_GRACE_MS,
+  createRefreshSession,
+} from "./refresh-sessions.js";
 
 // Progressive lockout thresholds
 const LOCKOUT_THRESHOLDS = [
@@ -61,22 +68,9 @@ async function createTokenPair(
   prisma: PrismaClient,
   userId: string,
   email: string,
-  familyId?: string,
 ) {
   const accessToken = signAccessToken({ sub: userId, email });
-  const refreshToken = generateRefreshToken();
-
-  const tokenFamilyId = familyId || crypto.randomUUID();
-
-  await prisma.refreshToken.create({
-    data: {
-      token: hashToken(refreshToken),
-      familyId: tokenFamilyId,
-      userId,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-    },
-  });
-
+  const refreshToken = await createRefreshSession(prisma, userId);
   return { accessToken, refreshToken };
 }
 
@@ -290,14 +284,22 @@ export async function login(
     await prisma.loginAttempt.delete({ where: { email } }).catch(() => {});
   }
 
-  // Delete old refresh tokens for this user
-  await prisma.refreshToken.deleteMany({ where: { userId: user.id } });
+  // A password login replaces the user's other sessions. The verified hash is
+  // held (FOR SHARE) until the new session commits, so a concurrent password
+  // change or reset either rejects this login or revokes the new session.
+  const refreshToken = await prisma.$transaction(async (tx) => {
+    const [current] = await tx.$queryRaw<
+      Array<{ passwordHash: string | null }>
+    >`
+      SELECT "passwordHash" FROM "User" WHERE id = ${user.id} FOR SHARE
+    `;
+    if (current?.passwordHash !== user.passwordHash) return null;
+    await revokeUserRefreshSessions(tx, user.id, "login");
+    return createRefreshSession(tx, user.id);
+  }, refreshTransactionOptions);
+  if (!refreshToken) throw new UnauthorizedError("Invalid email or password");
 
-  const { accessToken, refreshToken } = await createTokenPair(
-    prisma,
-    user.id,
-    user.email,
-  );
+  const accessToken = signAccessToken({ sub: user.id, email: user.email });
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
   const { passwordHash: _, ...userWithoutPassword } = user;
@@ -306,50 +308,23 @@ export async function login(
 }
 
 export async function refresh(prisma: PrismaClient, rawToken: string) {
-  const tokenHash = hashToken(rawToken);
-
-  // Look up the active refresh token
-  const storedToken = await prisma.refreshToken.findUnique({
-    where: { token: tokenHash },
-  });
-
-  if (!storedToken) {
-    // Check if this is a rotated token (reuse detection)
-    const rotated = await prisma.rotatedRefreshToken.findUnique({
-      where: { tokenHash },
-    });
-
-    if (rotated) {
-      // Token reuse detected — revoke entire family
-      await prisma.refreshToken.deleteMany({
-        where: { familyId: rotated.familyId },
-      });
-      await prisma.rotatedRefreshToken.deleteMany({
-        where: { familyId: rotated.familyId },
-      });
-    }
-
+  const rotation = await rotateRefreshToken(prisma, rawToken);
+  if (rotation.status === "superseded") {
+    // A concurrent request (usually another tab) rotated this cookie first.
+    // Nothing was minted or revoked; the client retries with its new cookie.
+    throw new ConflictError(
+      "This refresh token has already been refreshed by another request",
+    );
+  }
+  if (rotation.status === "expired") {
+    throw new UnauthorizedError("Refresh token expired");
+  }
+  if (rotation.status !== "rotated") {
     throw new UnauthorizedError("Invalid refresh token");
   }
 
-  if (storedToken.expiresAt < new Date()) {
-    await prisma.refreshToken.delete({ where: { id: storedToken.id } });
-    throw new UnauthorizedError("Refresh token expired");
-  }
-
-  // Rotate: store old token hash in RotatedRefreshToken, delete old, create new
-  await prisma.$transaction([
-    prisma.rotatedRefreshToken.create({
-      data: {
-        tokenHash: storedToken.token,
-        familyId: storedToken.familyId,
-      },
-    }),
-    prisma.refreshToken.delete({ where: { id: storedToken.id } }),
-  ]);
-
   const user = await prisma.user.findUnique({
-    where: { id: storedToken.userId },
+    where: { id: rotation.userId },
     select: {
       id: true,
       email: true,
@@ -366,23 +341,16 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
     throw new UnauthorizedError("User not found");
   }
 
-  const { accessToken, refreshToken } = await createTokenPair(
-    prisma,
-    user.id,
-    user.email,
-    storedToken.familyId,
-  );
-
+  const accessToken = signAccessToken({ sub: user.id, email: user.email });
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
-  return { user, accessToken, refreshToken, workspaces };
+  return { user, accessToken, refreshToken: rotation.refreshToken, workspaces };
 }
 
+// Ends the cookie's whole session (family), whether the presented token is the
+// current one or was already rotated. Unknown tokens are a no-op.
 export async function logout(prisma: PrismaClient, rawToken: string) {
-  const tokenHash = hashToken(rawToken);
-  await prisma.refreshToken
-    .delete({ where: { token: tokenHash } })
-    .catch(() => {});
+  await revokeRefreshFamily(prisma, rawToken, "logout");
 }
 
 export async function forgotPassword(prisma: PrismaClient, email: string) {
@@ -435,19 +403,17 @@ export async function resetPassword(
 
   const passwordHash = await hashPassword(newPassword);
 
-  await prisma.$transaction([
-    prisma.user.update({
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },
-    }),
-    prisma.passwordResetToken.update({
+    });
+    await tx.passwordResetToken.update({
       where: { id: resetToken.id },
       data: { usedAt: new Date() },
-    }),
-    prisma.refreshToken.deleteMany({
-      where: { userId: resetToken.userId },
-    }),
-  ]);
+    });
+    await revokeUserRefreshSessions(tx, resetToken.userId, "password_reset");
+  }, refreshTransactionOptions);
 }
 
 export async function verifyEmail(prisma: PrismaClient, token: string) {
@@ -554,6 +520,17 @@ export async function cleanupExpiredTokensAndAttempts(prisma: PrismaClient) {
     }),
     prisma.rotatedRefreshToken.deleteMany({
       where: { rotatedAt: { lt: sevenDaysAgo } },
+    }),
+    // A family without tokens can never mint again; keep it a week for reuse
+    // detection and revocation records, then remove it.
+    prisma.refreshTokenFamily.deleteMany({
+      where: {
+        tokens: { none: {} },
+        OR: [
+          { revokedAt: { lt: sevenDaysAgo } },
+          { revokedAt: null, createdAt: { lt: sevenDaysAgo } },
+        ],
+      },
     }),
     prisma.passwordResetToken.deleteMany({
       where: { expiresAt: { lt: now } },

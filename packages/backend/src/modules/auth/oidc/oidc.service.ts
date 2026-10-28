@@ -4,11 +4,8 @@ import crypto from "node:crypto";
 import type { PrismaClient } from "@prisma/client";
 import { env } from "../../../config/env.js";
 import { UnauthorizedError } from "../../../utils/errors.js";
-import {
-  signAccessToken,
-  generateRefreshToken,
-  hashToken,
-} from "../../../utils/tokens.js";
+import { signAccessToken } from "../../../utils/tokens.js";
+import { createRefreshSession } from "../refresh-sessions.js";
 import {
   assertSsoEnabled,
   readOidcIdentity,
@@ -193,16 +190,7 @@ export async function handleOidcCallback(
 
   // Generate werkyn tokens
   const accessToken = signAccessToken({ sub: user.id, email: user.email });
-  const refreshToken = generateRefreshToken();
-
-  await prisma.refreshToken.create({
-    data: {
-      token: hashToken(refreshToken),
-      familyId: crypto.randomUUID(),
-      userId: user.id,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    },
-  });
+  const refreshToken = await createRefreshSession(prisma, user.id);
 
   const workspaces = await prisma.workspaceMember.findMany({
     where: { userId: user.id },

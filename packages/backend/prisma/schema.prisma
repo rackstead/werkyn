@@ -29,6 +29,7 @@ model User {
   subtaskAssignments      Subtask[]
   comments                Comment[]
   refreshTokens           RefreshToken[]
+  refreshTokenFamilies    RefreshTokenFamily[]
   apiKeys                 ApiKey[]
   activityLogs            ActivityLog[]
   passwordResetTokens     PasswordResetToken[]
@@ -82,6 +83,22 @@ model ApiKey {
   @@index([userId])
 }
 
+// One sign-in session. Every rotation, reuse revocation and logout locks this
+// row first; a set revokedAt is durable and no token of the family can mint.
+model RefreshTokenFamily {
+  id            String    @id
+  userId        String
+  createdAt     DateTime  @default(now())
+  revokedAt     DateTime?
+  revokedReason String?
+
+  user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokens RefreshToken[]
+
+  @@unique([id, userId])
+  @@index([userId])
+}
+
 model RefreshToken {
   id        String   @id @default(cuid())
   token     String   @unique
@@ -90,7 +107,8 @@ model RefreshToken {
   expiresAt DateTime
   createdAt DateTime @default(now())
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user   User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  family RefreshTokenFamily @relation(fields: [familyId, userId], references: [id, userId], onDelete: Cascade)
 
   @@index([userId])
   @@index([familyId])

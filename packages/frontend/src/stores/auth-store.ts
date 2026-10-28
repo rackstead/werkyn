@@ -53,6 +53,12 @@ const channel =
 
 let lastRefreshTime = 0;
 
+// Tabs share one refresh cookie. When another tab rotates it first, the server
+// answers 409 without minting or revoking anything. That tab's response
+// replaces the cookie and normally broadcasts the new access token, so wait
+// briefly, adopt the broadcast, or retry with the replaced cookie.
+const SUPERSEDED_RETRY_DELAYS_MS = [250, 750, 1500];
+
 export const useAuthStore = create<AuthState>((set, get) => {
   // Listen for cross-tab messages
   channel?.addEventListener("message", (event) => {
@@ -135,10 +141,20 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
       const promise = (async () => {
         try {
-          const res = await fetch("/api/auth/refresh", {
+          const startedAt = Date.now();
+          let res = await fetch("/api/auth/refresh", {
             method: "POST",
             credentials: "include",
           });
+          for (const delay of SUPERSEDED_RETRY_DELAYS_MS) {
+            if (res.status !== 409) break;
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            if (lastRefreshTime > startedAt && get().accessToken) return true;
+            res = await fetch("/api/auth/refresh", {
+              method: "POST",
+              credentials: "include",
+            });
+          }
 
           if (!res.ok) return false;
 

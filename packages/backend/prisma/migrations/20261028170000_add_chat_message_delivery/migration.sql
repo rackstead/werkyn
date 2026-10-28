@@ -6,6 +6,8 @@
 -- duplicate; "clientMessageHash" fingerprints the original request so a key
 -- reused for a different message is rejected, even after an edit.
 -- Existing messages get no outbox row: their side effects already ran.
+-- A row that exhausts its attempts keeps "lastError" with a null
+-- "nextAttemptAt", so it leaves the due-row index range.
 
 -- AlterTable
 ALTER TABLE "ChatMessage" ADD COLUMN     "clientMessageHash" CHAR(64),
@@ -15,8 +17,9 @@ ADD COLUMN     "clientMessageId" VARCHAR(128);
 CREATE TABLE "ChatMessageDelivery" (
     "messageId" TEXT NOT NULL,
     "attempts" INTEGER NOT NULL DEFAULT 0,
-    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "nextAttemptAt" TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
     "lockedUntil" TIMESTAMP(3),
+    "mentionedUserIds" TEXT[] DEFAULT ARRAY[]::TEXT[],
     "notifiedAt" TIMESTAMP(3),
     "notificationIds" TEXT[] DEFAULT ARRAY[]::TEXT[],
     "lastError" TEXT,

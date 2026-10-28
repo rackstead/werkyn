@@ -428,7 +428,11 @@ export async function sendMessage(
       }
 
       await tx.chatMessageDelivery.create({
-        data: { messageId: created.id, nextAttemptAt: new Date() },
+        data: {
+          messageId: created.id,
+          nextAttemptAt: new Date(),
+          mentionedUserIds: parseMentions(content),
+        },
       });
 
       return created;

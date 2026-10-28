@@ -12,6 +12,8 @@ interface MentionInputProps {
   members: MemberOption[];
   placeholder?: string;
   disabled?: boolean;
+  /** The draft's destination; changing it discards the draft. */
+  scope?: string;
 }
 
 export function MentionInput({
@@ -20,6 +22,7 @@ export function MentionInput({
   members,
   placeholder = "Type a message... Use @ to mention",
   disabled,
+  scope,
 }: MentionInputProps) {
   const [displayContent, setDisplayContent] = useState("");
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -27,7 +30,11 @@ export function MentionInput({
   const [mentionIndex, setMentionIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionMapRef = useRef<Map<string, string>>(new Map());
-  const { sending, run } = usePendingSend(textareaRef, disabled);
+  const { sending, run } = usePendingSend(textareaRef, disabled, scope, () => {
+    setDisplayContent("");
+    setMentionQuery(null);
+    mentionMapRef.current.clear();
+  });
 
   const buildStoredContent = useCallback((display: string) => {
     let stored = display;

@@ -186,7 +186,7 @@ export function ChatLayout({
       sendMessage.mutateAsync({ content }).then(
         () => markRead.mutate(),
         (err: Error) => {
-          toast.error(`Message not sent: ${err.message}. Your draft was kept.`);
+          toast.error(`Message not sent: ${err.message}`);
           throw err;
         },
       ),
@@ -371,6 +371,7 @@ export function ChatLayout({
               </div>
             ) : (
               <MentionInput
+                scope={channelId}
                 onSend={handleSend}
                 onTyping={() => sendTyping.mutate()}
                 members={mentionMembers}

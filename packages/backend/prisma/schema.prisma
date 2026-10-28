@@ -1176,16 +1176,19 @@ model ChatMessage {
 
 /// Outbox row written in the same transaction as a chat message. It is retried
 /// until the message's notifications and realtime events have been delivered,
-/// then deleted. Rows left at the attempt limit keep their lastError.
+/// then deleted. Rows left at the attempt limit keep their lastError and have
+/// no nextAttemptAt.
 model ChatMessageDelivery {
-  messageId       String    @id
-  attempts        Int       @default(0)
-  nextAttemptAt   DateTime  @default(now())
-  lockedUntil     DateTime?
-  notifiedAt      DateTime?
-  notificationIds String[]  @default([])
-  lastError       String?
-  createdAt       DateTime  @default(now())
+  messageId        String    @id
+  attempts         Int       @default(0)
+  nextAttemptAt    DateTime? @default(now())
+  lockedUntil      DateTime?
+  /// Users mentioned by the content as sent; an edit cannot add recipients.
+  mentionedUserIds String[]  @default([])
+  notifiedAt       DateTime?
+  notificationIds  String[]  @default([])
+  lastError        String?
+  createdAt        DateTime  @default(now())
 
   message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
 

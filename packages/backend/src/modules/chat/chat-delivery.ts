@@ -79,10 +79,13 @@ async function currentRecipients(
 async function ensureNotifications(prisma: PrismaClient, message: DeliveryMessage) {
   return prisma.$transaction(async (tx) => {
     const [row] = await tx.$queryRaw<
-      Array<{ notifiedAt: Date | null; notificationIds: string[] }>
-    >`SELECT "notifiedAt", "notificationIds" FROM "ChatMessageDelivery" WHERE "messageId" = ${message.id} FOR UPDATE`;
+      Array<{ notifiedAt: Date | null; notificationIds: string[]; mentionedUserIds: string[] }>
+    >`SELECT "notifiedAt", "notificationIds", "mentionedUserIds" FROM "ChatMessageDelivery" WHERE "messageId" = ${message.id} FOR UPDATE`;
     if (!row) return [];
     if (row.notifiedAt) return row.notificationIds;
+    // Mentions present both when sent and now: an edit before a delayed
+    // delivery can withdraw a mention but cannot add one.
+    const mentionedWhenSent = new Set(row.mentionedUserIds);
 
     const recipients = await currentRecipients(tx, message.channelId, message.channel.workspaceId);
     const senderName = message.user.displayName;
@@ -91,7 +94,7 @@ async function ensureNotifications(prisma: PrismaClient, message: DeliveryMessag
     const drafts: Array<{ userId: string; type: NotificationType; title: string }> = [];
 
     for (const userId of parseMentions(message.content)) {
-      if (userId !== message.userId && recipients.has(userId)) {
+      if (userId !== message.userId && recipients.has(userId) && mentionedWhenSent.has(userId)) {
         drafts.push({ userId, type: "CHAT_MENTION", title: `${senderName} mentioned you in chat` });
       }
     }
@@ -182,12 +185,18 @@ async function runSideEffects(prisma: PrismaClient, messageId: string) {
     }
   };
 
-  await attempt(() =>
-    broadcastToChannel(message.channelId, "chat_message_created", {
-      message: payload,
-      channelId: message.channelId,
-    }),
-  );
+  // A retry can run after a member lost access while their socket is still
+  // subscribed, so only current members receive the content.
+  await attempt(async () => {
+    const readers = await currentRecipients(prisma, message.channelId, message.channel.workspaceId);
+    broadcastToChannel(
+      message.channelId,
+      "chat_message_created",
+      { message: payload, channelId: message.channelId },
+      undefined,
+      readers,
+    );
+  });
   let notificationIds: string[] | null = null;
   await attempt(async () => {
     notificationIds = await ensureNotifications(prisma, message);
@@ -262,7 +271,11 @@ export async function failChatMessageDelivery(
     data: {
       lockedUntil: null,
       lastError: describeError(err),
-      nextAttemptAt: new Date(now.getTime() + retryDelay(attempt)),
+      // An exhausted row is kept for inspection without a next attempt.
+      nextAttemptAt:
+        attempt >= MAX_DELIVERY_ATTEMPTS
+          ? null
+          : new Date(now.getTime() + retryDelay(attempt)),
     },
   });
   return updated.count === 1;

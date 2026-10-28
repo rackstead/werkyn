@@ -10,6 +10,8 @@ interface MessageInputProps {
   onTyping?: () => void;
   placeholder?: string;
   disabled?: boolean;
+  /** The draft's destination; changing it discards the draft. */
+  scope?: string;
 }
 
 export function MessageInput({
@@ -17,11 +19,14 @@ export function MessageInput({
   onTyping,
   placeholder = "Type a message...",
   disabled,
+  scope,
 }: MessageInputProps) {
   const [content, setContent] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const { sending, run } = usePendingSend(textareaRef, disabled);
+  const { sending, run } = usePendingSend(textareaRef, disabled, scope, () =>
+    setContent(""),
+  );
 
   const handleSubmit = useCallback(() => {
     const trimmed = content.trim();

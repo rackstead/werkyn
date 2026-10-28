@@ -51,7 +51,7 @@ export function ThreadPanel({
     sendMessage
       .mutateAsync({ content, parentId: parentMessage.id })
       .catch((err: Error) => {
-        toast.error(`Reply not sent: ${err.message}. Your draft was kept.`);
+        toast.error(`Reply not sent: ${err.message}`);
         throw err;
       });
 
@@ -146,6 +146,7 @@ export function ThreadPanel({
       </div>
 
       <MessageInput
+        scope={parentMessage.id}
         onSend={handleSend}
         placeholder="Reply in thread..."
         disabled={sendMessage.isPending}

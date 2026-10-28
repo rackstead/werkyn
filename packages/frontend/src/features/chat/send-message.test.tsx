@@ -94,9 +94,44 @@ describe("useSendMessage", () => {
 });
 
 describe.each([
-  ["MessageInput", (onSend: (c: string) => Promise<unknown>) => <MessageInput onSend={onSend} />],
-  ["MentionInput", (onSend: (c: string) => Promise<unknown>) => <MentionInput onSend={onSend} members={[]} />],
+  [
+    "MessageInput",
+    (onSend: (c: string) => Promise<unknown>, scope = "a") => (
+      <MessageInput onSend={onSend} scope={scope} />
+    ),
+  ],
+  [
+    "MentionInput",
+    (onSend: (c: string) => Promise<unknown>, scope = "a") => (
+      <MentionInput onSend={onSend} members={[]} scope={scope} />
+    ),
+  ],
 ])("%s", (_name, renderInput) => {
+  it("does not carry a kept draft, or a late confirmation, to another destination", async () => {
+    let settle!: { resolve: () => void; reject: (e: Error) => void };
+    const onSend = vi.fn(
+      () => new Promise<void>((resolve, reject) => (settle = { resolve, reject })),
+    );
+    const { rerender } = render(renderInput(onSend, "channel-a"));
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "for channel a" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    rerender(renderInput(onSend, "channel-b"));
+    expect(box.value).toBe("");
+    await act(async () => settle.reject(new Error("offline")));
+    expect(box.value).toBe("");
+    expect(box.disabled).toBe(false);
+
+    fireEvent.change(box, { target: { value: "for channel b" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    rerender(renderInput(onSend, "channel-c"));
+    fireEvent.change(box, { target: { value: "draft in c" } });
+    await act(async () => settle.resolve());
+    expect(box.value).toBe("draft in c");
+    expect(onSend.mock.calls).toEqual([["for channel a"], ["for channel b"]]);
+  });
+
   it("keeps the draft when the send is not confirmed and clears it once it is", async () => {
     let settle!: { resolve: () => void; reject: (e: Error) => void };
     const onSend = vi.fn(

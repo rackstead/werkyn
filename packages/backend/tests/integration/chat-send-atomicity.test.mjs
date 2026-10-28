@@ -547,3 +547,84 @@ test("the idempotency key and request fingerprint never reach readers or realtim
     assert.equal(leaks(JSON.stringify(event)), false, `${event.event} exposes idempotency data`);
   }
 });
+
+async function sendWithFailedDelivery(body, setFault, clearFault) {
+  await setFault();
+  try {
+    const response = await send("SENDER", body, crypto.randomUUID());
+    assert.equal(response.statusCode, 201, response.body);
+    return response.json().data.id;
+  } finally {
+    await clearFault();
+  }
+}
+
+test("a delayed message broadcast skips sockets of members removed before the retry", async () => {
+  const content = `revoked reader ${crypto.randomUUID()}`;
+  const messageId = await sendWithFailedDelivery(
+    { content },
+    async () => { socketFault = "chat_message_created"; },
+    async () => { socketFault = null; },
+  );
+  // PEER's socket stays subscribed, as it does until it reconnects.
+  await app.prisma.chatChannelMember.deleteMany({ where: { channelId: channel.id, userId: users.PEER.id } });
+  try {
+    await drain();
+    assert.equal(peerEvents.some((e) => e.event === "chat_message_created" && e.data.message?.id === messageId), false);
+    assert.equal(await app.prisma.chatMessageDelivery.count({ where: { messageId } }), 0, "delivery completed for current members");
+  } finally {
+    await app.prisma.chatChannelMember.create({ data: { channelId: channel.id, userId: users.PEER.id } });
+  }
+});
+
+test("an edit before a delayed delivery can withdraw a mention but not add one", async () => {
+  const mentions = (userId, messageId) =>
+    app.prisma.notification.count({ where: { userId, type: "CHAT_MENTION", data: { path: ["messageId"], equals: messageId } } });
+  const fault = [() => setDbFault("Notification:INSERT"), () => clearDbFaults()];
+  const added = await sendWithFailedDelivery({ content: `@[${users.OTHER.id}] mention ${crypto.randomUUID()}` }, ...fault);
+  const withdrawn = await sendWithFailedDelivery({ content: `@[${users.PEER.id}] mention ${crypto.randomUUID()}` }, ...fault);
+  const edit = (id, content) => app.inject({
+    method: "PATCH",
+    url: `/api/chat/${workspace.id}/messages/${id}`,
+    payload: { content },
+    headers: { authorization: `Bearer ${sessions.SENDER}` },
+  });
+  assert.equal((await edit(added, `@[${users.PEER.id}] @[${users.OTHER.id}] mention edited`)).statusCode, 200);
+  assert.equal((await edit(withdrawn, "mention removed")).statusCode, 200);
+  await drain();
+  assert.deepEqual(
+    {
+      originalStillMentioned: await mentions(users.OTHER.id, added),
+      addedByEdit: await mentions(users.PEER.id, added),
+      withdrawnByEdit: await mentions(users.PEER.id, withdrawn),
+      pending: await app.prisma.chatMessageDelivery.count({ where: { messageId: { in: [added, withdrawn] } } }),
+    },
+    { originalStillMentioned: 1, addedByEdit: 0, withdrawnByEdit: 0, pending: 0 },
+  );
+});
+
+test("a delivery that exhausts its attempts keeps its error and leaves the due range", async () => {
+  const content = `exhausted @[${users.PEER.id}] ${crypto.randomUUID()}`;
+  await setDbFault("Notification:INSERT");
+  let messageId;
+  try {
+    const response = await send("SENDER", { content }, crypto.randomUUID());
+    assert.equal(response.statusCode, 201, response.body);
+    messageId = response.json().data.id;
+    await app.prisma.chatMessageDelivery.update({
+      where: { messageId },
+      data: { attempts: delivery.MAX_DELIVERY_ATTEMPTS - 1, nextAttemptAt: new Date(Date.now() - 1000) },
+    });
+    await drain();
+  } finally {
+    await clearDbFaults();
+  }
+  const row = await app.prisma.chatMessageDelivery.findUniqueOrThrow({ where: { messageId } });
+  assert.equal(row.attempts, delivery.MAX_DELIVERY_ATTEMPTS);
+  assert.equal(row.nextAttemptAt, null);
+  assert.match(row.lastError, /injected/);
+  await drain();
+  assert.equal(await delivery.deliverChatMessage(app.prisma, messageId, { now: new Date(Date.now() + 365 * 86_400_000) }), "skipped");
+  assert.equal(await peerNotifications(content), 0);
+  assert.equal(await app.prisma.chatMessageDelivery.count({ where: { messageId } }), 1);
+});

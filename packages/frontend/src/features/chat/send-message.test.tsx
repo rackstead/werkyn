@@ -39,6 +39,19 @@ beforeEach(() => http.post.mockReset());
 afterEach(cleanup);
 
 describe("useSendMessage", () => {
+  it("leaves the failure report to the caller instead of the client-wide error toast", async () => {
+    const clientWideError = vi.fn();
+    const client = new QueryClient({
+      defaultOptions: { mutations: { retry: false, onError: clientWideError } },
+    });
+    const { result } = renderHook(() => useSendMessage("wid", "channel"), {
+      wrapper: ({ children }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>,
+    });
+    http.post.mockReturnValueOnce(respond(Promise.reject(new ApiError(500, "boom"))));
+    await act(() => expect(result.current.mutateAsync({ content: "hello" })).rejects.toThrow("boom"));
+    expect(clientWideError).not.toHaveBeenCalled();
+  });
+
   it("resends an unconfirmed message with the same key and starts a new key after success", async () => {
     const { result } = renderHook(() => useSendMessage("wid", "channel"), { wrapper });
     http.post.mockReturnValueOnce(respond(Promise.reject(new TypeError("Failed to fetch"))));
@@ -71,6 +84,7 @@ describe("useSendMessage", () => {
     await act(() => result.current.mutateAsync({ content: "hello" }));
     const retry = http.post.mock.calls[0][1].retry;
     expect(retry.methods).toEqual(["post"]);
+    expect(retry.retryOnTimeout).toBe(true);
     expect(retry.shouldRetry({ error: new ApiError(503, "down") })).toBe(true);
     expect(retry.shouldRetry({ error: new ApiError(409, "conflict") })).toBe(false);
     expect(retry.shouldRetry({ error: new ApiError(403, "forbidden") })).toBe(false);
@@ -93,12 +107,19 @@ describe.each([
     fireEvent.change(box, { target: { value: "draft text" } });
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("draft text");
+    // Locked while pending: nothing can be typed into, or resent from, the
+    // draft that is already on its way.
+    expect(box.disabled).toBe(true);
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledTimes(1);
     await act(async () => settle.reject(new Error("offline")));
     expect(box.value).toBe("draft text");
+    expect(box.disabled).toBe(false);
 
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onSend).toHaveBeenCalledTimes(2);
     await act(async () => settle.resolve());
     expect(box.value).toBe("");
+    expect(box.disabled).toBe(false);
   });
 });

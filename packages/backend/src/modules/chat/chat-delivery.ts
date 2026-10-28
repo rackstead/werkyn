@@ -200,6 +200,68 @@ async function runSideEffects(prisma: PrismaClient, messageId: string) {
 }
 
 /**
+ * Leases a due delivery for one attempt. The attempt number identifies the
+ * claim: each claim increments it, so a later claim (after this lease expired)
+ * makes this attempt's completion and failure writes no-ops.
+ */
+export async function claimChatMessageDelivery(
+  prisma: PrismaClient,
+  messageId: string,
+  now: Date,
+): Promise<number | null> {
+  const row = await prisma.chatMessageDelivery.findUnique({
+    where: { messageId },
+    select: { attempts: true },
+  });
+  if (!row) return null;
+  const attempt = row.attempts + 1;
+  const claimed = await prisma.chatMessageDelivery.updateMany({
+    where: {
+      messageId,
+      attempts: { equals: row.attempts, lt: MAX_DELIVERY_ATTEMPTS },
+      nextAttemptAt: { lte: now },
+      OR: [{ lockedUntil: null }, { lockedUntil: { lte: now } }],
+    },
+    data: {
+      lockedUntil: new Date(now.getTime() + LEASE_MS),
+      attempts: attempt,
+    },
+  });
+  return claimed.count === 1 ? attempt : null;
+}
+
+/** Removes a delivered row, unless a later attempt has claimed it since. */
+export async function completeChatMessageDelivery(
+  prisma: PrismaClient,
+  messageId: string,
+  attempt: number,
+) {
+  const deleted = await prisma.chatMessageDelivery.deleteMany({
+    where: { messageId, attempts: attempt },
+  });
+  return deleted.count === 1;
+}
+
+/** Releases a failed attempt for a retry, unless a later attempt owns the row. */
+export async function failChatMessageDelivery(
+  prisma: PrismaClient,
+  messageId: string,
+  attempt: number,
+  err: unknown,
+  now: Date,
+) {
+  const updated = await prisma.chatMessageDelivery.updateMany({
+    where: { messageId, attempts: attempt },
+    data: {
+      lockedUntil: null,
+      lastError: describeError(err),
+      nextAttemptAt: new Date(now.getTime() + retryDelay(attempt)),
+    },
+  });
+  return updated.count === 1;
+}
+
+/**
  * Runs one delivery attempt for a message if it is due and not leased by
  * another attempt. It never throws: a failure is recorded on the outbox row
  * for a later retry.
@@ -210,47 +272,26 @@ export async function deliverChatMessage(
   options: DeliveryOptions = {},
 ): Promise<DeliveryResult> {
   const now = options.now ?? new Date();
+  let attempt: number | null;
   try {
-    const claimed = await prisma.chatMessageDelivery.updateMany({
-      where: {
-        messageId,
-        attempts: { lt: MAX_DELIVERY_ATTEMPTS },
-        nextAttemptAt: { lte: now },
-        OR: [{ lockedUntil: null }, { lockedUntil: { lte: now } }],
-      },
-      data: {
-        lockedUntil: new Date(now.getTime() + LEASE_MS),
-        attempts: { increment: 1 },
-      },
-    });
-    if (claimed.count === 0) return "skipped";
+    attempt = await claimChatMessageDelivery(prisma, messageId, now);
   } catch (err) {
     options.log?.error({ err, messageId }, "Could not claim chat message delivery");
     return "pending";
   }
+  if (attempt === null) return "skipped";
 
   try {
     await runSideEffects(prisma, messageId);
-    await prisma.chatMessageDelivery.deleteMany({ where: { messageId } });
+    await completeChatMessageDelivery(prisma, messageId, attempt);
     return "completed";
   } catch (err) {
     try {
-      const row = await prisma.chatMessageDelivery.findUnique({
-        where: { messageId },
-        select: { attempts: true },
-      });
-      const attempts = row?.attempts ?? 1;
-      await prisma.chatMessageDelivery.updateMany({
-        where: { messageId },
-        data: {
-          lockedUntil: null,
-          lastError: describeError(err),
-          nextAttemptAt: new Date(now.getTime() + retryDelay(attempts)),
-        },
-      });
+      await failChatMessageDelivery(prisma, messageId, attempt, err, now);
+      const finalAttempt = attempt >= MAX_DELIVERY_ATTEMPTS;
       options.log?.error(
-        { err, messageId, attempts, finalAttempt: attempts >= MAX_DELIVERY_ATTEMPTS },
-        attempts >= MAX_DELIVERY_ATTEMPTS
+        { err, messageId, attempt, finalAttempt },
+        finalAttempt
           ? "Chat message delivery failed for the last time"
           : "Chat message delivery failed; it will be retried",
       );

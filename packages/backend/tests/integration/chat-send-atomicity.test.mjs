@@ -370,10 +370,28 @@ test("a key reused for a different message conflicts, keys are per author, and m
   assert.equal(threadConflict.statusCode, 409, threadConflict.body);
   assert.equal(await persisted(`different ${key}`), 0);
 
+  // The key stays bound to the original request after the message is edited.
+  const edit = await app.inject({
+    method: "PATCH",
+    url: `/api/chat/${workspace.id}/messages/${first.json().data.id}`,
+    payload: { content: `edited ${key}` },
+    headers: { authorization: `Bearer ${sessions.SENDER}` },
+  });
+  assert.equal(edit.statusCode, 200, edit.body);
+  const afterEdit = await send("SENDER", { content }, key);
+  assert.equal(afterEdit.statusCode, 200, afterEdit.body);
+  assert.equal(afterEdit.json().data.id, first.json().data.id);
+  for (const reused of [`edited ${key}`, `unrelated ${key}`]) {
+    const response = await send("SENDER", { content: reused }, key);
+    assert.equal(response.statusCode, 409, response.body);
+  }
+  assert.equal(await persisted(`unrelated ${key}`), 0);
+
   const otherAuthor = await send("OTHER", { content }, key);
   assert.equal(otherAuthor.statusCode, 201, otherAuthor.body);
   assert.notEqual(otherAuthor.json().data.id, first.json().data.id);
-  assert.equal(await persisted(content), 2);
+  // The first message now carries its edited text.
+  assert.equal(await persisted(content), 1);
 
   for (const bad of ["", "has spaces", "x".repeat(129)]) {
     const response = await send("SENDER", { content: `bad key ${key}` }, bad);
@@ -443,4 +461,35 @@ test("an archived channel rejects new sends without writes but replays an alread
   } finally {
     await app.prisma.chatChannel.update({ where: { id: channel.id }, data: { archivedAt: null } });
   }
+});
+
+test("an attempt whose lease was taken over cannot complete or release the newer claim", async () => {
+  assert.ok(delivery, "a retry worker must exist for post-commit side effects");
+  const content = `takeover @[${users.PEER.id}] ${crypto.randomUUID()}`;
+  await setDbFault("Notification:INSERT");
+  let response;
+  try {
+    response = await send("SENDER", { content }, crypto.randomUUID());
+  } finally {
+    await clearDbFaults();
+  }
+  assert.equal(response.statusCode, 201, response.body);
+  const messageId = response.json().data.id;
+  const start = new Date(Date.now() + 60 * 60_000);
+
+  const stale = await delivery.claimChatMessageDelivery(app.prisma, messageId, start);
+  assert.ok(stale);
+  assert.equal(await delivery.claimChatMessageDelivery(app.prisma, messageId, start), null, "a live lease is exclusive");
+  const current = await delivery.claimChatMessageDelivery(app.prisma, messageId, new Date(start.getTime() + 61_000));
+  assert.equal(current, stale + 1, "an expired lease can be claimed again");
+
+  assert.equal(await delivery.completeChatMessageDelivery(app.prisma, messageId, stale), false);
+  assert.equal(await delivery.failChatMessageDelivery(app.prisma, messageId, stale, new Error("stale"), start), false);
+  const row = await app.prisma.chatMessageDelivery.findUnique({ where: { messageId } });
+  assert.equal(row.attempts, current);
+  assert.ok(row.lockedUntil > new Date(start.getTime() + 61_000), "the newer lease is untouched");
+  assert.doesNotMatch(row.lastError ?? "", /stale/);
+
+  assert.equal(await delivery.completeChatMessageDelivery(app.prisma, messageId, current), true);
+  assert.equal(await app.prisma.chatMessageDelivery.count({ where: { messageId } }), 0);
 });

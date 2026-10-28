@@ -3,11 +3,13 @@
 -- row is retried until the message's notifications and realtime events have
 -- been delivered, then deleted. "clientMessageId" is the sender's idempotency
 -- key, so a retried send returns the original message instead of storing a
--- duplicate.
+-- duplicate; "clientMessageHash" fingerprints the original request so a key
+-- reused for a different message is rejected, even after an edit.
 -- Existing messages get no outbox row: their side effects already ran.
 
 -- AlterTable
-ALTER TABLE "ChatMessage" ADD COLUMN     "clientMessageId" VARCHAR(128);
+ALTER TABLE "ChatMessage" ADD COLUMN     "clientMessageHash" CHAR(64),
+ADD COLUMN     "clientMessageId" VARCHAR(128);
 
 -- CreateTable
 CREATE TABLE "ChatMessageDelivery" (

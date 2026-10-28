@@ -248,11 +248,12 @@ export function useSendMessage(wid: string, channelId: string) {
           json: data,
           headers: { "Idempotency-Key": attempt.key },
           // Safe to repeat: the key makes the server return the stored message.
-          // Network failures and transient statuses are retried; other API
-          // errors (conflict, forbidden, validation) are final.
+          // Network failures, timeouts and transient statuses are retried;
+          // other API errors (conflict, forbidden, validation) are final.
           retry: {
             limit: 2,
             methods: ["post"],
+            retryOnTimeout: true,
             shouldRetry: ({ error }) =>
               error instanceof ApiError
                 ? RETRYABLE_SEND_STATUSES.has(error.statusCode)
@@ -265,6 +266,9 @@ export function useSendMessage(wid: string, channelId: string) {
           return res;
         });
     },
+    // Callers report a failed send together with the kept draft; this
+    // replaces the client-wide error toast so it is not shown twice.
+    onError: () => {},
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: queryKeys.chatMessages(channelId) });
       // If this was a thread reply, also refresh the thread panel

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "@prisma/client";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
@@ -311,27 +312,26 @@ async function assertSendMembership(
   if (!membership) throw new ForbiddenError("Not a member of this channel");
 }
 
+function clientMessageHash(channelId: string, parentId: string | undefined, content: string) {
+  return createHash("sha256")
+    .update(JSON.stringify([channelId, parentId ?? null, content]))
+    .digest("hex");
+}
+
 // Returns the message an earlier send with this key stored, after checking
-// that the retry describes the same message.
+// that the retry describes the same original request.
 async function findKeyedMessage(
   prisma: PrismaClient,
-  channelId: string,
   userId: string,
   clientMessageId: string,
-  content: string,
-  parentId: string | undefined,
+  requestHash: string,
 ) {
   const message = await prisma.chatMessage.findUnique({
     where: { userId_clientMessageId: { userId, clientMessageId } },
     include: chatMessageInclude,
   });
   if (!message) return null;
-  const sameMessage =
-    message.channelId === channelId &&
-    (message.parentId ?? undefined) === parentId &&
-    // An edit after the original send changes the stored content.
-    (message.editedAt !== null || message.content === content);
-  if (!sameMessage) {
+  if (message.clientMessageHash !== requestHash) {
     throw new ConflictError("This idempotency key was already used for a different message");
   }
   return message;
@@ -361,10 +361,13 @@ export async function sendMessage(
   parentId?: string,
   clientMessageId?: string,
 ) {
-  if (clientMessageId) {
+  const requestHash = clientMessageId
+    ? clientMessageHash(channelId, parentId, content)
+    : undefined;
+  if (clientMessageId && requestHash) {
     // Replays are still sends: only a current member gets the stored message.
     await assertSendMembership(prisma, channelId, userId);
-    const existing = await findKeyedMessage(prisma, channelId, userId, clientMessageId, content, parentId);
+    const existing = await findKeyedMessage(prisma, userId, clientMessageId, requestHash);
     if (existing) return { message: existing, replayed: true };
   }
 
@@ -400,6 +403,7 @@ export async function sendMessage(
           content,
           parentId,
           clientMessageId,
+          clientMessageHash: requestHash,
         },
         include: chatMessageInclude,
       });
@@ -421,8 +425,8 @@ export async function sendMessage(
     return { message, replayed: false };
   } catch (err) {
     // A concurrent send with the same key committed first.
-    if (clientMessageId && isClientMessageIdConflict(err)) {
-      const existing = await findKeyedMessage(prisma, channelId, userId, clientMessageId, content, parentId);
+    if (clientMessageId && requestHash && isClientMessageIdConflict(err)) {
+      const existing = await findKeyedMessage(prisma, userId, clientMessageId, requestHash);
       if (existing) return { message: existing, replayed: true };
     }
     throw err;

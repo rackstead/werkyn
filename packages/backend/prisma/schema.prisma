@@ -1154,6 +1154,8 @@ model ChatMessage {
   pinnedById String?
   /// Client-supplied idempotency key; a retried send returns the original message.
   clientMessageId String? @db.VarChar(128)
+  /// SHA-256 of the keyed send's channel, thread parent and original content.
+  clientMessageHash String? @db.Char(64)
   createdAt  DateTime  @default(now())
 
   channel       ChatChannel              @relation(fields: [channelId], references: [id], onDelete: Cascade)

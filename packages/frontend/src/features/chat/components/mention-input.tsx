@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { SendHorizontal } from "lucide-react";
 import { MentionDropdown, type MemberOption } from "@/features/comments/components/mention-dropdown";
+import { usePendingSend } from "./use-pending-send";
 
 interface MentionInputProps {
   /** A returned promise keeps the draft until it resolves; on rejection the draft stays for a retry. */
@@ -26,6 +27,7 @@ export function MentionInput({
   const [mentionIndex, setMentionIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionMapRef = useRef<Map<string, string>>(new Map());
+  const { sending, run } = usePendingSend(textareaRef, disabled);
 
   const buildStoredContent = useCallback((display: string) => {
     let stored = display;
@@ -38,21 +40,14 @@ export function MentionInput({
   const handleSubmit = useCallback(() => {
     const stored = buildStoredContent(displayContent).trim();
     if (!stored) return;
-    const submitted = displayContent;
-    Promise.resolve(onSend(stored)).then(
+    run(
+      () => onSend(stored),
       () => {
-        setDisplayContent((current) => {
-          if (current !== submitted) return current;
-          mentionMapRef.current.clear();
-          return "";
-        });
-        textareaRef.current?.focus();
-      },
-      () => {
-        // Not confirmed as sent: keep the draft so it can be resent.
+        setDisplayContent("");
+        mentionMapRef.current.clear();
       },
     );
-  }, [displayContent, onSend, buildStoredContent]);
+  }, [displayContent, onSend, buildStoredContent, run]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -148,7 +143,7 @@ export function MentionInput({
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
-          disabled={disabled}
+          disabled={disabled || sending}
           className="min-h-[40px] max-h-32 resize-none"
           rows={1}
         />
@@ -164,7 +159,7 @@ export function MentionInput({
         size="icon"
         className="shrink-0"
         onClick={handleSubmit}
-        disabled={!displayContent.trim() || disabled}
+        disabled={!displayContent.trim() || disabled || sending}
       >
         <SendHorizontal className="h-4 w-4" />
       </Button>

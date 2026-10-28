@@ -45,35 +45,6 @@ function InvitePage() {
     );
   }
 
-  if (isError) {
-    const apiError = error instanceof ApiError ? error : null;
-    const isExpired = apiError?.statusCode === 410;
-
-    return (
-      <div className="flex min-h-screen items-center justify-center p-4">
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-xl">
-              {isExpired ? "Invite expired" : "Invalid invite"}
-            </CardTitle>
-            <CardDescription>
-              {isExpired
-                ? "This invite link has expired or reached its usage limit."
-                : "This invite link is invalid or has been revoked."}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="text-center">
-            <Link to="/">
-              <Button variant="outline">Go home</Button>
-            </Link>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
-  if (!invite) return null;
-
   const accept = () => acceptInvite.mutate(token);
   const acceptError = acceptInvite.isError ? (
     <p role="alert" className="text-sm text-center text-destructive">
@@ -137,11 +108,10 @@ function InvitePage() {
         <p role="alert" className="text-sm text-center text-destructive">
           {admission.message}
         </p>
-        {admission.status === "unavailable" && (
-          <Button className="w-full" onClick={accept} disabled={acceptInvite.isPending}>
-            Try again
-          </Button>
-        )}
+        {/* Policy, capacity or the invitation may have changed since. */}
+        <Button className="w-full" onClick={accept} disabled={acceptInvite.isPending}>
+          {acceptInvite.isPending ? "Checking..." : "Try again"}
+        </Button>
         {acceptError}
         {goHome}
       </>
@@ -156,6 +126,56 @@ function InvitePage() {
       </>
     );
   }
+
+  if (isError) {
+    const apiError = error instanceof ApiError ? error : null;
+    const isExpired = apiError?.statusCode === 410;
+
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <CardTitle className="text-xl">
+              {isExpired ? "Invite expired" : "Invalid invite"}
+            </CardTitle>
+            <CardDescription>
+              {isExpired
+                ? "This invite link has expired or reached its usage limit."
+                : "This invite link is invalid or has been revoked."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4 text-center">
+            {user ? (
+              // The public preview cannot know the signed-in account. Show any
+              // remembered result, and let the server answer for this account
+              // (for example, an existing member is still admitted).
+              admission ? (
+                signedInContent
+              ) : (
+                <>
+                  <Button
+                    className="w-full"
+                    onClick={accept}
+                    disabled={acceptInvite.isPending}
+                  >
+                    {acceptInvite.isPending ? "Checking..." : "Check my access"}
+                  </Button>
+                  {acceptError}
+                  {goHome}
+                </>
+              )
+            ) : (
+              <Link to="/">
+                <Button variant="outline">Go home</Button>
+              </Link>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!invite) return null;
 
   return (
     <div className="flex min-h-screen items-center justify-center p-4">

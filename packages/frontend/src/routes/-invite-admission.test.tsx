@@ -300,3 +300,71 @@ it("continues from email verification only to the fixed invitation route", async
   await screen.findByText("Email verified");
   expect(screen.queryByRole("link", { name: "Continue to invitation" })).toBeNull();
 });
+
+it("keeps a pending explanation when a recheck fails for a transient reason", async () => {
+  signIn();
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(202, {
+      data: { status: "approval_pending", workspace, requestId: "rq-1", requestedAt: "2026-10-27T00:00:00Z", userId: "applicant" },
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await screen.findByText(/waiting for an administrator/);
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(409, { statusCode: 409, error: "Conflict", message: "The workspace is busy. Please try again." }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+  expect(await screen.findByRole("alert")).toHaveProperty(
+    "textContent",
+    "The workspace is busy. Please try again.",
+  );
+  expect(screen.getByText(/waiting for an administrator/)).toBeTruthy();
+  expect(state.navigate).not.toHaveBeenCalled();
+});
+
+it("lets the server admit an existing member past an expired public preview", async () => {
+  const joined = [membership("acme")];
+  signIn("member", joined);
+  respond("GET", "/api/invites/invite-token", () =>
+    json(410, { statusCode: 410, error: "Gone", message: "This invite has expired" }),
+  );
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: { status: "joined", workspace, role: "MEMBER", alreadyMember: true, userId: "member", workspaces: joined },
+    }),
+  );
+  renderRoute(InviteRoute);
+  expect(await screen.findByText("Invite expired")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Check my access" }));
+  await waitFor(() =>
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: "/$workspaceSlug",
+      params: { workspaceSlug: "acme" },
+    }),
+  );
+});
+
+it("rechecks a remembered registration refusal against current policy", async () => {
+  signIn("new");
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  rememberInviteAdmission("new", "invite-token", {
+    status: "denied",
+    reason: "member_limit",
+    message: "This workspace has reached its member limit",
+  });
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: { status: "joined", workspace, role: "MEMBER", alreadyMember: false, userId: "new", workspaces: [membership("acme")] },
+    }),
+  );
+  renderRoute(InviteRoute);
+  expect(await screen.findByText("This workspace has reached its member limit")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  await waitFor(() =>
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: "/$workspaceSlug",
+      params: { workspaceSlug: "acme" },
+    }),
+  );
+});

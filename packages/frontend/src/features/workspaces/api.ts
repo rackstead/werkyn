@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
@@ -249,10 +249,13 @@ export function useAcceptInvite() {
         params: { workspaceSlug: result.workspace.slug },
       });
     },
-    onError: (_error, token) => {
-      // Show the current refusal rather than an earlier pending state.
+    onError: (error, token) => {
+      // A refusal replaces an earlier pending or verification state. Busy,
+      // server and network failures keep it, with the error shown beneath.
+      const refused =
+        error instanceof ApiError && [403, 404, 410].includes(error.statusCode);
       const userId = useAuthStore.getState().user?.id;
-      if (userId)
+      if (refused && userId)
         queryClient.removeQueries({
           queryKey: queryKeys.inviteAdmission(userId, token),
           exact: true,

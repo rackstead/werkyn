@@ -13,6 +13,7 @@ import {
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { useWorkspaceMembers } from "@/features/workspaces/api";
 import { useUserRates, useSetUserRate, type UserRate } from "../api";
+import { formatMoney } from "../money";
 
 interface RateManagementDialogProps {
   workspaceId: string;
@@ -35,8 +36,8 @@ export function RateManagementDialog({
         <DialogHeader>
           <DialogTitle>Hourly Rates</DialogTitle>
           <DialogDescription>
-            Set hourly rates for team members. Rates are used to calculate costs
-            in time reports.
+            Set hourly rates for team members. Time reports price each entry at
+            the rate in effect on its date.
           </DialogDescription>
         </DialogHeader>
         {open && <RatesList workspaceId={workspaceId} />}
@@ -50,8 +51,12 @@ function RatesList({ workspaceId }: { workspaceId: string }) {
   const { data: rates = [] } = useUserRates(workspaceId);
   const members = membersData?.data ?? [];
 
+  // The rate in force today: a future-dated rate is not yet current. Today is
+  // the UTC date, which the server uses as the default effectiveFrom.
+  const today = new Date().toISOString().slice(0, 10);
   const rateMap = new Map<string, UserRate>();
   for (const rate of rates) {
+    if (rate.effectiveFrom > today) continue;
     const existing = rateMap.get(rate.userId);
     if (!existing || rate.effectiveFrom > existing.effectiveFrom) {
       rateMap.set(rate.userId, rate);
@@ -143,7 +148,9 @@ function MemberRateRow({
         {editing ? (
           <>
             <div className="flex items-center">
-              <span className="text-sm text-muted-foreground mr-1">$</span>
+              <span className="text-sm text-muted-foreground mr-1">
+                {currentRate?.currency ?? "USD"}
+              </span>
               <Input
                 type="number"
                 min="0"
@@ -166,7 +173,7 @@ function MemberRateRow({
           >
             <span className="font-medium">
               {currentRate && currentRate.rate > 0
-                ? `$${currentRate.rate.toFixed(2)}/hr`
+                ? `${formatMoney(currentRate.rate, currentRate.currency)}/hr`
                 : "Set rate"}
             </span>
             {(!currentRate || currentRate.rate === 0) && (

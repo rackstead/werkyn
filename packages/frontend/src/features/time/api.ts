@@ -38,13 +38,31 @@ export interface UserRate {
   user?: { id: string; displayName: string; avatarUrl: string | null };
 }
 
-export interface TimeReportGroup {
+export interface CurrencyAmount {
+  currency: string;
+  amount: number;
+}
+
+/**
+ * Report cost totals. Amounts in different currencies are never added:
+ * costByCurrency has one total per currency, and totalCost/currency are only
+ * set when every priced amount shares one currency (totalCost is null when
+ * currencies are mixed). Billable hours without a rate on their date add no
+ * cost and are counted in unratedBillableHours.
+ */
+export interface TimeReportCostTotals {
+  totalCost: number | null;
+  currency: string | null;
+  costByCurrency: CurrencyAmount[];
+  unratedBillableHours: number;
+}
+
+export interface TimeReportGroup extends TimeReportCostTotals {
   key: string;
   label: string;
   totalHours: number;
   billableHours: number;
   nonBillableHours: number;
-  totalCost: number;
   entries: Array<{
     id: string;
     date: string;
@@ -54,18 +72,20 @@ export interface TimeReportGroup {
     userName: string;
     projectName: string | null;
     taskTitle: string | null;
-    rate: number;
-    cost: number;
+    /** Rate in effect on the entry's date; null when the member had none. */
+    rate: number | null;
+    currency: string | null;
+    /** null when the entry is billable but has no rate. */
+    cost: number | null;
   }>;
 }
 
 export interface TimeReport {
   groups: TimeReportGroup[];
-  summary: {
+  summary: TimeReportCostTotals & {
     totalHours: number;
     billableHours: number;
     nonBillableHours: number;
-    totalCost: number;
   };
 }
 

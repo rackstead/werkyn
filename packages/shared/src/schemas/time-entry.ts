@@ -53,7 +53,8 @@ export const SetUserRateSchema = z.object({
   rate: z.number().min(0, "Rate must be non-negative"),
   currency: z
     .string()
-    .length(3, "Currency must be a 3-letter code")
+    .regex(/^[A-Za-z]{3}$/, "Currency must be a 3-letter code")
+    .transform((code) => code.toUpperCase())
     .optional(),
   effectiveFrom: z
     .string()

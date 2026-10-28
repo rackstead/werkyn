@@ -10,6 +10,7 @@ import {
 import { ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TimeReportGroup } from "../api";
+import { formatCostLines, formatEntryCost, formatUnratedHours } from "../money";
 
 interface ReportTableProps {
   groups: TimeReportGroup[];
@@ -78,12 +79,25 @@ export function ReportTable({ groups, groupBy }: ReportTableProps) {
         ),
         size: 110,
       }),
-      columnHelper.accessor("totalCost", {
+      columnHelper.accessor("costByCurrency", {
         header: "Cost",
-        cell: ({ getValue }) => (
-          <span className="font-semibold">${getValue().toFixed(2)}</span>
-        ),
-        size: 100,
+        // One line per currency: amounts in different currencies are not added.
+        cell: ({ getValue, row }) => {
+          const unrated = formatUnratedHours(row.original.unratedBillableHours);
+          return (
+            <>
+              {formatCostLines(getValue()).map((line, index) => (
+                <div key={index} className="font-semibold">
+                  {line}
+                </div>
+              ))}
+              {unrated && (
+                <div className="text-xs text-muted-foreground">{unrated}</div>
+              )}
+            </>
+          );
+        },
+        size: 120,
       }),
     ],
     [groupBy],
@@ -201,7 +215,7 @@ export function ReportTable({ groups, groupBy }: ReportTableProps) {
                       –
                     </td>
                     <td className="px-3 py-1.5 text-right text-xs">
-                      ${entry.cost.toFixed(2)}
+                      {formatEntryCost(entry.cost, entry.currency)}
                     </td>
                   </tr>
                 ))}

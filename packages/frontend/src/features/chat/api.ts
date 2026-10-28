@@ -7,6 +7,7 @@ import {
 import { useRef } from "react";
 import { ApiError, api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
+import { useAuthStore } from "@/stores/auth-store";
 import type {
   CreateChannelInput,
   UpdateChannelInput,
@@ -241,7 +242,17 @@ export function useSendMessage(wid: string, channelId: string) {
   const unconfirmed = useRef<{ target: string; key: string } | null>(null);
   return useMutation({
     mutationFn: (data: SendMessageInput) => {
-      const target = JSON.stringify([wid, channelId, data.parentId ?? null, data.content]);
+      // The author when the send starts. The API client checks it before every
+      // attempt, so a retry after an account switch is refused instead of
+      // posting the draft as the new account.
+      const expectedUserId = useAuthStore.getState().user?.id;
+      const target = JSON.stringify([
+        expectedUserId ?? null,
+        wid,
+        channelId,
+        data.parentId ?? null,
+        data.content,
+      ]);
       if (unconfirmed.current?.target !== target) {
         unconfirmed.current = { target, key: createClientMessageId() };
       }
@@ -250,6 +261,7 @@ export function useSendMessage(wid: string, channelId: string) {
         .post(`chat/${wid}/channels/${channelId}/messages`, {
           json: data,
           headers: { "Idempotency-Key": attempt.key },
+          context: { expectedUserId },
           // Safe to repeat: the key makes the server return the stored message.
           // Network failures, timeouts and transient statuses are retried;
           // other API errors (rate limit, conflict, forbidden, validation)

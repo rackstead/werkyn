@@ -6,6 +6,8 @@ import { processRecurringTasks } from "./schedulers/recurring-tasks.js";
 import { processTrashPurge } from "./schedulers/trash-purge.js";
 import { startBlobCleanupWorker } from "./services/blob-cleanup.js";
 import { dexManager } from "./services/dex-manager.js";
+import { logger } from "./utils/logger.js";
+import { createShutdownHandler } from "./utils/shutdown.js";
 
 async function start() {
   const app = await buildApp();
@@ -88,20 +90,24 @@ async function start() {
       app.log.error(err, "Failed to start Dex");
     });
 
-    // Graceful shutdown
-    const shutdown = async () => {
-      app.log.info("Shutting down...");
-      await blobCleanup.stop();
-      await dexManager.stop();
-      await app.close();
-      process.exit(0);
-    };
-    process.on("SIGTERM", shutdown);
-    process.on("SIGINT", shutdown);
+    // Graceful shutdown: failures and timeouts are logged and exit non-zero
+    const shutdown = createShutdownHandler({
+      log: app.log,
+      steps: [
+        { name: "blob cleanup", run: () => blobCleanup.stop() },
+        { name: "dex", run: () => dexManager.stop() },
+        { name: "http server", run: () => app.close() },
+      ],
+    });
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    process.on("SIGINT", () => void shutdown("SIGINT"));
   } catch (err) {
-    app.log.error(err);
+    app.log.fatal({ err }, "Server failed to start");
     process.exit(1);
   }
 }
 
-start();
+start().catch((err) => {
+  logger.fatal({ err }, "Server failed to start");
+  process.exit(1);
+});

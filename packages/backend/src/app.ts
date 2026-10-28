@@ -18,6 +18,7 @@ import websocketPlugin from "./plugins/websocket.js";
 import multipartPlugin from "./plugins/multipart.js";
 import storagePlugin from "./plugins/storage.js";
 import dexProxyPlugin from "./plugins/dex-proxy.js";
+import healthPlugin from "./plugins/health.js";
 import authRoutes from "./modules/auth/auth.routes.js";
 import apiKeysRoutes from "./modules/api-keys/api-keys.routes.js";
 import usersRoutes from "./modules/users/users.routes.js";
@@ -68,11 +69,8 @@ export async function buildApp() {
   await app.register(storagePlugin);
   await app.register(dexProxyPlugin);
 
-  // Health check
-  app.get("/api/health", async (request) => {
-    await app.prisma.$queryRaw`SELECT 1`;
-    return { status: "ok", timestamp: new Date().toISOString() };
-  });
+  // Liveness (/api/health) and readiness (/api/ready) probes
+  await app.register(healthPlugin);
 
   // Module routes
   await app.register(authRoutes, { prefix: "/api/auth" });

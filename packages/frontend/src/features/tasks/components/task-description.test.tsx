@@ -3,9 +3,15 @@ import { act, cleanup, render } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { UpdateTaskSchema } from "@pm/shared";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
 import { TaskDescription } from "./task-description";
+
+// jsdom has no ClipboardEvent; prosemirror-view's pasteText and pasteHTML build one.
+(globalThis as { ClipboardEvent?: unknown }).ClipboardEvent ??= class extends Event {
+  clipboardData = null;
+};
 
 const { http, editors } = vi.hoisted(() => ({
   http: { patch: vi.fn(), get: vi.fn(), post: vi.fn(), delete: vi.fn() },
@@ -498,4 +504,53 @@ it("an ordinary rich-text paste is stored as before", async () => {
     },
     context: { expectedUserId: "task-editor-user" },
   });
+});
+
+function sentDescriptions() {
+  return http.patch.mock.calls.map(
+    ([, options]) => (options as { json: { description: string } }).json.description,
+  );
+}
+function serverAccepts(description: string) {
+  return UpdateTaskSchema.safeParse({ description }).success;
+}
+
+it("real Tiptap: a plain-text paste with Word and PDF breaks saves a description the server accepts", async () => {
+  const id = `task-paste-${++suffix}`;
+  render(<TaskDescription taskId={id} description="" canEdit />, { wrapper });
+  await tick();
+  act(() => {
+    // Ctrl+Shift+V of Word text with a manual line break (VT) and a page break (FF).
+    currentEditor().view.pasteText("Word line\u000bnext line\fnext page \u001b[0mend\u0007");
+  });
+  await tick(801);
+  act(() => {
+    currentEditor().view.pasteHTML("<p>html\u000bline</p>");
+  });
+  await tick(801);
+  const [plain, html] = sentDescriptions();
+  expect(plain).toBe("<p>Word line</p><p>next line</p><p>next page [0mend</p>");
+  // The HTML paste joins the last paragraph; its vertical tab became a space.
+  expect(html).toBe("<p>Word line</p><p>next line</p><p>next page [0mendhtml line</p>");
+  expect(serverAccepts(plain)).toBe(true);
+  expect(serverAccepts(html)).toBe(true);
+});
+
+it("real Tiptap: a legacy description with control characters saves after the next edit", async () => {
+  const id = `task-legacy-${++suffix}`;
+  const legacy = "<p>legacy\u000bvt esc\u001b[0m end</p>";
+  expect(serverAccepts(legacy)).toBe(false);
+  const screen = render(<TaskDescription taskId={id} description={legacy} canEdit />, {
+    wrapper,
+  });
+  await tick();
+  act(() => {
+    const editor = currentEditor();
+    editor.commands.insertContentAt(editor.state.doc.content.size - 1, " edited");
+  });
+  await tick(801);
+  expect(sentDescriptions()).toEqual(["<p>legacy vt esc[0m end edited</p>"]);
+  expect(serverAccepts(sentDescriptions()[0])).toBe(true);
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(toast.error).not.toHaveBeenCalled();
 });

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { stripDisallowedControlCharacters } from "@pm/shared";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -10,6 +11,22 @@ import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { useAuthStore } from "@/stores/auth-store";
 import { useRouter } from "@tanstack/react-router";
 import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
+
+// The server rejects control characters other than tab, line feed and carriage
+// return in a description. A plain-text paste keeps them (Word's manual line
+// break is U+000B, a page break U+000C), and descriptions saved before that
+// rule may still hold them, so they are removed from pasted text and from
+// every description sent to the server. Pasted breaks start a new paragraph;
+// in HTML they become a space.
+function pastedText(text: string) {
+  return stripDisallowedControlCharacters(text, "\n");
+}
+function pastedHtml(html: string) {
+  return stripPastedStyleSheets(stripDisallowedControlCharacters(html, " "));
+}
+function savableDescription(html: string | null) {
+  return html === null ? null : stripDisallowedControlCharacters(html, " ");
+}
 
 interface TaskDescriptionProps {
   taskId: string;
@@ -48,7 +65,11 @@ function TaskDescriptionEditor({
           new Error("Sign in as the author to save these changes"),
         );
       }
-      return updateTask({ ...patch, id: taskId, expectedUserId: userId });
+      return updateTask({
+        description: savableDescription(patch.description),
+        id: taskId,
+        expectedUserId: userId,
+      });
     },
     [taskId, updateTask, userId],
   );
@@ -76,9 +97,12 @@ function TaskDescriptionEditor({
         : description) ?? "",
     ),
     editable: canEdit,
-    editorProps: { transformPastedHTML: stripPastedStyleSheets },
+    editorProps: {
+      transformPastedHTML: pastedHtml,
+      transformPastedText: pastedText,
+    },
     onUpdate: ({ editor: e }) => {
-      autosave.schedule({ description: e.getHTML() || null });
+      autosave.schedule({ description: savableDescription(e.getHTML() || null) });
     },
     onBlur: () => {
       void autosave.flush().catch(() => {});

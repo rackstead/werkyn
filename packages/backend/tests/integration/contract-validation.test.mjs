@@ -164,6 +164,19 @@ test("every date-only input rejects impossible and ancient dates", async () => {
   assert.equal(await (await req("GET", exportUrl({ startDate: "2026-01-01", endDate: "2026-12-31" }))).statusCode, 200);
 });
 
+test("custom field DATE values follow the same calendar-date contract", async () => {
+  const task = assertStatus(await req("POST", `/api/projects/${project.id}/tasks`, { title: "Custom date" }), 201);
+  const field = assertStatus(await req("POST", `/api/projects/${project.id}/custom-fields`, { name: "Launch", type: "DATE" }), 201);
+  const url = `/api/projects/${project.id}/tasks/${task.id}/custom-fields/${field.id}`;
+  for (const value of ["2026-02-31", "0202-03-15", "2026-3-1", "2026-03-01\n"]) {
+    const response = await req("PUT", url, { value });
+    assert.equal(response.statusCode, 400, `${JSON.stringify(value)}: ${response.body}`);
+    assert.match(response.json().message, /real calendar date/);
+  }
+  assertStatus(await req("PUT", url, { value: "2028-02-29" }), 200);
+  assertStatus(await req("PUT", url, { value: null }), 200);
+});
+
 // ─── DAT-017: recurrence edits ─────────────────────────────────────────
 
 test("recurrence edits keep the day each frequency requires", async () => {

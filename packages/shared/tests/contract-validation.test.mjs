@@ -12,6 +12,7 @@ import {
   isDateOnly,
   multilineText,
   singleLineText,
+  stripDisallowedControlCharacters,
 } from "../dist/index.js";
 
 test("isDateOnly accepts only real calendar dates between 1900 and 2999", () => {
@@ -50,6 +51,18 @@ test("single-line text allows tab; multi-line text also allows line breaks; neit
   }
   // Printable characters beyond C0 (DEL and above) are left alone.
   assert.equal(single.safeParse("a\u007fb c d").success, true);
+});
+
+test("stripDisallowedControlCharacters makes any text acceptable as multi-line text", () => {
+  let every = "";
+  for (let code = 0; code < 0x20; code += 1) every += `${code}:${String.fromCharCode(code)};`;
+  const stripped = stripDisallowedControlCharacters(every);
+  assert.equal(multilineText().safeParse(stripped).success, true);
+  assert.equal(stripped.includes("9:\t;10:\n;"), true);
+  assert.equal(stripped.includes("13:\r;"), true);
+  assert.equal(stripDisallowedControlCharacters("a\u000bb\u000cc\u001bd\u0000e"), "a\nb\ncde");
+  assert.equal(stripDisallowedControlCharacters("<p>a\u000bb</p>", " "), "<p>a b</p>");
+  assert.equal(stripDisallowedControlCharacters("plain Zoë\ttext\r\n"), "plain Zoë\ttext\r\n");
 });
 
 test("schemas apply the text, date and number rules to their fields", () => {

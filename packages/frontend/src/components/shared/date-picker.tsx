@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { committedDate } from "@/lib/date-input";
 
 interface DatePickerProps {
   value: string | null;
@@ -20,9 +21,11 @@ export function DatePicker({ value, onChange, className, disabled, id, label }: 
     setLocal(value);
   }, [value]);
 
-  const handleChange = (date: string | null) => {
-    setLocal(date);
-    onChange(date);
+  const handleChange = (value: string) => {
+    setLocal(value || null);
+    // A partial year being typed is shown but not reported.
+    const date = committedDate(value);
+    if (date !== undefined) onChange(date);
   };
 
   return (
@@ -32,7 +35,7 @@ export function DatePicker({ value, onChange, className, disabled, id, label }: 
         aria-label={label}
         type="date"
         value={local ?? ""}
-        onChange={(e) => handleChange(e.target.value || null)}
+        onChange={(e) => handleChange(e.target.value)}
         disabled={disabled}
         className={cn(
           "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors",
@@ -43,7 +46,7 @@ export function DatePicker({ value, onChange, className, disabled, id, label }: 
       {local && !disabled && (
         <button
           type="button"
-          onClick={() => handleChange(null)}
+          onClick={() => handleChange("")}
           aria-label={label ? `Clear ${label.toLowerCase()}` : "Clear date"}
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
         >

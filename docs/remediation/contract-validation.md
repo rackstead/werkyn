@@ -12,6 +12,14 @@ report ranges, rate `effectiveFrom`, and schedule `startDate`/`endDate`) uses
 (`2026-02-31`, `2027-02-29` and `2026-13-01` are rejected) and fall in the
 years 1900 to 2999. Years 0000-0099 used to reach `Date.UTC`, which reads
 them as 1900-1999. Invalid dates return HTTP 400 with the field name.
+Custom field values of type DATE are checked with the same `isDateOnly()` in
+the custom field service.
+
+The web client only saves a date input once it holds a complete date (or is
+cleared). While a year is typed, Chromium reports partial years such as
+`0002-03-15`, `0020-03-15` and `0202-03-15`; the task detail and custom field
+date pickers, the list view's inline due date and custom field date cells, the
+bulk due date, the task list filters and the time pages hold those back.
 
 ## Recurring schedules
 
@@ -32,7 +40,15 @@ allows line feed and carriage return. U+0000 in particular used to reach
 PostgreSQL, which cannot store it, and fail with a 500. The chat, SSO, mail
 and backup schemas are owned by other work and are not changed here; a NUL
 in those fields is still stopped by the database and reported as a 400 (see
-below).
+below). DEL, C1 controls and U+2028/U+2029 are not C0 characters and are
+accepted.
+
+The task description editor removes the characters `multilineText()` rejects:
+from plain-text and HTML pastes (a plain-text paste keeps Word's manual line
+break U+000B and a page break U+000C; in pasted text they start a new
+paragraph), and from every description it saves, so a description stored with
+such characters before this rule saves normally after its next edit.
+`stripDisallowedControlCharacters()` in `common.ts` does this.
 
 ## Numbers
 
@@ -70,6 +86,13 @@ of such rows (the time entry list, rate list) still fail, now with a generic
 ```sql
 SELECT id FROM "TimeEntry" WHERE hours IN ('NaN', 'Infinity', '-Infinity');
 SELECT id FROM "UserRate" WHERE rate IN ('NaN', 'Infinity', '-Infinity');
+```
+
+A template `dueOffset` above 3650 can only come from a direct database write;
+such a template creates tasks with an invalid due date. Find them with:
+
+```sql
+SELECT id FROM "TaskTemplate" WHERE "dueOffset" > 3650;
 ```
 
 ## Compatibility

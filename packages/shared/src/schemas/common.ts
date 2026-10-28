@@ -52,6 +52,19 @@ export function multilineText() {
   return z.string().regex(MULTILINE_TEXT, "Must not contain control characters");
 }
 
+// The characters MULTILINE_TEXT rejects, and the two of them that stand for a
+// break: vertical tab (a manual line break in Word) and form feed (a page break).
+const MULTILINE_DISALLOWED = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;
+const BREAK_CONTROLS = /[\u000B\u000C]/g;
+
+/**
+ * Makes text acceptable to multilineText(): vertical tab and form feed become
+ * `breakWith`, and the other rejected control characters are removed.
+ */
+export function stripDisallowedControlCharacters(value: string, breakWith = "\n"): string {
+  return value.replace(BREAK_CONTROLS, breakWith).replace(MULTILINE_DISALLOWED, "");
+}
+
 // ─── Numbers ────────────────────────────────────────────
 
 /** The largest value a PostgreSQL integer column holds; positions and counts stay within it. */

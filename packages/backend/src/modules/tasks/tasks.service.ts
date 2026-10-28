@@ -11,7 +11,6 @@ import type {
   BulkUpdateFieldsInput,
   TaskDependencyInput,
 } from "@pm/shared";
-import sanitizeHtml from "sanitize-html";
 import {
   ConflictError,
   ForbiddenError,
@@ -20,23 +19,7 @@ import {
 } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
 import { assertProjectAccess, assertTaskEdit } from "../../utils/project-access.js";
-
-const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
-  allowedTags: [
-    "b", "i", "em", "strong", "p", "br", "ul", "ol", "li", "a",
-    "h1", "h2", "h3", "blockquote", "code", "pre",
-  ],
-  allowedAttributes: {
-    a: ["href", "target", "rel"],
-  },
-  allowedSchemes: ["http", "https", "mailto"],
-  disallowedTagsMode: "discard",
-};
-
-function sanitize(html: string | undefined | null): string | undefined | null {
-  if (html === undefined || html === null) return html;
-  return sanitizeHtml(html, SANITIZE_OPTIONS);
-}
+import { sanitizeDescription } from "../../utils/description-html.js";
 
 export async function listTasks(
   prisma: PrismaClient,
@@ -175,7 +158,7 @@ export async function createTask(
     });
     const position = (maxPos._max.position ?? -1) + 1;
 
-    const description = sanitize(data.description);
+    const description = sanitizeDescription(data.description);
 
     // Build assigneeIds: if MEMBER, auto-include creator
     let assigneeIds = data.assigneeIds ?? [];
@@ -310,7 +293,7 @@ export async function updateTask(
 
     if (data.title !== undefined) updateData.title = data.title;
     if (data.description !== undefined) {
-      updateData.description = sanitize(data.description);
+      updateData.description = sanitizeDescription(data.description);
     }
     if (data.dueDate !== undefined) updateData.dueDate = data.dueDate;
     if (data.startDate !== undefined) updateData.startDate = data.startDate;
@@ -968,7 +951,8 @@ export async function duplicateTask(
         projectId: source.projectId,
         statusId: source.statusId,
         title: `Copy of ${source.title}`,
-        description: source.description,
+        // Rows written before every path sanitized may hold unfiltered HTML.
+        description: sanitizeDescription(source.description),
         priority: source.priority,
         position,
         dueDate: source.dueDate,

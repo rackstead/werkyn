@@ -121,7 +121,8 @@ export type RotationResult =
   | { status: "invalid" };
 
 // The interactive transaction ran out of its budget (or was closed) and was
-// rolled back, so nothing it did is committed.
+// rolled back, so nothing it did is committed. Answered 503: unlike a
+// superseded token (409), the presented cookie is unchanged.
 function isTransactionTimeout(error: unknown) {
   return (
     error instanceof Prisma.PrismaClientKnownRequestError &&

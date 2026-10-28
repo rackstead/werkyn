@@ -17,6 +17,7 @@ import {
   sendPasswordResetEmail,
 } from "../../utils/mailer.js";
 import {
+  AppError,
   ConflictError,
   UnauthorizedError,
   NotFoundError,
@@ -319,7 +320,11 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
   if (rotation.status === "busy") {
     // Another operation held this session past the transaction budget and
     // this attempt was rolled back; the same cookie can be retried.
-    throw new ConflictError("This session is busy. Retry the refresh.");
+    throw new AppError(
+      503,
+      "Service Unavailable",
+      "This session is busy. Retry the refresh.",
+    );
   }
   if (rotation.status === "expired") {
     throw new UnauthorizedError("Refresh token expired");

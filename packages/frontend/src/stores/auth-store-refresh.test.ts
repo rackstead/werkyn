@@ -134,6 +134,44 @@ it("a tab that gave up refreshes again after another tab's broadcast", async () 
   expect(useAuthStore.getState().accessToken).toBe("after-broadcast");
 });
 
+it("a busy session retries the unchanged cookie without starting the superseded budget", async () => {
+  const fetch = vi.fn(async () => status(503));
+  vi.stubGlobal("fetch", fetch);
+  const busy = useAuthStore.getState().refresh();
+  await vi.advanceTimersByTimeAsync(13_750);
+  await expect(busy).resolves.toBe(false);
+  expect(fetch).toHaveBeenCalledTimes(7);
+  // Contention ends: the same cookie is sent again and succeeds.
+  await vi.advanceTimersByTimeAsync(10_000);
+  fetch.mockImplementation(async () => refreshed("after-busy"));
+  await expect(useAuthStore.getState().refresh()).resolves.toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(8);
+});
+
+it("a 409 that arrives after another tab's broadcast does not block later refreshes", async () => {
+  let respond!: (response: Response) => void;
+  const fetch = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const result = useAuthStore.getState().refresh();
+  await vi.advanceTimersByTimeAsync(1);
+  // The winning tab's broadcast lands before this tab's request returns.
+  await broadcastFromOtherTab("winner");
+  respond(status(409));
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(result).resolves.toBe(true);
+
+  await vi.advanceTimersByTimeAsync(20_000);
+  fetch.mockImplementation(async () => refreshed("next-cycle"));
+  await expect(useAuthStore.getState().refresh()).resolves.toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(useAuthStore.getState().accessToken).toBe("next-cycle");
+});
+
 it("a rejected refresh fails at once without retrying", async () => {
   const fetch = vi.fn(async () => status(401));
   vi.stubGlobal("fetch", fetch);

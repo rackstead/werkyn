@@ -627,7 +627,7 @@ test("a refresh waiting on a busy family past Prisma's default budget completes"
   ]);
 });
 
-test("a refresh that exhausts its transaction budget is a retryable 409 that changes nothing", async () => {
+test("a refresh that exhausts its transaction budget is a retryable 503 that changes nothing", async () => {
   const user = await makeUser();
   const session = await signIn(user);
   const familyId = await familyOf(session.refresh);
@@ -646,7 +646,7 @@ test("a refresh that exhausts its transaction budget is a retryable 409 that cha
   } finally {
     refreshTransactionOptions.timeout = budget;
   }
-  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.statusCode, 503, response.body);
   assert.match(response.json().message, /busy/i);
   assert.equal(cookieOf(response), undefined);
   assert.deepEqual(await activeTokens(familyId), [hashToken(session.refresh)]);

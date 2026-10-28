@@ -54,10 +54,10 @@ const channel =
 let lastRefreshTime = 0;
 
 // Tabs share one refresh cookie. When another tab rotates it first, the server
-// answers 409 without minting or revoking anything (as it does for a session
-// busy past its transaction budget). The winning tab's response replaces the
-// cookie and normally broadcasts the new access token: adopt that broadcast as
-// soon as it arrives, or retry with the replaced cookie.
+// answers 409 without minting or revoking anything. The winning tab's response
+// replaces the cookie and normally broadcasts the new access token: adopt that
+// broadcast as soon as it arrives, or retry with the replaced cookie. A 503
+// means the session was busy and the unchanged cookie is retried the same way.
 //
 // The server answers the old cookie 409 for 30 s after its rotation and then
 // treats it as reuse, revoking the session. A run of 409s is therefore tracked
@@ -77,14 +77,22 @@ function supersededTooLong() {
 }
 
 async function requestRefresh() {
+  const sentAt = Date.now();
   const res = await fetch("/api/auth/refresh", {
     method: "POST",
     credentials: "include",
   });
-  if (res.status === 409) supersededSince ??= Date.now();
-  else supersededSince = null;
+  // A 409 for a cookie sent before a newer refresh landed says nothing about
+  // the cookie the browser holds now; a busy 503 leaves the cookie unchanged.
+  if (res.status === 409) {
+    if (lastRefreshTime < sentAt) supersededSince ??= Date.now();
+  } else if (res.status !== 503) {
+    supersededSince = null;
+  }
   return res;
 }
+
+const retryable = (res: Response) => res.status === 409 || res.status === 503;
 
 function waitForBroadcast(ms: number) {
   return new Promise<void>((resolve) => {
@@ -189,9 +197,12 @@ export const useAuthStore = create<AuthState>((set, get) => {
           const startedAt = Date.now();
           let res = await requestRefresh();
           for (const delay of SUPERSEDED_RETRY_DELAYS_MS) {
-            if (res.status !== 409) break;
+            if (!retryable(res)) break;
             await waitForBroadcast(delay);
-            if (lastRefreshTime > startedAt && get().accessToken) return true;
+            if (lastRefreshTime > startedAt && get().accessToken) {
+              supersededSince = null;
+              return true;
+            }
             if (supersededTooLong()) return false;
             res = await requestRefresh();
           }

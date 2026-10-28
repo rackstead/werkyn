@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
@@ -10,7 +10,9 @@ import type {
   UpdateWorkspaceInput,
   UpdateWorkspaceMemberInput,
   CreateInviteInput,
+  WorkspaceAdmissionCheck,
 } from "@pm/shared";
+import type { WorkspaceMembership } from "@/stores/auth-store";
 
 interface Workspace {
   id: string;
@@ -187,21 +189,162 @@ export function useInviteDetails(token: string) {
   });
 }
 
-export function useAcceptInvite() {
+type AdmissionResponse = {
+  data: Exclude<WorkspaceAdmissionCheck, { status: "denied" | "unavailable" }> & {
+    userId: string;
+    workspaces?: WorkspaceMembership[];
+  };
+};
+
+/** Remembers an admission result for this account and invite in memory only. */
+export function rememberInviteAdmission(
+  userId: string,
+  token: string,
+  admission: WorkspaceAdmissionCheck,
+) {
+  queryClient.setQueryData(
+    queryKeys.inviteAdmission(userId, token),
+    admission,
+  );
+}
+
+/** The current account's latest admission result for an invite, if any. */
+export function useInviteAdmission(token: string) {
+  const userId = useAuthStore((s) => s.user?.id ?? "");
+  const { data } = useQuery<WorkspaceAdmissionCheck | null>({
+    queryKey: queryKeys.inviteAdmission(userId, token),
+    // Populated by registration, acceptance and status checks; never fetched.
+    queryFn: () => null,
+    enabled: false,
+    staleTime: Infinity,
+  });
+  return userId ? (data ?? null) : null;
+}
+
+// Shared by acceptance (a join attempt) and the read-only status check.
+function useAdmissionMutation(
+  send: (token: string) => Promise<AdmissionResponse>,
+) {
   const navigate = useNavigate();
   return useMutation({
-    mutationFn: (token: string) =>
-      api
-        .post(`invites/${token}/accept`)
-        .json<{ data: { id: string; slug: string; name: string } }>(),
-    onSuccess: async (res) => {
-      await useAuthStore.getState().refresh();
+    mutationFn: send,
+    // The account that sends the request owns its result, even if the browser
+    // switches accounts before the response arrives.
+    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
+    onSuccess: async (res, token) => {
+      const result = res.data;
+      // If this browser has since switched or signed out, the response must
+      // not change the current session.
+      if (useAuthStore.getState().user?.id !== result.userId) return;
+      rememberInviteAdmission(result.userId, token, result);
+      if (result.status !== "joined") return;
+      if (
+        !result.workspaces ||
+        !useAuthStore
+          .getState()
+          .setWorkspacesForUser(result.userId, result.workspaces)
+      )
+        return;
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });
-      toast.success(`Joined ${res.data.name}`);
+      toast.success(
+        result.alreadyMember
+          ? `You're already a member of ${result.workspace.name}`
+          : `Joined ${result.workspace.name}`,
+      );
       navigate({
         to: "/$workspaceSlug",
-        params: { workspaceSlug: res.data.slug },
+        params: { workspaceSlug: result.workspace.slug },
       });
     },
+    onError: (error, token, context) => {
+      // A refusal replaces that account's earlier pending or verification
+      // state. Busy, server and network failures keep it, with the error
+      // shown beneath.
+      const refused =
+        error instanceof ApiError && [403, 404, 410].includes(error.statusCode);
+      if (refused && context?.requesterId)
+        queryClient.removeQueries({
+          queryKey: queryKeys.inviteAdmission(context.requesterId, token),
+          exact: true,
+        });
+    },
+  });
+}
+
+/** Attempts to join; may create a pending join request. */
+export function useAcceptInvite() {
+  return useAdmissionMutation((token) =>
+    api.post(`invites/${token}/accept`).json<AdmissionResponse>(),
+  );
+}
+
+/** Reports where the current account stands without creating a request. */
+export function useCheckInviteAdmission() {
+  return useAdmissionMutation((token) =>
+    // An explicit user check: report the answer once rather than letting the
+    // client's default GET retries repeat a refusal.
+    api
+      .get(`invites/${token}/admission`, { retry: 0 })
+      .json<AdmissionResponse>(),
+  );
+}
+
+// ─── Join requests (administrator review) ───────────────
+
+export interface AdmissionRequest {
+  id: string;
+  createdAt: string;
+  user: {
+    id: string;
+    email: string;
+    displayName: string;
+    avatarUrl: string | null;
+    emailVerified: boolean;
+  };
+  invite: {
+    id: string;
+    role: "ADMIN" | "MEMBER" | "VIEWER";
+    email: string | null;
+    expiresAt: string | null;
+    maxUses: number | null;
+    useCount: number;
+  };
+}
+
+export function useAdmissionRequests(wid: string) {
+  return useQuery({
+    queryKey: queryKeys.admissionRequests(wid),
+    queryFn: () =>
+      api
+        .get(`workspaces/${wid}/admission-requests`)
+        .json<{ data: AdmissionRequest[] }>(),
+    enabled: !!wid,
+  });
+}
+
+function invalidateAdmission(wid: string) {
+  queryClient.invalidateQueries({ queryKey: queryKeys.admissionRequests(wid) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.invites(wid) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.workspaceMembers(wid) });
+}
+
+export function useApproveAdmissionRequest(wid: string) {
+  return useMutation({
+    mutationFn: (requestId: string) =>
+      api
+        .post(`workspaces/${wid}/admission-requests/${requestId}/approve`)
+        .json(),
+    onSuccess: () => toast.success("Join request approved"),
+    // A refused or stale decision also refreshes the queue and counters.
+    onSettled: () => invalidateAdmission(wid),
+  });
+}
+
+export function useRejectAdmissionRequest(wid: string) {
+  return useMutation({
+    mutationFn: (requestId: string) =>
+      api.post(`workspaces/${wid}/admission-requests/${requestId}/reject`),
+    onSuccess: () => toast.success("Join request rejected"),
+    onSettled: () => invalidateAdmission(wid),
   });
 }

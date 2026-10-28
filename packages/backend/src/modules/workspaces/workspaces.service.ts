@@ -9,6 +9,11 @@ import type {
 } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { projectAccessWhere } from "../../utils/project-access.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import {
+  assertCurrentAdmin,
+  normalizeAllowedEmailDomains,
+} from "../invites/admission.service.js";
 
 export async function createWorkspace(
   prisma: PrismaClient,
@@ -120,13 +125,18 @@ export async function listMembers(
   });
 }
 
+// Membership changes take the workspace lock before any member row, so role
+// changes, removals (seat release) and admission decisions serialize. READ
+// COMMITTED after the lock gives each one the previous holder's committed state.
 export async function updateMemberRole(
   prisma: PrismaClient,
   workspaceId: string,
   targetUserId: string,
+  actorId: string,
   data: UpdateWorkspaceMemberInput,
 ) {
-  return prisma.$transaction(async (tx) => {
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertCurrentAdmin(tx, workspaceId, actorId);
     const member = await tx.workspaceMember.findUnique({
       where: { userId_workspaceId: { userId: targetUserId, workspaceId } },
     });
@@ -159,7 +169,7 @@ export async function updateMemberRole(
         },
       },
     });
-  }, { isolationLevel: "Serializable" });
+  });
 }
 
 export async function removeMember(
@@ -175,7 +185,15 @@ export async function removeMember(
     throw new ForbiddenError("Only admins can remove other members");
   }
 
-  return prisma.$transaction(async (tx) => {
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    if (!isSelf) {
+      await assertCurrentAdmin(
+        tx,
+        workspaceId,
+        actorId,
+        "Only admins can remove other members",
+      );
+    }
     const member = await tx.workspaceMember.findUnique({
       where: { userId_workspaceId: { userId: targetUserId, workspaceId } },
     });
@@ -195,7 +213,7 @@ export async function removeMember(
     }
 
     await tx.workspaceMember.delete({ where: { id: member.id } });
-  }, { isolationLevel: "Serializable" });
+  });
 }
 
 export async function getDashboard(
@@ -385,15 +403,28 @@ export async function getWorkspaceSettings(
 export async function updateWorkspaceSettings(
   prisma: PrismaClient,
   workspaceId: string,
+  actorId: string,
   data: UpdateWorkspaceSettingsInput,
 ) {
-  return prisma.workspaceSettings.upsert({
-    where: { workspaceId },
-    create: {
-      workspaceId,
-      ...data,
-    },
-    update: data,
+  const update = data.allowedEmailDomains
+    ? {
+        ...data,
+        allowedEmailDomains: normalizeAllowedEmailDomains(
+          data.allowedEmailDomains,
+        ),
+      }
+    : data;
+  // Admission policy changes serialize with admission decisions.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertCurrentAdmin(tx, workspaceId, actorId);
+    return tx.workspaceSettings.upsert({
+      where: { workspaceId },
+      create: {
+        workspaceId,
+        ...update,
+      },
+      update,
+    });
   });
 }
 

@@ -34,7 +34,11 @@ function RegisterPage() {
         <Card>
           <CardHeader className="text-center">
             <CardTitle className="text-2xl font-heading">Create account</CardTitle>
-            <CardDescription>Sign up for a new account</CardDescription>
+            <CardDescription>
+              {inviteToken
+                ? "Create an account to accept your workspace invite"
+                : "Sign up for a new account"}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <RegisterForm inviteToken={inviteToken} />

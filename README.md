@@ -291,6 +291,51 @@ for bootstrap. OIDC identity/linking transactions retain serializable isolation.
 The application has no account-deletion endpoint; do not run destructive seeds or
 manual deletion of all users concurrently with registration.
 
+## Workspace invitations and admission
+
+Registration with an invite token and accepting an invite while signed in use
+the same admission check. It reads the account's current email and verification
+state, the live invitation and the workspace settings, and returns one of:
+
+- `joined`: the membership was created with the invitation's role (an existing
+  member keeps their role and the invitation is not used again);
+- `verification_required`: the invitation is limited to an email address, or the
+  workspace limits allowed email domains, and the address is not yet verified;
+- `approval_pending`: the workspace requires admin approval and a join request
+  is waiting for review;
+- `denied`: the invitation is missing, revoked, expired or used up, invites are
+  disabled, the email or domain does not match, or the workspace is full.
+
+`POST /api/invites/:token/accept` answers `200` when joined, `202` while
+verification or approval is pending, and `403`/`404`/`410` when denied.
+`GET /api/invites/:token/admission` reports the same state for the signed-in
+account without writing anything, or `not_pending` when there is no membership
+and no pending request (for example, after a request was declined).
+`POST /api/auth/register` always keeps the new account and reports the result in
+`data.admission`; a verification email sent because of an invitation links back
+to that invitation. Open invitations without an email or domain restriction still
+admit unverified accounts. The workspace's default role setting does not change
+the role granted by an invitation.
+
+When **Require admin approval** is enabled, invitations create join requests
+instead of memberships. Workspace admins review them under Admin, Invites, Join
+requests (`GET /api/workspaces/:wid/admission-requests`, then
+`POST .../admission-requests/:requestId/approve` or `.../reject`). Approval checks the approver, invitation, applicant and
+settings again at decision time and does not reserve a seat or invitation use
+in advance. Revoking an invitation cancels its pending requests. Checking a
+request's status never creates or revives it; a declined person sees that the
+request is no longer pending and may explicitly ask again while the invitation
+remains valid. Revoke the invitation to stop that.
+
+Admission, workspace settings changes, invitation creation/revocation, member
+role changes and removals lock the workspace row (`SELECT ... FOR NO KEY UPDATE`)
+before reading admission state, so member limits and invitation use limits hold
+under concurrent requests. Allowed email domains are stored lowercase without a
+leading `@`; blank entries are rejected. The migration
+`20261027140000_add_workspace_admission_requests` adds the join request table;
+existing data is unchanged. See
+[docs/remediation/sec-007.md](docs/remediation/sec-007.md) for details and tests.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

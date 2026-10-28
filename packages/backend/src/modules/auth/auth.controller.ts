@@ -1,4 +1,5 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
+import type { ResendVerificationInput } from "@pm/shared";
 import * as authService from "./auth.service.js";
 import { env } from "../../config/env.js";
 
@@ -43,6 +44,7 @@ export async function registerHandler(
       user: result.user,
       accessToken: result.accessToken,
       workspaces: result.workspaces,
+      ...(result.admission ? { admission: result.admission } : {}),
     },
   });
 }
@@ -153,9 +155,11 @@ export async function resendVerificationHandler(
   request: FastifyRequest,
   reply: FastifyReply,
 ) {
+  const body = request.body as ResendVerificationInput;
   const result = await authService.resendVerification(
     request.server.prisma,
     request.user!.id,
+    body?.inviteToken,
   );
 
   return reply.send(result);

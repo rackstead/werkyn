@@ -5,6 +5,10 @@ import {
   revokeInviteHandler,
   getInviteHandler,
   acceptInviteHandler,
+  checkAdmissionHandler,
+  listAdmissionRequestsHandler,
+  approveAdmissionRequestHandler,
+  rejectAdmissionRequestHandler,
 } from "./invites.controller.js";
 import { authenticate } from "../../middleware/authenticate.js";
 import { authorize } from "../../middleware/authorize.js";
@@ -50,5 +54,37 @@ export default async function invitesRoutes(fastify: FastifyInstance) {
     url: "/invites/:token/accept",
     preHandler: [authenticate],
     handler: acceptInviteHandler,
+  });
+
+  // GET /api/invites/:token/admission (read-only status for the caller)
+  fastify.route({
+    method: "GET",
+    url: "/invites/:token/admission",
+    preHandler: [authenticate],
+    handler: checkAdmissionHandler,
+  });
+
+  // GET /api/workspaces/:wid/admission-requests (pending join requests)
+  fastify.route({
+    method: "GET",
+    url: "/workspaces/:wid/admission-requests",
+    preHandler: [authenticate, authorize("ADMIN")],
+    handler: listAdmissionRequestsHandler,
+  });
+
+  // POST /api/workspaces/:wid/admission-requests/:rid/approve
+  fastify.route({
+    method: "POST",
+    url: "/workspaces/:wid/admission-requests/:rid/approve",
+    preHandler: [authenticate, authorize("ADMIN")],
+    handler: approveAdmissionRequestHandler,
+  });
+
+  // POST /api/workspaces/:wid/admission-requests/:rid/reject
+  fastify.route({
+    method: "POST",
+    url: "/workspaces/:wid/admission-requests/:rid/reject",
+    preHandler: [authenticate, authorize("ADMIN")],
+    handler: rejectAdmissionRequestHandler,
   });
 }

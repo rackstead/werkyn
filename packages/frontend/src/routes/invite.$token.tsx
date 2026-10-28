@@ -1,5 +1,11 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useInviteDetails, useAcceptInvite } from "@/features/workspaces/api";
+import {
+  useInviteDetails,
+  useAcceptInvite,
+  useCheckInviteAdmission,
+  useInviteAdmission,
+} from "@/features/workspaces/api";
+import { useResendVerification } from "@/features/auth/api";
 import { useAuthStore } from "@/stores/auth-store";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,6 +26,9 @@ function InvitePage() {
   const user = useAuthStore((s) => s.user);
   const { data, isLoading, isError, error } = useInviteDetails(token);
   const acceptInvite = useAcceptInvite();
+  const checkAdmission = useCheckInviteAdmission();
+  const admission = useInviteAdmission(token);
+  const resend = useResendVerification(token);
 
   const invite = data?.data;
 
@@ -35,6 +44,117 @@ function InvitePage() {
           </CardContent>
         </Card>
       </div>
+    );
+  }
+
+  // Accepting is a join attempt (it may create a join request); checking only
+  // reports the current state and never creates or revives a request.
+  const accept = () => {
+    checkAdmission.reset();
+    acceptInvite.mutate(token);
+  };
+  const check = () => {
+    acceptInvite.reset();
+    checkAdmission.mutate(token);
+  };
+  const busy = acceptInvite.isPending || checkAdmission.isPending;
+  const failed = acceptInvite.isError
+    ? acceptInvite.error
+    : checkAdmission.isError
+      ? checkAdmission.error
+      : null;
+  const acceptError = failed ? (
+    <p role="alert" className="text-sm text-center text-destructive">
+      {failed instanceof ApiError ? failed.message : "Failed to accept invite"}
+    </p>
+  ) : null;
+  const goHome = (
+    <Link to="/" className="block">
+      <Button variant="outline" className="w-full">
+        Go home
+      </Button>
+    </Link>
+  );
+
+  let signedInContent;
+  if (admission?.status === "verification_required") {
+    signedInContent = (
+      <>
+        <p className="text-sm text-center">
+          Verify <span className="font-medium">{admission.email}</span> to join.
+          Open the verification link we emailed you, then continue here.
+        </p>
+        <Button className="w-full" onClick={accept} disabled={busy}>
+          {acceptInvite.isPending ? "Checking..." : "I've verified my email"}
+        </Button>
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={() => resend.mutate()}
+          disabled={resend.isPending}
+        >
+          {resend.isPending ? "Sending..." : "Resend verification email"}
+        </Button>
+        {acceptError}
+      </>
+    );
+  } else if (admission?.status === "approval_pending") {
+    signedInContent = (
+      <>
+        <p className="text-sm text-center">
+          Your request to join{" "}
+          <span className="font-medium">{admission.workspace.name}</span> is
+          waiting for an administrator&apos;s approval. You&apos;ll have access
+          once it is approved.
+        </p>
+        <Button className="w-full" onClick={check} disabled={busy}>
+          {checkAdmission.isPending ? "Checking..." : "Check status"}
+        </Button>
+        {acceptError}
+        {goHome}
+      </>
+    );
+  } else if (admission?.status === "not_pending") {
+    signedInContent = (
+      <>
+        <p className="text-sm text-center">
+          Your request to join{" "}
+          <span className="font-medium">{admission.workspace.name}</span> is no
+          longer pending. An administrator may have declined it. You can ask
+          again.
+        </p>
+        <Button className="w-full" onClick={accept} disabled={busy}>
+          {acceptInvite.isPending ? "Sending..." : "Ask again"}
+        </Button>
+        {acceptError}
+        {goHome}
+      </>
+    );
+  } else if (
+    admission?.status === "denied" ||
+    admission?.status === "unavailable"
+  ) {
+    signedInContent = (
+      <>
+        <p role="alert" className="text-sm text-center text-destructive">
+          {admission.message}
+        </p>
+        {/* Policy, capacity or the invitation may have changed since. */}
+        <Button className="w-full" onClick={accept} disabled={busy}>
+          {acceptInvite.isPending ? "Checking..." : "Try again"}
+        </Button>
+        {acceptError}
+        {goHome}
+      </>
+    );
+  } else {
+    signedInContent = (
+      <>
+        <Button className="w-full" onClick={accept} disabled={busy}>
+          {acceptInvite.isPending ? "Joining..." : "Accept invite"}
+        </Button>
+        {acceptError}
+      </>
     );
   }
 
@@ -55,10 +175,27 @@ function InvitePage() {
                 : "This invite link is invalid or has been revoked."}
             </CardDescription>
           </CardHeader>
-          <CardContent className="text-center">
-            <Link to="/">
-              <Button variant="outline">Go home</Button>
-            </Link>
+          <CardContent className="space-y-4 text-center">
+            {user ? (
+              // The public preview cannot know the signed-in account. Show any
+              // remembered result, and let the server answer for this account
+              // (for example, an existing member is still admitted).
+              admission ? (
+                signedInContent
+              ) : (
+                <>
+                  <Button className="w-full" onClick={check} disabled={busy}>
+                    {checkAdmission.isPending ? "Checking..." : "Check my access"}
+                  </Button>
+                  {acceptError}
+                  {goHome}
+                </>
+              )
+            ) : (
+              <Link to="/">
+                <Button variant="outline">Go home</Button>
+              </Link>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -85,20 +222,7 @@ function InvitePage() {
               <p className="text-sm text-center text-muted-foreground">
                 Signed in as {user.email}
               </p>
-              <Button
-                className="w-full"
-                onClick={() => acceptInvite.mutate(token)}
-                disabled={acceptInvite.isPending}
-              >
-                {acceptInvite.isPending ? "Joining..." : "Accept invite"}
-              </Button>
-              {acceptInvite.isError && (
-                <p className="text-sm text-center text-destructive">
-                  {acceptInvite.error instanceof ApiError
-                    ? acceptInvite.error.message
-                    : "Failed to accept invite"}
-                </p>
-              )}
+              {signedInContent}
             </>
           ) : (
             <div className="space-y-2">

@@ -37,7 +37,7 @@
     "pino": "^10.3.1",
     "sanitize-html": "^2.17.0",
     "sharp": "^0.34.5",
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.6.1",
     "archiver": "^7.0.1",
     "yaml": "^2.8.2",
     "zod": "^3.24.1"
@@ -46,7 +46,6 @@
     "seed": "tsx prisma/seed.ts"
   },
   "devDependencies": {
-    "@types/adm-zip": "^0.5.7",
     "@types/archiver": "^6.0.3",
     "@types/bcrypt": "^5.0.2",
     "@types/jsonwebtoken": "^9.0.7",

@@ -54,8 +54,8 @@ importers:
         specifier: ^6.3.1
         version: 6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3)
       adm-zip:
-        specifier: ^0.5.16
-        version: 0.5.16
+        specifier: ^0.6.1
+        version: 0.6.1
       archiver:
         specifier: ^7.0.1
         version: 7.0.1
@@ -96,9 +96,6 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
     devDependencies:
-      '@types/adm-zip':
-        specifier: ^0.5.7
-        version: 0.5.7
       '@types/archiver':
         specifier: ^6.0.3
         version: 6.0.4
@@ -2368,9 +2365,6 @@ packages:
   '@tokenizer/token@0.3.0':
     resolution: {integrity: sha512-OvjF+z51L3ov0OyAU0duzsYuvO01PH7x4t6DJx+guahgTnBHkhJdG7soQeTSFLWN3efnHyibZ4Z8l2EuWwJN3A==}
 
-  '@types/adm-zip@0.5.7':
-    resolution: {integrity: sha512-DNEs/QvmyRLurdQPChqq0Md4zGvPwHerAJYWk9l2jCbD1VPpnzRJorOdiq4zsw09NFbYnhfsoEhWtxIzXpn2yw==}
-
   '@types/archiver@6.0.4':
     resolution: {integrity: sha512-ULdQpARQ3sz9WH4nb98mJDYA0ft2A8C4f4fovvUcFwINa1cgGjY36JCAYuP5YypRq4mco1lJp1/7jEMS2oR0Hg==}
 
@@ -2528,9 +2522,9 @@ packages:
     engines: {node: '>=0.4.0'}
     hasBin: true
 
-  adm-zip@0.5.16:
-    resolution: {integrity: sha512-TGw5yVi4saajsSEgz25grObGHEUaDrniwvA2qwSC060KfqGPdglhvPMA2lPIoxs3PQIItj2iag35fONcQqgUaQ==}
-    engines: {node: '>=12.0'}
+  adm-zip@0.6.1:
+    resolution: {integrity: sha512-Xwrja8nx9e5o2N1my4DsKCeKpdrnACyr1wtbPxBDgGzKzKyE9kRtBFA8mWldI+RVlD7CBZNWY/wQ2+ydwOR6kQ==}
+    engines: {node: '>=14.0'}
 
   agent-base@7.1.4:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
@@ -6814,10 +6808,6 @@ snapshots:
 
   '@tokenizer/token@0.3.0': {}
 
-  '@types/adm-zip@0.5.7':
-    dependencies:
-      '@types/node': 22.19.10
-
   '@types/archiver@6.0.4':
     dependencies:
       '@types/readdir-glob': 1.1.5
@@ -7005,7 +6995,7 @@ snapshots:
 
   acorn@8.15.0: {}
 
-  adm-zip@0.5.16: {}
+  adm-zip@0.6.1: {}
 
   agent-base@7.1.4: {}
 

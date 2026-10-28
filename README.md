@@ -52,6 +52,12 @@ This builds the app image, starts PostgreSQL, runs database migrations, and laun
 
 - **App**: `http://localhost:3000`
 
+The server validates its environment at startup and exits with a message naming
+each invalid variable. See `docs/remediation/ops-009.md` for the accepted formats.
+`GET /api/live` reports liveness. `GET /api/ready` reports readiness: the database is
+reachable and all migrations are applied. `GET /api/health` still reports whether
+the database is reachable.
+
 When upgrading an existing installation, back up the database and storage first.
 Set new JWT and cookie secrets to invalidate credentials signed with the published
 sample secrets. Changing `POSTGRES_PASSWORD` in `.env` does not change the password

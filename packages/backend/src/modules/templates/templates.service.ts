@@ -3,6 +3,26 @@ import type { CreateTemplateInput, UpdateTemplateInput, InstantiateTemplateInput
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
+import {
+  assertProjectAssignees,
+  assertProjectLabels,
+  assertProjectStatus,
+  projectAssigneeIds,
+  projectLabelIds,
+} from "../../utils/task-references.js";
+
+type TemplateReferences = Pick<UpdateTemplateInput, "statusId" | "assigneeIds" | "labelIds">;
+
+async function assertTemplateReferences(prisma: PrismaClient, projectId: string, data: TemplateReferences) {
+  if (data.statusId) await assertProjectStatus(prisma, projectId, data.statusId);
+  if (data.assigneeIds) await assertProjectAssignees(prisma, projectId, data.assigneeIds);
+  if (data.labelIds) await assertProjectLabels(prisma, projectId, data.labelIds);
+}
+
+/** Stored JSON lists predate validation; ignore anything that is not an ID. */
+function storedIds(value: Prisma.JsonValue): string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
 
 export async function listTemplates(prisma: PrismaClient, projectId: string) {
   return prisma.taskTemplate.findMany({
@@ -24,6 +44,7 @@ export async function createTemplate(
   projectId: string,
   data: CreateTemplateInput,
 ) {
+  await assertTemplateReferences(prisma, projectId, data);
   return prisma.taskTemplate.create({
     data: {
       projectId,
@@ -48,6 +69,7 @@ export async function updateTemplate(
 ) {
   const existing = await prisma.taskTemplate.findFirst({ where: { id: templateId, projectId } });
   if (!existing) throw new NotFoundError("Template not found");
+  await assertTemplateReferences(prisma, projectId, data);
 
   const updateData: Prisma.TaskTemplateUpdateInput = {};
   if (data.name !== undefined) updateData.name = data.name;
@@ -95,15 +117,16 @@ export async function createTaskFromTemplate(
   }
 
   return prisma.$transaction(async (tx) => {
-    // Filter stale assigneeIds against project members
-    const rawAssigneeIds = (overrides?.assigneeIds ?? template.assigneeIds) as string[];
-    let assigneeIds: string[] = [];
-    if (rawAssigneeIds.length > 0) {
-      const members = await tx.projectMember.findMany({
-        where: { projectId, userId: { in: rawAssigneeIds } },
-        select: { userId: true },
-      });
-      assigneeIds = members.map((m) => m.userId);
+    // Explicit overrides are validated like any other write. Stored template
+    // values may be stale (deleted columns, departed members) or predate
+    // validation, so only the ones still valid in this project are copied.
+    if (overrides?.statusId) await assertProjectStatus(tx, projectId, overrides.statusId);
+    let assigneeIds: string[];
+    if (overrides?.assigneeIds) {
+      await assertProjectAssignees(tx, projectId, overrides.assigneeIds);
+      assigneeIds = overrides.assigneeIds;
+    } else {
+      assigneeIds = await projectAssigneeIds(tx, projectId, storedIds(template.assigneeIds));
     }
 
     // Auto-include actor for MEMBER role
@@ -111,20 +134,11 @@ export async function createTaskFromTemplate(
       assigneeIds = [actorId, ...assigneeIds];
     }
 
-    // Filter stale labelIds against project labels
-    const rawLabelIds = template.labelIds as string[];
-    let labelIds: string[] = [];
-    if (rawLabelIds.length > 0) {
-      const labels = await tx.label.findMany({
-        where: { projectId, id: { in: rawLabelIds } },
-        select: { id: true },
-      });
-      labelIds = labels.map((l) => l.id);
-    }
+    const labelIds = await projectLabelIds(tx, projectId, storedIds(template.labelIds));
 
     // Resolve statusId: override > template > first column
     let statusId = overrides?.statusId ?? template.statusId;
-    if (statusId) {
+    if (statusId && !overrides?.statusId) {
       const status = await tx.statusColumn.findFirst({
         where: { id: statusId, projectId },
       });

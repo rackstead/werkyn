@@ -20,6 +20,15 @@ import {
 import { logActivity } from "../../utils/activity-log.js";
 import { assertProjectAccess, assertTaskEdit } from "../../utils/project-access.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
+import {
+  assertProjectAssignees,
+  assertProjectLabels,
+  assertProjectStatus,
+  assertUniqueIds,
+  projectAssigneeIds,
+  projectLabelIds,
+} from "../../utils/task-references.js";
+import { scopeTaskDependencyTasks, scopeTaskRelations } from "../../utils/task-scope.js";
 
 export async function listTasks(
   prisma: PrismaClient,
@@ -67,7 +76,9 @@ export async function listTasks(
     customFieldValues: {
       include: { field: true },
     },
-    _count: { select: { subtasks: true, blockedBy: true } },
+    _count: {
+      select: { subtasks: true, blockedBy: { where: { blockingTask: { projectId } } } },
+    },
     status: true,
   };
 
@@ -93,7 +104,7 @@ export async function listTasks(
       include,
       orderBy,
     });
-    return { data: tasks };
+    return { data: tasks.map(scopeTaskRelations) };
   }
 
   // Paginated view
@@ -109,7 +120,7 @@ export async function listTasks(
   ]);
 
   return {
-    data: tasks,
+    data: tasks.map(scopeTaskRelations),
     pagination: {
       page: query.page,
       limit: query.limit,
@@ -138,9 +149,11 @@ export async function createTask(
   }
 
   return prisma.$transaction(async (tx) => {
-    // Determine statusId: use provided or first column by position
+    // Determine statusId: use provided (same project only) or first column by position
     let statusId = data.statusId;
-    if (!statusId) {
+    if (statusId) {
+      await assertProjectStatus(tx, projectId, statusId);
+    } else {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },
         orderBy: { position: "asc" },
@@ -162,9 +175,12 @@ export async function createTask(
 
     // Build assigneeIds: if MEMBER, auto-include creator
     let assigneeIds = data.assigneeIds ?? [];
+    assertUniqueIds(assigneeIds, "assignee");
     if (actorRole === "MEMBER" && !assigneeIds.includes(actorId)) {
       assigneeIds = [actorId, ...assigneeIds];
     }
+    await assertProjectAssignees(tx, projectId, assigneeIds);
+    await assertProjectLabels(tx, projectId, data.labelIds ?? []);
 
     const task = await tx.task.create({
       data: {
@@ -242,14 +258,14 @@ export async function getTask(
       blockedBy: {
         include: {
           blockingTask: {
-            select: { id: true, title: true, status: true },
+            select: { id: true, title: true, projectId: true, status: true },
           },
         },
       },
       blocking: {
         include: {
           blockedTask: {
-            select: { id: true, title: true, status: true },
+            select: { id: true, title: true, projectId: true, status: true },
           },
         },
       },
@@ -261,7 +277,7 @@ export async function getTask(
     throw new NotFoundError("Task not found");
   }
 
-  return task;
+  return scopeTaskRelations(task);
 }
 
 export async function updateTask(
@@ -353,7 +369,7 @@ export async function updateTask(
       });
     }
 
-    return tx.task.update({
+    const task = await tx.task.update({
       where: { id: taskId },
       data: updateData,
       include: {
@@ -368,6 +384,7 @@ export async function updateTask(
         status: true,
       },
     });
+    return scopeTaskRelations(task);
   });
 }
 
@@ -411,6 +428,7 @@ export async function moveTask(
       where: {
         blockedTaskId: taskId,
         blockingTask: {
+          projectId: task.projectId,
           status: { isCompletion: false },
         },
       },
@@ -564,10 +582,9 @@ export async function addAssignee(
   actorRole: string,
   data: TaskAssigneeInput,
 ) {
-  // Validate user is a workspace member
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    select: { projectId: true, project: { select: { workspaceId: true } } },
+    select: { projectId: true },
   });
   if (!task) {
     throw new NotFoundError("Task not found");
@@ -578,17 +595,7 @@ export async function addAssignee(
     throw new ForbiddenError("Members can only assign themselves");
   }
 
-  const wsMember = await prisma.workspaceMember.findUnique({
-    where: {
-      userId_workspaceId: {
-        userId: data.userId,
-        workspaceId: task.project.workspaceId,
-      },
-    },
-  });
-  if (!wsMember) {
-    throw new NotFoundError("User is not a workspace member");
-  }
+  await assertProjectAssignees(prisma, task.projectId, [data.userId]);
 
   // Check if already assigned
   const existing = await prisma.taskAssignee.findUnique({
@@ -740,6 +747,7 @@ export async function bulkUpdateTasks(
       throw new ForbiddenError("Only administrators can archive tasks");
     }
     // Validate all tasks belong to this project
+    assertUniqueIds(data.taskIds, "task");
     const tasks = await tx.task.findMany({
       where: { id: { in: data.taskIds }, projectId },
       select: { id: true, assignees: { select: { userId: true } } },
@@ -762,14 +770,13 @@ export async function bulkUpdateTasks(
       }
     }
 
+    // Resolve every referenced status, assignee and label before any write
+    if (data.statusId) await assertProjectStatus(tx, projectId, data.statusId);
+    if (data.assigneeIds) await assertProjectAssignees(tx, projectId, data.assigneeIds);
+    if (data.labelIds) await assertProjectLabels(tx, projectId, data.labelIds);
+
     // Bulk update status
     if (data.statusId) {
-      const status = await tx.statusColumn.findFirst({
-        where: { id: data.statusId, projectId },
-      });
-      if (!status) {
-        throw new ValidationError("Status column not found in this project");
-      }
       await tx.task.updateMany({
         where: { id: { in: data.taskIds } },
         data: { statusId: data.statusId },
@@ -939,9 +946,33 @@ export async function duplicateTask(
   }
 
   return prisma.$transaction(async (tx) => {
+    // Copy only references that are valid in the source project today: legacy
+    // rows may point at another project, and members may have lost access.
+    let statusId = source.statusId;
+    const sourceStatus = await tx.statusColumn.findFirst({
+      where: { id: statusId, projectId: source.projectId },
+      select: { id: true },
+    });
+    if (!sourceStatus) {
+      const firstColumn = await tx.statusColumn.findFirst({
+        where: { projectId: source.projectId },
+        orderBy: { position: "asc" },
+        select: { id: true },
+      });
+      if (!firstColumn) throw new ValidationError("Project has no status columns");
+      statusId = firstColumn.id;
+    }
+    const labelIds = await projectLabelIds(tx, source.projectId, source.labels.map((l) => l.labelId));
+    const assigneeIds = await projectAssigneeIds(tx, source.projectId, source.assignees.map((a) => a.userId));
+    const subtaskAssignees = new Set(await projectAssigneeIds(
+      tx,
+      source.projectId,
+      source.subtasks.flatMap((s) => (s.assigneeId ? [s.assigneeId] : [])),
+    ));
+
     // Calculate position
     const maxPos = await tx.task.aggregate({
-      where: { statusId: source.statusId, projectId: source.projectId },
+      where: { statusId, projectId: source.projectId },
       _max: { position: true },
     });
     const position = (maxPos._max.position ?? -1) + 1;
@@ -949,7 +980,7 @@ export async function duplicateTask(
     const task = await tx.task.create({
       data: {
         projectId: source.projectId,
-        statusId: source.statusId,
+        statusId,
         title: `Copy of ${source.title}`,
         // Rows written before every path sanitized may hold unfiltered HTML.
         description: sanitizeDescription(source.description),
@@ -958,19 +989,11 @@ export async function duplicateTask(
         dueDate: source.dueDate,
         startDate: source.startDate,
         reminder: source.reminder,
-        assignees: source.assignees.length
-          ? {
-              createMany: {
-                data: source.assignees.map((a) => ({ userId: a.userId })),
-              },
-            }
+        assignees: assigneeIds.length
+          ? { createMany: { data: assigneeIds.map((userId) => ({ userId })) } }
           : undefined,
-        labels: source.labels.length
-          ? {
-              createMany: {
-                data: source.labels.map((l) => ({ labelId: l.labelId })),
-              },
-            }
+        labels: labelIds.length
+          ? { createMany: { data: labelIds.map((labelId) => ({ labelId })) } }
           : undefined,
       },
       include: {
@@ -993,7 +1016,7 @@ export async function duplicateTask(
           taskId: task.id,
           title: s.title,
           position: i,
-          assigneeId: s.assigneeId,
+          assigneeId: s.assigneeId && subtaskAssignees.has(s.assigneeId) ? s.assigneeId : null,
         })),
       });
     }
@@ -1097,8 +1120,8 @@ export async function addDependency(
       blockingTaskId: data.blockingTaskId,
     },
     include: {
-      blockingTask: { select: { id: true, title: true, status: true } },
-      blockedTask: { select: { id: true, title: true, status: true } },
+      blockingTask: { select: { id: true, title: true, projectId: true, status: true } },
+      blockedTask: { select: { id: true, title: true, projectId: true, status: true } },
     },
   });
 
@@ -1109,7 +1132,7 @@ export async function addDependency(
     details: { blockingTaskId: data.blockingTaskId, blockingTaskTitle: blockingTask.title },
   });
 
-  return dependency;
+  return scopeTaskDependencyTasks(dependency);
 }
 
 export async function removeDependency(
@@ -1122,7 +1145,8 @@ export async function removeDependency(
   const dependency = await prisma.taskDependency.findUnique({
     where: { id: dependencyId },
     include: {
-      blockingTask: { select: { id: true, title: true } },
+      blockingTask: { select: { id: true, title: true, projectId: true } },
+      blockedTask: { select: { projectId: true } },
     },
   });
 
@@ -1140,7 +1164,13 @@ export async function removeDependency(
     taskId,
     actorId,
     action: "dependency_removed",
-    details: { blockingTaskId: dependency.blockingTaskId, blockingTaskTitle: dependency.blockingTask.title },
+    details: {
+      blockingTaskId: dependency.blockingTaskId,
+      // A legacy cross-project link may be removed without copying its title.
+      ...(dependency.blockingTask.projectId === dependency.blockedTask.projectId
+        ? { blockingTaskTitle: dependency.blockingTask.title }
+        : {}),
+    },
   });
 
   return { blockingTaskId: dependency.blockingTaskId };

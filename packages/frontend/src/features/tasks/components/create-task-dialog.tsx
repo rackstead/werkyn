@@ -3,6 +3,7 @@ import { useCreateTask } from "../api";
 import { useStatuses, useLabels, useProjectMembers } from "@/features/projects/api";
 import { useTemplates, useCreateTaskFromTemplate } from "@/features/templates/api";
 import type { TaskTemplate } from "@/features/templates/api";
+import { templatePrefill } from "@/features/templates/template-prefill";
 import {
   Dialog,
   DialogContent,
@@ -91,11 +92,16 @@ export function CreateTaskDialog({
     if (!templateId) return;
     const t = templates.find((t) => t.id === templateId);
     if (!t) return;
+    const prefill = templatePrefill(t, {
+      statusIds: statuses.map((s) => s.id),
+      memberIds: members.map((m) => m.id),
+      labelIds: labels.map((l) => l.id),
+    });
     setTitle(t.title);
     setPriority(t.priority);
-    if (t.statusId) setStatusId(t.statusId);
-    setAssigneeIds(t.assigneeIds);
-    setLabelIds(t.labelIds);
+    if (prefill.statusId) setStatusId(prefill.statusId);
+    setAssigneeIds(prefill.assigneeIds);
+    setLabelIds(prefill.labelIds);
     setShowMore(true);
   };
 

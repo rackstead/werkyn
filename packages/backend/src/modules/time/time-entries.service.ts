@@ -1,6 +1,6 @@
 import type { Prisma, PrismaClient, WorkspaceRole } from "@prisma/client";
 import type { CreateTimeEntryInput, UpdateTimeEntryInput, TimeEntryQuery } from "@pm/shared";
-import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
 import { assertProjectAccess, projectAccessWhere } from "../../utils/project-access.js";
 
 /** Both nullable relations can carry project content, including legacy mismatches. */
@@ -36,6 +36,13 @@ async function assertEntryProjects(
   return taskProjectId;
 }
 
+/** An entry for a task always belongs to that task's project. */
+function assertTaskInProject(taskProjectId: string | undefined, projectId: string | null) {
+  if (taskProjectId && projectId !== taskProjectId) {
+    throw new ValidationError("Task does not belong to the selected project");
+  }
+}
+
 export async function createEntry(
   prisma: PrismaClient,
   workspaceId: string,
@@ -44,6 +51,7 @@ export async function createEntry(
 ) {
   const taskProjectId = await assertEntryProjects(prisma, workspaceId, userId, data);
   const projectId = data.projectId ?? taskProjectId ?? null;
+  assertTaskInProject(taskProjectId, projectId);
 
   return prisma.timeEntry.create({
     data: {
@@ -88,10 +96,15 @@ export async function updateEntry(
     projectId = await assertEntryProjects(prisma, entry.workspaceId, userId, { taskId: data.taskId });
   }
 
-  await assertEntryProjects(prisma, entry.workspaceId, userId, {
+  const nextReferences = {
     taskId: data.taskId === undefined ? entry.taskId : data.taskId,
     projectId: projectId === undefined ? entry.projectId : projectId,
-  });
+  };
+  const nextTaskProjectId = await assertEntryProjects(prisma, entry.workspaceId, userId, nextReferences);
+  // Unrelated edits leave a legacy mismatch as is; changing either reference must fix it.
+  if (data.taskId !== undefined || projectId !== undefined) {
+    assertTaskInProject(nextTaskProjectId, nextReferences.projectId);
+  }
 
   const updateData: Record<string, unknown> = {};
   if (data.date !== undefined) updateData.date = data.date;

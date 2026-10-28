@@ -107,11 +107,17 @@ export async function deleteStatus(
       orderBy: { position: "asc" },
     });
 
-    // Move tasks to the target column
+    // Move this project's tasks to the target column. A legacy task from
+    // another project that still points here must be repaired, not relinked.
     await tx.task.updateMany({
-      where: { statusId },
+      where: { statusId, projectId },
       data: { statusId: targetColumn!.id },
     });
+    if (await tx.task.count({ where: { statusId } })) {
+      throw new ConflictError(
+        "Status column is still referenced by tasks in another project; repair those tasks first",
+      );
+    }
 
     // If deleting the completion column, reassign to highest-position remaining
     if (status.isCompletion) {

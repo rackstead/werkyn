@@ -26,6 +26,7 @@ export class AutosaveQueue<T extends object> {
     private delay: number,
     private onError: (error: Error, retry: () => Promise<void>) => void,
     private onIdle: () => void,
+    private onSaved: () => void = () => {},
   ) {}
 
   setSave(save: (patch: T) => Promise<unknown>) {
@@ -99,6 +100,7 @@ export class AutosaveQueue<T extends object> {
           }
         }
         this.publish("saved", undefined);
+        this.onSaved();
       })
       .finally(() => {
         this.running = null;

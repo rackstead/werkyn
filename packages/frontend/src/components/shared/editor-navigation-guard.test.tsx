@@ -16,7 +16,10 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { EditorNavigationGuard } from "./editor-navigation-guard";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 async function createEditorRoute(beforeLeave: () => Promise<void>) {
   const root = createRootRoute({ component: () => <Outlet /> });
@@ -71,6 +74,7 @@ it("actual router navigation waits for save completion", async () => {
 });
 
 it("a failed save keeps the actual router on the editor and allows a successful retry", async () => {
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   const beforeLeave = vi
     .fn()
     .mockRejectedValueOnce(new Error("Offline"))
@@ -82,4 +86,14 @@ it("a failed save keeps the actual router on the editor and allows a successful 
   fireEvent.click(screen.getByText("Leave editor"));
   await waitFor(() => expect(screen.getByText("Other page")).toBeTruthy());
   expect(beforeLeave).toHaveBeenCalledTimes(2);
+  expect(confirm).toHaveBeenCalledTimes(1);
+});
+
+it("a save that keeps failing still lets the user choose to leave", async () => {
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  const beforeLeave = vi.fn().mockRejectedValue(new Error("Forbidden"));
+  const { screen } = await createEditorRoute(beforeLeave);
+  fireEvent.click(screen.getByText("Leave editor"));
+  await waitFor(() => expect(screen.getByText("Other page")).toBeTruthy());
+  expect(confirm).toHaveBeenCalledTimes(1);
 });

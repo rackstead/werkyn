@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAuthStore } from "@/stores/auth-store";
+import { toast } from "sonner";
 import { TaskDescription } from "./task-description";
 
 const { http, editors } = vi.hoisted(() => ({
@@ -22,7 +23,9 @@ vi.mock("@tiptap/react", async (importOriginal) => {
     },
   };
 });
-vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+vi.mock("sonner", () => ({
+  toast: { error: vi.fn(), success: vi.fn(), dismiss: vi.fn() },
+}));
 
 let client: QueryClient;
 let suffix = 0;
@@ -132,4 +135,29 @@ it("does not persist a prior identity's pending task description under a new ide
     json: { description: "<p>Alice draft</p>" },
     context: { expectedUserId: "task-editor-user" },
   });
+});
+
+it("a failing autosave shows only its retry notice, not a generic error per attempt", async () => {
+  const id = `task-failure-${++suffix}`;
+  http.patch.mockImplementation(() => ({
+    json: async () => {
+      throw new Error("Offline");
+    },
+  }));
+  const screen = render(
+    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  act(() => {
+    currentEditor().commands.setContent("<p>Offline draft</p>");
+  });
+  await tick(801);
+  expect(screen.getByRole("alert").textContent).toContain("Changes not saved");
+  const messages = vi
+    .mocked(toast.error)
+    .mock.calls.map(([message]) => message);
+  expect(messages).toEqual([
+    "Your changes couldn't be saved. Retry before closing this tab.",
+  ]);
 });

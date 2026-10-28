@@ -26,6 +26,8 @@ export function usePageLock(
 ) {
   const userId = useAuthStore((s) => s.user?.id);
   const { data: lockData, refetch } = useWikiPageLock(pageId);
+  const refetchLock = useRef(refetch);
+  refetchLock.current = refetch;
   const { mutateAsync: acquireLock } = useAcquireWikiLock();
   const { mutateAsync: releaseLock } = useReleaseWikiLock();
   const { mutateAsync: heartbeat } = useHeartbeatWikiLock();
@@ -61,12 +63,19 @@ export function usePageLock(
         stopHeartbeat();
         return;
       }
-      void heartbeat({ pageId, expectedUserId: userId }).catch(() => {
-        stopHeartbeat();
-        toast.error(
-          "The editing lock could not be renewed. Save your changes before continuing.",
-        );
-      });
+      const notice = `wiki-lock-renewal:${pageId}`;
+      void heartbeat({ pageId, expectedUserId: userId }).then(
+        () => toast.dismiss(notice),
+        () => {
+          // Keep renewing after a transient failure. If the lock was lost, the
+          // refreshed lock state makes the editor read-only and stops renewal.
+          toast.error(
+            "The editing lock could not be renewed. Save your changes before continuing.",
+            { id: notice },
+          );
+          void refetchLock.current();
+        },
+      );
     };
     renew();
     heartbeatInterval.current = setInterval(renew, 30_000);
@@ -103,9 +112,16 @@ export function usePageLock(
     const lifetime = currentLifetime.current;
     if (!lease || lease.key !== leaseKey)
       throw new Error("Editor is not ready");
+    // A release still in flight (for example from a just-closed lifetime of
+    // this page) must settle first, or its DELETE could remove the new lock.
+    const releasing = lease.releasing;
     const operation =
       lease.acquisitions.values().next().value ??
-      acquireLock({ pageId, expectedUserId: userId });
+      (releasing
+        ? releasing
+            .catch(() => {})
+            .then(() => acquireLock({ pageId, expectedUserId: userId }))
+        : acquireLock({ pageId, expectedUserId: userId }));
     lease.acquisitions.add(operation);
     try {
       await operation;
@@ -128,9 +144,18 @@ export function usePageLock(
   const release = useCallback(async () => {
     // Retain the lock and heartbeat until all queued saves are durable.
     const lease = leaseRef.current;
+    const lifetime = currentLifetime.current;
     if (lease) await Promise.allSettled([...lease.acquisitions]);
     await beforeRelease();
     if (!lease || (!owned.current && !lease.owned) || !isCurrentUser()) return;
+    // If this editor closed (or a newer lifetime of the page replaced it) while
+    // saving, the latest lifetime's cleanup owns the release.
+    if (
+      !mounted.current ||
+      currentLifetime.current !== lifetime ||
+      lease.latest !== lifetime
+    )
+      return;
     await performRelease(lease);
     owned.current = false;
     stopHeartbeat();

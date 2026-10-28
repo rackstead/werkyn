@@ -29,6 +29,8 @@ export function useEntityAutosave<T extends object>(
   const queue = useMemo(() => {
     let existing = queues.get(entityKey)?.queue as AutosaveQueue<T> | undefined;
     if (!existing) {
+      // One notice per entity: repeated failures update it, a save clears it.
+      const notice = `autosave:${entityKey}`;
       const created = new AutosaveQueue<T>(
         save,
         delay,
@@ -36,6 +38,7 @@ export function useEntityAutosave<T extends object>(
           toast.error(
             "Your changes couldn't be saved. Retry before closing this tab.",
             {
+              id: notice,
               duration: Infinity,
               action: {
                 label: "Retry",
@@ -50,6 +53,7 @@ export function useEntityAutosave<T extends object>(
           if (queues.get(entityKey)?.queue === created)
             queues.delete(entityKey);
         },
+        () => toast.dismiss(notice),
       );
       existing = created;
       queues.set(entityKey, {

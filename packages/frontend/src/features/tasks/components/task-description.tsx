@@ -62,7 +62,9 @@ function TaskDescriptionEditor({
       Placeholder.configure({ placeholder: "Add a description..." }),
     ],
     content: DOMPurify.sanitize(
-      autosave.draft?.description ?? description ?? "",
+      (autosave.draft && "description" in autosave.draft
+        ? autosave.draft.description
+        : description) ?? "",
     ),
     editable: canEdit,
     onUpdate: ({ editor: e }) => {

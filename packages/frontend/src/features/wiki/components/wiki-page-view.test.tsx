@@ -8,7 +8,7 @@ import { useAuthStore } from "@/stores/auth-store";
 
 const { http, notices } = vi.hoisted(() => ({
   http: { get: vi.fn(), patch: vi.fn(), post: vi.fn(), delete: vi.fn() },
-  notices: { error: vi.fn(), success: vi.fn() },
+  notices: { error: vi.fn(), success: vi.fn(), dismiss: vi.fn() },
 }));
 vi.mock("@/lib/api-client", () => ({ api: http }));
 vi.mock("sonner", () => ({ toast: notices }));
@@ -518,5 +518,127 @@ describe("entity-bound Wiki autosave", () => {
     });
     await tick();
     expect(http.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it("reverting or clearing a title saves what the heading shows, never an abandoned value", async () => {
+    const id = `title-revert-${++suffix}`;
+    const screen = render(view(id), { wrapper });
+    const heading = screen.getByRole("heading");
+    heading.textContent = `${id} draft`;
+    fireEvent.input(heading);
+    heading.textContent = id;
+    fireEvent.input(heading);
+    await tick(801);
+    expect(written).toEqual([
+      { path: `wiki/pages/${id}`, body: { title: id } },
+    ]);
+    heading.textContent = `${id} x`;
+    fireEvent.input(heading);
+    heading.textContent = "";
+    fireEvent.input(heading);
+    await tick(801);
+    expect(written.at(-1)).toEqual({
+      path: `wiki/pages/${id}`,
+      body: { title: id },
+    });
+  });
+
+  it("a failed lock renewal keeps renewing and refreshes the lock state", async () => {
+    const id = `renewal-${++suffix}`,
+      refetch = vi.fn();
+    vi.mocked(wiki.useWikiPageLock).mockReturnValue({
+      data: {
+        data: {
+          pageId: id,
+          userId: "editor-user",
+          user: { displayName: "Editor" },
+        },
+      },
+      refetch,
+    } as any);
+    const patch = http.patch.getMockImplementation()!;
+    let renewals = 0;
+    http.patch.mockImplementation((path: string, options: any) => {
+      if (!path.endsWith("/heartbeat")) return patch(path, options);
+      return ++renewals === 1
+        ? Promise.reject(new Error("Network blip"))
+        : Promise.resolve(undefined);
+    });
+    render(view(id), { wrapper });
+    await tick();
+    expect(renewals).toBe(1);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    expect(notices.error).toHaveBeenCalledWith(expect.any(String), {
+      id: `wiki-lock-renewal:${id}`,
+    });
+    await tick(30_001);
+    expect(renewals).toBe(2);
+    expect(notices.dismiss).toHaveBeenCalledWith(`wiki-lock-renewal:${id}`);
+  });
+
+  it("a new acquisition waits for an in-flight release of the same page", async () => {
+    const a = `release-race-a-${++suffix}`,
+      b = `release-race-b-${suffix}`,
+      releasing = deferred<undefined>();
+    let held = true;
+    vi.mocked(wiki.useWikiPageLock).mockImplementation(
+      (id) =>
+        ({
+          data: {
+            data:
+              held && id === a
+                ? {
+                    pageId: id,
+                    userId: "editor-user",
+                    user: { displayName: "Editor" },
+                  }
+                : null,
+          },
+          refetch: vi.fn(),
+        }) as any,
+    );
+    http.delete.mockReturnValueOnce(releasing.promise);
+    const screen = render(view(a), { wrapper });
+    await tick();
+    screen.rerender(view(b));
+    await tick();
+    expect(http.delete).toHaveBeenCalledWith(`wiki/pages/${a}/lock`, {
+      context: { expectedUserId: "editor-user" },
+    });
+    held = false;
+    screen.rerender(view(a));
+    await tick();
+    fireEvent.click(screen.getByText("Start Editing"));
+    await tick();
+    expect(http.post).not.toHaveBeenCalled();
+    await act(async () => {
+      releasing.resolve(undefined);
+    });
+    await tick();
+    expect(http.post).toHaveBeenCalledTimes(1);
+    expect(http.post.mock.calls[0][0]).toBe(`wiki/pages/${a}/lock`);
+  });
+
+  it("repeated save failures share one notice that a successful save clears", async () => {
+    const id = `notice-${++suffix}`;
+    nextPatch = () => Promise.reject(new Error("Offline"));
+    const screen = render(view(id), { wrapper });
+    fireEvent.change(screen.getByLabelText("Page body"), {
+      target: { value: "still offline" },
+    });
+    fireEvent.click(screen.getByText("Done Editing"));
+    await tick();
+    fireEvent.click(screen.getByText("Retry save"));
+    await tick();
+    const notice = `autosave:wiki:editor-user:${id}`;
+    const failures = notices.error.mock.calls.filter(
+      ([, options]) => options?.action,
+    );
+    expect(failures).toHaveLength(2);
+    expect(failures.every(([, options]) => options.id === notice)).toBe(true);
+    nextPatch = undefined;
+    fireEvent.click(screen.getByText("Retry save"));
+    await tick();
+    expect(notices.dismiss).toHaveBeenCalledWith(notice);
   });
 });

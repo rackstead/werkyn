@@ -13,7 +13,10 @@ export function EditorNavigationGuard({
         await beforeLeave();
         return false;
       } catch {
-        return true;
+        // The draft stays queued in this tab for retry; never trap the user.
+        return !window.confirm(
+          "Your changes could not be saved. Leave anyway? You can retry the unsaved changes when you reopen this item in this tab.",
+        );
       }
     },
     enableBeforeUnload: hasUnsavedChanges,

@@ -145,7 +145,9 @@ export function useUpdateTask() {
       });
       invalidateMyTasks();
     },
-    onError: (err) => {
+    onError: (err, { expectedUserId }) => {
+      // Editor autosaves report failures through their own retry notice.
+      if (expectedUserId) return;
       toast.error(`Failed to update task: ${err.message}`);
     },
   });

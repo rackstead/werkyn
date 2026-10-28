@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { multilineText, singleLineText } from "./common.js";
 
 export const CustomFieldTypeEnum = z.enum([
   "TEXT",
@@ -12,13 +13,12 @@ export const CustomFieldTypeEnum = z.enum([
 export type CustomFieldType = z.infer<typeof CustomFieldTypeEnum>;
 
 export const SelectOptionSchema = z.object({
-  value: z.string().min(1),
+  value: singleLineText().min(1),
   color: z.string().optional(),
 });
 
 export const CreateCustomFieldSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Field name is required")
     .max(100, "Field name must be 100 characters or less"),
   type: CustomFieldTypeEnum,
@@ -28,7 +28,7 @@ export const CreateCustomFieldSchema = z.object({
 export type CreateCustomFieldInput = z.infer<typeof CreateCustomFieldSchema>;
 
 export const UpdateCustomFieldSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
+  name: singleLineText().min(1).max(100).optional(),
   options: z.array(SelectOptionSchema).optional(),
   required: z.boolean().optional(),
 });
@@ -41,7 +41,12 @@ export type ReorderCustomFieldsInput = z.infer<typeof ReorderCustomFieldsSchema>
 
 export const SetCustomFieldValueSchema = z.object({
   value: z
-    .union([z.string(), z.number(), z.boolean(), z.array(z.string())])
+    .union([
+      multilineText(),
+      z.number().finite(),
+      z.boolean(),
+      z.array(singleLineText()),
+    ])
     .nullable(),
 });
 export type SetCustomFieldValueInput = z.infer<typeof SetCustomFieldValueSchema>;

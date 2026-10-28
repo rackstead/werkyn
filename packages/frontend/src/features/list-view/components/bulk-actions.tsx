@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { committedDate } from "@/lib/date-input";
 import { useBulkUpdateTasks, useBulkDeleteTasks } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels } from "@/features/projects/api";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -150,7 +151,9 @@ export function BulkActions({
           <input
             type="date"
             onChange={(e) => {
-              if (e.target.value) handleUpdate({ dueDate: e.target.value });
+              // Only a complete date is applied, not a year still being typed.
+              const dueDate = committedDate(e.target.value);
+              if (dueDate) handleUpdate({ dueDate });
             }}
             disabled={bulkUpdate.isPending}
             className="h-8 rounded-md border border-input bg-transparent px-2 text-sm"

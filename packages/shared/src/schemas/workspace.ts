@@ -1,8 +1,8 @@
 import { z } from "zod";
+import { singleLineText } from "./common.js";
 
 export const CreateWorkspaceSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Workspace name is required")
     .max(100, "Workspace name must be 100 characters or less"),
   slug: z
@@ -17,8 +17,7 @@ export const CreateWorkspaceSchema = z.object({
 export type CreateWorkspaceInput = z.infer<typeof CreateWorkspaceSchema>;
 
 export const UpdateWorkspaceSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1)
     .max(100, "Workspace name must be 100 characters or less")
     .optional(),

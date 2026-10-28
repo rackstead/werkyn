@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { committedDate } from "@/lib/date-input";
 import { createColumnHelper } from "@tanstack/react-table";
 import type { Task } from "@/features/tasks/api";
 import {
@@ -122,7 +123,7 @@ function InlinePriorityCell({
   );
 }
 
-function InlineDueDateCell({
+export function InlineDueDateCell({
   task,
   onUpdateTask,
 }: {
@@ -144,9 +145,10 @@ function InlineDueDateCell({
           className="text-xs border border-border rounded px-1 py-0.5 bg-background"
           defaultValue={task.dueDate ?? ""}
           onChange={(e) => {
-            onUpdateTask(task.id, {
-              dueDate: e.target.value || null,
-            });
+            // Keep editing while a year is still being typed.
+            const dueDate = committedDate(e.target.value);
+            if (dueDate === undefined) return;
+            onUpdateTask(task.id, { dueDate });
             setEditing(false);
           }}
           onBlur={() => setEditing(false)}
@@ -526,7 +528,10 @@ function InlineCustomFieldCell({
             autoFocus
             className="text-xs border border-border rounded px-1 py-0.5 bg-background"
             defaultValue={typeof value === "string" ? value : ""}
-            onChange={(e) => save(e.target.value || null)}
+            onChange={(e) => {
+              const date = committedDate(e.target.value);
+              if (date !== undefined) save(date);
+            }}
             onBlur={() => setEditing(false)}
           />
         );

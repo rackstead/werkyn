@@ -39,6 +39,26 @@ it("shows mixed-currency summary totals and unrated billable hours", () => {
   expect(screen.getByText("4h billable without a rate")).toBeTruthy();
 });
 
+it("warns when entries with invalid stored hours were left out", () => {
+  const props = {
+    totalHours: 2,
+    billableHours: 2,
+    nonBillableHours: 0,
+    costByCurrency: [],
+    unratedBillableHours: 0,
+  };
+  const { rerender } = render(<ReportSummaryCards {...props} skippedEntries={0} />);
+  expect(screen.queryByRole("status")).toBeNull();
+  rerender(<ReportSummaryCards {...props} skippedEntries={3} />);
+  expect(screen.getByRole("status").textContent).toBe(
+    "3 time entries with invalid stored hours are not included in this report or its CSV export.",
+  );
+  rerender(<ReportSummaryCards {...props} skippedEntries={1} />);
+  expect(screen.getByRole("status").textContent).toBe(
+    "1 time entry with invalid stored hours is not included in this report or its CSV export.",
+  );
+});
+
 it("renders group costs per currency and unpriced entries as having no rate", () => {
   const group: TimeReportGroup = {
     key: "project-1",

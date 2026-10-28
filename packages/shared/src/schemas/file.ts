@@ -1,9 +1,8 @@
 import { z } from "zod";
-import { QueryBooleanSchema } from "./common.js";
+import { QueryBooleanSchema, singleLineText } from "./common.js";
 
 export const CreateFolderSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Folder name is required")
     .max(255, "Folder name must be 255 characters or less"),
   parentId: z.string().optional(),
@@ -12,8 +11,7 @@ export const CreateFolderSchema = z.object({
 export type CreateFolderInput = z.infer<typeof CreateFolderSchema>;
 
 export const UpdateFileSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1)
     .max(255, "File name must be 255 characters or less")
     .optional(),
@@ -26,7 +24,7 @@ export type UpdateFileInput = z.infer<typeof UpdateFileSchema>;
 export const FileQuerySchema = z.object({
   parentId: z.string().nullable().optional(),
   teamFolderId: z.string().optional(),
-  search: z.string().optional(),
+  search: singleLineText().optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
   trashed: QueryBooleanSchema.default(false),

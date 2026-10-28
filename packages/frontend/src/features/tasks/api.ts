@@ -4,12 +4,18 @@ import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
-import type {
-  CreateTaskInput,
-  UpdateTaskInput,
-  MoveTaskInput,
-  ArchiveInput,
+import {
+  isDateOnly,
+  type CreateTaskInput,
+  type UpdateTaskInput,
+  type MoveTaskInput,
+  type ArchiveInput,
 } from "@pm/shared";
+
+// A date filter is only sent once it is a complete, real date. While a year is
+// still being typed, a date input reports values such as 0002-03-15, which
+// the server rejects.
+const DATE_FILTERS = new Set(["dueBefore", "dueAfter"]);
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -82,9 +88,9 @@ export function useProjectTasks(
       const searchParams: Record<string, string> = { view: "board" };
       if (filters) {
         for (const [key, value] of Object.entries(filters)) {
-          if (value !== undefined && value !== null && value !== "") {
-            searchParams[key] = String(value);
-          }
+          if (value === undefined || value === null || value === "") continue;
+          if (DATE_FILTERS.has(key) && !isDateOnly(String(value))) continue;
+          searchParams[key] = String(value);
         }
       }
       return api

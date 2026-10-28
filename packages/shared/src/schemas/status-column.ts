@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { singleLineText } from "./common.js";
 
 const HexColorSchema = z
   .string()
@@ -8,8 +9,7 @@ const HexColorSchema = z
   );
 
 export const CreateStatusColumnSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Status name is required")
     .max(100, "Status name must be 100 characters or less"),
   color: HexColorSchema.optional(),
@@ -18,7 +18,7 @@ export const CreateStatusColumnSchema = z.object({
 export type CreateStatusColumnInput = z.infer<typeof CreateStatusColumnSchema>;
 
 export const UpdateStatusColumnSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
+  name: singleLineText().min(1).max(100).optional(),
   color: HexColorSchema.optional(),
   isCompletion: z.boolean().optional(),
 });

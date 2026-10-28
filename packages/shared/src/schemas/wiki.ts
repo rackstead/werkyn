@@ -1,31 +1,29 @@
 import { z } from "zod";
-import { QueryBooleanSchema } from "./common.js";
+import { QueryBooleanSchema, INT32_MAX, multilineText, singleLineText } from "./common.js";
 
 // ─── Wiki Spaces ────────────────────────────────────────
 
 export const CreateWikiSpaceSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Space name is required")
     .max(100, "Space name must be 100 characters or less"),
-  description: z.string().max(500).optional(),
+  description: multilineText().max(500).optional(),
   icon: z.string().optional(),
 });
 export type CreateWikiSpaceInput = z.infer<typeof CreateWikiSpaceSchema>;
 
 export const UpdateWikiSpaceSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
-  description: z.string().max(500).nullable().optional(),
+  name: singleLineText().min(1).max(100).optional(),
+  description: multilineText().max(500).nullable().optional(),
   icon: z.string().nullable().optional(),
-  position: z.number().int().min(0).optional(),
+  position: z.number().int().min(0).max(INT32_MAX).optional(),
 });
 export type UpdateWikiSpaceInput = z.infer<typeof UpdateWikiSpaceSchema>;
 
 // ─── Wiki Pages ─────────────────────────────────────────
 
 export const CreateWikiPageSchema = z.object({
-  title: z
-    .string()
+  title: singleLineText()
     .min(1, "Page title is required")
     .max(500, "Page title must be 500 characters or less"),
   parentId: z.string().optional(),
@@ -35,7 +33,7 @@ export const CreateWikiPageSchema = z.object({
 export type CreateWikiPageInput = z.infer<typeof CreateWikiPageSchema>;
 
 export const UpdateWikiPageSchema = z.object({
-  title: z.string().min(1).max(500).optional(),
+  title: singleLineText().min(1).max(500).optional(),
   content: z.any().optional(),
   icon: z.string().nullable().optional(),
 });
@@ -44,7 +42,7 @@ export type UpdateWikiPageInput = z.infer<typeof UpdateWikiPageSchema>;
 export const MoveWikiPageSchema = z.object({
   parentId: z.string().nullable().optional(),
   spaceId: z.string().optional(),
-  position: z.number().int().min(0),
+  position: z.number().int().min(0).max(INT32_MAX),
 });
 export type MoveWikiPageInput = z.infer<typeof MoveWikiPageSchema>;
 
@@ -62,14 +60,14 @@ export const WikiPageVersionQuerySchema = z.object({
 export type WikiPageVersionQueryInput = z.infer<typeof WikiPageVersionQuerySchema>;
 
 export const CreateNamedVersionSchema = z.object({
-  name: z.string().min(1).max(255),
+  name: singleLineText().min(1).max(255),
 });
 export type CreateNamedVersionInput = z.infer<typeof CreateNamedVersionSchema>;
 
 // ─── Wiki Page Comments ─────────────────────────────────
 
 export const CreateWikiCommentSchema = z.object({
-  body: z.string().min(1).max(10000),
+  body: multilineText().min(1).max(10000),
   highlightId: z.string().min(1).max(100),
   selectionStart: z.any().optional(),
   selectionEnd: z.any().optional(),
@@ -77,7 +75,7 @@ export const CreateWikiCommentSchema = z.object({
 export type CreateWikiCommentInput = z.infer<typeof CreateWikiCommentSchema>;
 
 export const UpdateWikiCommentSchema = z.object({
-  body: z.string().min(1).max(10000),
+  body: multilineText().min(1).max(10000),
 });
 export type UpdateWikiCommentInput = z.infer<typeof UpdateWikiCommentSchema>;
 

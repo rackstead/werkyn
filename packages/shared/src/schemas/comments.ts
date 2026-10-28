@@ -1,15 +1,15 @@
 import { z } from "zod";
+import { multilineText } from "./common.js";
 
 export const CreateCommentSchema = z.object({
-  body: z
-    .string()
+  body: multilineText()
     .min(1, "Comment body is required")
     .max(10000, "Comment must be 10000 characters or less"),
 });
 export type CreateCommentInput = z.infer<typeof CreateCommentSchema>;
 
 export const UpdateCommentSchema = z.object({
-  body: z.string().min(1).max(10000),
+  body: multilineText().min(1).max(10000),
 });
 export type UpdateCommentInput = z.infer<typeof UpdateCommentSchema>;
 

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { QueryBooleanSchema } from "./common.js";
+import { QueryBooleanSchema, INT32_MAX, dateOnly, multilineText, singleLineText } from "./common.js";
 
 export const PriorityEnum = z.enum(["NONE", "LOW", "MEDIUM", "HIGH", "URGENT"]);
 
@@ -11,21 +11,14 @@ export const ReminderEnum = z.enum([
 ]);
 
 export const CreateTaskSchema = z.object({
-  title: z
-    .string()
+  title: singleLineText()
     .min(1, "Title is required")
     .max(255, "Title must be 255 characters or less"),
-  description: z.string().optional(),
+  description: multilineText().optional(),
   priority: PriorityEnum.default("NONE"),
   statusId: z.string().optional(),
-  dueDate: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD format")
-    .optional(),
-  startDate: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD format")
-    .optional(),
+  dueDate: dateOnly("Due date").optional(),
+  startDate: dateOnly("Start date").optional(),
   reminder: ReminderEnum.optional(),
   assigneeIds: z.array(z.string()).optional(),
   labelIds: z.array(z.string()).optional(),
@@ -33,27 +26,19 @@ export const CreateTaskSchema = z.object({
 export type CreateTaskInput = z.infer<typeof CreateTaskSchema>;
 
 export const UpdateTaskSchema = z.object({
-  title: z.string().min(1).max(255).optional(),
-  description: z.string().nullable().optional(),
+  title: singleLineText().min(1).max(255).optional(),
+  description: multilineText().nullable().optional(),
   priority: PriorityEnum.optional(),
   statusId: z.string().optional(),
-  dueDate: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/)
-    .nullable()
-    .optional(),
-  startDate: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/)
-    .nullable()
-    .optional(),
+  dueDate: dateOnly("Due date").nullable().optional(),
+  startDate: dateOnly("Start date").nullable().optional(),
   reminder: ReminderEnum.nullable().optional(),
 });
 export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
 
 export const MoveTaskSchema = z.object({
   statusId: z.string().min(1, "Status column is required"),
-  position: z.number().int().min(0, "Position must be >= 0"),
+  position: z.number().int().min(0, "Position must be >= 0").max(INT32_MAX),
 });
 export type MoveTaskInput = z.infer<typeof MoveTaskSchema>;
 
@@ -62,15 +47,15 @@ export const TaskQuerySchema = z.object({
   priority: z.string().optional(),
   assignee: z.string().optional(),
   label: z.string().optional(),
-  dueBefore: z.string().optional(),
-  dueAfter: z.string().optional(),
-  search: z.string().optional(),
+  dueBefore: dateOnly("dueBefore").optional(),
+  dueAfter: dateOnly("dueAfter").optional(),
+  search: singleLineText().optional(),
   archived: QueryBooleanSchema.default(false),
   sort: z
     .enum(["dueDate", "priority", "createdAt", "position"])
     .default("position"),
   order: z.enum(["asc", "desc"]).default("asc"),
-  page: z.coerce.number().int().min(1).default(1),
+  page: z.coerce.number().int().min(1).max(INT32_MAX).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   view: z.enum(["paginated", "board"]).default("paginated"),
 });
@@ -88,8 +73,8 @@ export const BulkUpdateFieldsSchema = z.object({
   assigneeIds: z.array(z.string()).optional(),
   archived: z.boolean().optional(),
   labelIds: z.array(z.string()).optional(),
-  dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
-  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  dueDate: dateOnly("Due date").nullable().optional(),
+  startDate: dateOnly("Start date").nullable().optional(),
 });
 export type BulkUpdateFieldsInput = z.infer<typeof BulkUpdateFieldsSchema>;
 

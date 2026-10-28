@@ -1,10 +1,11 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import { assertTaskEdit } from "../../utils/project-access.js";
-import type {
-  CreateCustomFieldInput,
-  UpdateCustomFieldInput,
-  ReorderCustomFieldsInput,
-  SetCustomFieldValueInput,
+import {
+  isDateOnly,
+  type CreateCustomFieldInput,
+  type UpdateCustomFieldInput,
+  type ReorderCustomFieldsInput,
+  type SetCustomFieldValueInput,
 } from "@pm/shared";
 import { ConflictError, NotFoundError, ValidationError } from "../../utils/errors.js";
 
@@ -215,6 +216,12 @@ function validateValueType(
     case "DATE":
       if (typeof value !== "string") {
         throw new ValidationError(`${fieldType} field expects a string value`);
+      }
+      // The same calendar-date contract as every other date-only input.
+      if (fieldType === "DATE" && !isDateOnly(value)) {
+        throw new ValidationError(
+          "DATE field expects a real calendar date in YYYY-MM-DD format between 1900 and 2999",
+        );
       }
       break;
     case "NUMBER":

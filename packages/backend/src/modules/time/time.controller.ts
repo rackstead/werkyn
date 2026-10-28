@@ -83,6 +83,25 @@ export async function deleteEntryHandler(
 
 // ─── Reports ────────────────────────────────────────────
 
+/** Records report entries left out because their stored hours are not finite. */
+function logSkippedEntries(
+  request: FastifyRequest,
+  workspaceId: string,
+  query: TimeReportQuery,
+  skippedEntries: number,
+) {
+  if (skippedEntries === 0) return;
+  request.log.warn(
+    {
+      workspaceId,
+      startDate: query.startDate,
+      endDate: query.endDate,
+      skippedEntries,
+    },
+    "Time report left out entries whose stored hours are not a finite number",
+  );
+}
+
 export async function getReportHandler(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -96,6 +115,7 @@ export async function getReportHandler(
     request.user!.id,
     query,
   );
+  logSkippedEntries(request, wid, query, report.summary.skippedEntries);
 
   return reply.send({ data: report });
 }
@@ -107,16 +127,19 @@ export async function exportCSVHandler(
   const { wid } = request.params as { wid: string };
   const query = request.query as TimeReportQuery;
 
-  const csv = await timeReportsService.exportReportCSV(
+  const { csv, skippedEntries } = await timeReportsService.exportReportCSV(
     request.server.prisma,
     wid,
     request.user!.id,
     query,
   );
+  logSkippedEntries(request, wid, query, skippedEntries);
 
   return reply
     .header("Content-Type", "text/csv; charset=utf-8")
     .header("Content-Disposition", "attachment; filename=time-report.csv")
+    // Entries left out because their stored hours are not a finite number.
+    .header("X-Skipped-Entries", String(skippedEntries))
     .send(csv);
 }
 

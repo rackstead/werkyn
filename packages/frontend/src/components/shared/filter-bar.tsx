@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { useStatuses, useLabels, useProjectMembers } from "@/features/projects/api";
+import { committedDate } from "@/lib/date-input";
 import { X, Filter } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { SearchInput } from "@/components/shared/search-input";
@@ -30,6 +32,38 @@ interface FilterBarProps {
 }
 
 const priorities = ["NONE", "LOW", "MEDIUM", "HIGH", "URGENT"] as const;
+
+/**
+ * A due-date filter input. What is typed stays in the input, but the filter
+ * only changes once it is a complete date or is cleared, so a year still being
+ * typed (Chromium reports 0002-03-15, 0020-03-15, 0202-03-15) keeps the
+ * current filter instead of dropping it.
+ */
+function DateFilterInput({
+  value,
+  onChange,
+  title,
+}: {
+  value: string | undefined;
+  onChange: (value: string | undefined) => void;
+  title: string;
+}) {
+  const [local, setLocal] = useState(value ?? "");
+  useEffect(() => setLocal(value ?? ""), [value]);
+  return (
+    <input
+      type="date"
+      value={local}
+      onChange={(e) => {
+        setLocal(e.target.value);
+        const date = committedDate(e.target.value);
+        if (date !== undefined) onChange(date ?? undefined);
+      }}
+      className="h-8 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+      title={title}
+    />
+  );
+}
 
 const ALL = "__all__";
 
@@ -135,18 +169,14 @@ export function FilterBar({ projectId, filters, onFilterChange, hideDateRange }:
       {/* Due date range */}
       {!hideDateRange && (
         <>
-          <input
-            type="date"
-            value={filters.dueAfter ?? ""}
-            onChange={(e) => updateFilter("dueAfter", e.target.value || undefined)}
-            className="h-8 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+          <DateFilterInput
+            value={filters.dueAfter}
+            onChange={(value) => updateFilter("dueAfter", value)}
             title="Due after"
           />
-          <input
-            type="date"
-            value={filters.dueBefore ?? ""}
-            onChange={(e) => updateFilter("dueBefore", e.target.value || undefined)}
-            className="h-8 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+          <DateFilterInput
+            value={filters.dueBefore}
+            onChange={(value) => updateFilter("dueBefore", value)}
             title="Due before"
           />
         </>

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { singleLineText } from "./common.js";
 
 const passwordField = z
   .string()
@@ -18,8 +19,7 @@ export type LoginInput = z.infer<typeof LoginSchema>;
 export const RegisterSchema = z.object({
   email: z.string().email("Invalid email address"),
   password: passwordField,
-  displayName: z
-    .string()
+  displayName: singleLineText()
     .min(1, "Display name is required")
     .max(100, "Display name must be 100 characters or less"),
   inviteToken: z.string().optional(),

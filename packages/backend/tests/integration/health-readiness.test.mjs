@@ -43,9 +43,9 @@ test("a migrated database is ready, healthy and live", async () => {
   }
 });
 
-test("probes are not counted against the client rate limit", async () => {
+test("liveness and readiness probes are not counted against the client rate limit", async () => {
   for (let i = 0; i < 120; i += 1) {
-    const url = ["/api/live", "/api/health", "/api/ready"][i % 3];
+    const url = i % 2 ? "/api/live" : "/api/ready";
     const response = await app.inject({ url, remoteAddress: "198.51.100.7" });
     assert.equal(response.statusCode, 200, `${url} #${i}: ${response.body}`);
   }

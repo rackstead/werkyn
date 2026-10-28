@@ -42,9 +42,10 @@ async function listMigrations(directory: string): Promise<string[]> {
  * GET /api/ready — readiness: the database answers and every migration shipped
  * with this build has been applied.
  *
- * Probes are exempt from the client rate limit, so database work is bounded
- * instead: concurrent probes share one evaluation with a single overall
- * deadline, and its result is reused briefly. Details are logged, not returned.
+ * /api/live and /api/ready are exempt from the client rate limit, so database
+ * work is bounded instead: concurrent probes share one evaluation with a single
+ * overall deadline, and its result is reused briefly. Details are logged, not
+ * returned.
  */
 export default fp(async (fastify: FastifyInstance, options: HealthOptions) => {
   const migrationsDir = options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR;
@@ -126,7 +127,8 @@ export default fp(async (fastify: FastifyInstance, options: HealthOptions) => {
     return { status: "ok", timestamp: new Date().toISOString() };
   });
 
-  fastify.get("/api/health", probe, async (_request, reply) => {
+  // The pre-existing route keeps the normal client rate limit it always had.
+  fastify.get("/api/health", async (_request, reply) => {
     reply.header("Cache-Control", "no-store");
     const { database } = await currentChecks();
     return reply.code(database === "ok" ? 200 : 503).send({

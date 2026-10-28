@@ -534,9 +534,12 @@ for (const ordinary of [false, true]) {
   test(`local retry after written account rollback commits once (${ordinary ? "ordinary" : "bootstrap"})`, async () => {
     if (ordinary) await oidc("existing-oidc");
     let attempts = 0;
+    let accountCommitted = false;
     const client = new Proxy(prisma, {
       get(target, key) {
-        if (key === "$transaction")
+        // Counts account-creation transactions; the later refresh-session
+        // transaction passes through.
+        if (key === "$transaction" && !accountCommitted)
           return (callback, options) =>
             target.$transaction(async (tx) => {
               const result = await callback(tx);
@@ -545,6 +548,7 @@ for (const ordinary of [false, true]) {
                   new Error("fixture serialization rollback"),
                   { code: "P2034" },
                 );
+              accountCommitted = true;
               return result;
             }, options);
         return Reflect.get(target, key);

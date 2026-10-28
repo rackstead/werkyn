@@ -238,10 +238,21 @@ function useAdmissionMutation(
     mutationFn: send,
     // The account that sends the request owns its result, even if the browser
     // switches accounts before the response arrives.
-    onMutate: () => ({
-      requesterId: useAuthStore.getState().user?.id,
-      generation: sessionGeneration,
-    }),
+    onMutate: (token) => {
+      const requesterId = useAuthStore.getState().user?.id;
+      return {
+        requesterId,
+        generation: sessionGeneration,
+        // The remembered result's state when the request was sent; a refusal
+        // must not remove a result stored since (for example, after this
+        // account signed in again). Every update replaces the state object.
+        remembered: requesterId
+          ? queryClient.getQueryState(
+              queryKeys.inviteAdmission(requesterId, token),
+            )
+          : undefined,
+      };
+    },
     onSuccess: async (res, token, context) => {
       const result = res.data;
       // If this browser has since signed out, switched or signed in again,
@@ -273,15 +284,15 @@ function useAdmissionMutation(
     },
     onError: (error, token, context) => {
       // A refusal replaces that account's earlier pending or verification
-      // state. Busy, server and network failures keep it, with the error
-      // shown beneath.
+      // state, unless a newer result was stored after the request was sent.
+      // Busy, server and network failures keep it, with the error shown
+      // beneath.
       const refused =
         error instanceof ApiError && [403, 404, 410].includes(error.statusCode);
-      if (refused && context?.requesterId)
-        queryClient.removeQueries({
-          queryKey: queryKeys.inviteAdmission(context.requesterId, token),
-          exact: true,
-        });
+      if (!refused || !context?.requesterId) return;
+      const key = queryKeys.inviteAdmission(context.requesterId, token);
+      if (queryClient.getQueryState(key) !== context.remembered) return;
+      queryClient.removeQueries({ queryKey: key, exact: true });
     },
   });
 }

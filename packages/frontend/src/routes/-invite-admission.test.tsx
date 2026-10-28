@@ -549,3 +549,35 @@ it("ignores a reply to a request sent before the same account signed out and in 
   expect(state.broadcasts.some((m) => (m as { type: string }).type === "workspaces")).toBe(false);
   expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
 });
+
+it("keeps a result stored after the same account signed in again when an earlier check is refused late", async () => {
+  signIn("first");
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  const pending = (requestId: string) => ({
+    status: "approval_pending" as const,
+    workspace,
+    requestId,
+    requestedAt: "2026-10-27T00:00:00Z",
+  });
+  rememberInviteAdmission("first", "invite-token", pending("rq-old"));
+  let refuse!: () => void;
+  respond("GET", "/api/invites/invite-token/admission", () =>
+    new Promise<Response>((resolve) => {
+      refuse = () =>
+        resolve(json(403, { statusCode: 403, error: "Forbidden", message: "Invites are currently disabled for this workspace" }));
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+  await waitFor(() => expect(refuse).toBeTypeOf("function"));
+  act(() => useAuthStore.setState({ user: null, accessToken: null, workspaces: [] }));
+  act(() => signIn("first"));
+  const fresh = pending("rq-new");
+  act(() => rememberInviteAdmission("first", "invite-token", fresh));
+  await act(async () => refuse());
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Check status" })).toHaveProperty("disabled", false),
+  );
+  expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toEqual(fresh);
+  expect(screen.getByText(/waiting for an administrator/)).toBeTruthy();
+});

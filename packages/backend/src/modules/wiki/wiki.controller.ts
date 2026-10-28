@@ -74,6 +74,7 @@ export async function updateSpaceHandler(
 
   const space = await spacesService.updateSpace(
     request.server.prisma,
+    request.workspaceMember!.workspaceId,
     sid,
     body,
   );
@@ -95,7 +96,11 @@ export async function deleteSpaceHandler(
 
   const space = await spacesService.getSpace(request.server.prisma, sid);
 
-  await spacesService.deleteSpace(request.server.prisma, sid);
+  await spacesService.deleteSpace(
+    request.server.prisma,
+    request.workspaceMember!.workspaceId,
+    sid,
+  );
 
   request.server.broadcastToWorkspace(
     request.workspaceMember!.workspaceId,
@@ -117,6 +122,7 @@ export async function createPageHandler(
 
   const page = await pagesService.createPage(
     request.server.prisma,
+    request.workspaceMember!.workspaceId,
     sid,
     request.user!.id,
     body,
@@ -191,7 +197,12 @@ export async function deletePageHandler(
 ) {
   const { pgid } = request.params as { pgid: string };
 
-  const deleted = await pagesService.deletePage(request.server.prisma, pgid);
+  const deleted = await pagesService.deletePage(
+    request.server.prisma,
+    request.workspaceMember!.workspaceId,
+    request.user!.id,
+    pgid,
+  );
 
   request.server.broadcastToWorkspace(
     request.workspaceMember!.workspaceId,
@@ -209,8 +220,10 @@ export async function movePageHandler(
   const { pgid } = request.params as { pgid: string };
   const body = request.body as MoveWikiPageInput;
 
-  const page = await pagesService.movePage(
+  const { page, previous } = await pagesService.movePage(
     request.server.prisma,
+    request.workspaceMember!.workspaceId,
+    request.user!.id,
     pgid,
     body,
   );
@@ -218,7 +231,7 @@ export async function movePageHandler(
   request.server.broadcastToWorkspace(
     request.workspaceMember!.workspaceId,
     "wiki_page_moved",
-    { page },
+    { page, previous },
   );
 
   return reply.send({ data: page });

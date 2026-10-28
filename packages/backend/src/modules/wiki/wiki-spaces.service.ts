@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import type { CreateWikiSpaceInput, UpdateWikiSpaceInput } from "@pm/shared";
 import { ConflictError, NotFoundError } from "../../utils/errors.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 
 function generateSlug(name: string): string {
   return name
@@ -17,30 +18,33 @@ export async function createSpace(
 ) {
   let slug = generateSlug(data.name);
 
-  // Ensure slug uniqueness within workspace
-  const existing = await prisma.wikiSpace.findUnique({
-    where: { workspaceId_slug: { workspaceId, slug } },
-  });
-  if (existing) {
-    slug = `${slug}-${Date.now().toString(36)}`;
-  }
+  // The workspace lock serializes the MAX+1 append with other space writers.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    // Ensure slug uniqueness within workspace
+    const existing = await tx.wikiSpace.findUnique({
+      where: { workspaceId_slug: { workspaceId, slug } },
+    });
+    if (existing) {
+      slug = `${slug}-${Date.now().toString(36)}`;
+    }
 
-  // Position: append at end
-  const maxPos = await prisma.wikiSpace.aggregate({
-    where: { workspaceId },
-    _max: { position: true },
-  });
-  const position = (maxPos._max.position ?? -1) + 1;
+    // Position: append at end
+    const maxPos = await tx.wikiSpace.aggregate({
+      where: { workspaceId },
+      _max: { position: true },
+    });
+    const position = (maxPos._max.position ?? -1) + 1;
 
-  return prisma.wikiSpace.create({
-    data: {
-      workspaceId,
-      name: data.name,
-      slug,
-      description: data.description,
-      icon: data.icon,
-      position,
-    },
+    return tx.wikiSpace.create({
+      data: {
+        workspaceId,
+        name: data.name,
+        slug,
+        description: data.description,
+        icon: data.icon,
+        position,
+      },
+    });
   });
 }
 
@@ -67,30 +71,47 @@ export async function getSpace(prisma: PrismaClient, spaceId: string) {
 
 export async function updateSpace(
   prisma: PrismaClient,
+  workspaceId: string,
   spaceId: string,
   data: UpdateWikiSpaceInput,
 ) {
-  const existing = await prisma.wikiSpace.findUnique({
-    where: { id: spaceId },
-  });
-  if (!existing) throw new NotFoundError("Wiki space not found");
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const existing = await tx.wikiSpace.findFirst({
+      where: { id: spaceId, workspaceId },
+    });
+    if (!existing) throw new NotFoundError("Wiki space not found");
 
-  return prisma.wikiSpace.update({
-    where: { id: spaceId },
-    data: {
-      name: data.name,
-      description: data.description,
-      icon: data.icon,
-      position: data.position,
-    },
+    return tx.wikiSpace.update({
+      where: { id: spaceId },
+      data: {
+        name: data.name,
+        description: data.description,
+        icon: data.icon,
+        position: data.position,
+      },
+    });
   });
 }
 
-export async function deleteSpace(prisma: PrismaClient, spaceId: string) {
-  const existing = await prisma.wikiSpace.findUnique({
-    where: { id: spaceId },
-  });
-  if (!existing) throw new NotFoundError("Wiki space not found");
+export async function deleteSpace(
+  prisma: PrismaClient,
+  workspaceId: string,
+  spaceId: string,
+) {
+  // Ordered with page moves into or out of the space and with page creates.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const existing = await tx.wikiSpace.findFirst({
+      where: { id: spaceId, workspaceId },
+    });
+    if (!existing) throw new NotFoundError("Wiki space not found");
 
-  await prisma.wikiSpace.delete({ where: { id: spaceId } });
+    // The parent cascade would also delete legacy pages of other spaces whose
+    // parent lives here; refuse instead of removing content outside the space.
+    const foreignChildren = await tx.wikiPage.count({
+      where: { spaceId: { not: spaceId }, parent: { spaceId } },
+    });
+    if (foreignChildren > 0) throw new ConflictError("Invalid page hierarchy");
+
+    await tx.wikiSpace.delete({ where: { id: spaceId } });
+  });
 }

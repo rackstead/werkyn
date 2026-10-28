@@ -5,6 +5,8 @@ import type {
 } from "@pm/shared";
 import { NotFoundError } from "../../utils/errors.js";
 import { fileAccessRole, teamFolderAccessWhere } from "../files/file-access.js";
+import { collectDescendantFiles } from "../files/files.service.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 
 export async function createTeamFolder(
   prisma: PrismaClient,
@@ -177,14 +179,17 @@ export async function deleteTeamFolder(
   workspaceId: string,
   teamFolderId: string,
 ) {
-  const teamFolder = await prisma.teamFolder.findFirst({
-    where: { id: teamFolderId, workspaceId },
-  });
-  if (!teamFolder) throw new NotFoundError("Team folder not found");
+  // Deleting the root File cascades children; deleting TeamFolder cascades members.
+  // The workspace graph lock orders this against moves into or out of the
+  // team folder and new children, and the bounded subtree walk rejects legacy
+  // foreign or cyclic rows before the cascade could reach them.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const teamFolder = await tx.teamFolder.findFirst({
+      where: { id: teamFolderId, workspaceId },
+    });
+    if (!teamFolder) throw new NotFoundError("Team folder not found");
+    await collectDescendantFiles(tx, teamFolder.folderId);
 
-  // Deleting the root File cascades children; deleting TeamFolder cascades members
-  // Delete TeamFolder first (FK from File.teamFolderId is SET NULL), then delete root file
-  await prisma.$transaction(async (tx) => {
     // Null out teamFolderId on children so cascade doesn't fail
     await tx.file.updateMany({
       where: { teamFolderId },

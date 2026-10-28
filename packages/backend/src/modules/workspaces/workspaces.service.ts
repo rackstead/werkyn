@@ -10,6 +10,7 @@ import type {
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { scopeTaskRelations } from "../../utils/task-scope.js";
 import {
   assertCurrentAdmin,
   normalizeAllowedEmailDomains,
@@ -314,7 +315,7 @@ export async function getMyTasks(
     orderBy: [{ project: { name: "asc" } }, { position: "asc" }],
   });
 
-  return { data: tasks };
+  return { data: tasks.map(scopeTaskRelations) };
 }
 
 export async function searchTasks(
@@ -386,7 +387,7 @@ export async function searchTasks(
     });
   }
 
-  return { data: [...titleMatches, ...descriptionMatches] };
+  return { data: [...titleMatches, ...descriptionMatches].map(scopeTaskRelations) };
 }
 
 export async function getWorkspaceSettings(

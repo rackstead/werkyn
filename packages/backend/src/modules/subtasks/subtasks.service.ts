@@ -3,6 +3,7 @@ import type { CreateSubtaskInput, UpdateSubtaskInput } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
 import { assertTaskEdit } from "../../utils/project-access.js";
+import { assertProjectAssignees } from "../../utils/task-references.js";
 
 export async function listSubtasks(prisma: PrismaClient, taskId: string) {
   return prisma.subtask.findMany({
@@ -28,6 +29,9 @@ export async function createSubtask(
     select: { id: true, projectId: true },
   });
   if (!task) throw new NotFoundError("Task not found");
+  if (data.assigneeId !== undefined) {
+    await assertProjectAssignees(prisma, task.projectId, [data.assigneeId]);
+  }
 
   const maxPos = await prisma.subtask.aggregate({
     where: { taskId },
@@ -73,6 +77,9 @@ export async function updateSubtask(
   if (!existing) throw new NotFoundError("Subtask not found");
 
   await assertTaskEdit(prisma, existing.taskId, actorId);
+  if (data.assigneeId !== undefined && data.assigneeId !== null) {
+    await assertProjectAssignees(prisma, existing.task.projectId, [data.assigneeId]);
+  }
 
   const subtask = await prisma.subtask.update({
     where: { id: subtaskId },

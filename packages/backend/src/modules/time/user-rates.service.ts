@@ -1,5 +1,6 @@
 import type { PrismaClient } from "@prisma/client";
 import type { SetUserRateInput } from "@pm/shared";
+import { NotFoundError } from "../../utils/errors.js";
 
 export async function setRate(
   prisma: PrismaClient,
@@ -7,6 +8,12 @@ export async function setRate(
   userId: string,
   data: SetUserRateInput,
 ) {
+  const member = await prisma.workspaceMember.findUnique({
+    where: { userId_workspaceId: { userId, workspaceId } },
+    select: { id: true },
+  });
+  if (!member) throw new NotFoundError("User is not a workspace member");
+
   const effectiveFrom =
     data.effectiveFrom ?? new Date().toISOString().slice(0, 10);
   // A new rate without an explicit currency keeps the member's currency in

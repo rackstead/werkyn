@@ -286,15 +286,18 @@ export async function login(
     await prisma.loginAttempt.delete({ where: { email } }).catch(() => {});
   }
 
-  // A password login replaces the user's other sessions. The verified hash is
-  // held (FOR SHARE) until the new session commits, so a concurrent password
-  // change or reset either rejects this login or revokes the new session.
+  // A password login replaces the user's other sessions. The user row is held
+  // FOR NO KEY UPDATE until the new session commits: a concurrent password
+  // change or reset either rejects this login or revokes the new session, and
+  // concurrent logins (which find no family to lock on a fresh account) run
+  // one after another, so only the last one's session remains. The lock still
+  // admits the KEY SHARE checks of in-flight rotations.
   const refreshToken = await prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     const [current] = await tx.$queryRaw<
       Array<{ passwordHash: string | null }>
     >`
-      SELECT "passwordHash" FROM "User" WHERE id = ${user.id} FOR SHARE
+      SELECT "passwordHash" FROM "User" WHERE id = ${user.id} FOR NO KEY UPDATE
     `;
     if (current?.passwordHash !== user.passwordHash) return null;
     await revokeUserRefreshSessions(tx, user.id, "login");

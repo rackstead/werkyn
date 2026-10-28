@@ -556,6 +556,34 @@ for (const [name, prepare, expected] of [
   });
 }
 
+test("concurrent password logins on an account without sessions leave only one", async () => {
+  const user = await makeUser();
+  assert.equal(await userTokenCount(user), 0);
+  let order;
+  const logins = await withTokenInsertBarrier(
+    "userId",
+    user.id,
+    async (start) => {
+      // The first login pauses immediately before its token INSERT.
+      start(() => loginRequest(user));
+      await waitForLockWaiters(1);
+      const second = start(() => loginRequest(user));
+      order = await settlesOrWaits(second, 2);
+    },
+  );
+  for (const response of logins)
+    assert.equal(response.statusCode, 200, response.body);
+  assert.equal(
+    await userTokenCount(user),
+    1,
+    `password login replaces the other session (second login ${order})`,
+  );
+  const outcomes = [];
+  for (const response of logins)
+    outcomes.push((await refresh(cookieOf(response))).statusCode);
+  assert.deepEqual(outcomes.sort(), [200, 401]);
+});
+
 // Every new session (password login, OIDC sign-in, registration) is created
 // while its user row is held, so a racing reset revokes it or commits first.
 for (const [name, create, stale] of [

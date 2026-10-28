@@ -1,0 +1,493 @@
+{
+  "description": "Hashes and compare results recorded with bcrypt 5.1.1, the release Werkyn used before bcrypt 6. Kept verbatim so tests prove stored hashes still verify; never regenerate with a newer bcrypt.",
+  "bcrypt": "5.1.1",
+  "node": "v22.16.0",
+  "fixtures": [
+    {
+      "name": "account password at the application cost (12)",
+      "password": "Werkyn-compat-user-12",
+      "passwordBytes": 21,
+      "rounds": 12,
+      "prefix": "$2b$",
+      "hash": "$2b$12$xspfmpXZ/W/cA9K0cMNNAusPHzlD9sU4MrGSTxaRUQA4xPv1HFCj6",
+      "rehashWithStoredSalt": "$2b$12$xspfmpXZ/W/cA9K0cMNNAusPHzlD9sU4MrGSTxaRUQA4xPv1HFCj6",
+      "getRounds": 12,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-user-12",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-user-12",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-user-12!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-user-12",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "share-link password at the share cost (10)",
+      "password": "Werkyn-compat-share-10",
+      "passwordBytes": 22,
+      "rounds": 10,
+      "prefix": "$2b$",
+      "hash": "$2b$10$YhE2sS7kWBuD/rfMlVvQsean7umWxuN.GflDf8XN5nEoqqHITE/kq",
+      "rehashWithStoredSalt": "$2b$10$YhE2sS7kWBuD/rfMlVvQsean7umWxuN.GflDf8XN5nEoqqHITE/kq",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-share-10",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-share-10",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-share-10!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-share-10",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "minimum cost (4)",
+      "password": "Werkyn-compat-min-4",
+      "passwordBytes": 19,
+      "rounds": 4,
+      "prefix": "$2b$",
+      "hash": "$2b$04$ENdW3YH1BcpPRlL8yc5ze.K.6qOo77L5aUUxbk44N8hRHzhLcBo3G",
+      "rehashWithStoredSalt": "$2b$04$ENdW3YH1BcpPRlL8yc5ze.K.6qOo77L5aUUxbk44N8hRHzhLcBo3G",
+      "getRounds": 4,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-min-4",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-min-4",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-min-4!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-min-4",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "cost 11",
+      "password": "Werkyn-compat-cost-11",
+      "passwordBytes": 21,
+      "rounds": 11,
+      "prefix": "$2b$",
+      "hash": "$2b$11$59C4R3S97T9Un6GFFjBPGeo5.8JaIVYlSyavfFmZHqM123rsLBQde",
+      "rehashWithStoredSalt": "$2b$11$59C4R3S97T9Un6GFFjBPGeo5.8JaIVYlSyavfFmZHqM123rsLBQde",
+      "getRounds": 11,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-cost-11",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-cost-11",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-cost-11!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-cost-11",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "$2a$ prefix at cost 10",
+      "password": "Werkyn-compat-2a-10",
+      "passwordBytes": 19,
+      "rounds": 10,
+      "prefix": "$2a$",
+      "hash": "$2a$10$trrFxipi2ggybYpFWYLX/.gph9cfeqf91Pfzh5NC5/ht/fLg//p9y",
+      "rehashWithStoredSalt": "$2a$10$trrFxipi2ggybYpFWYLX/.gph9cfeqf91Pfzh5NC5/ht/fLg//p9y",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-2a-10",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-2a-10",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-2a-10!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-2a-10",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "$2a$ prefix at cost 12",
+      "password": "Werkyn-compat-2a-12",
+      "passwordBytes": 19,
+      "rounds": 12,
+      "prefix": "$2a$",
+      "hash": "$2a$12$Wklwr2DLVPc6LgZpXFNFPetIVdllqzgtgfRmtJW28tcPzt.493Hpa",
+      "rehashWithStoredSalt": "$2a$12$Wklwr2DLVPc6LgZpXFNFPetIVdllqzgtgfRmtJW28tcPzt.493Hpa",
+      "getRounds": 12,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Werkyn-compat-2a-12",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qerkyn-compat-2a-12",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Werkyn-compat-2a-12!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "werkyn-compat-2a-12",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "exactly 72 bytes",
+      "password": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4seventy",
+      "passwordBytes": 72,
+      "rounds": 10,
+      "prefix": "$2b$",
+      "hash": "$2b$10$ecRp5bbS3fbRfN8zKR9gyOAOZ12YStK5JGY/NSli606248qdMzJBa",
+      "rehashWithStoredSalt": "$2b$10$ecRp5bbS3fbRfN8zKR9gyOAOZ12YStK5JGY/NSli606248qdMzJBa",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4seventy",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qeventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4seventy",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4seventy!",
+          "matches": true
+        },
+        {
+          "label": "case changed",
+          "candidate": "SEVENTY-TWO-0SEVENTY-TWO-1SEVENTY-TWO-2SEVENTY-TWO-3SEVENTY-TWO-4SEVENTY",
+          "matches": false
+        },
+        {
+          "label": "first 72 bytes only",
+          "candidate": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4seventy",
+          "matches": true
+        },
+        {
+          "label": "first 71 bytes only",
+          "candidate": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4sevent",
+          "matches": false
+        },
+        {
+          "label": "byte 71 changed",
+          "candidate": "seventy-two-0seventy-two-1seventy-two-2seventy-two-3seventy-two-4sevenxy",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "100 bytes (over the 72-byte bcrypt input limit)",
+      "password": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-bytes-4hundred-bytes-5hundred-by",
+      "passwordBytes": 100,
+      "rounds": 12,
+      "prefix": "$2b$",
+      "hash": "$2b$12$DPA.aVt8aCV0d3UADlGZBO1iN3wN64LASb6yVb0eTTcY.JdcQSBSm",
+      "rehashWithStoredSalt": "$2b$12$DPA.aVt8aCV0d3UADlGZBO1iN3wN64LASb6yVb0eTTcY.JdcQSBSm",
+      "getRounds": 12,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-bytes-4hundred-bytes-5hundred-by",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-bytes-4hundred-bytes-5hundred-by",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-bytes-4hundred-bytes-5hundred-by!",
+          "matches": true
+        },
+        {
+          "label": "case changed",
+          "candidate": "HUNDRED-BYTES-0HUNDRED-BYTES-1HUNDRED-BYTES-2HUNDRED-BYTES-3HUNDRED-BYTES-4HUNDRED-BYTES-5HUNDRED-BY",
+          "matches": false
+        },
+        {
+          "label": "first 72 bytes only",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-byte",
+          "matches": true
+        },
+        {
+          "label": "first 71 bytes only",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-byt",
+          "matches": false
+        },
+        {
+          "label": "byte 71 changed",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-byxes-4hundred-bytes-5hundred-by",
+          "matches": false
+        },
+        {
+          "label": "byte 73 changed",
+          "candidate": "hundred-bytes-0hundred-bytes-1hundred-bytes-2hundred-bytes-3hundred-bytex-4hundred-bytes-5hundred-by",
+          "matches": true
+        }
+      ]
+    },
+    {
+      "name": "$2a$ with 100 bytes",
+      "password": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-long-4legacy-a-long-5legacy-a-l",
+      "passwordBytes": 100,
+      "rounds": 10,
+      "prefix": "$2a$",
+      "hash": "$2a$10$kH.j232mKKl8R7YkOBy.JeBvX43hpQUnuIw7U1VthJWHNYZXMFu1O",
+      "rehashWithStoredSalt": "$2a$10$kH.j232mKKl8R7YkOBy.JeBvX43hpQUnuIw7U1VthJWHNYZXMFu1O",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-long-4legacy-a-long-5legacy-a-l",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qegacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-long-4legacy-a-long-5legacy-a-l",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-long-4legacy-a-long-5legacy-a-l!",
+          "matches": true
+        },
+        {
+          "label": "case changed",
+          "candidate": "LEGACY-A-LONG-0LEGACY-A-LONG-1LEGACY-A-LONG-2LEGACY-A-LONG-3LEGACY-A-LONG-4LEGACY-A-LONG-5LEGACY-A-L",
+          "matches": false
+        },
+        {
+          "label": "first 72 bytes only",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-lon",
+          "matches": true
+        },
+        {
+          "label": "first 71 bytes only",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-lo",
+          "matches": false
+        },
+        {
+          "label": "byte 71 changed",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-lxng-4legacy-a-long-5legacy-a-l",
+          "matches": false
+        },
+        {
+          "label": "byte 73 changed",
+          "candidate": "legacy-a-long-0legacy-a-long-1legacy-a-long-2legacy-a-long-3legacy-a-lonx-4legacy-a-long-5legacy-a-l",
+          "matches": true
+        }
+      ]
+    },
+    {
+      "name": "128 three-byte characters (384 bytes)",
+      "password": "日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本",
+      "passwordBytes": 384,
+      "rounds": 10,
+      "prefix": "$2b$",
+      "hash": "$2b$10$qkWFDuFqs72JQz812u74TeMxx.xhv0syRDLiuqFbk5/SzwVUqkDc6",
+      "rehashWithStoredSalt": "$2b$10$qkWFDuFqs72JQz812u74TeMxx.xhv0syRDLiuqFbk5/SzwVUqkDc6",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Q日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本本!",
+          "matches": true
+        },
+        {
+          "label": "first 72 bytes only",
+          "candidate": "日日日日日日日日日日日日日日日日日日日日日日日日",
+          "matches": true
+        },
+        {
+          "label": "first 71 bytes only",
+          "candidate": "日日日日日日日日日日日日日日日日日日日日日日日�",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "$2a$ with 384 bytes",
+      "password": "語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語",
+      "passwordBytes": 384,
+      "rounds": 10,
+      "prefix": "$2a$",
+      "hash": "$2a$10$HxU1qFlD35E2WObTh.BaceQOQHzndXEkjWM7OeraxZ/7WEb4Hdrri",
+      "rehashWithStoredSalt": "$2a$10$HxU1qFlD35E2WObTh.BaceQOQHzndXEkjWM7OeraxZ/7WEb4Hdrri",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Q語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語語!",
+          "matches": true
+        },
+        {
+          "label": "first 72 bytes only",
+          "candidate": "語語語語語語語語語語語語語語語語語語語語語語語語",
+          "matches": true
+        },
+        {
+          "label": "first 71 bytes only",
+          "candidate": "語語語語語語語語語語語語語語語語語語語語語語語�",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "mixed Unicode",
+      "password": "Pässwörd-日本語-🔐-Ω",
+      "passwordBytes": 28,
+      "rounds": 10,
+      "prefix": "$2b$",
+      "hash": "$2b$10$dcLKhUa7wGMzOR7wNVtOyO1VOh8vJBc.u.nn4F4HgU33Xos7CWVSC",
+      "rehashWithStoredSalt": "$2b$10$dcLKhUa7wGMzOR7wNVtOyO1VOh8vJBc.u.nn4F4HgU33Xos7CWVSC",
+      "getRounds": 10,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "Pässwörd-日本語-🔐-Ω",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qässwörd-日本語-🔐-Ω",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "Pässwörd-日本語-🔐-Ω!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "pässwörd-日本語-🔐-ω",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "embedded NUL",
+      "password": "before\u0000after",
+      "passwordBytes": 12,
+      "rounds": 4,
+      "prefix": "$2b$",
+      "hash": "$2b$04$iWjBidOqexw.23ctH/eLruuEdVSBDYJukKBDikeieUuLncujKAGo2",
+      "rehashWithStoredSalt": "$2b$04$iWjBidOqexw.23ctH/eLruuEdVSBDYJukKBDikeieUuLncujKAGo2",
+      "getRounds": 4,
+      "compare": [
+        {
+          "label": "same password",
+          "candidate": "before\u0000after",
+          "matches": true
+        },
+        {
+          "label": "first character changed",
+          "candidate": "Qefore\u0000after",
+          "matches": false
+        },
+        {
+          "label": "character appended",
+          "candidate": "before\u0000after!",
+          "matches": false
+        },
+        {
+          "label": "case changed",
+          "candidate": "BEFORE\u0000AFTER",
+          "matches": false
+        },
+        {
+          "label": "text before the NUL",
+          "candidate": "before",
+          "matches": false
+        }
+      ]
+    }
+  ]
+}

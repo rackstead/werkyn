@@ -86,12 +86,15 @@ function WikiPageSession({
   const handleTitleChange = useCallback(
     (title: string) => {
       if (readOnly) return;
-      // Replace any pending title so reverting never saves an abandoned value.
-      // An emptied heading keeps the saved title, as before.
+      // An emptied heading keeps the saved title, as before. Returning to the
+      // saved title drops an unsent change; one already being saved gets a
+      // corrective update instead, so an abandoned value never wins.
       const next = title || page?.title;
-      if (next) autosave.schedule({ title: next });
+      if (!next) return;
+      if (next === page?.title && autosave.discard("title")) return;
+      autosave.schedule({ title: next });
     },
-    [autosave.schedule, page?.title, readOnly],
+    [autosave.discard, autosave.schedule, page?.title, readOnly],
   );
 
   const handleStartEditing = () => {

@@ -11,6 +11,7 @@ export interface SaveSnapshot<T> {
 /** Serializes one entity's patches; newer fields replace older queued fields. */
 export class AutosaveQueue<T extends object> {
   private pending: T | undefined;
+  private inFlight: T | undefined;
   private running: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Set<() => void>();
@@ -71,6 +72,30 @@ export class AutosaveQueue<T extends object> {
     }, this.delay);
   };
 
+  /**
+   * Drops an unsent field, for example a title edited back to its saved value.
+   * Returns false when that field is being saved right now; the caller should
+   * then schedule a corrective value instead.
+   */
+  discard = (key: keyof T): boolean => {
+    if (this.inFlight && key in this.inFlight) return false;
+    if (!this.pending || !(key in this.pending)) return true;
+    const pending = { ...this.pending };
+    delete pending[key];
+    this.pending = Object.keys(pending).length ? pending : undefined;
+    const draft = this.snapshot.draft && { ...this.snapshot.draft };
+    if (draft) delete draft[key];
+    if (this.pending || this.running) {
+      this.publish(this.snapshot.status, draft, this.snapshot.error);
+    } else {
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = null;
+      this.publish("saved", undefined);
+      this.onSaved();
+    }
+    return true;
+  };
+
   flush = (): Promise<void> => {
     if (this.timer) {
       clearTimeout(this.timer);
@@ -86,6 +111,7 @@ export class AutosaveQueue<T extends object> {
           const patch = this.pending;
           this.pending = undefined;
           this.publish("saving", this.snapshot.draft);
+          this.inFlight = patch;
           try {
             await this.save(patch);
           } catch (cause) {
@@ -97,6 +123,8 @@ export class AutosaveQueue<T extends object> {
             this.publish("error", this.snapshot.draft ?? this.pending, error);
             this.onError(error, this.flush);
             throw error;
+          } finally {
+            this.inFlight = undefined;
           }
         }
         this.publish("saved", undefined);

@@ -520,7 +520,7 @@ describe("entity-bound Wiki autosave", () => {
     expect(http.delete).toHaveBeenCalledTimes(1);
   });
 
-  it("reverting or clearing a title saves what the heading shows, never an abandoned value", async () => {
+  it("reverting or clearing an unsent title edit sends nothing", async () => {
     const id = `title-revert-${++suffix}`;
     const screen = render(view(id), { wrapper });
     const heading = screen.getByRole("heading");
@@ -528,14 +528,34 @@ describe("entity-bound Wiki autosave", () => {
     fireEvent.input(heading);
     heading.textContent = id;
     fireEvent.input(heading);
-    await tick(801);
-    expect(written).toEqual([
-      { path: `wiki/pages/${id}`, body: { title: id } },
-    ]);
+    expect(screen.getByText("All changes saved")).toBeTruthy();
     heading.textContent = `${id} x`;
     fireEvent.input(heading);
     heading.textContent = "";
     fireEvent.input(heading);
+    await tick(801);
+    expect(written).toEqual([]);
+    expect(screen.getByText("All changes saved")).toBeTruthy();
+  });
+
+  it("reverting a title that is already being saved sends a corrective title", async () => {
+    const id = `title-inflight-${++suffix}`,
+      request = deferred<unknown>();
+    nextPatch = () => request.promise;
+    const screen = render(view(id), { wrapper });
+    const heading = screen.getByRole("heading");
+    heading.textContent = `${id} draft`;
+    fireEvent.input(heading);
+    await tick(801);
+    expect(written).toEqual([
+      { path: `wiki/pages/${id}`, body: { title: `${id} draft` } },
+    ]);
+    heading.textContent = id;
+    fireEvent.input(heading);
+    nextPatch = undefined;
+    await act(async () => {
+      request.resolve({ data: { ...page(id), title: `${id} draft` } });
+    });
     await tick(801);
     expect(written.at(-1)).toEqual({
       path: `wiki/pages/${id}`,

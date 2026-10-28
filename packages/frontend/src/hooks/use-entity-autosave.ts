@@ -90,5 +90,10 @@ export function useEntityAutosave<T extends object>(
     [queue],
   );
 
-  return { ...snapshot, schedule: queue.schedule, flush: queue.flush };
+  return {
+    ...snapshot,
+    schedule: queue.schedule,
+    flush: queue.flush,
+    discard: queue.discard,
+  };
 }

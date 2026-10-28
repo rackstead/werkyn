@@ -1,4 +1,22 @@
-type EventHandler = (data: unknown) => void;
+import { parseRealtimeEnvelope, type RealtimeEnvelope } from "./realtime-events";
+
+type EventHandler = (message: RealtimeEnvelope) => void;
+
+// Each subscription kind and the frames that open and close it on the server.
+const SCOPES = {
+  project: { field: "projectId", subscribe: "subscribe", unsubscribe: "unsubscribe" },
+  workspace: {
+    field: "workspaceId",
+    subscribe: "subscribe_workspace",
+    unsubscribe: "unsubscribe_workspace",
+  },
+  channel: {
+    field: "channelId",
+    subscribe: "subscribe_channel",
+    unsubscribe: "unsubscribe_channel",
+  },
+} as const;
+type Scope = keyof typeof SCOPES;
 
 interface WebSocketClientOptions {
   url: string;
@@ -15,9 +33,21 @@ export class WebSocketClient {
   private reconnectAttempts = 0;
   private maxReconnectDelay = 30_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private subscriptions = new Set<string>();
-  private workspaceSubscriptions = new Set<string>();
-  private channelSubscriptions = new Set<string>();
+  // Consumers holding each subscription. The server keeps one subscription
+  // per resource, so it is opened for the first holder and closed after the
+  // last one lets go.
+  private holders: Record<Scope, Map<string, number>> = {
+    project: new Map(),
+    workspace: new Map(),
+    channel: new Map(),
+  };
+  // Releases waiting for the end of the current task, so a route transition
+  // that hands a resource from one view to the next sends nothing.
+  private pendingReleases: Record<Scope, Set<string>> = {
+    project: new Set(),
+    workspace: new Set(),
+    channel: new Set(),
+  };
   private connected = false;
   private destroyed = false;
 
@@ -45,45 +75,27 @@ export class WebSocketClient {
       };
 
       this.ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
+        // Anything that is not a well-formed event envelope is ignored.
+        const msg = parseRealtimeEnvelope(event.data);
+        if (!msg) return;
 
-          if (msg.event === "authenticated") {
-            this.connected = true;
-            this.reconnectAttempts = 0;
-            // Re-subscribe to all channels
-            for (const projectId of this.subscriptions) {
-              this.ws?.send(JSON.stringify({ type: "subscribe", projectId }));
-            }
-            for (const workspaceId of this.workspaceSubscriptions) {
-              this.ws?.send(JSON.stringify({ type: "subscribe_workspace", workspaceId }));
-            }
-            for (const channelId of this.channelSubscriptions) {
-              this.ws?.send(JSON.stringify({ type: "subscribe_channel", channelId }));
-            }
-            return;
-          }
-
-          if (msg.event === "pong") return;
-
-          // Dispatch to handlers
-          const eventHandlers = this.handlers.get(msg.event);
-          if (eventHandlers) {
-            for (const handler of eventHandlers) {
-              handler(msg);
+        if (msg.event === "authenticated") {
+          this.connected = true;
+          this.reconnectAttempts = 0;
+          // Re-open every subscription that is still held.
+          for (const scope of Object.keys(SCOPES) as Scope[]) {
+            this.pendingReleases[scope].clear();
+            for (const id of this.holders[scope].keys()) {
+              this.sendScopeFrame(scope, "subscribe", id);
             }
           }
-
-          // Also dispatch to wildcard handlers
-          const wildcardHandlers = this.handlers.get("*");
-          if (wildcardHandlers) {
-            for (const handler of wildcardHandlers) {
-              handler(msg);
-            }
-          }
-        } catch {
-          // Ignore parse errors
+          return;
         }
+
+        if (msg.event === "pong") return;
+
+        this.dispatch(msg.event, msg);
+        this.dispatch("*", msg);
       };
 
       this.ws.onclose = () => {
@@ -114,51 +126,83 @@ export class WebSocketClient {
     }
     this.connected = false;
     this.handlers.clear();
-    this.subscriptions.clear();
-    this.workspaceSubscriptions.clear();
-    this.channelSubscriptions.clear();
+    for (const scope of Object.keys(SCOPES) as Scope[]) {
+      this.holders[scope].clear();
+      this.pendingReleases[scope].clear();
+    }
     document.removeEventListener("visibilitychange", this.handleVisibility);
   }
 
+  // Every subscribe call must be paired with one unsubscribe call.
   subscribe(projectId: string): void {
-    this.subscriptions.add(projectId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "subscribe", projectId }));
-    }
+    this.hold("project", projectId);
   }
 
   unsubscribe(projectId: string): void {
-    this.subscriptions.delete(projectId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "unsubscribe", projectId }));
-    }
+    this.release("project", projectId);
   }
 
   subscribeWorkspace(workspaceId: string): void {
-    this.workspaceSubscriptions.add(workspaceId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "subscribe_workspace", workspaceId }));
-    }
+    this.hold("workspace", workspaceId);
   }
 
   unsubscribeWorkspace(workspaceId: string): void {
-    this.workspaceSubscriptions.delete(workspaceId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "unsubscribe_workspace", workspaceId }));
-    }
+    this.release("workspace", workspaceId);
   }
 
   subscribeChannel(channelId: string): void {
-    this.channelSubscriptions.add(channelId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "subscribe_channel", channelId }));
-    }
+    this.hold("channel", channelId);
   }
 
   unsubscribeChannel(channelId: string): void {
-    this.channelSubscriptions.delete(channelId);
-    if (this.connected && this.ws) {
-      this.ws.send(JSON.stringify({ type: "unsubscribe_channel", channelId }));
+    this.release("channel", channelId);
+  }
+
+  private hold(scope: Scope, id: string): void {
+    const count = this.holders[scope].get(id) ?? 0;
+    this.holders[scope].set(id, count + 1);
+    if (count > 0) return;
+    // Taken back before its release was sent: the server never let it go.
+    if (this.pendingReleases[scope].delete(id)) return;
+    this.sendScopeFrame(scope, "subscribe", id);
+  }
+
+  private release(scope: Scope, id: string): void {
+    const count = this.holders[scope].get(id);
+    if (!count) return;
+    if (count > 1) {
+      this.holders[scope].set(id, count - 1);
+      return;
+    }
+    this.holders[scope].delete(id);
+    this.pendingReleases[scope].add(id);
+    queueMicrotask(() => {
+      if (!this.pendingReleases[scope].delete(id)) return;
+      this.sendScopeFrame(scope, "unsubscribe", id);
+    });
+  }
+
+  private sendScopeFrame(
+    scope: Scope,
+    action: "subscribe" | "unsubscribe",
+    id: string,
+  ): void {
+    if (!this.connected || !this.ws) return;
+    const { field, [action]: type } = SCOPES[scope];
+    this.ws.send(JSON.stringify({ type, [field]: id }));
+  }
+
+  private dispatch(event: string, msg: RealtimeEnvelope): void {
+    const handlers = this.handlers.get(event);
+    if (!handlers) return;
+    // A handler may remove itself or others while the event is delivered.
+    for (const handler of [...handlers]) {
+      try {
+        handler(msg);
+      } catch (error) {
+        // One failing consumer must not stop the others from updating.
+        console.error(`Realtime handler for "${event}" failed`, error);
+      }
     }
   }
 

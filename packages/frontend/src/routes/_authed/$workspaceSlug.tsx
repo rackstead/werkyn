@@ -12,8 +12,7 @@ import { useState, useEffect } from "react";
 import { CreateProjectDialog } from "@/features/projects/components/create-project-dialog";
 import { CreateSpaceDialog } from "@/features/wiki/components/create-space-dialog";
 import { RealtimeProvider } from "@/components/providers/realtime-provider";
-import { useNotificationRealtime } from "@/hooks/use-notification-realtime";
-import { useWikiRealtime } from "@/features/wiki/hooks/use-wiki-realtime";
+import { WorkspaceRealtime } from "@/components/providers/workspace-realtime";
 
 export const Route = createFileRoute("/_authed/$workspaceSlug")({
   beforeLoad: ({ params }) => {
@@ -34,7 +33,6 @@ function WorkspaceLayout() {
   const navigate = useNavigate();
   const [createOpen, setCreateOpen] = useState(false);
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
-  useNotificationRealtime();
 
   // Guard against stale route context (e.g. after HMR or auth state changes)
   useEffect(() => {
@@ -42,8 +40,6 @@ function WorkspaceLayout() {
       navigate({ to: "/" });
     }
   }, [workspace, navigate]);
-
-  useWikiRealtime(workspace?.id);
 
   const workspaceId = workspace?.id ?? "";
   const { data: projectsData } = useProjects(workspaceId);
@@ -57,6 +53,7 @@ function WorkspaceLayout() {
 
   return (
     <RealtimeProvider>
+      <WorkspaceRealtime workspaceId={workspace.id} />
       <div className="flex h-screen flex-col">
         <OfflineBanner />
         <EmailVerificationBanner />

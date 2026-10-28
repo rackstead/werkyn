@@ -3,13 +3,30 @@ import { useRealtimeClient } from "@/components/providers/realtime-provider";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 
+/**
+ * Keeps the connection subscribed to a workspace's events (wiki, presence,
+ * chat channels). The workspace layout is the single owner of this
+ * subscription, so it survives every route change inside the workspace.
+ */
+export function useWorkspaceSubscription(workspaceId: string | undefined) {
+  const client = useRealtimeClient();
+
+  useEffect(() => {
+    if (!client || !workspaceId) return;
+    client.subscribeWorkspace(workspaceId);
+    return () => client.unsubscribeWorkspace(workspaceId);
+  }, [client, workspaceId]);
+}
+
+/**
+ * Refreshes the workspace's task summaries when a task event arrives. It only
+ * listens: the subscription itself belongs to the workspace layout.
+ */
 export function useWorkspaceRealtime(workspaceId: string | undefined) {
   const client = useRealtimeClient();
 
   useEffect(() => {
     if (!client || !workspaceId) return;
-
-    client.subscribeWorkspace(workspaceId);
 
     const handler = () => {
       queryClient.invalidateQueries({
@@ -29,7 +46,6 @@ export function useWorkspaceRealtime(workspaceId: string | undefined) {
     client.on("task_moved", handler);
 
     return () => {
-      client.unsubscribeWorkspace(workspaceId);
       client.off("task_created", handler);
       client.off("task_updated", handler);
       client.off("task_deleted", handler);

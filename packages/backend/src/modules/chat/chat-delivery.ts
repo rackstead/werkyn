@@ -135,14 +135,23 @@ async function ensureNotifications(prisma: PrismaClient, message: DeliveryMessag
   });
 }
 
-async function broadcastNotifications(prisma: PrismaClient, ids: string[]) {
+// Notifications carry a message snippet. One created by an earlier attempt is
+// only announced while its recipient can still read the channel.
+async function broadcastNotifications(
+  prisma: PrismaClient,
+  message: DeliveryMessage,
+  ids: string[],
+) {
   if (ids.length === 0) return;
+  const recipients = await currentRecipients(prisma, message.channelId, message.channel.workspaceId);
   const notifications = await prisma.notification.findMany({
     where: { id: { in: ids } },
     orderBy: { createdAt: "asc" },
   });
   for (const notification of notifications) {
-    broadcastToUser(notification.userId, "notification_created", notification);
+    if (recipients.has(notification.userId)) {
+      broadcastToUser(notification.userId, "notification_created", notification);
+    }
   }
 }
 
@@ -203,7 +212,7 @@ async function runSideEffects(prisma: PrismaClient, messageId: string) {
   });
   if (notificationIds) {
     const ids: string[] = notificationIds;
-    await attempt(() => broadcastNotifications(prisma, ids));
+    await attempt(() => broadcastNotifications(prisma, message, ids));
   }
   const parentId = message.parentId;
   if (parentId) {

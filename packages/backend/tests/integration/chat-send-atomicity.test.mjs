@@ -577,6 +577,25 @@ test("a delayed message broadcast skips sockets of members removed before the re
   }
 });
 
+test("a notification created before its recipient was removed is not announced on a retry", async () => {
+  const content = `removed recipient @[${users.PEER.id}] ${crypto.randomUUID()}`;
+  const messageId = await sendWithFailedDelivery(
+    { content },
+    async () => { socketFault = "notification_created"; },
+    async () => { socketFault = null; },
+  );
+  assert.equal(await notificationsFor(messageId), 1, "created by the first attempt");
+  await app.prisma.chatChannelMember.deleteMany({ where: { channelId: channel.id, userId: users.PEER.id } });
+  try {
+    await drain();
+    assert.equal(peerEvents.some((e) => e.event === "notification_created" && e.data.data?.messageId === messageId), false);
+    assert.equal(await notificationsFor(messageId), 1, "not created again");
+    assert.equal(await app.prisma.chatMessageDelivery.count({ where: { messageId } }), 0);
+  } finally {
+    await app.prisma.chatChannelMember.create({ data: { channelId: channel.id, userId: users.PEER.id } });
+  }
+});
+
 test("an edit before a delayed delivery can withdraw a mention but not add one", async () => {
   const mentions = (userId, messageId) =>
     app.prisma.notification.count({ where: { userId, type: "CHAT_MENTION", data: { path: ["messageId"], equals: messageId } } });

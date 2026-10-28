@@ -249,15 +249,18 @@ export function useAcceptInvite() {
         params: { workspaceSlug: result.workspace.slug },
       });
     },
-    onError: (error, token) => {
-      // A refusal replaces an earlier pending or verification state. Busy,
-      // server and network failures keep it, with the error shown beneath.
+    // The account that sends the request owns its result, even if the browser
+    // switches accounts before the response arrives.
+    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
+    onError: (error, token, context) => {
+      // A refusal replaces that account's earlier pending or verification
+      // state. Busy, server and network failures keep it, with the error
+      // shown beneath.
       const refused =
         error instanceof ApiError && [403, 404, 410].includes(error.statusCode);
-      const userId = useAuthStore.getState().user?.id;
-      if (refused && userId)
+      if (refused && context?.requesterId)
         queryClient.removeQueries({
-          queryKey: queryKeys.inviteAdmission(userId, token),
+          queryKey: queryKeys.inviteAdmission(context.requesterId, token),
           exact: true,
         });
     },

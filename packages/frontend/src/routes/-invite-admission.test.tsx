@@ -368,3 +368,33 @@ it("rechecks a remembered registration refusal against current policy", async ()
     }),
   );
 });
+
+it("clears only the requesting account's remembered state when a check is refused after an account switch", async () => {
+  signIn("first");
+  const { rememberInviteAdmission } = await import("@/features/workspaces/api");
+  const pending = (userId: string) => ({
+    status: "approval_pending" as const,
+    workspace,
+    requestId: `rq-${userId}`,
+    requestedAt: "2026-10-27T00:00:00Z",
+  });
+  rememberInviteAdmission("first", "invite-token", pending("first"));
+  rememberInviteAdmission("second", "invite-token", pending("second"));
+  let refuse!: () => void;
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    new Promise<Response>((resolve) => {
+      refuse = () =>
+        resolve(json(403, { statusCode: 403, error: "Forbidden", message: "Invites are currently disabled for this workspace" }));
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+  await waitFor(() => expect(refuse).toBeTypeOf("function"));
+  act(() => signIn("second"));
+  await act(async () => refuse());
+  await waitFor(() =>
+    expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined(),
+  );
+  expect(queryClient.getQueryData(["invite-admission", "second", "invite-token"])).toEqual(pending("second"));
+  expect(screen.getByText(/waiting for an administrator/)).toBeTruthy();
+});

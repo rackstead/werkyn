@@ -221,6 +221,14 @@ export function useInviteAdmission(token: string) {
   return userId ? (data ?? null) : null;
 }
 
+// Counts sign-in changes in this tab (sign-out, sign-in, account switch). A
+// reply to a request sent before such a change belongs to an earlier session,
+// even when the same account has signed in again since.
+let sessionGeneration = 0;
+useAuthStore.subscribe((current, previous) => {
+  if (current.user?.id !== previous.user?.id) sessionGeneration++;
+});
+
 // Shared by acceptance (a join attempt) and the read-only status check.
 function useAdmissionMutation(
   send: (token: string) => Promise<AdmissionResponse>,
@@ -230,12 +238,30 @@ function useAdmissionMutation(
     mutationFn: send,
     // The account that sends the request owns its result, even if the browser
     // switches accounts before the response arrives.
-    onMutate: () => ({ requesterId: useAuthStore.getState().user?.id }),
-    onSuccess: async (res, token) => {
+    onMutate: (token) => {
+      const requesterId = useAuthStore.getState().user?.id;
+      return {
+        requesterId,
+        generation: sessionGeneration,
+        // The remembered result's state when the request was sent; a refusal
+        // must not remove a result stored since (for example, after this
+        // account signed in again). Every update replaces the state object.
+        remembered: requesterId
+          ? queryClient.getQueryState(
+              queryKeys.inviteAdmission(requesterId, token),
+            )
+          : undefined,
+      };
+    },
+    onSuccess: async (res, token, context) => {
       const result = res.data;
-      // If this browser has since switched or signed out, the response must
-      // not change the current session.
-      if (useAuthStore.getState().user?.id !== result.userId) return;
+      // If this browser has since signed out, switched or signed in again,
+      // the response must not change the current session.
+      if (
+        context?.generation !== sessionGeneration ||
+        useAuthStore.getState().user?.id !== result.userId
+      )
+        return;
       rememberInviteAdmission(result.userId, token, result);
       if (result.status !== "joined") return;
       if (
@@ -258,15 +284,15 @@ function useAdmissionMutation(
     },
     onError: (error, token, context) => {
       // A refusal replaces that account's earlier pending or verification
-      // state. Busy, server and network failures keep it, with the error
-      // shown beneath.
+      // state, unless a newer result was stored after the request was sent.
+      // Busy, server and network failures keep it, with the error shown
+      // beneath.
       const refused =
         error instanceof ApiError && [403, 404, 410].includes(error.statusCode);
-      if (refused && context?.requesterId)
-        queryClient.removeQueries({
-          queryKey: queryKeys.inviteAdmission(context.requesterId, token),
-          exact: true,
-        });
+      if (!refused || !context?.requesterId) return;
+      const key = queryKeys.inviteAdmission(context.requesterId, token);
+      if (queryClient.getQueryState(key) !== context.remembered) return;
+      queryClient.removeQueries({ queryKey: key, exact: true });
     },
   });
 }

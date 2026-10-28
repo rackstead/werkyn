@@ -315,8 +315,9 @@ state, the live invitation and the workspace settings, and returns one of:
 `POST /api/invites/:token/accept` answers `200` when joined, `202` while
 verification or approval is pending, and `403`/`404`/`410` when denied.
 `GET /api/invites/:token/admission` reports the same state for the signed-in
-account without writing anything, or `not_pending` when there is no membership
-and no pending request (for example, after a request was declined).
+account without writing anything: `not_pending` when approval is required and
+there is no membership and no pending request (for example, after a request was
+declined), or `ready` when approval is not required and the account can join.
 `POST /api/auth/register` always keeps the new account and reports the result in
 `data.admission`; a verification email sent because of an invitation links back
 to that invitation. Open invitations without an email or domain restriction still
@@ -328,7 +329,10 @@ instead of memberships. Workspace admins review them under Admin, Invites, Join
 requests (`GET /api/workspaces/:wid/admission-requests`, then
 `POST .../admission-requests/:requestId/approve` or `.../reject`). Approval checks the approver, invitation, applicant and
 settings again at decision time and does not reserve a seat or invitation use
-in advance. Revoking an invitation cancels its pending requests. Checking a
+in advance. A request stays bound to the invitation it was made through; asking
+again through a different invitation replaces it with a new request, so a
+decision on the request an admin reviewed never applies to another invitation's
+role. Revoking an invitation cancels its pending requests. Checking a
 request's status never creates or revives it; a declined person sees that the
 request is no longer pending and may explicitly ask again while the invitation
 remains valid. Revoke the invitation to stop that.

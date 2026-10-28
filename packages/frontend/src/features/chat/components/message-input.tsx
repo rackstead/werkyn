@@ -2,12 +2,16 @@ import { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { SendHorizontal } from "lucide-react";
+import { usePendingSend } from "./use-pending-send";
 
 interface MessageInputProps {
-  onSend: (content: string) => void;
+  /** A returned promise keeps the draft until it resolves; on rejection the draft stays for a retry. */
+  onSend: (content: string) => void | Promise<unknown>;
   onTyping?: () => void;
   placeholder?: string;
   disabled?: boolean;
+  /** The draft's destination; changing it discards the draft. */
+  scope?: string;
 }
 
 export function MessageInput({
@@ -15,17 +19,23 @@ export function MessageInput({
   onTyping,
   placeholder = "Type a message...",
   disabled,
+  scope,
 }: MessageInputProps) {
   const [content, setContent] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  const { sending, run } = usePendingSend(textareaRef, disabled, scope, () =>
+    setContent(""),
+  );
+
   const handleSubmit = useCallback(() => {
     const trimmed = content.trim();
     if (!trimmed) return;
-    onSend(trimmed);
-    setContent("");
-    textareaRef.current?.focus();
-  }, [content, onSend]);
+    run(
+      () => onSend(trimmed),
+      () => setContent(""),
+    );
+  }, [content, onSend, run]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -47,7 +57,7 @@ export function MessageInput({
         onChange={handleChange}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        disabled={disabled}
+        disabled={disabled || sending}
         className="min-h-[40px] max-h-32 resize-none"
         rows={1}
       />
@@ -55,7 +65,7 @@ export function MessageInput({
         size="icon"
         className="shrink-0"
         onClick={handleSubmit}
-        disabled={!content.trim() || disabled}
+        disabled={!content.trim() || disabled || sending}
       >
         <SendHorizontal className="h-4 w-4" />
       </Button>

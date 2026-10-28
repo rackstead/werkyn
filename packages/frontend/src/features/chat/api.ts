@@ -4,8 +4,10 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { api } from "@/lib/api-client";
+import { useRef } from "react";
+import { ApiError, api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
+import { useAuthStore } from "@/stores/auth-store";
 import type {
   CreateChannelInput,
   UpdateChannelInput,
@@ -215,13 +217,76 @@ export function useMessages(wid: string, channelId: string) {
   });
 }
 
+// 429 is not retried automatically: the API client does not expose
+// Retry-After, and the rate-limit window outlasts these quick retries. The
+// draft and its key are kept, so a manual resend still cannot duplicate.
+const RETRYABLE_SEND_STATUSES = new Set([408, 500, 502, 503, 504]);
+
+function createClientMessageId() {
+  const cryptoApi = globalThis.crypto;
+  // randomUUID is missing outside secure contexts (plain-HTTP self-hosting).
+  if (typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+  return Array.from(cryptoApi.getRandomValues(new Uint8Array(16)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+/**
+ * Sends a message with an Idempotency-Key. Resending the same text to the same
+ * place after a failed or unanswered attempt reuses that attempt's key, so the
+ * server returns the message it may already have stored instead of a
+ * duplicate. A successful send, or different text, starts a new key.
+ */
 export function useSendMessage(wid: string, channelId: string) {
   const qc = useQueryClient();
+  const unconfirmed = useRef<{ target: string; key: string } | null>(null);
   return useMutation({
-    mutationFn: (data: SendMessageInput) =>
-      api
-        .post(`chat/${wid}/channels/${channelId}/messages`, { json: data })
-        .json<{ data: ChatMessage }>(),
+    mutationFn: (data: SendMessageInput) => {
+      // The author when the send starts. The API client checks it before every
+      // attempt, so a retry after an account switch is refused instead of
+      // posting the draft as the new account.
+      const expectedUserId = useAuthStore.getState().user?.id;
+      const target = JSON.stringify([
+        expectedUserId ?? null,
+        wid,
+        channelId,
+        data.parentId ?? null,
+        data.content,
+      ]);
+      if (unconfirmed.current?.target !== target) {
+        unconfirmed.current = { target, key: createClientMessageId() };
+      }
+      const attempt = unconfirmed.current;
+      return api
+        .post(`chat/${wid}/channels/${channelId}/messages`, {
+          json: data,
+          headers: { "Idempotency-Key": attempt.key },
+          context: { expectedUserId },
+          // Safe to repeat: the key makes the server return the stored message.
+          // Network failures, timeouts and transient statuses are retried;
+          // other API errors (rate limit, conflict, forbidden, validation)
+          // are final. Every error is an ApiError from the client's
+          // afterResponse hook, so the predicate must decide them all: an
+          // undefined result would make ky retry any of them.
+          retry: {
+            limit: 2,
+            methods: ["post"],
+            retryOnTimeout: true,
+            shouldRetry: ({ error }) =>
+              error instanceof ApiError
+                ? RETRYABLE_SEND_STATUSES.has(error.statusCode)
+                : undefined,
+          },
+        })
+        .json<{ data: ChatMessage }>()
+        .then((res) => {
+          if (unconfirmed.current === attempt) unconfirmed.current = null;
+          return res;
+        });
+    },
+    // Callers report a failed send together with the kept draft; this
+    // replaces the client-wide error toast so it is not shown twice.
+    onError: () => {},
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: queryKeys.chatMessages(channelId) });
       // If this was a thread reply, also refresh the thread panel

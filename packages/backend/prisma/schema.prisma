@@ -1152,6 +1152,10 @@ model ChatMessage {
   deletedAt  DateTime?
   pinnedAt   DateTime?
   pinnedById String?
+  /// Client-supplied idempotency key; a retried send returns the original message.
+  clientMessageId String? @db.VarChar(128)
+  /// SHA-256 of the keyed send's channel, thread parent and original content.
+  clientMessageHash String? @db.Char(64)
   createdAt  DateTime  @default(now())
 
   channel       ChatChannel              @relation(fields: [channelId], references: [id], onDelete: Cascade)
@@ -1162,10 +1166,33 @@ model ChatMessage {
   pinnedBy      User?                    @relation("pinnedMessages", fields: [pinnedById], references: [id])
   bookmarks     ChatBookmark[]
   subscriptions ChatThreadSubscription[]
+  delivery      ChatMessageDelivery?
 
+  @@unique([userId, clientMessageId])
   @@index([channelId, createdAt])
   @@index([parentId])
   @@index([userId])
+}
+
+/// Outbox row written in the same transaction as a chat message. It is retried
+/// until the message's notifications and realtime events have been delivered,
+/// then deleted. Rows left at the attempt limit keep their lastError and have
+/// no nextAttemptAt.
+model ChatMessageDelivery {
+  messageId        String    @id
+  attempts         Int       @default(0)
+  nextAttemptAt    DateTime? @default(now())
+  lockedUntil      DateTime?
+  /// Users mentioned by the content as sent; an edit cannot add recipients.
+  mentionedUserIds String[]  @default([])
+  notifiedAt       DateTime?
+  notificationIds  String[]  @default([])
+  lastError        String?
+  createdAt        DateTime  @default(now())
+
+  message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([nextAttemptAt])
 }
 
 model ChatReaction {

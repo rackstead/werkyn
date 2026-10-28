@@ -3,13 +3,17 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { SendHorizontal } from "lucide-react";
 import { MentionDropdown, type MemberOption } from "@/features/comments/components/mention-dropdown";
+import { usePendingSend } from "./use-pending-send";
 
 interface MentionInputProps {
-  onSend: (content: string) => void;
+  /** A returned promise keeps the draft until it resolves; on rejection the draft stays for a retry. */
+  onSend: (content: string) => void | Promise<unknown>;
   onTyping?: () => void;
   members: MemberOption[];
   placeholder?: string;
   disabled?: boolean;
+  /** The draft's destination; changing it discards the draft. */
+  scope?: string;
 }
 
 export function MentionInput({
@@ -18,6 +22,7 @@ export function MentionInput({
   members,
   placeholder = "Type a message... Use @ to mention",
   disabled,
+  scope,
 }: MentionInputProps) {
   const [displayContent, setDisplayContent] = useState("");
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -25,6 +30,11 @@ export function MentionInput({
   const [mentionIndex, setMentionIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionMapRef = useRef<Map<string, string>>(new Map());
+  const { sending, run } = usePendingSend(textareaRef, disabled, scope, () => {
+    setDisplayContent("");
+    setMentionQuery(null);
+    mentionMapRef.current.clear();
+  });
 
   const buildStoredContent = useCallback((display: string) => {
     let stored = display;
@@ -37,11 +47,14 @@ export function MentionInput({
   const handleSubmit = useCallback(() => {
     const stored = buildStoredContent(displayContent).trim();
     if (!stored) return;
-    onSend(stored);
-    setDisplayContent("");
-    mentionMapRef.current.clear();
-    textareaRef.current?.focus();
-  }, [displayContent, onSend, buildStoredContent]);
+    run(
+      () => onSend(stored),
+      () => {
+        setDisplayContent("");
+        mentionMapRef.current.clear();
+      },
+    );
+  }, [displayContent, onSend, buildStoredContent, run]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -137,7 +150,7 @@ export function MentionInput({
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
-          disabled={disabled}
+          disabled={disabled || sending}
           className="min-h-[40px] max-h-32 resize-none"
           rows={1}
         />
@@ -153,7 +166,7 @@ export function MentionInput({
         size="icon"
         className="shrink-0"
         onClick={handleSubmit}
-        disabled={!displayContent.trim() || disabled}
+        disabled={!displayContent.trim() || disabled || sending}
       >
         <SendHorizontal className="h-4 w-4" />
       </Button>

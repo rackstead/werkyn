@@ -1,6 +1,7 @@
 import { env } from "./config/env.js";
 import { buildApp } from "./app.js";
 import { cleanupExpiredTokensAndAttempts } from "./modules/auth/auth.service.js";
+import { startChatMessageDeliveryWorker } from "./modules/chat/chat-delivery.js";
 import { processDueDateReminders } from "./schedulers/due-date-reminders.js";
 import { processRecurringTasks } from "./schedulers/recurring-tasks.js";
 import { processTrashPurge } from "./schedulers/trash-purge.js";
@@ -85,6 +86,10 @@ async function start() {
     // Remove queued stored blobs after 30s, then every 5 minutes
     const blobCleanup = startBlobCleanupWorker(app);
 
+    // Retry chat notifications/realtime events whose first delivery failed,
+    // every 30s
+    const chatDeliveries = startChatMessageDeliveryWorker(app);
+
     // Start embedded Dex (SSO identity provider)
     dexManager.start(app.prisma, app.log).catch((err) => {
       app.log.error(err, "Failed to start Dex");
@@ -93,11 +98,14 @@ async function start() {
     // Graceful shutdown: failures and timeouts are logged and exit non-zero.
     // Each step has its own budget inside the 8 s overall deadline, so a
     // stalled cleanup batch cannot keep Dex from being signalled. Dex's own
-    // stop sends SIGKILL 5 s after SIGTERM, inside its 5.5 s budget.
+    // stop sends SIGKILL 5 s after SIGTERM, inside its 5.5 s budget. An
+    // interrupted chat delivery pass is safe: its rows are retried after
+    // their lease expires.
     const shutdown = createShutdownHandler({
       log: app.log,
       steps: [
         { name: "blob cleanup", run: () => blobCleanup.stop(), timeoutMs: 1_000 },
+        { name: "chat deliveries", run: () => chatDeliveries.stop(), timeoutMs: 500 },
         { name: "dex", run: () => dexManager.stop(), timeoutMs: 5_500 },
         { name: "http server", run: () => app.close() },
       ],

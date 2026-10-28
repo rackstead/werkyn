@@ -300,11 +300,17 @@ export function broadcastToChannel(
   event: string,
   data: unknown,
   excludeUserId?: string,
+  // When given, only subscribers among these users receive the event.
+  onlyUserIds?: ReadonlySet<string>,
 ): void {
   const message = JSON.stringify({ event, data, channelId });
 
   for (const [ws, conn] of connections) {
-    if (conn.channels.has(channelId) && conn.userId !== excludeUserId) {
+    if (
+      conn.channels.has(channelId) &&
+      conn.userId !== excludeUserId &&
+      (!onlyUserIds || onlyUserIds.has(conn.userId))
+    ) {
       deliver(ws, conn, message);
     }
   }

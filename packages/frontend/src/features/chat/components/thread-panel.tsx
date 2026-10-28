@@ -1,6 +1,7 @@
 import { X, Loader2, Bell, BellOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MessageItem } from "./message-item";
+import { toast } from "sonner";
 import { MessageInput } from "./message-input";
 import {
   useThreadReplies,
@@ -46,9 +47,13 @@ export function ThreadPanel({
 
   const replies = data?.pages.flatMap((p) => p.data) ?? [];
 
-  const handleSend = (content: string) => {
-    sendMessage.mutate({ content, parentId: parentMessage.id });
-  };
+  const handleSend = (content: string) =>
+    sendMessage
+      .mutateAsync({ content, parentId: parentMessage.id })
+      .catch((err: Error) => {
+        toast.error(`Reply not sent: ${err.message}`);
+        throw err;
+      });
 
   const handleReaction = (messageId: string, emoji: string) => {
     toggleReaction.mutate({ messageId, emoji });
@@ -141,6 +146,7 @@ export function ThreadPanel({
       </div>
 
       <MessageInput
+        scope={parentMessage.id}
         onSend={handleSend}
         placeholder="Reply in thread..."
         disabled={sendMessage.isPending}

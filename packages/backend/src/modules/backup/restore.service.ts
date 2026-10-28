@@ -7,6 +7,7 @@ import { IdMapper, UserMapper } from "./id-mapper.js";
 import { ValidationError } from "../../utils/errors.js";
 import { rewriteUrls } from "./backup-assets.js";
 import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
+import { sanitizeDescription } from "../../utils/description-html.js";
 
 /** Parse and validate a backup JSON buffer. */
 function parseBackupFile(buffer: Buffer): BackupFile {
@@ -284,7 +285,7 @@ export async function executeRestore(
               projectId: newProject.id,
               statusId,
               title: t.title,
-              description: t.description,
+              description: sanitizeDescription(t.description),
               priority: toPriority(t.priority),
               position: t.position,
               dueDate: t.dueDate,

@@ -2,6 +2,7 @@ import type { PrismaClient, Prisma } from "@prisma/client";
 import type { CreateTemplateInput, UpdateTemplateInput, InstantiateTemplateInput } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
+import { sanitizeDescription } from "../../utils/description-html.js";
 
 export async function listTemplates(prisma: PrismaClient, projectId: string) {
   return prisma.taskTemplate.findMany({
@@ -28,7 +29,7 @@ export async function createTemplate(
       projectId,
       name: data.name,
       title: data.title,
-      description: data.description,
+      description: sanitizeDescription(data.description),
       priority: data.priority,
       statusId: data.statusId,
       dueOffset: data.dueOffset,
@@ -51,7 +52,7 @@ export async function updateTemplate(
   const updateData: Prisma.TaskTemplateUpdateInput = {};
   if (data.name !== undefined) updateData.name = data.name;
   if (data.title !== undefined) updateData.title = data.title;
-  if (data.description !== undefined) updateData.description = data.description;
+  if (data.description !== undefined) updateData.description = sanitizeDescription(data.description);
   if (data.priority !== undefined) updateData.priority = data.priority;
   if (data.statusId !== undefined) updateData.statusId = data.statusId;
   if (data.dueOffset !== undefined) updateData.dueOffset = data.dueOffset;
@@ -163,7 +164,9 @@ export async function createTaskFromTemplate(
         projectId,
         statusId,
         title,
-        description: template.description,
+        // Sanitize again on copy: templates stored before sanitizing was added
+        // may still hold unfiltered HTML.
+        description: sanitizeDescription(template.description),
         priority: template.priority,
         position,
         dueDate,

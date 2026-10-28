@@ -8,6 +8,7 @@ import {
   type AccessContext,
 } from "../files/file-access.js";
 import { assertProjectAccess } from "../../utils/project-access.js";
+import { cleanupBlobsNow } from "../../services/blob-cleanup.js";
 
 async function assertAttachmentTarget(
   prisma: PrismaClient,
@@ -135,12 +136,13 @@ export async function downloadAttachment(
   if (!attachment.file?.storagePath || attachment.file.isFolder)
     throw new NotFoundError("The linked Drive file is no longer available");
   await assertFileAccess(prisma, attachment.file.id, ctx);
-  const stream = storage.readStream(attachment.file.storagePath);
+  const stream = await storage.openReadStream(attachment.file.storagePath);
   return { stream, attachment: { ...attachment, name: attachment.file.name } };
 }
 
 export async function deleteAttachment(
   prisma: PrismaClient,
+  storage: StorageProvider,
   workspaceId: string,
   attachmentId: string,
   ctx: AccessContext,
@@ -160,6 +162,11 @@ export async function deleteAttachment(
       "Only the uploader or workspace administrator can remove an attachment",
     );
   await prisma.attachment.delete({ where: { id: attachmentId, workspaceId } });
+  // A row without a Drive file is a legacy direct upload (or a SetNull
+  // leftover): its delete trigger queued the blob, removed here when possible.
+  // Linked Drive files keep their blob.
+  if (!attachment.fileId)
+    await cleanupBlobsNow(prisma, storage, [attachment.storagePath]);
 }
 
 export async function linkAttachment(

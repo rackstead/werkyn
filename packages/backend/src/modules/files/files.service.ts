@@ -21,6 +21,11 @@ import {
 import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import {
+  blobPaths,
+  cleanupBlobsNow,
+  discardStagedBlobs,
+} from "../../services/blob-cleanup.js";
+import {
   assertFileAccess,
   fileAccessRole,
   fileReadWhere,
@@ -111,8 +116,7 @@ export async function uploadFileStream(
       });
     });
   } catch (err) {
-    await storage.delete(storagePath);
-    if (thumbnailPath) await storage.delete(thumbnailPath).catch(() => {});
+    await discardStagedBlobs(prisma, storage, [storagePath, thumbnailPath]);
     throw err;
   }
 }
@@ -280,7 +284,7 @@ export async function downloadFile(
 
   await assertFileAccess(prisma, fileId, { ...ctx, workspaceId });
 
-  const stream = storage.readStream(file.storagePath);
+  const stream = await storage.openReadStream(file.storagePath);
   return { stream, file };
 }
 
@@ -435,10 +439,13 @@ export async function deleteFile(
   const access = { ...ctx, workspaceId };
   // Validate the complete current subtree (rights, cycles, foreign or
   // non-folder child edges, budgets) under the graph lock before the cascade.
+  // The delete triggers queue every original and thumbnail in the same
+  // transaction; they are removed right after the commit when possible and
+  // otherwise by the cleanup worker.
   const removed = await withWorkspaceLock(prisma, workspaceId, async (tx) => {
     const file = await tx.file.findFirst({
       where: { id: fileId, workspaceId },
-      select: { storagePath: true },
+      select: { storagePath: true, thumbnailPath: true },
     });
     if (!file) throw new NotFoundError("File not found");
 
@@ -447,9 +454,7 @@ export async function deleteFile(
     await tx.file.delete({ where: { id: fileId } });
     return [file, ...descendants];
   });
-  for (const row of removed) {
-    if (row.storagePath) await storage.delete(row.storagePath);
-  }
+  await cleanupBlobsNow(prisma, storage, blobPaths(removed));
 }
 
 export async function getFileAttachmentCount(
@@ -574,7 +579,7 @@ export async function copyFile(
     : ctx.userId;
 
   // Copy storage
-  const sourceStream = storage.readStream(source.storagePath);
+  const sourceStream = await storage.openReadStream(source.storagePath);
   const { storagePath, size } = await storage.saveStream(
     `${workspaceId}/files`,
     scopeId,
@@ -609,7 +614,7 @@ export async function copyFile(
       });
     });
   } catch (err) {
-    await storage.delete(storagePath);
+    await discardStagedBlobs(prisma, storage, [storagePath]);
     throw err;
   }
 }
@@ -625,14 +630,20 @@ export async function collectDescendantFiles(
   prisma: Prisma.TransactionClient,
   parentId: string,
   ctx?: AccessContext,
-): Promise<Array<{ id: string; storagePath: string | null }>> {
+): Promise<
+  Array<{ id: string; storagePath: string | null; thumbnailPath: string | null }>
+> {
   const root = await prisma.file.findUnique({
     where: { id: parentId },
     select: { workspaceId: true, isFolder: true },
   });
   if (!root || (ctx && root.workspaceId !== ctx.workspaceId))
     throw new NotFoundError("Folder not found");
-  const result: Array<{ id: string; storagePath: string | null }> = [];
+  const result: Array<{
+    id: string;
+    storagePath: string | null;
+    thumbnailPath: string | null;
+  }> = [];
   const isFolder = new Map([[parentId, root.isFolder]]);
   const writableScopes = new Set<string>();
   let parents = [parentId];
@@ -647,6 +658,7 @@ export async function collectDescendantFiles(
             parentId: true,
             workspaceId: true,
             storagePath: true,
+            thumbnailPath: true,
             isFolder: true,
             ownerId: true,
             teamFolderId: true,
@@ -673,7 +685,11 @@ export async function collectDescendantFiles(
         await assertFileAccess(prisma, child.id, ctx, true, true);
         writableScopes.add(scope);
       }
-      result.push({ id: child.id, storagePath: child.storagePath });
+      result.push({
+        id: child.id,
+        storagePath: child.storagePath,
+        thumbnailPath: child.thumbnailPath,
+      });
       parents.push(child.id);
     }
   }

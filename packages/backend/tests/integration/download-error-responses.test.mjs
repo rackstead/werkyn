@@ -273,7 +273,7 @@ test("guarded authorized app downloads return JSON for early blob errors, keep d
     route.security = security(response);
   }
   // Only owned fixture blobs are removed; valid File/link records deliberately
-  // remain, modelling early ENOENT rather than SetNull/missing-resource404.
+  // remain, modelling a missing blob rather than SetNull/missing-resource 404.
   await app.storage.delete(source.storagePath);
   await app.storage.delete(source.thumbnailPath);
   for (const [method, kind] of [
@@ -310,11 +310,16 @@ test("guarded authorized app downloads return JSON for early blob errors, keep d
   assert.deepEqual(effects, { reads: 0, writes: 0, deletes: 0, events: 0 });
   for (const route of routes) {
     const response = await request("GET", route.url, undefined, route.actor);
-    assert.equal(response.status, 500, response.bytes.toString());
+    // A missing blob is an intentional 410 without the storage path.
+    assert.equal(response.status, 410, response.bytes.toString());
     assert.match(response.headers.get("content-type"), /^application\/json/);
     assert.equal(response.headers.get("content-disposition"), null);
-    assert.equal(response.json().statusCode, 500);
-    assert.match(response.json().message, /ENOENT/);
+    assert.equal(response.json().statusCode, 410);
+    assert.equal(
+      response.json().message,
+      "File content is no longer available",
+    );
+    assert.doesNotMatch(response.bytes.toString(), /ENOENT|werkyn-app/);
     assert.equal(
       Number(response.headers.get("content-length")),
       response.bytes.length,

@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@prisma/client";
+import type { StorageProvider } from "../../services/storage.js";
 import type {
   CreateTeamFolderInput,
   UpdateTeamFolderInput,
@@ -7,6 +8,7 @@ import { NotFoundError } from "../../utils/errors.js";
 import { fileAccessRole, teamFolderAccessWhere } from "../files/file-access.js";
 import { collectDescendantFiles } from "../files/files.service.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { blobPaths, cleanupBlobsNow } from "../../services/blob-cleanup.js";
 
 export async function createTeamFolder(
   prisma: PrismaClient,
@@ -176,19 +178,21 @@ export async function updateTeamFolder(
 
 export async function deleteTeamFolder(
   prisma: PrismaClient,
+  storage: StorageProvider,
   workspaceId: string,
   teamFolderId: string,
 ) {
   // Deleting the root File cascades children; deleting TeamFolder cascades members.
   // The workspace graph lock orders this against moves into or out of the
   // team folder and new children, and the bounded subtree walk rejects legacy
-  // foreign or cyclic rows before the cascade could reach them.
-  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+  // foreign or cyclic rows before the cascade could reach them. The File
+  // delete triggers queue every descendant blob in the same transaction.
+  const removed = await withWorkspaceLock(prisma, workspaceId, async (tx) => {
     const teamFolder = await tx.teamFolder.findFirst({
       where: { id: teamFolderId, workspaceId },
     });
     if (!teamFolder) throw new NotFoundError("Team folder not found");
-    await collectDescendantFiles(tx, teamFolder.folderId);
+    const descendants = await collectDescendantFiles(tx, teamFolder.folderId);
 
     // Null out teamFolderId on children so cascade doesn't fail
     await tx.file.updateMany({
@@ -200,7 +204,9 @@ export async function deleteTeamFolder(
 
     // Now delete the root folder (cascades File children)
     await tx.file.delete({ where: { id: teamFolder.folderId } });
+    return descendants;
   });
+  await cleanupBlobsNow(prisma, storage, blobPaths(removed));
 }
 
 export async function addMember(

@@ -82,6 +82,7 @@ export async function deleteTeamFolderHandler(
 
   await teamFoldersService.deleteTeamFolder(
     request.server.prisma,
+    request.server.storage,
     params.wid,
     params.tfid,
   );

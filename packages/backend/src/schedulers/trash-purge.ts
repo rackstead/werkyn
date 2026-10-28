@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { StorageProvider } from "../services/storage.js";
 import { collectDescendantFiles } from "../modules/files/files.service.js";
 import { withWorkspaceLock } from "../utils/workspace-lock.js";
+import { blobPaths, cleanupBlobsNow } from "../services/blob-cleanup.js";
 
 const BATCH_SIZE = 100;
 const PURGE_AFTER_DAYS = 30;
@@ -49,13 +50,10 @@ export async function processTrashPurge(
             });
             if (!current) return null;
             const descendants = await collectDescendantFiles(tx, file.id);
-            // Delete DB record (cascade deletes children for folders)
+            // Delete DB record (cascade deletes children for folders). The
+            // delete triggers queue every original and thumbnail durably.
             await tx.file.delete({ where: { id: file.id } });
-            return [
-              current.storagePath,
-              current.thumbnailPath,
-              ...descendants.map((d) => d.storagePath),
-            ].filter((sp): sp is string => !!sp);
+            return blobPaths([current, ...descendants]);
           },
           { onMissing: () => null },
         );
@@ -65,10 +63,8 @@ export async function processTrashPurge(
       }
       if (!storagePaths) continue;
 
-      // Delete storage files
-      for (const sp of storagePaths) {
-        await storage.delete(sp).catch(() => {});
-      }
+      // Storage failures stay queued with backoff for the cleanup worker.
+      await cleanupBlobsNow(prisma, storage, storagePaths);
 
       totalPurged++;
     }

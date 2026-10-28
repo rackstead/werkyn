@@ -35,15 +35,33 @@ type Client = PrismaClient | Prisma.TransactionClient;
 type Tx = Prisma.TransactionClient;
 
 // Locking relies on READ COMMITTED: each statement after a lock wait sees the
-// rows the previous holder committed.
+// rows the previous holder committed. Lock waits count toward the transaction
+// budget; holders keep a family lock for a few statements, so it runs out only
+// when the database is stalled.
 export const refreshTransactionOptions = {
   isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+  maxWait: 5_000,
+  timeout: 10_000,
 };
 
-/** Starts a new family for the user and returns its first raw refresh token. */
-export async function createRefreshSession(client: Client, userId: string) {
+/**
+ * Starts a new family for the user and returns its first raw refresh token.
+ * The user row is held FOR SHARE while the family is created. Password change
+ * and reset update that row before revoking every family, so they either
+ * commit first or wait for this session and then revoke it too.
+ */
+export async function createRefreshSession(
+  client: Client,
+  userId: string,
+): Promise<string> {
+  if ("$transaction" in client)
+    return client.$transaction(
+      (tx) => createRefreshSession(tx, userId),
+      refreshTransactionOptions,
+    );
+  await client.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR SHARE`;
   const refreshToken = generateRefreshToken();
-  // One nested write: the family is never visible without its first token.
+  // The family is never visible without its first token.
   await client.refreshTokenFamily.create({
     data: {
       id: crypto.randomUUID(),
@@ -98,8 +116,18 @@ async function revokeLockedFamily(
 export type RotationResult =
   | { status: "rotated"; userId: string; refreshToken: string }
   | { status: "superseded" }
+  | { status: "busy" }
   | { status: "expired" }
   | { status: "invalid" };
+
+// The interactive transaction ran out of its budget (or was closed) and was
+// rolled back, so nothing it did is committed.
+function isTransactionTimeout(error: unknown) {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2028"
+  );
+}
 
 /**
  * Rotates a presented refresh token. The outcome is returned rather than
@@ -110,7 +138,7 @@ export function rotateRefreshToken(
   rawToken: string,
 ): Promise<RotationResult> {
   const tokenHash = hashToken(rawToken);
-  return prisma.$transaction(async (tx): Promise<RotationResult> => {
+  const rotation = prisma.$transaction(async (tx): Promise<RotationResult> => {
     const familyId = await findFamilyId(tx, tokenHash);
     if (!familyId) return { status: "invalid" };
     const family = await lockFamily(tx, familyId);
@@ -153,6 +181,10 @@ export function rotateRefreshToken(
     await revokeLockedFamily(tx, familyId, "reuse");
     return { status: "invalid" };
   }, refreshTransactionOptions);
+  return rotation.catch((error: unknown): RotationResult => {
+    if (isTransactionTimeout(error)) return { status: "busy" };
+    throw error;
+  });
 }
 
 /** Revokes the family of a presented active or rotated token, if any. */

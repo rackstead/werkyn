@@ -316,6 +316,11 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
       "This refresh token has already been refreshed by another request",
     );
   }
+  if (rotation.status === "busy") {
+    // Another operation held this session past the transaction budget and
+    // this attempt was rolled back; the same cookie can be retried.
+    throw new ConflictError("This session is busy. Retry the refresh.");
+  }
   if (rotation.status === "expired") {
     throw new UnauthorizedError("Refresh token expired");
   }

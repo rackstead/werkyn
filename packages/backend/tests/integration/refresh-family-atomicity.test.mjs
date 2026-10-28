@@ -44,6 +44,8 @@ const { buildApp } = await import("../../src/app.ts");
 const { hashToken } = await import("../../src/utils/tokens.ts");
 const { hashPassword } = await import("../../src/utils/passwords.ts");
 const authService = await import("../../src/modules/auth/auth.service.ts");
+const { refreshTransactionOptions } =
+  await import("../../src/modules/auth/refresh-sessions.ts");
 
 // Policy under test: a rotated token presented within this window of its
 // rotation is a benign concurrent use (another tab sharing the same cookie):
@@ -74,9 +76,10 @@ before(async () => {
 
 after(async () => {
   try {
-    await control.$executeRawUnsafe(
-      `DROP TRIGGER IF EXISTS ${barrierFn} ON "RefreshToken"`,
-    );
+    for (const table of ["RefreshToken", "RefreshTokenFamily"])
+      await control.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS ${barrierFn} ON "${table}"`,
+      );
     await control.$executeRawUnsafe(
       `DROP FUNCTION IF EXISTS ${barrierFn}() CASCADE`,
     );
@@ -324,6 +327,15 @@ async function withControlLock(lock, body) {
 
 // Any rotation must change the presented token's row, so a row lock on it
 // pauses every implementation after it has read the token as active.
+function familyRowLock(familyId) {
+  return async (tx) => {
+    const rows = await tx.$queryRaw`
+      SELECT id FROM "RefreshTokenFamily" WHERE id = ${familyId} FOR UPDATE
+    `;
+    assert.equal(rows.length, 1);
+  };
+}
+
 function tokenRowLock(raw) {
   return async (tx) => {
     const rows = await tx.$queryRaw`
@@ -544,32 +556,133 @@ for (const [name, prepare, expected] of [
   });
 }
 
-test("a password reset racing a login with the old password leaves no session from it", async () => {
+// Every new session (password login, OIDC sign-in, registration) is created
+// while its user row is held, so a racing reset revokes it or commits first.
+for (const [name, create, stale] of [
+  [
+    "a login with the old password",
+    (user) => loginRequest(user),
+    (user) => loginRequest(user),
+  ],
+  [
+    "a new session from OIDC sign-in",
+    async (user) => ({
+      statusCode: 200,
+      cookies: [
+        {
+          name: "refresh_token",
+          value: await authService.createRefreshSession(app.prisma, user.id),
+        },
+      ],
+    }),
+    null,
+  ],
+]) {
+  test(`a password reset racing ${name} leaves no session from before it`, async () => {
+    const user = await makeUser();
+    const reset = await resetPassword(user);
+    let order;
+    const [created, done] = await withTokenInsertBarrier(
+      "userId",
+      user.id,
+      async (start) => {
+        // The new session pauses immediately before its token INSERT.
+        start(() => create(user));
+        await waitForLockWaiters(1);
+        const resetting = start(reset);
+        order = await settlesOrWaits(resetting, 2);
+      },
+    );
+    assert.equal(done.statusCode, 200, done.body);
+    assert([200, 401].includes(created.statusCode), created.body);
+    assert.equal(
+      await userTokenCount(user),
+      0,
+      `no session created before the reset survives (reset ${order})`,
+    );
+    await assertUnusable(created);
+    assert.equal(order, "waiting", "the reset serializes behind the session");
+    if (stale) {
+      const response = await stale(user);
+      assert.equal(response.statusCode, 401, response.body);
+    }
+  });
+}
+
+test("a refresh waiting on a busy family past Prisma's default budget completes", async () => {
   const user = await makeUser();
-  const reset = await resetPassword(user);
-  let order;
-  const [login, done] = await withTokenInsertBarrier(
-    "userId",
-    user.id,
+  const session = await signIn(user);
+  const familyId = await familyOf(session.refresh);
+  const [response] = await withControlLock(
+    familyRowLock(familyId),
     async (start) => {
-      // The login has verified the old password and pauses before its INSERT.
-      start(() => loginRequest(user));
+      start(() => refresh(session.refresh));
       await waitForLockWaiters(1);
-      const resetting = start(reset);
-      order = await settlesOrWaits(resetting, 2);
+      await sleep(6_000);
     },
   );
-  assert.equal(done.statusCode, 200, done.body);
-  assert([200, 401].includes(login.statusCode), login.body);
-  assert.equal(
-    await userTokenCount(user),
-    0,
-    `no session created with the old password survives (reset ${order})`,
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(await activeTokens(familyId), [
+    hashToken(cookieOf(response)),
+  ]);
+});
+
+test("a refresh that exhausts its transaction budget is a retryable 409 that changes nothing", async () => {
+  const user = await makeUser();
+  const session = await signIn(user);
+  const familyId = await familyOf(session.refresh);
+  const budget = refreshTransactionOptions.timeout;
+  let response;
+  refreshTransactionOptions.timeout = 300;
+  try {
+    [response] = await withControlLock(
+      familyRowLock(familyId),
+      async (start) => {
+        start(() => refresh(session.refresh));
+        await waitForLockWaiters(1);
+        await sleep(1_000);
+      },
+    );
+  } finally {
+    refreshTransactionOptions.timeout = budget;
+  }
+  assert.equal(response.statusCode, 409, response.body);
+  assert.match(response.json().message, /busy/i);
+  assert.equal(cookieOf(response), undefined);
+  assert.deepEqual(await activeTokens(familyId), [hashToken(session.refresh)]);
+  assert.equal((await familyRecord(familyId)).revokedAt, null);
+  await rotate(session.refresh);
+});
+
+test("logout clears the cookie even when revoking its family fails", async () => {
+  const user = await makeUser();
+  const session = await signIn(user);
+  const familyId = await familyOf(session.refresh);
+  assert.match(familyId, /^[A-Za-z0-9-]+$/);
+  await control.$executeRawUnsafe(
+    `CREATE OR REPLACE FUNCTION ${barrierFn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced revocation failure'; END $$`,
   );
-  await assertUnusable(login);
-  assert.equal(order, "waiting", "the reset serializes behind the login");
-  const stale = await loginRequest(user);
-  assert.equal(stale.statusCode, 401, stale.body);
+  await control.$executeRawUnsafe(
+    `CREATE TRIGGER ${barrierFn} BEFORE UPDATE ON "RefreshTokenFamily" FOR EACH ROW WHEN (NEW.id = '${familyId}') EXECUTE FUNCTION ${barrierFn}()`,
+  );
+  let response;
+  try {
+    response = await logout(session.refresh, session.access);
+  } finally {
+    await control.$executeRawUnsafe(
+      `DROP TRIGGER IF EXISTS ${barrierFn} ON "RefreshTokenFamily"`,
+    );
+  }
+  assert.equal(response.statusCode, 500, response.body);
+  const cleared = response.cookies.find((c) => c.name === "refresh_token");
+  assert(cleared, "the failed logout still clears the cookie");
+  assert.equal(cleared.value, "");
+  assert(cleared.expires.getTime() <= Date.now());
+  // Revocation rolled back; a retried logout completes it.
+  assert.deepEqual(await activeTokens(familyId), [hashToken(session.refresh)]);
+  const retried = await logout(session.refresh, session.access);
+  assert.equal(retried.statusCode, 204, retried.body);
+  assert.deepEqual(await activeTokens(familyId), []);
 });
 
 test("concurrent revocation and refresh storms never leave a usable token", async () => {

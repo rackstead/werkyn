@@ -99,11 +99,12 @@ export async function logoutHandler(
   reply: FastifyReply,
 ) {
   const rawToken = request.cookies.refresh_token;
+  // The browser drops the cookie even when revoking its family fails; the
+  // error is still reported.
+  clearRefreshCookie(reply);
   if (rawToken) {
     await authService.logout(request.server.prisma, rawToken);
   }
-
-  clearRefreshCookie(reply);
 
   return reply.status(204).send();
 }

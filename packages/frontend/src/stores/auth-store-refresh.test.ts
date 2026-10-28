@@ -58,30 +58,48 @@ it("a superseded refresh retries with the cookie another tab replaced", async ()
   expect(useAuthStore.getState().accessToken).toBe("from-retry");
 });
 
-it("a superseded refresh adopts the access token the winning tab broadcast", async () => {
-  const fetch = vi.fn().mockResolvedValue(status(409));
-  vi.stubGlobal("fetch", fetch);
-  const result = useAuthStore.getState().refresh();
-  await vi.advanceTimersByTimeAsync(1);
+async function broadcastFromOtherTab(accessToken: string) {
   otherTab.postMessage({
     type: "refresh",
-    data: { user, accessToken: "from-other-tab", workspaces: [] },
+    data: { user, accessToken, workspaces: [] },
   });
   await vi.waitFor(() =>
-    expect(useAuthStore.getState().accessToken).toBe("from-other-tab"),
+    expect(useAuthStore.getState().accessToken).toBe(accessToken),
   );
-  await vi.advanceTimersByTimeAsync(250);
-  await expect(result).resolves.toBe(true);
+}
+
+it("a superseded refresh adopts the winning tab's broadcast as soon as it arrives", async () => {
+  const fetch = vi.fn().mockResolvedValue(status(409));
+  vi.stubGlobal("fetch", fetch);
+  let settled: boolean | undefined;
+  const result = useAuthStore.getState().refresh();
+  result.then((value) => (settled = value));
+  await vi.advanceTimersByTimeAsync(1);
+  await broadcastFromOtherTab("from-other-tab");
+  await vi.advanceTimersByTimeAsync(0);
+  expect(settled).toBe(true);
   expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("a slow winning tab's late broadcast is still adopted", async () => {
+  const fetch = vi.fn(async () => status(409));
+  vi.stubGlobal("fetch", fetch);
+  const result = useAuthStore.getState().refresh();
+  await vi.advanceTimersByTimeAsync(5000);
+  await broadcastFromOtherTab("late-winner");
+  await expect(result).resolves.toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(5);
 });
 
 it("a refresh that stays superseded fails after bounded retries", async () => {
   const fetch = vi.fn(async () => status(409));
   vi.stubGlobal("fetch", fetch);
   const result = useAuthStore.getState().refresh();
-  await vi.advanceTimersByTimeAsync(2500);
+  await vi.advanceTimersByTimeAsync(15_749);
+  expect(fetch).toHaveBeenCalledTimes(6);
+  await vi.advanceTimersByTimeAsync(1);
   await expect(result).resolves.toBe(false);
-  expect(fetch).toHaveBeenCalledTimes(4);
+  expect(fetch).toHaveBeenCalledTimes(7);
   expect(useAuthStore.getState().accessToken).toBe("expired");
 });
 

@@ -54,10 +54,26 @@ const channel =
 let lastRefreshTime = 0;
 
 // Tabs share one refresh cookie. When another tab rotates it first, the server
-// answers 409 without minting or revoking anything. That tab's response
-// replaces the cookie and normally broadcasts the new access token, so wait
-// briefly, adopt the broadcast, or retry with the replaced cookie.
-const SUPERSEDED_RETRY_DELAYS_MS = [250, 750, 1500];
+// answers 409 without minting or revoking anything (as it does for a session
+// busy past its transaction budget). The winning tab's response replaces the
+// cookie and normally broadcasts the new access token: adopt that broadcast as
+// soon as it arrives, or retry with the replaced cookie. The schedule (about
+// 16 s) ends well inside the server's 30 s window, during which the old cookie
+// is answered 409 rather than treated as reuse that revokes the session.
+const SUPERSEDED_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+const broadcastWaiters = new Set<() => void>();
+
+function waitForBroadcast(ms: number) {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      broadcastWaiters.delete(done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    broadcastWaiters.add(done);
+  });
+}
 
 export const useAuthStore = create<AuthState>((set, get) => {
   // Listen for cross-tab messages
@@ -72,6 +88,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
         accessToken: data.accessToken,
         workspaces: data.workspaces,
       });
+      for (const wake of [...broadcastWaiters]) wake();
     } else if (type === "workspaces") {
       // Memberships of one account; ignored by tabs signed in as another.
       set((state) =>
@@ -148,7 +165,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
           });
           for (const delay of SUPERSEDED_RETRY_DELAYS_MS) {
             if (res.status !== 409) break;
-            await new Promise((resolve) => setTimeout(resolve, delay));
+            await waitForBroadcast(delay);
             if (lastRefreshTime > startedAt && get().accessToken) return true;
             res = await fetch("/api/auth/refresh", {
               method: "POST",

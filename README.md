@@ -345,15 +345,16 @@ existing data is unchanged. See
 ## Sessions
 
 Each sign-in is a refresh-token family. Refresh rotates the `refresh_token`
-cookie atomically; logout ends that family, and password login, password change
-and password reset end all of the account's families, including a rotation in
-progress. Two tabs refreshing the same cookie at once get one new token and one
-`409`, after which the second tab uses the first tab's result. A rotated token
-presented 30 seconds or more after its rotation revokes its family. Access
-tokens stay valid for up to 15 minutes after logout or a password change, and
-personal API keys stay valid until revoked or expired. The migration
-`20261028150000_add_refresh_token_families` adds the family table and backfills
-families for existing sessions, so users stay signed in. See
+cookie atomically. Logout ends that family; password login, password change and
+password reset end all of the account's families, including a rotation in
+progress, and a sign-in that overlaps a password change or reset is revoked by
+it or waits for it to finish. Two tabs refreshing the same cookie at once get
+one new token and one `409`, after which the second tab uses the first tab's
+result. A rotated token presented 30 seconds or more after its rotation revokes
+its family. Access tokens stay valid for up to 15 minutes after logout or a
+password change, and personal API keys stay valid until revoked or expired. The
+migration `20261028150000_add_refresh_token_families` adds the family table and
+backfills families for existing sessions, so users stay signed in. See
 [docs/remediation/sec-011.md](docs/remediation/sec-011.md).
 
 ## Contributing

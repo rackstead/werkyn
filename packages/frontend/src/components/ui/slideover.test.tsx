@@ -1,5 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
+import { Toaster, toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./dialog";
 import { Slideover } from "./slideover";
@@ -59,17 +60,40 @@ describe("Slideover", () => {
 
   it("ignores pointer presses outside the panel other than on the backdrop", async () => {
     const onClose = vi.fn();
-    const toast = document.createElement("button");
-    toast.textContent = "Toast";
-    document.body.append(toast);
+    const outside = document.createElement("button");
+    outside.textContent = "Toast";
+    document.body.append(outside);
     try {
       render(<Slideover title="Details" onClose={onClose}>body</Slideover>);
       await screen.findByRole("dialog", { name: "Details" });
-      fireEvent.pointerDown(toast);
-      fireEvent.focusIn(toast);
+      fireEvent.pointerDown(outside);
+      fireEvent.focusIn(outside);
       expect(onClose).not.toHaveBeenCalled();
     } finally {
-      toast.remove();
+      outside.remove();
     }
+  });
+
+  it("keeps the toast live region exposed while open", async () => {
+    render(
+      <>
+        <main>
+          <button type="button">Background</button>
+          <Toaster />
+        </main>
+        <Slideover title="Details" onClose={vi.fn()}>
+          body
+        </Slideover>
+      </>,
+    );
+    await screen.findByRole("dialog", { name: "Details" });
+    // The page behind is hidden; the live region inside it is not.
+    expect(screen.queryByRole("button", { name: "Background" })).toBeNull();
+    act(() => {
+      toast.error("Failed to update task");
+    });
+    const message = await screen.findByText("Failed to update task");
+    expect(message.closest('[aria-hidden="true"]')).toBeNull();
+    expect(message.closest("[aria-live]")).toBeTruthy();
   });
 });

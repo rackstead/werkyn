@@ -384,7 +384,8 @@ function WikiPageSession({
       <WikiEditor
         key={`${pageId}:${documentVersion}`}
         initialContent={page.content}
-        hasUnsavedChanges={autosave.hasUnsavedChanges}
+        // Only unsaved body edits hold back a refreshed body; a pending title does not.
+        hasUnsavedChanges={autosave.draft?.content !== undefined}
         recoveredContent={autosave.draft?.content}
         readOnly={readOnly}
         workspaceId={workspaceId}

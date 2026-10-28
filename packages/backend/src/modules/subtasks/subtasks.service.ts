@@ -29,7 +29,9 @@ export async function createSubtask(
     select: { id: true, projectId: true },
   });
   if (!task) throw new NotFoundError("Task not found");
-  if (data.assigneeId) await assertProjectAssignees(prisma, task.projectId, [data.assigneeId]);
+  if (data.assigneeId !== undefined) {
+    await assertProjectAssignees(prisma, task.projectId, [data.assigneeId]);
+  }
 
   const maxPos = await prisma.subtask.aggregate({
     where: { taskId },
@@ -75,7 +77,7 @@ export async function updateSubtask(
   if (!existing) throw new NotFoundError("Subtask not found");
 
   await assertTaskEdit(prisma, existing.taskId, actorId);
-  if (data.assigneeId) {
+  if (data.assigneeId !== undefined && data.assigneeId !== null) {
     await assertProjectAssignees(prisma, existing.task.projectId, [data.assigneeId]);
   }
 

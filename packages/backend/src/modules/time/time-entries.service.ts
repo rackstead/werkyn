@@ -21,9 +21,10 @@ async function assertEntryProjects(
   references: { projectId?: string | null; taskId?: string | null },
 ) {
   const projectIds = new Set<string>();
-  if (references.projectId) projectIds.add(references.projectId);
+  // Any supplied ID, including an empty string, must resolve before it is written.
+  if (references.projectId != null) projectIds.add(references.projectId);
   let taskProjectId: string | undefined;
-  if (references.taskId) {
+  if (references.taskId != null) {
     const task = await prisma.task.findUnique({ where: { id: references.taskId }, select: { projectId: true } });
     if (!task) throw new NotFoundError("Task not found");
     taskProjectId = task.projectId;
@@ -92,7 +93,7 @@ export async function updateEntry(
 
   let projectId = data.projectId;
   // Auto-populate projectId from task if taskId changes
-  if (data.taskId !== undefined && data.taskId && projectId === undefined) {
+  if (data.taskId !== undefined && data.taskId !== null && projectId === undefined) {
     projectId = await assertEntryProjects(prisma, entry.workspaceId, userId, { taskId: data.taskId });
   }
 

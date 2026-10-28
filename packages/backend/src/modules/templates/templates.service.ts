@@ -1,4 +1,4 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import type { PrismaClient, Prisma, TaskTemplate } from "@prisma/client";
 import type { CreateTemplateInput, UpdateTemplateInput, InstantiateTemplateInput } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
@@ -24,11 +24,48 @@ function storedIds(value: Prisma.JsonValue): string[] {
   return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
 }
 
+/**
+ * Stored references can go stale (deleted columns or labels, departed members)
+ * or predate validation. Those are no longer part of the template: responses and
+ * instantiation only carry references valid in the project today, so an editor
+ * round trip never resubmits an ID that writes now reject.
+ */
+async function scopeTemplateReferences(
+  prisma: Prisma.TransactionClient,
+  projectId: string,
+  templates: TaskTemplate[],
+): Promise<TaskTemplate[]> {
+  if (templates.length === 0) return templates;
+  const statusIds = [...new Set(templates.flatMap((t) => (t.statusId ? [t.statusId] : [])))];
+  const [statuses, labelIds, assigneeIds] = await Promise.all([
+    statusIds.length
+      ? prisma.statusColumn.findMany({ where: { projectId, id: { in: statusIds } }, select: { id: true } })
+      : [],
+    projectLabelIds(prisma, projectId, templates.flatMap((t) => storedIds(t.labelIds))),
+    projectAssigneeIds(prisma, projectId, templates.flatMap((t) => storedIds(t.assigneeIds))),
+  ]);
+  const validStatuses = new Set(statuses.map((s) => s.id));
+  const validLabels = new Set(labelIds);
+  const validAssignees = new Set(assigneeIds);
+  return templates.map((t) => ({
+    ...t,
+    statusId: t.statusId && validStatuses.has(t.statusId) ? t.statusId : null,
+    labelIds: [...new Set(storedIds(t.labelIds))].filter((id) => validLabels.has(id)),
+    assigneeIds: [...new Set(storedIds(t.assigneeIds))].filter((id) => validAssignees.has(id)),
+  }));
+}
+
+async function scopeTemplate(prisma: Prisma.TransactionClient, projectId: string, template: TaskTemplate) {
+  const [scoped] = await scopeTemplateReferences(prisma, projectId, [template]);
+  return scoped;
+}
+
 export async function listTemplates(prisma: PrismaClient, projectId: string) {
-  return prisma.taskTemplate.findMany({
+  const templates = await prisma.taskTemplate.findMany({
     where: { projectId },
     orderBy: { name: "asc" },
   });
+  return scopeTemplateReferences(prisma, projectId, templates);
 }
 
 export async function getTemplate(prisma: PrismaClient, projectId: string, templateId: string) {
@@ -36,7 +73,7 @@ export async function getTemplate(prisma: PrismaClient, projectId: string, templ
     where: { id: templateId, projectId },
   });
   if (!template) throw new NotFoundError("Template not found");
-  return template;
+  return scopeTemplate(prisma, projectId, template);
 }
 
 export async function createTemplate(
@@ -45,7 +82,7 @@ export async function createTemplate(
   data: CreateTemplateInput,
 ) {
   await assertTemplateReferences(prisma, projectId, data);
-  return prisma.taskTemplate.create({
+  const template = await prisma.taskTemplate.create({
     data: {
       projectId,
       name: data.name,
@@ -59,6 +96,7 @@ export async function createTemplate(
       subtasks: data.subtasks as Prisma.InputJsonValue,
     },
   });
+  return scopeTemplate(prisma, projectId, template);
 }
 
 export async function updateTemplate(
@@ -82,10 +120,11 @@ export async function updateTemplate(
   if (data.labelIds !== undefined) updateData.labelIds = data.labelIds as Prisma.InputJsonValue;
   if (data.subtasks !== undefined) updateData.subtasks = data.subtasks as Prisma.InputJsonValue;
 
-  return prisma.taskTemplate.update({
+  const template = await prisma.taskTemplate.update({
     where: { id: templateId, projectId },
     data: updateData,
   });
+  return scopeTemplate(prisma, projectId, template);
 }
 
 export async function deleteTemplate(prisma: PrismaClient, projectId: string, templateId: string) {
@@ -117,33 +156,22 @@ export async function createTaskFromTemplate(
   }
 
   return prisma.$transaction(async (tx) => {
-    // Explicit overrides are validated like any other write. Stored template
-    // values may be stale (deleted columns, departed members) or predate
-    // validation, so only the ones still valid in this project are copied.
+    // Explicit overrides are validated like any other write; stored values are
+    // copied only while still valid in this project.
+    const stored = await scopeTemplate(tx, projectId, template);
     if (overrides?.statusId) await assertProjectStatus(tx, projectId, overrides.statusId);
-    let assigneeIds: string[];
-    if (overrides?.assigneeIds) {
-      await assertProjectAssignees(tx, projectId, overrides.assigneeIds);
-      assigneeIds = overrides.assigneeIds;
-    } else {
-      assigneeIds = await projectAssigneeIds(tx, projectId, storedIds(template.assigneeIds));
-    }
+    if (overrides?.assigneeIds) await assertProjectAssignees(tx, projectId, overrides.assigneeIds);
+    let assigneeIds = overrides?.assigneeIds ?? (stored.assigneeIds as string[]);
 
     // Auto-include actor for MEMBER role
     if (actorId && actorRole === "MEMBER" && !assigneeIds.includes(actorId)) {
       assigneeIds = [actorId, ...assigneeIds];
     }
 
-    const labelIds = await projectLabelIds(tx, projectId, storedIds(template.labelIds));
+    const labelIds = stored.labelIds as string[];
 
     // Resolve statusId: override > template > first column
-    let statusId = overrides?.statusId ?? template.statusId;
-    if (statusId && !overrides?.statusId) {
-      const status = await tx.statusColumn.findFirst({
-        where: { id: statusId, projectId },
-      });
-      if (!status) statusId = null;
-    }
+    let statusId = overrides?.statusId ?? stored.statusId;
     if (!statusId) {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },

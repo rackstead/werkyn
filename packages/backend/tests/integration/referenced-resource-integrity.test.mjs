@@ -199,7 +199,7 @@ test("single-task status, assignee, label and dependency writers stay inside the
 
 test("subtask assignees must be current members with access to the task project", async () => {
   await assertRejectedAtomically([
-    ...[users.SIBLING.id, users.FOREIGN.id, users.STALE.id, "missing-user"].flatMap((assigneeId) => [
+    ...[users.SIBLING.id, users.FOREIGN.id, users.STALE.id, "missing-user", ""].flatMap((assigneeId) => [
       ["ADMIN", "POST", `/api/tasks/${task.P.id}/subtasks`, { title: "Rejected", assigneeId }],
       ["MEMBER", "POST", `/api/tasks/${task.P.id}/subtasks`, { title: "Rejected", assigneeId }],
       ["ADMIN", "PATCH", `/api/subtasks/${subtask.id}`, { title: "Rejected", assigneeId }],
@@ -253,18 +253,32 @@ test("templates validate stored references and explicit instantiation overrides"
   assert.deepEqual(instance.json().data.labels.map((l) => l.labelId), [label.P2.id]);
 
   // Values stored before validation (or since deleted) are dropped rather than copied.
+  // ADMIN has no project-member row but can access P, so it remains a valid assignee.
   const legacy = await app.prisma.taskTemplate.create({ data: {
     projectId: P.id, name: "Legacy template", title: "Legacy", statusId: status.Q.id,
     labelIds: [label.P.id, label.Q.id, label.R.id, label.P.id],
-    assigneeIds: [users.MEMBER.id, users.SIBLING.id, users.FOREIGN.id, users.STALE.id, users.MEMBER.id],
+    assigneeIds: [users.MEMBER.id, users.SIBLING.id, users.FOREIGN.id, users.STALE.id, users.ADMIN.id, users.MEMBER.id],
   } });
+  const valid = { statusId: null, labelIds: [label.P.id], assigneeIds: [users.MEMBER.id, users.ADMIN.id] };
+  const listed = await req("MEMBER", "GET", templateUrl);
+  assert.equal(listed.statusCode, 200, listed.body);
+  const single = await req("MEMBER", "GET", `${templateUrl}/${legacy.id}`);
+  assert.equal(single.statusCode, 200, single.body);
+  for (const view of [listed.json().data.find((t) => t.id === legacy.id), single.json().data]) {
+    assert.deepEqual({ statusId: view.statusId, labelIds: view.labelIds, assigneeIds: view.assigneeIds }, valid);
+  }
   const fromLegacy = await req("ADMIN", "POST", `${templateUrl}/${legacy.id}/create-task`, {});
   assert.equal(fromLegacy.statusCode, 201, fromLegacy.body);
   assert(!fromLegacy.body.includes(SECRET), fromLegacy.body);
   const legacyTask = fromLegacy.json().data;
   assert.equal(legacyTask.status.id, status.P.id);
   assert.deepEqual(legacyTask.labels.map((l) => l.labelId), [label.P.id]);
-  assert.deepEqual(legacyTask.assignees.map((a) => a.userId), [users.MEMBER.id]);
+  assert.deepEqual(legacyTask.assignees.map((a) => a.userId), [users.MEMBER.id, users.ADMIN.id]);
+  // An editor round trip resubmits exactly what it was shown and keeps every valid reference.
+  const resaved = await req("MEMBER", "PATCH", `${templateUrl}/${legacy.id}`, { name: "Legacy template saved", ...valid });
+  assert.equal(resaved.statusCode, 200, resaved.body);
+  const stored = await app.prisma.taskTemplate.findUnique({ where: { id: legacy.id } });
+  assert.deepEqual({ statusId: stored.statusId, labelIds: stored.labelIds, assigneeIds: stored.assigneeIds }, valid);
 });
 
 test("time entries reject foreign references and task/project mismatches", async () => {
@@ -282,6 +296,9 @@ test("time entries reject foreign references and task/project mismatches", async
     ["ADMIN", "POST", url, { ...day, taskId: task.R.id }],
     ["ADMIN", "POST", url, { ...day, projectId: R.id }],
     ["ADMIN", "POST", url, { ...day, taskId: "missing-task" }],
+    ["ADMIN", "POST", url, { ...day, taskId: "" }],
+    ["ADMIN", "POST", url, { ...day, projectId: "" }],
+    ["ADMIN", "PATCH", `/api/time/entries/${entry.id}`, { taskId: "" }],
     ["ADMIN", "PATCH", `/api/time/entries/${entry.id}`, { taskId: task.R.id }],
     ["ADMIN", "PATCH", `/api/time/entries/${entry.id}`, { projectId: R.id }],
   ], [403, 404]);

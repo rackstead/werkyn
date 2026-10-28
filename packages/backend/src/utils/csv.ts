@@ -9,11 +9,16 @@
  * - A text cell whose first non-blank character a spreadsheet would read as
  *   the start of a formula (= + - @, or the full-width forms some locales
  *   accept), or that starts with a tab, CR or LF, is prefixed with an
- *   apostrophe. Quoting alone does not stop spreadsheets evaluating formulas.
- *   The apostrophe is part of the exported text.
+ *   apostrophe and a tab. Quoting alone does not stop spreadsheets evaluating
+ *   formulas. The apostrophe is OWASP's text marker; spreadsheets that read
+ *   it as their own text prefix on open (Excel) drop it when re-saving, so
+ *   the tab, OWASP's Excel-resistant marker, keeps the re-saved value inert,
+ *   while the apostrophe survives consumers that trim leading whitespace.
+ *   Both characters are part of the exported text.
  * - Number and date cells come only from csvDecimal and csvIsoDate and are
  *   written bare, so numeric columns (including negative values) and dates
- *   keep their type.
+ *   keep their type. A non-finite number becomes an empty cell, as it does in
+ *   JSON.
  * - Records end with CRLF and the document starts with a UTF-8 byte order
  *   mark so spreadsheet applications decode non-ASCII text as UTF-8.
  */
@@ -21,6 +26,7 @@
 const CSV_RECORD_BREAK = "\r\n";
 const UTF8_BOM = "\uFEFF";
 
+const FORMULA_GUARD = "'\t";
 const FORMULA_START =
   /^(?:[\t\r\n]|[\s\p{Cc}\p{Cf}]*[=+\-@\uFF1D\uFF0B\uFF0D\uFF20])/u;
 
@@ -33,11 +39,12 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 export class CsvBareValue {
   private constructor(readonly text: string) {}
 
-  /** A decimal cell, e.g. hours or money, with fixed fraction digits. */
-  static decimal(value: number, fractionDigits = 2): CsvBareValue {
-    if (!Number.isFinite(value)) {
-      throw new RangeError("CSV numbers must be finite");
-    }
+  /**
+   * A decimal cell, e.g. hours or money, with fixed fraction digits. A
+   * non-finite value (an overflowing cost) is an empty cell, not an error.
+   */
+  static decimal(value: number, fractionDigits = 2): CsvCell {
+    if (!Number.isFinite(value)) return null;
     return new CsvBareValue(value.toFixed(fractionDigits));
   }
 
@@ -56,7 +63,7 @@ export type CsvCell = string | CsvBareValue | null | undefined;
 export function encodeCsvCell(cell: CsvCell): string {
   if (cell instanceof CsvBareValue) return cell.text;
   if (cell === null || cell === undefined || cell === "") return "";
-  const text = FORMULA_START.test(cell) ? `'${cell}` : cell;
+  const text = FORMULA_START.test(cell) ? FORMULA_GUARD + cell : cell;
   return `"${text.replace(/"/g, '""')}"`;
 }
 

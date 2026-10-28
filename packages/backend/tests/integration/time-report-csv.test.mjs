@@ -16,7 +16,9 @@ process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
 
-const BOM = "﻿";
+const BOM = "\uFEFF";
+// Formula-leading text gains an apostrophe and a tab.
+const GUARD = "'\t";
 const HEADER = ["Date", "User", "Project", "Task", "Hours", "Billable", "Rate", "Currency", "Cost", "Description"];
 const NAMES = {
   ADMIN: "Admin",
@@ -36,20 +38,20 @@ const req = (actor, method, url, payload) => app.inject({
 const exportUrl = (query = "") => `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-04-01&endDate=2026-04-30${query}`;
 
 // Each entry is logged through the API; expected cells are the exact text a
-// spreadsheet should show (formula-leading text gains an apostrophe).
+// spreadsheet should show.
 const fixtures = [
   { actor: "WORKER", body: { date: "2026-04-01", hours: 1.5, description: 'Café, "quoted"\nnext line 日本語 \u{1F600}' },
-    row: ["2026-04-01", 'Worker "A", Jr.', "'" + PROJECT, "", "1.50", "Yes", "12.50", "EUR", "18.75", 'Café, "quoted"\nnext line 日本語 \u{1F600}'] },
+    row: ["2026-04-01", 'Worker "A", Jr.', GUARD + PROJECT, "", "1.50", "Yes", "12.50", "EUR", "18.75", 'Café, "quoted"\nnext line 日本語 \u{1F600}'] },
   { actor: "WORKER", body: { date: "2026-04-02", hours: 2, description: "+1+1", task: true },
-    row: ["2026-04-02", 'Worker "A", Jr.', "'" + PROJECT, "'" + TASK, "2.00", "Yes", "12.50", "EUR", "25.00", "'+1+1"] },
+    row: ["2026-04-02", 'Worker "A", Jr.', GUARD + PROJECT, GUARD + TASK, "2.00", "Yes", "12.50", "EUR", "25.00", GUARD + "+1+1"] },
   { actor: "WORKER", body: { date: "2026-04-03", hours: 0.25, description: "-5", billable: false },
-    row: ["2026-04-03", 'Worker "A", Jr.', "'" + PROJECT, "", "0.25", "No", "12.50", "EUR", "0.00", "'-5"] },
+    row: ["2026-04-03", 'Worker "A", Jr.', GUARD + PROJECT, "", "0.25", "No", "12.50", "EUR", "0.00", GUARD + "-5"] },
   { actor: "EVIL", body: { date: "2026-04-04", hours: 3, description: "\t=1+1\r\n" },
-    row: ["2026-04-04", "'" + NAMES.EVIL, "'" + PROJECT, "", "3.00", "Yes", "", "", "", "'\t=1+1\r\n"] },
+    row: ["2026-04-04", GUARD + NAMES.EVIL, GUARD + PROJECT, "", "3.00", "Yes", "", "", "", GUARD + "\t=1+1\r\n"] },
   { actor: "EVIL", body: { date: "2026-04-05", hours: 1, description: "@cmd" },
-    row: ["2026-04-05", "'" + NAMES.EVIL, "'" + PROJECT, "", "1.00", "Yes", "", "", "", "'@cmd"] },
+    row: ["2026-04-05", GUARD + NAMES.EVIL, GUARD + PROJECT, "", "1.00", "Yes", "", "", "", GUARD + "@cmd"] },
   { actor: "EVIL", body: { date: "2026-04-06", hours: 1, projectless: true },
-    row: ["2026-04-06", "'" + NAMES.EVIL, "", "", "1.00", "Yes", "", "", "", ""] },
+    row: ["2026-04-06", GUARD + NAMES.EVIL, "", "", "1.00", "Yes", "", "", "", ""] },
 ];
 
 before(async () => {
@@ -127,7 +129,7 @@ test("numbers and dates are bare and every text cell is quoted", async () => {
   }
   for (const record of records) {
     for (const { value } of record) {
-      assert.doesNotMatch(value, /^[=+\-@\t\r\n＝＋－＠]/u, `formula-leading cell ${JSON.stringify(value)}`);
+      assert.doesNotMatch(value, /^[=+\-@\t\r\n\uFF1D\uFF0B\uFF0D\uFF20]/u, `formula-leading cell ${JSON.stringify(value)}`);
     }
   }
 });
@@ -138,4 +140,21 @@ test("filters, grouping and the admin-only boundary are unchanged", async () => 
   for (const actor of ["WORKER", "EVIL"]) {
     assert.equal((await req(actor, "GET", exportUrl())).statusCode, 403);
   }
+});
+
+test("an overflowing cost exports as an empty cell instead of failing the download", async () => {
+  const suffix = crypto.randomUUID().slice(0, 12);
+  users.HUGE = await app.prisma.user.create({ data: { email: `time-csv-huge-${suffix}@example.test`, displayName: "Huge", emailVerified: true } });
+  tokens.HUGE = signAccessToken({ sub: users.HUGE.id, email: users.HUGE.email });
+  await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: users.HUGE.id, role: "MEMBER" } });
+  const rate = await req("ADMIN", "POST", `/api/workspaces/${workspace.id}/time/rates/${users.HUGE.id}`, {
+    rate: 1e308, currency: "USD", effectiveFrom: "2026-01-01",
+  });
+  assert.equal(rate.statusCode, 200, rate.body);
+  const entry = await req("HUGE", "POST", `/api/workspaces/${workspace.id}/time/entries`, { date: "2026-05-01", hours: 24, billable: true });
+  assert.equal(entry.statusCode, 201, entry.body);
+  const response = await req("ADMIN", "GET", `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-05-01&endDate=2026-05-31`);
+  assert.equal(response.statusCode, 200, response.body);
+  const [, row] = values(parseCsv(response.body.slice(BOM.length)));
+  assert.deepEqual(row, ["2026-05-01", "Huge", "", "", "24.00", "Yes", "1e+308", "USD", "", ""]);
 });

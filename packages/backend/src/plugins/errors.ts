@@ -21,11 +21,6 @@ const INVALID_VALUE: ErrorBody = {
   error: "Bad Request",
   message: "The request contains a value that cannot be stored",
 };
-const INVALID_REQUEST: ErrorBody = {
-  statusCode: 400,
-  error: "Bad Request",
-  message: "The request could not be processed",
-};
 const RELATED_CONFLICT: ErrorBody = {
   statusCode: 409,
   error: "Conflict",
@@ -90,12 +85,10 @@ function prismaErrorResponse(error: unknown): ErrorBody | null {
     const sqlState = /\bcode: "([0-9A-Z]{5})"/.exec(error.message)?.[1];
     return isDataException(sqlState) ? INVALID_VALUE : INTERNAL_ERROR;
   }
-  if (error instanceof Prisma.PrismaClientValidationError) {
-    // The query built from the request was invalid, for example a number
-    // outside what the column type holds.
-    return INVALID_REQUEST;
-  }
   if (
+    // An invalid query is a server bug (request values that used to cause
+    // one, such as an infinite rate, are rejected by the request schemas).
+    error instanceof Prisma.PrismaClientValidationError ||
     error instanceof Prisma.PrismaClientInitializationError ||
     error instanceof Prisma.PrismaClientRustPanicError
   ) {

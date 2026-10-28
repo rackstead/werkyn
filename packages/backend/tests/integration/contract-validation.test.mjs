@@ -109,7 +109,7 @@ after(async () => {
 
 const IMPOSSIBLE_DATES = [
   "2026-02-31", "2027-02-29", "1900-02-29", "2026-04-31", "2026-13-01", "2026-00-10",
-  "2026-01-00", "2026-01-32", "0099-01-12", "0000-01-01", "1899-12-31", "3000-01-01", "2026-1-01",
+  "2026-01-00", "2026-01-32", "0099-01-12", "0000-01-01", "1899-12-31", "3000-01-01", "2026-1-01", "2026-03-01\n",
 ];
 const REAL_DATES = ["2028-02-29", "2000-02-29", "1900-01-01", "2999-12-31", "2026-12-31", "2026-01-31"];
 
@@ -226,6 +226,8 @@ test("text inputs reject NUL and control characters with a 400", async () => {
     [() => req("PATCH", "/api/users/me", { jobTitle: "Ops\u0007" }), "jobTitle"],
     [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "T\u0000" }), "title"],
     [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "two\nlines" }), "title"],
+    [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "trailing\n" }), "title"],
+    [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "\n" }), "title"],
     [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "esc \u001b[31m" }), "title"],
     [() => req("POST", `/api/projects/${project.id}/tasks`, { title: "ok", description: "<p>x\u0000</p>" }), "description"],
     [() => req("PATCH", `/api/tasks/${task.id}`, { description: "<p>\u0000</p>" }), "description"],
@@ -279,7 +281,7 @@ test("database errors map to generic client errors without Prisma internals", as
   const outcomes = { wikiNulContent: [nulContent.statusCode, INTERNALS.test(nulContent.body)] };
   const expected = { wikiNulContent: [400, false] };
 
-  const mapped = { P2002: 409, P2003: 409, P2025: 404, P2000: 400, P2023: 500, validation: 400, unknown: 500 };
+  const mapped = { P2002: 409, P2003: 409, P2025: 404, P2000: 400, P2023: 500, validation: 500, unknown: 500 };
   for (const [kind, statusCode] of Object.entries(mapped)) {
     const response = await req("GET", `/__contract/prisma/${kind}`);
     outcomes[kind] = [response.statusCode, INTERNALS.test(response.body), Object.keys(response.json()).sort().join()];

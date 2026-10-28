@@ -1,4 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
+import { isDateOnly } from "@pm/shared";
 import { ArrowLeft, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -110,7 +111,12 @@ export function TimeReportsPage({
     updateFilters({ startDate: s, endDate: e });
   }
 
+  // Like the report itself, the export waits until both dates are complete:
+  // a cleared date or a year still being typed would be rejected.
+  const datesComplete = isDateOnly(startDate) && isDateOnly(endDate);
+
   async function handleExport() {
+    if (!datesComplete) return;
     await exportTimeReportCSV(workspaceId, {
       startDate,
       endDate,
@@ -141,7 +147,12 @@ export function TimeReportsPage({
         </div>
         <div className="flex items-center gap-2">
           <RateManagementDialog workspaceId={workspaceId} />
-          <Button size="sm" variant="outline" onClick={handleExport}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleExport}
+            disabled={!datesComplete}
+          >
             <Download className="h-4 w-4 mr-1" />
             Export CSV
           </Button>

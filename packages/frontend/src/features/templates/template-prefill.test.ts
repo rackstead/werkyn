@@ -19,4 +19,9 @@ describe("templatePrefill", () => {
     expect(templatePrefill(template({ statusId: "gone", assigneeIds: ["u1", "left", "u1"], labelIds: ["other", "l1", "l1"] }), options))
       .toEqual({ statusId: null, assigneeIds: ["u1"], labelIds: ["l1"] });
   });
+
+  it("leaves a list unfiltered until its options have loaded", () => {
+    expect(templatePrefill(template({ statusId: "s9", assigneeIds: ["u9"], labelIds: ["l9"] }), {}))
+      .toEqual({ statusId: "s9", assigneeIds: ["u9"], labelIds: ["l9"] });
+  });
 });

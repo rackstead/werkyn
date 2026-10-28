@@ -6,6 +6,7 @@ import {
   useDeleteTemplate,
 } from "../api";
 import type { TaskTemplate } from "../api";
+import { templatePrefill } from "../template-prefill";
 import { useStatuses, useLabels, useProjectMembers } from "@/features/projects/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -299,16 +300,21 @@ function TemplateForm({
   );
 }
 
-function templateToForm(t: TaskTemplate): TemplateFormData {
+function templateToForm(
+  t: TaskTemplate,
+  options: Parameters<typeof templatePrefill>[1],
+): TemplateFormData {
+  // Saving sends every reference back; stale ones the form cannot show are rejected.
+  const references = templatePrefill(t, options);
   return {
     name: t.name,
     title: t.title,
     description: t.description ?? "",
     priority: t.priority,
-    statusId: t.statusId ?? "",
+    statusId: references.statusId ?? "",
     dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",
-    assigneeIds: t.assigneeIds,
-    labelIds: t.labelIds,
+    assigneeIds: references.assigneeIds,
+    labelIds: references.labelIds,
     subtasks: t.subtasks,
   };
 }
@@ -435,7 +441,11 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                 <button
                   onClick={() => {
                     setEditingId(t.id);
-                    setEditForm(templateToForm(t));
+                    setEditForm(templateToForm(t, {
+                      statusIds: statusesData && statuses.map((s) => s.id),
+                      memberIds: membersData && members.map((m) => m.id),
+                      labelIds: labelsData && labels.map((l) => l.id),
+                    }));
                   }}
                   className="text-muted-foreground hover:text-foreground shrink-0"
                 >

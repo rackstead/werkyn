@@ -93,9 +93,9 @@ export function CreateTaskDialog({
     const t = templates.find((t) => t.id === templateId);
     if (!t) return;
     const prefill = templatePrefill(t, {
-      statusIds: statuses.map((s) => s.id),
-      memberIds: members.map((m) => m.id),
-      labelIds: labels.map((l) => l.id),
+      statusIds: statusesData && statuses.map((s) => s.id),
+      memberIds: membersData && members.map((m) => m.id),
+      labelIds: labelsData && labels.map((l) => l.id),
     });
     setTitle(t.title);
     setPriority(t.priority);

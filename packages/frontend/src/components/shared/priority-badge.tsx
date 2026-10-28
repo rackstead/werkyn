@@ -4,6 +4,8 @@ interface PriorityBadgeProps {
   priority: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "URGENT";
   className?: string;
   onClick?: () => void;
+  /** With `onClick`: whether this priority is the selected one. */
+  pressed?: boolean;
 }
 
 const priorityConfig = {
@@ -14,20 +16,21 @@ const priorityConfig = {
   URGENT: { label: "Urgent", className: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300" },
 };
 
-export function PriorityBadge({ priority, className, onClick }: PriorityBadgeProps) {
+export function PriorityBadge({ priority, className, onClick, pressed }: PriorityBadgeProps) {
   const config = priorityConfig[priority];
-
-  return (
-    <span
-      role={onClick ? "button" : undefined}
-      onClick={onClick}
-      className={cn(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium",
-        config.className,
-        className,
-      )}
-    >
-      {config.label}
-    </span>
+  const classes = cn(
+    "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium",
+    config.className,
+    className,
   );
+
+  if (onClick) {
+    return (
+      <button type="button" aria-pressed={pressed} onClick={onClick} className={classes}>
+        {config.label}
+      </button>
+    );
+  }
+
+  return <span className={classes}>{config.label}</span>;
 }

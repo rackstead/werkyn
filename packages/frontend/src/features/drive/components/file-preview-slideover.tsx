@@ -1,11 +1,11 @@
 import { useEffect, useMemo } from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import type { DriveFile } from "../api";
 import { useFilePreviewUrl, useFileTextContent } from "../api";
 import { getPreviewType, getFileIcon, formatFileSize } from "@/lib/file-icons";
 import { useAuthStore } from "@/stores/auth-store";
-import { X, Download } from "lucide-react";
+import { Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Slideover } from "@/components/ui/slideover";
 import { timeAgo } from "@/lib/time-ago";
 
 interface FilePreviewSlideoverProps {
@@ -53,84 +53,46 @@ export function FilePreviewSlideover({
     };
   }, [blobUrl]);
 
-  // Escape key handler
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  }, [onClose]);
-
   const Icon = getFileIcon(file.mimeType, false);
 
   return (
-    <AnimatePresence>
-      {/* Backdrop */}
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="fixed inset-0 z-40 bg-black/30"
-      />
+    <Slideover
+      title={file.name}
+      titleClassName="text-sm font-medium truncate mr-4"
+      titleTooltip={file.name}
+      onClose={onClose}
+      className="max-w-2xl border-l"
+      actions={
+        <Button variant="ghost" size="sm" onClick={() => onDownload(file)}>
+          <Download className="h-4 w-4 mr-1" />
+          Download
+        </Button>
+      }
+    >
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto p-6">
+        <PreviewContent
+          previewType={previewType}
+          blobUrl={blobUrl}
+          pdfUrl={pdfUrl}
+          textContent={textContent}
+          file={file}
+          Icon={Icon}
+        />
 
-      {/* Panel */}
-      <motion.div
-        initial={{ x: "100%" }}
-        animate={{ x: 0 }}
-        exit={{ x: "100%" }}
-        transition={{ type: "spring", damping: 25, stiffness: 300 }}
-        className="fixed right-0 top-0 z-50 flex h-full w-full max-w-2xl flex-col border-l bg-background shadow-xl"
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between border-b px-6 py-4">
-          <span className="text-sm font-medium truncate mr-4" title={file.name}>
-            {file.name}
-          </span>
-          <div className="flex items-center gap-1 shrink-0">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onDownload(file)}
-            >
-              <Download className="h-4 w-4 mr-1" />
-              Download
-            </Button>
-            <button
-              onClick={onClose}
-              className="rounded-md p-1 hover:bg-accent transition-colors"
-            >
-              <X className="h-5 w-5" />
-            </button>
-          </div>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
-          <PreviewContent
-            previewType={previewType}
-            blobUrl={blobUrl}
-            pdfUrl={pdfUrl}
-            textContent={textContent}
-            file={file}
-            Icon={Icon}
+        {/* Metadata section */}
+        <div className="mt-6 space-y-2 border-t pt-4">
+          <MetadataRow label="Name" value={file.name} />
+          <MetadataRow label="Size" value={formatFileSize(file.size)} />
+          <MetadataRow label="Type" value={file.mimeType ?? "Unknown"} />
+          <MetadataRow
+            label="Uploaded by"
+            value={file.uploadedBy?.displayName ?? "Unknown"}
           />
-
-          {/* Metadata section */}
-          <div className="mt-6 space-y-2 border-t pt-4">
-            <MetadataRow label="Name" value={file.name} />
-            <MetadataRow label="Size" value={formatFileSize(file.size)} />
-            <MetadataRow label="Type" value={file.mimeType ?? "Unknown"} />
-            <MetadataRow
-              label="Uploaded by"
-              value={file.uploadedBy?.displayName ?? "Unknown"}
-            />
-            <MetadataRow label="Modified" value={timeAgo(file.updatedAt)} />
-          </div>
+          <MetadataRow label="Modified" value={timeAgo(file.updatedAt)} />
         </div>
-      </motion.div>
-    </AnimatePresence>
+      </div>
+    </Slideover>
   );
 }
 

@@ -58,6 +58,7 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
       <Field label="Status">
         {canEdit ? (
           <select
+            aria-label="Status"
             value={task.statusId}
             onChange={(e) =>
               updateTask.mutate({ id: task.id, statusId: e.target.value })
@@ -83,6 +84,7 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
               <PriorityBadge
                 key={p}
                 priority={p}
+                pressed={task.priority === p}
                 className={cn(
                   "cursor-pointer transition-shadow",
                   task.priority === p
@@ -114,6 +116,8 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
               <span className="text-xs">{a.user.displayName}</span>
               {canEdit && (
                 <button
+                  type="button"
+                  aria-label={`Remove assignee ${a.user.displayName}`}
                   onClick={() => removeAssignee.mutate(a.userId)}
                   className="ml-1 text-xs text-muted-foreground hover:text-foreground"
                 >
@@ -145,6 +149,8 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
               {tl.label.name}
               {canEdit && (
                 <button
+                  type="button"
+                  aria-label={`Remove label ${tl.label.name}`}
                   onClick={() => removeLabel.mutate(tl.labelId)}
                   className="ml-0.5 hover:opacity-70"
                 >
@@ -168,6 +174,7 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
       <Field label="Start date">
         {canEdit ? (
           <DatePicker
+            label="Start date"
             value={task.startDate}
             onChange={(date) =>
               updateTask.mutate({ id: task.id, startDate: date })
@@ -185,6 +192,7 @@ export function TaskFields({ task, canEdit }: TaskFieldsProps) {
       <Field label="Due date">
         {canEdit ? (
           <DatePicker
+            label="Due date"
             value={task.dueDate}
             onChange={(date) =>
               updateTask.mutate({ id: task.id, dueDate: date })
@@ -290,6 +298,7 @@ function InlineCustomFieldEditor({
       return (
         <input
           type="checkbox"
+          aria-label={field.name}
           checked={!!value}
           onChange={(e) => save(e.target.checked)}
           className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
@@ -299,6 +308,7 @@ function InlineCustomFieldEditor({
     case "SELECT":
       return (
         <select
+          aria-label={field.name}
           value={typeof value === "string" ? value : ""}
           onChange={(e) => save(e.target.value || null)}
           className="rounded-md border border-input bg-transparent px-2 py-1 text-sm"
@@ -321,6 +331,8 @@ function InlineCustomFieldEditor({
             return (
               <button
                 key={opt.value}
+                type="button"
+                aria-pressed={selected}
                 onClick={() => {
                   const next = selected
                     ? selectedVals.filter((v) => v !== opt.value)
@@ -345,6 +357,7 @@ function InlineCustomFieldEditor({
     case "DATE":
       return (
         <DatePicker
+          label={field.name}
           value={typeof value === "string" ? value : null}
           onChange={(date) => save(date)}
           className="max-w-[200px]"
@@ -355,6 +368,7 @@ function InlineCustomFieldEditor({
       return (
         <input
           type="number"
+          aria-label={field.name}
           defaultValue={typeof value === "number" ? value : ""}
           onBlur={(e) => {
             const v = e.target.value;
@@ -376,6 +390,7 @@ function InlineCustomFieldEditor({
       return (
         <input
           type={field.type === "URL" ? "url" : "text"}
+          aria-label={field.name}
           defaultValue={typeof value === "string" ? value : ""}
           onBlur={(e) => save(e.target.value || null)}
           onKeyDown={(e) => {

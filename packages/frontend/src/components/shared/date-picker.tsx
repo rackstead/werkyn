@@ -7,9 +7,13 @@ interface DatePickerProps {
   onChange: (date: string | null) => void;
   className?: string;
   disabled?: boolean;
+  /** Id of the date input, for an associated <label>. */
+  id?: string;
+  /** Accessible name of the date input when no <label> points at it. */
+  label?: string;
 }
 
-export function DatePicker({ value, onChange, className, disabled }: DatePickerProps) {
+export function DatePicker({ value, onChange, className, disabled, id, label }: DatePickerProps) {
   const [local, setLocal] = useState(value);
 
   useEffect(() => {
@@ -24,6 +28,8 @@ export function DatePicker({ value, onChange, className, disabled }: DatePickerP
   return (
     <div className={cn("flex items-center gap-1.5", className)}>
       <input
+        id={id}
+        aria-label={label}
         type="date"
         value={local ?? ""}
         onChange={(e) => handleChange(e.target.value || null)}
@@ -38,9 +44,10 @@ export function DatePicker({ value, onChange, className, disabled }: DatePickerP
         <button
           type="button"
           onClick={() => handleChange(null)}
+          aria-label={label ? `Clear ${label.toLowerCase()}` : "Clear date"}
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
         >
-          <X className="h-3.5 w-3.5" />
+          <X className="h-3.5 w-3.5" aria-hidden="true" />
         </button>
       )}
     </div>

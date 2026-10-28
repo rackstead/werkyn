@@ -44,7 +44,7 @@ function ListRoute() {
 
   useRealtime(projectId);
 
-  const updateTask = useUpdateTask();
+  const { mutate: updateTask } = useUpdateTask();
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
 
   const filters: Record<string, unknown> = {};
@@ -66,11 +66,16 @@ function ListRoute() {
     });
   };
 
-  const openTask = (taskId: string) => {
-    navigate({
-      search: (prev) => ({ ...prev, task: taskId }),
-    });
-  };
+  // Stable so the table's cells (and the focused task button) are not
+  // remounted when the slideover opens or closes; focus returns to that button.
+  const openTask = useCallback(
+    (taskId: string) => {
+      navigate({
+        search: (prev) => ({ ...prev, task: taskId }),
+      });
+    },
+    [navigate],
+  );
 
   const closeTask = () => {
     navigate({
@@ -83,7 +88,7 @@ function ListRoute() {
 
   const handleUpdateTask = useCallback(
     (id: string, data: Record<string, unknown>) => {
-      updateTask.mutate({ id, ...data } as Parameters<typeof updateTask.mutate>[0]);
+      updateTask({ id, ...data } as Parameters<typeof updateTask>[0]);
     },
     [updateTask],
   );

@@ -62,6 +62,9 @@ export function Sidebar({ projects = [], wikiSpaces = [], enabledModules = ["dri
         />
       )}
       <aside
+        // Collapsed, the sidebar is off-canvas (mobile) or zero-width; keep its
+        // links out of the Tab order and the accessibility tree.
+        inert={collapsed}
         className={cn(
           "flex h-full flex-col border-r bg-background transition-all duration-200",
           isMobile

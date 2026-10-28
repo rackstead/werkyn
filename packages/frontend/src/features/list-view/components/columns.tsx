@@ -616,6 +616,7 @@ export function getColumns(options: {
         canEdit ? (
           <input
             type="checkbox"
+            aria-label="Select all tasks"
             checked={table.getIsAllRowsSelected()}
             onChange={table.getToggleAllRowsSelectedHandler()}
             className="h-3.5 w-3.5 rounded border-input accent-primary"
@@ -625,6 +626,7 @@ export function getColumns(options: {
         canEdit ? (
           <input
             type="checkbox"
+            aria-label={`Select ${row.original.title}`}
             checked={row.getIsSelected()}
             onChange={row.getToggleSelectedHandler()}
             className="h-3.5 w-3.5 rounded border-input accent-primary"

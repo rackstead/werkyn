@@ -406,9 +406,57 @@ test("a cleanup record never removes a blob that a live file still references", 
   assert.equal(result.claimed, 2);
   assert.equal(result.retained, 2);
   assert.deepEqual(await present(paths), all(paths, true));
-  assert.deepEqual(await queued(paths), []);
-  await request("DELETE", api(`/files/${live.id}`));
+  // The rows are kept (with backoff), not dropped.
+  const kept = await queued(paths);
+  assert.equal(kept.length, 2);
+  for (const row of kept) assert.match(row.lastError, /live File/);
+  assert.equal((await sweep({ paths })).claimed, 0);
+  // Deleting the file makes the kept rows due again and removes both blobs.
+  const removed = await request("DELETE", api(`/files/${live.id}`));
+  assert.equal(removed.status, 204, removed.text);
   assert.deepEqual(await present(paths), all(paths, false));
+  assert.deepEqual(await queued(paths), []);
+});
+
+test("a file deleted while a sweep holds its stale live check is still cleaned up", async () => {
+  const live = await makeFile({ thumbnail: true });
+  const paths = blobsOf(live);
+  await app.prisma.$executeRaw`
+    INSERT INTO "BlobCleanup" ("storagePath")
+    SELECT unnest(${paths}::text[])`;
+  // The File is deleted right after the sweep's live-file query returns, so
+  // the sweep acts on a stale "still live" result while the delete trigger
+  // finds the rows already queued.
+  const racing = new Proxy(app.prisma, {
+    get(target, key) {
+      if (key === "file")
+        return {
+          findMany: async (args) => {
+            const rows = await target.file.findMany(args);
+            await target.file.delete({ where: { id: live.id } });
+            return rows;
+          },
+        };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const { processBlobCleanup } = await import(
+    "../../src/services/blob-cleanup.ts"
+  );
+  const result = await processBlobCleanup(racing, app.storage, { paths });
+  assert.equal(result.retained, 2);
+  assert.equal(await app.prisma.file.count({ where: { id: live.id } }), 0);
+  assert.deepEqual(await present(paths), all(paths, true));
+  // No record is lost: the rows survive and a later sweep removes the blobs.
+  assert.deepEqual(
+    (await queued(paths)).map((row) => row.storagePath),
+    [...paths].sort(),
+  );
+  await makeDue(paths);
+  assert.equal((await sweep({ paths })).deleted, 2);
+  assert.deepEqual(await present(paths), all(paths, false));
+  assert.deepEqual(await queued(paths), []);
 });
 
 test("task, comment and workspace deletion cascade attachments and remove every owned blob", async () => {

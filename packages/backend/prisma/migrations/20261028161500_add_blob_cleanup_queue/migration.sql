@@ -27,7 +27,9 @@ CREATE INDEX "File_storagePath_idx" ON "File"("storagePath");
 CREATE INDEX "File_thumbnailPath_idx" ON "File"("thumbnailPath");
 
 -- A deleted File queues its original and thumbnail. A changed path queues the
--- path it no longer names (stored paths are otherwise immutable).
+-- path it no longer names (stored paths are otherwise immutable). A path that
+-- is already queued (for example kept while a live File still named it)
+-- becomes due now.
 CREATE FUNCTION enqueue_file_blob_cleanup() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -48,7 +50,8 @@ BEGIN
   INSERT INTO "BlobCleanup" ("storagePath")
   SELECT DISTINCT path FROM unnest(paths) AS path
   WHERE path IS NOT NULL AND path <> ''
-  ON CONFLICT ("storagePath") DO NOTHING;
+  ON CONFLICT ("storagePath") DO UPDATE
+  SET "availableAt" = LEAST("BlobCleanup"."availableAt", CURRENT_TIMESTAMP);
   RETURN NULL;
 END;
 $$;
@@ -73,7 +76,8 @@ BEGIN
   IF OLD."fileId" IS NULL AND OLD."storagePath" <> '' THEN
     INSERT INTO "BlobCleanup" ("storagePath")
     VALUES (OLD."storagePath")
-    ON CONFLICT ("storagePath") DO NOTHING;
+    ON CONFLICT ("storagePath") DO UPDATE
+    SET "availableAt" = LEAST("BlobCleanup"."availableAt", CURRENT_TIMESTAMP);
   END IF;
   RETURN NULL;
 END;

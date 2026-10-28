@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type { FastifyBaseLogger } from "fastify";
 import type { StorageProvider } from "./storage.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Durable blob cleanup.
@@ -16,7 +17,10 @@ import type { StorageProvider } from "./storage.js";
  * - a blob that is already gone counts as deleted, so every retry converges;
  * - other storage errors keep the row with exponential backoff and the error;
  * - a path still named by a live File row is never deleted (defense in depth;
- *   stored paths are unique per row and immutable).
+ *   stored paths are unique per row and immutable). Its row is kept with
+ *   backoff rather than removed, so a concurrent File delete, whose trigger
+ *   finds the row already queued, cannot strand the blob; that trigger makes
+ *   the row due again.
  */
 
 const BATCH_SIZE = 100;
@@ -43,8 +47,7 @@ export function blobPaths(
 }
 
 function errorMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.slice(0, 1000);
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -56,6 +59,7 @@ export async function processBlobCleanup(
   storage: StorageProvider,
   options: { paths?: string[]; limit?: number; log?: Logger } = {},
 ): Promise<BlobCleanupResult> {
+  const log = options.log ?? logger;
   const result = { claimed: 0, deleted: 0, retained: 0, failed: 0 };
   if (options.paths?.length === 0) return result;
   const only = options.paths
@@ -90,12 +94,28 @@ export async function processBlobCleanup(
     ),
   );
 
+  const retry = async (storagePath: string, attempts: number, reason: string) => {
+    const delay = Math.min(
+      BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
+      MAX_BACKOFF_SECONDS,
+    );
+    await prisma.$executeRaw`
+      UPDATE "BlobCleanup"
+      SET "lastError" = ${reason.slice(0, 1000)},
+        "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
+      WHERE "storagePath" = ${storagePath}`;
+  };
+
   const done: string[] = [];
   try {
     for (const { storagePath, attempts } of claimed) {
       if (live.has(storagePath)) {
         result.retained++;
-        done.push(storagePath);
+        await retry(storagePath, attempts, "Still referenced by a live File");
+        log.warn(
+          { storagePath, attempts },
+          "Queued stored blob is still referenced by a live File; kept",
+        );
         continue;
       }
       try {
@@ -104,16 +124,8 @@ export async function processBlobCleanup(
         done.push(storagePath);
       } catch (error) {
         result.failed++;
-        const delay = Math.min(
-          BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
-          MAX_BACKOFF_SECONDS,
-        );
-        await prisma.$executeRaw`
-          UPDATE "BlobCleanup"
-          SET "lastError" = ${errorMessage(error)},
-            "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
-          WHERE "storagePath" = ${storagePath}`;
-        options.log?.warn(
+        await retry(storagePath, attempts, errorMessage(error));
+        log.warn(
           { err: error, storagePath, attempts },
           "Stored blob cleanup failed; it will be retried",
         );
@@ -149,20 +161,26 @@ export async function cleanupBlobsNow(
         log,
       });
     } catch (error) {
-      log?.error(error, "Deferred stored blob cleanup to the worker");
+      (log ?? logger).error(
+        { err: error, paths: chunk },
+        "Deferred stored blob cleanup to the worker",
+      );
     }
   }
 }
 
 /**
  * Removes blobs staged for a row whose transaction failed. They are queued
- * first, so the live-row check guards an ambiguous commit and a storage
- * failure is retried by the worker.
+ * first and never deleted directly, so the live-row check guards an
+ * ambiguous commit (a File that did commit keeps its blob) and a storage
+ * failure is retried by the worker. If the queue itself cannot be written,
+ * the blobs are left in place and logged rather than risk live content.
  */
 export async function discardStagedBlobs(
   prisma: PrismaClient,
   storage: StorageProvider,
   paths: Array<string | null | undefined>,
+  log: Logger = logger,
 ) {
   const staged = paths.filter((p): p is string => !!p);
   if (staged.length === 0) return;
@@ -171,13 +189,14 @@ export async function discardStagedBlobs(
       data: staged.map((storagePath) => ({ storagePath })),
       skipDuplicates: true,
     });
-  } catch {
-    // Database unavailable: fall back to a best-effort direct delete.
-    for (const storagePath of staged)
-      await storage.delete(storagePath).catch(() => {});
+  } catch (error) {
+    log.error(
+      { err: error, paths: staged },
+      "Could not queue staged blobs for cleanup; left in place",
+    );
     return;
   }
-  await cleanupBlobsNow(prisma, storage, staged);
+  await cleanupBlobsNow(prisma, storage, staged, log);
 }
 
 export interface BlobCleanupWorker {

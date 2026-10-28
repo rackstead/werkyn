@@ -58,25 +58,65 @@ afterEach(() => {
 });
 
 describe("wiki events", () => {
-  it("refreshes only the open page and its history for a body-only save", async () => {
+  // Lists hold rows for pages; the page-1 row matches page() unless overridden.
+  function list(key: readonly unknown[], ...rows: Record<string, unknown>[]) {
+    queryClient.setQueryData(key, { data: rows });
+  }
+  const crumb = (overrides: Record<string, unknown> = {}) => {
+    const { id, title, icon } = page(overrides);
+    return { id, title, icon };
+  };
+  const otherTree = queryKeys.wikiPageTree("space-1", "other-parent");
+
+  it("refreshes the page and its history but no list that already shows this version", async () => {
     const send = await connect(() => useWikiRealtime("ws"));
-    seed(tree("space-1"), crumbs, ["wiki-versions", "page-1"]);
-    queryClient.setQueryData(queryKeys.wikiPage("page-1"), { data: page() });
+    // No page detail is cached: the decision must not depend on it.
+    list(tree("space-1"), page(), { id: "page-2", title: "Other" });
+    list(crumbs, crumb());
+    seed(["wiki-versions", "page-1"]);
     send({
       event: "wiki_page_updated",
       workspaceId: "ws",
       data: { page: page({ content: [{ type: "paragraph" }] }) },
     });
-    expect(stale(queryKeys.wikiPage("page-1"))).toBe(true);
     expect(stale(["wiki-versions", "page-1"])).toBe(true);
     expect(stale(tree("space-1"))).toBe(false);
     expect(stale(crumbs)).toBe(false);
   });
 
-  it("also refreshes trees and breadcrumbs when the title changes", async () => {
+  it("refreshes the open page itself on every update", async () => {
     const send = await connect(() => useWikiRealtime("ws"));
-    seed(tree("space-1"), tree("space-2"), crumbs);
     queryClient.setQueryData(queryKeys.wikiPage("page-1"), { data: page() });
+    send({
+      event: "wiki_page_updated",
+      workspaceId: "ws",
+      data: { page: page() },
+    });
+    expect(stale(queryKeys.wikiPage("page-1"))).toBe(true);
+  });
+
+  it("refreshes only lists that show the page, for a body save that changes its edit time", async () => {
+    const send = await connect(() => useWikiRealtime("ws"));
+    list(tree("space-1"), page({ updatedAt: "2026-10-01T00:00:00.000Z" }));
+    list(otherTree, { id: "page-2", title: "Other" });
+    list(crumbs, crumb());
+    send({
+      event: "wiki_page_updated",
+      workspaceId: "ws",
+      data: { page: page({ updatedAt: "2026-10-02T00:00:00.000Z" }) },
+    });
+    expect(stale(tree("space-1"))).toBe(true);
+    expect(stale(otherTree)).toBe(false);
+    expect(stale(crumbs)).toBe(false);
+  });
+
+  it("refreshes trees and breadcrumbs that show the old title", async () => {
+    const send = await connect(() => useWikiRealtime("ws"));
+    list(tree("space-1"), page());
+    list(tree("space-2"), { id: "page-9", title: "Elsewhere" });
+    list(crumbs, crumb());
+    const childCrumbs = queryKeys.wikiPageBreadcrumbs("child");
+    list(childCrumbs, crumb(), { id: "child", title: "Child", icon: null });
     send({
       event: "wiki_page_updated",
       workspaceId: "ws",
@@ -84,7 +124,24 @@ describe("wiki events", () => {
     });
     expect(stale(tree("space-1"))).toBe(true);
     expect(stale(crumbs)).toBe(true);
+    expect(stale(childCrumbs)).toBe(true);
     expect(stale(tree("space-2"))).toBe(false);
+  });
+
+  it("still refreshes a list left behind by a newer page detail after rapid renames", async () => {
+    const send = await connect(() => useWikiRealtime("ws"));
+    // The detail refetch from the first rename already returned the second
+    // title, while the tree still shows the first one.
+    queryClient.setQueryData(queryKeys.wikiPage("page-1"), {
+      data: page({ title: "Third" }),
+    });
+    list(tree("space-1"), page({ title: "Second" }));
+    send({
+      event: "wiki_page_updated",
+      workspaceId: "ws",
+      data: { page: page({ title: "Third" }) },
+    });
+    expect(stale(tree("space-1"))).toBe(true);
   });
 
   it.each([

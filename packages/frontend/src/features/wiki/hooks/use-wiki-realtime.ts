@@ -31,27 +31,41 @@ function invalidateSpacePages(spaceId: string | undefined) {
   if (spaceId) invalidate(["wiki-pages", { sid: spaceId }]);
 }
 
-// Breadcrumbs show the titles of a page and its ancestors.
-function invalidateBreadcrumbs() {
+// What page lists show for a page: trees (sidebar, space view, dashboard
+// widgets) list all of these, breadcrumbs only the title and icon.
+const LISTED_FIELDS = [
+  "title",
+  "icon",
+  "parentId",
+  "position",
+  "updatedAt",
+  "lastEditedById",
+];
+
+// Refreshes each cached page list (tree or breadcrumbs) whose row for the
+// updated page differs from the update. The comparison is with the list
+// itself, so lists that do not show the page, or already show this version of
+// it, are left alone, and a list still holding older data is refreshed again
+// even while an earlier refresh is pending.
+function invalidateListsShowing(pageId: string, page: Record<string, unknown>) {
   void queryClient.invalidateQueries({
     queryKey: ["wiki-pages"],
-    predicate: (query) => query.queryKey[2] === "breadcrumbs",
+    predicate: (query) => {
+      const rows = (query.state.data as { data?: unknown } | undefined)?.data;
+      if (!Array.isArray(rows)) return false;
+      const row: unknown = rows.find(
+        (item: unknown) =>
+          typeof item === "object" &&
+          item !== null &&
+          (item as { id?: unknown }).id === pageId,
+      );
+      if (!row) return false;
+      const listed = row as Record<string, unknown>;
+      return LISTED_FIELDS.some(
+        (field) => field in listed && listed[field] !== page[field],
+      );
+    },
   });
-}
-
-// Whether an update may change how the page is listed (trees, breadcrumbs).
-// Body-only saves, by far the most frequent update, do not.
-function changesOutline(pageId: string, page: Record<string, unknown>) {
-  const cached = queryClient.getQueryData<{ data?: Record<string, unknown> }>(
-    queryKeys.wikiPage(pageId),
-  )?.data;
-  return (
-    !cached ||
-    cached.title !== page.title ||
-    cached.icon !== page.icon ||
-    cached.parentId !== page.parentId ||
-    cached.position !== page.position
-  );
 }
 
 /**
@@ -95,14 +109,14 @@ export function useWikiRealtime(workspaceId: string | undefined) {
         case "wiki_page_updated": {
           const pageId = readId(page, "id");
           if (!page || !pageId) break;
-          if (changesOutline(pageId, page)) {
-            invalidateSpacePages(readId(page, "spaceId"));
-            invalidateBreadcrumbs();
-          }
+          invalidateListsShowing(pageId, page);
           // Refetching an open page is safe for its editor: an idle editor
           // takes the new document; unsaved or set-aside changes are never
           // replaced or sent.
           invalidate(queryKeys.wikiPage(pageId), true);
+          // Best effort: the server records its occasional auto-save version
+          // without waiting, so this list can lag by that version until the
+          // next update.
           invalidate(["wiki-versions", pageId]);
           break;
         }

@@ -135,6 +135,7 @@ function TemplateForm({
           <Input
             type="number"
             min="0"
+            max="3650"
             value={form.dueOffset}
             onChange={(e) => setForm({ ...form, dueOffset: e.target.value })}
             placeholder="No due date"

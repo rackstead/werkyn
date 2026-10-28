@@ -154,6 +154,7 @@ function MemberRateRow({
               <Input
                 type="number"
                 min="0"
+                max="1000000000"
                 step="0.01"
                 value={value}
                 onChange={(e) => setValue(e.target.value)}

@@ -111,21 +111,29 @@ export async function generateReport(
     where.billable = false;
   }
 
-  const entries = await prisma.timeEntry.findMany({
-    where,
-    include: {
-      user: { select: { id: true, displayName: true } },
-      task: { select: { id: true, title: true } },
-      project: { select: { id: true, name: true } },
-    },
-    orderBy: [{ date: "asc" }, { createdAt: "asc" }],
-  });
+  // Hours that are not a finite number (only possible through direct database
+  // writes; the API rejects them) cannot be read by Prisma. Such entries are
+  // left out of the report and counted in summary.skippedEntries.
+  const [entries, skippedEntries] = await Promise.all([
+    prisma.timeEntry.findMany({
+      where: { ...where, hours: userRatesService.FINITE_FLOAT },
+      include: {
+        user: { select: { id: true, displayName: true } },
+        task: { select: { id: true, title: true } },
+        project: { select: { id: true, name: true } },
+      },
+      orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+    }),
+    prisma.timeEntry.count({
+      where: { ...where, NOT: { hours: userRatesService.FINITE_FLOAT } },
+    }),
+  ]);
 
   // Price every entry at the rate in effect on its own date. The report end
   // date only bounds which entries are included, never which rate applies.
   const rateHistory = new Map<
     string,
-    Array<{ rate: number; currency: string; effectiveFrom: string }>
+    Array<{ rate: number | null; currency: string; effectiveFrom: string }>
   >();
   const latestEntryDate = entries.at(-1)?.date;
   if (latestEntryDate) {
@@ -185,10 +193,15 @@ export async function generateReport(
     }
 
     const { group, costs } = groupMap.get(key)!;
-    const applied = userRatesService.rateInEffect(
+    const inEffect = userRatesService.rateInEffect(
       rateHistory.get(entry.userId) ?? [],
       entry.date,
     );
+    // A stored rate that is not a finite number prices nothing: its dates are unrated.
+    const applied =
+      inEffect && inEffect.rate !== null
+        ? { rate: inEffect.rate, currency: inEffect.currency }
+        : null;
     const reportEntry: ReportEntry = {
       id: entry.id,
       date: entry.date,
@@ -225,7 +238,10 @@ export async function generateReport(
     }),
   );
 
-  return { groups, summary: { ...summary, ...summaryCosts.totals() } };
+  return {
+    groups,
+    summary: { ...summary, ...summaryCosts.totals(), skippedEntries },
+  };
 }
 
 export async function exportReportCSV(

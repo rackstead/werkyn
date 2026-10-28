@@ -1,6 +1,11 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
-import type { CreateRecurringInput, UpdateRecurringInput } from "@pm/shared";
-import { NotFoundError } from "../../utils/errors.js";
+import {
+  RECURRENCE_DAY_REQUIRED_MESSAGE,
+  requiredRecurrenceDay,
+  type CreateRecurringInput,
+  type UpdateRecurringInput,
+} from "@pm/shared";
+import { NotFoundError, ValidationError } from "../../utils/errors.js";
 
 export async function listRecurringConfigs(prisma: PrismaClient, projectId: string) {
   return prisma.recurringTaskConfig.findMany({
@@ -56,6 +61,25 @@ export async function updateRecurringConfig(
 ) {
   const existing = await prisma.recurringTaskConfig.findFirst({ where: { id: configId, projectId } });
   if (!existing) throw new NotFoundError("Recurring config not found");
+
+  // An edit to the schedule must leave it with the day its frequency needs,
+  // as on create. Omitted fields keep their stored values. Edits that leave
+  // the schedule alone (pausing, the end date) are allowed on any stored row.
+  const changesSchedule =
+    data.frequency !== undefined || data.dayOfWeek !== undefined || data.dayOfMonth !== undefined;
+  if (changesSchedule) {
+    const merged = {
+      frequency: data.frequency ?? existing.frequency,
+      dayOfWeek: data.dayOfWeek !== undefined ? data.dayOfWeek : existing.dayOfWeek,
+      dayOfMonth: data.dayOfMonth !== undefined ? data.dayOfMonth : existing.dayOfMonth,
+    };
+    const day = requiredRecurrenceDay(merged.frequency);
+    if (day && merged[day] === null) {
+      throw new ValidationError("Validation failed", [
+        { field: day, message: RECURRENCE_DAY_REQUIRED_MESSAGE[day] },
+      ]);
+    }
+  }
 
   const updateData: Prisma.RecurringTaskConfigUpdateInput = {};
   if (data.frequency !== undefined) updateData.frequency = data.frequency;

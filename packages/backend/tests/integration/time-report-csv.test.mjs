@@ -171,10 +171,14 @@ test("an overflowing cost exports as an empty cell instead of failing the downlo
   users.HUGE = await app.prisma.user.create({ data: { email: `time-csv-huge-${suffix}@example.test`, displayName: "Huge", emailVerified: true } });
   tokens.HUGE = signAccessToken({ sub: users.HUGE.id, email: users.HUGE.email });
   await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: users.HUGE.id, role: "MEMBER" } });
-  const rate = await req("ADMIN", "POST", `/api/workspaces/${workspace.id}/time/rates/${users.HUGE.id}`, {
+  // The API now caps rates, so this is a rate stored before that limit.
+  const rejected = await req("ADMIN", "POST", `/api/workspaces/${workspace.id}/time/rates/${users.HUGE.id}`, {
     rate: 1e308, currency: "USD", effectiveFrom: "2026-01-01",
   });
-  assert.equal(rate.statusCode, 200, rate.body);
+  assert.equal(rejected.statusCode, 400, rejected.body);
+  await app.prisma.userRate.create({ data: {
+    workspaceId: workspace.id, userId: users.HUGE.id, rate: 1e308, currency: "USD", effectiveFrom: "2026-01-01",
+  } });
   const entry = await req("HUGE", "POST", `/api/workspaces/${workspace.id}/time/entries`, { date: "2026-05-01", hours: 24, billable: true });
   assert.equal(entry.statusCode, 201, entry.body);
   const response = await req("ADMIN", "GET", `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-05-01&endDate=2026-05-31`);

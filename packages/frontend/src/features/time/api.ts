@@ -3,10 +3,11 @@ import { api } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { toast } from "sonner";
-import type {
-  CreateTimeEntryInput,
-  UpdateTimeEntryInput,
-  SetUserRateInput,
+import {
+  isDateOnly,
+  type CreateTimeEntryInput,
+  type UpdateTimeEntryInput,
+  type SetUserRateInput,
 } from "@pm/shared";
 
 // ─── Types ──────────────────────────────────────────────
@@ -86,6 +87,8 @@ export interface TimeReport {
     totalHours: number;
     billableHours: number;
     nonBillableHours: number;
+    /** Stored entries left out of the report because their hours are not a finite number. */
+    skippedEntries: number;
   };
 }
 
@@ -107,7 +110,8 @@ export function useTimeEntries(
         .json<{ data: TimeEntry[] }>();
     },
     select: (res) => res.data,
-    enabled: !!workspaceId && !!startDate && !!endDate,
+    // A date input reports partial years (0002-03-15) while the user types.
+    enabled: !!workspaceId && isDateOnly(startDate) && isDateOnly(endDate),
   });
 }
 
@@ -131,7 +135,10 @@ export function useTimeReport(
         })
         .json<{ data: TimeReport }>(),
     select: (res) => res.data,
-    enabled: !!workspaceId && !!filters.startDate && !!filters.endDate,
+    enabled:
+      !!workspaceId &&
+      isDateOnly(filters.startDate) &&
+      isDateOnly(filters.endDate),
   });
 }
 

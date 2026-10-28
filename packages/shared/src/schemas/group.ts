@@ -1,11 +1,11 @@
 import { z } from "zod";
+import { multilineText, singleLineText } from "./common.js";
 
 export const CreateGroupSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Name is required")
     .max(100, "Name must be 100 characters or less"),
-  description: z.string().max(500).optional(),
+  description: multilineText().max(500).optional(),
   color: z
     .string()
     .regex(/^#[0-9a-fA-F]{6}$/, "Invalid hex color")
@@ -15,12 +15,11 @@ export const CreateGroupSchema = z.object({
 export type CreateGroupInput = z.infer<typeof CreateGroupSchema>;
 
 export const UpdateGroupSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1)
     .max(100, "Name must be 100 characters or less")
     .optional(),
-  description: z.string().max(500).nullable().optional(),
+  description: multilineText().max(500).nullable().optional(),
   color: z
     .string()
     .regex(/^#[0-9a-fA-F]{6}$/, "Invalid hex color")

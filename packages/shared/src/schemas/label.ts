@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { singleLineText } from "./common.js";
 
 const HexColorSchema = z
   .string()
@@ -8,8 +9,7 @@ const HexColorSchema = z
   );
 
 export const CreateLabelSchema = z.object({
-  name: z
-    .string()
+  name: singleLineText()
     .min(1, "Label name is required")
     .max(100, "Label name must be 100 characters or less"),
   color: HexColorSchema,
@@ -17,7 +17,7 @@ export const CreateLabelSchema = z.object({
 export type CreateLabelInput = z.infer<typeof CreateLabelSchema>;
 
 export const UpdateLabelSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
+  name: singleLineText().min(1).max(100).optional(),
   color: HexColorSchema.optional(),
 });
 export type UpdateLabelInput = z.infer<typeof UpdateLabelSchema>;

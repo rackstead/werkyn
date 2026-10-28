@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma, PrismaClient } from "@prisma/client";
 import type { SetUserRateInput } from "@pm/shared";
 import { NotFoundError } from "../../utils/errors.js";
 
@@ -64,23 +64,54 @@ export async function getRate(
   });
 }
 
-/** Rates for several members that start on or before `throughDate`, oldest first per member. */
+/**
+ * Matches the Float values Prisma can read. PostgreSQL orders NaN above every
+ * number, so the upper bound excludes NaN and Infinity and the lower bound
+ * excludes -Infinity. The bound is 1e308 rather than Number.MAX_VALUE because
+ * Prisma sends query numbers with 16 significant digits, which rounds
+ * MAX_VALUE up past the largest double; the few finite values beyond 1e308
+ * are treated like non-finite ones.
+ */
+export const FINITE_FLOAT: Prisma.FloatFilter = { gte: -1e308, lte: 1e308 };
+
+/**
+ * Rates for several members that start on or before `throughDate`, oldest
+ * first per member. A stored rate that is not a finite number (only possible
+ * through direct database writes) comes back with `rate: null`, so the dates
+ * it covers count as unrated instead of failing the read or falling back to an
+ * earlier rate.
+ */
 export async function listRateHistory(
   prisma: PrismaClient,
   workspaceId: string,
   userIds: string[],
   throughDate: string,
-) {
+): Promise<Array<{ userId: string; rate: number | null; currency: string; effectiveFrom: string }>> {
   if (userIds.length === 0) return [];
-  return prisma.userRate.findMany({
-    where: {
-      workspaceId,
-      userId: { in: userIds },
-      effectiveFrom: { lte: throughDate },
-    },
-    select: { userId: true, rate: true, currency: true, effectiveFrom: true },
-    orderBy: [{ userId: "asc" }, { effectiveFrom: "asc" }],
-  });
+  const where: Prisma.UserRateWhereInput = {
+    workspaceId,
+    userId: { in: userIds },
+    effectiveFrom: { lte: throughDate },
+  };
+  const [finite, nonFinite] = await Promise.all([
+    prisma.userRate.findMany({
+      where: { ...where, rate: FINITE_FLOAT },
+      select: { userId: true, rate: true, currency: true, effectiveFrom: true },
+    }),
+    // Prisma cannot read a non-finite Float, so the rate column is not selected.
+    prisma.userRate.findMany({
+      where: { ...where, NOT: { rate: FINITE_FLOAT } },
+      select: { userId: true, currency: true, effectiveFrom: true },
+    }),
+  ]);
+  return [...finite, ...nonFinite.map((row) => ({ ...row, rate: null }))].sort(
+    (a, b) =>
+      a.userId < b.userId ? -1
+      : a.userId > b.userId ? 1
+      : a.effectiveFrom < b.effectiveFrom ? -1
+      : a.effectiveFrom > b.effectiveFrom ? 1
+      : 0,
+  );
 }
 
 /**

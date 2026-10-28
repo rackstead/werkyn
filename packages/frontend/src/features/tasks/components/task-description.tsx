@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
-import DOMPurify from "dompurify";
 import { SafeHtml } from "@/components/safe-html";
+import { sanitizeDescriptionHtml } from "@/lib/description-html";
+import { stripPastedStyleSheets } from "@/lib/pasted-html";
 import { useUpdateTask } from "../api";
 import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { useAuthStore } from "@/stores/auth-store";
@@ -69,12 +70,13 @@ function TaskDescriptionEditor({
       StarterKit,
       Placeholder.configure({ placeholder: "Add a description..." }),
     ],
-    content: DOMPurify.sanitize(
+    content: sanitizeDescriptionHtml(
       (autosave.draft && "description" in autosave.draft
         ? autosave.draft.description
         : description) ?? "",
     ),
     editable: canEdit,
+    editorProps: { transformPastedHTML: stripPastedStyleSheets },
     onUpdate: ({ editor: e }) => {
       autosave.schedule({ description: e.getHTML() || null });
     },
@@ -105,7 +107,7 @@ function TaskDescriptionEditor({
     }
     if (appliedSource.current === description) return;
     appliedSource.current = description;
-    const next = DOMPurify.sanitize(description ?? "");
+    const next = sanitizeDescriptionHtml(description ?? "");
     // The detail refetch after a save usually returns the text already shown;
     // replacing an identical document would move the caret to the end.
     if (editor.getHTML() === next) return;
@@ -147,7 +149,7 @@ function TaskDescriptionEditor({
             className="underline"
             onClick={() => {
               const restored = autosave.parked?.description ?? "";
-              editor?.commands.setContent(DOMPurify.sanitize(restored), {
+              editor?.commands.setContent(sanitizeDescriptionHtml(restored), {
                 emitUpdate: false,
               });
               void autosave.restoreParked().catch(() => {});

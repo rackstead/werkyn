@@ -6,6 +6,7 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import type { Block } from "@blocknote/core";
 import { useAuthStore } from "@/stores/auth-store";
+import { stripPastedStyleSheets } from "@/lib/pasted-html";
 
 function useIsDark() {
   return useSyncExternalStore(
@@ -50,6 +51,11 @@ export function WikiEditor({
       Array.isArray(initialDocument) && initialDocument.length > 0
         ? (initialDocument as Block[])
         : undefined,
+    // BlockNote pastes its own blocknote/html clipboard type, and drops HTML,
+    // straight into prosemirror-view without re-serializing it.
+    _tiptapOptions: {
+      editorProps: { transformPastedHTML: stripPastedStyleSheets },
+    },
     uploadFile: async (file: File) => {
       const token = useAuthStore.getState().accessToken;
       const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";

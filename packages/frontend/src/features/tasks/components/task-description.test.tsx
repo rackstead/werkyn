@@ -103,6 +103,68 @@ it("real Tiptap editor remounts for another task and flushes pending text to the
   });
 });
 
+it("real Tiptap syncs idle remote updates without an update loop and protects dirty local text", async () => {
+  const id = `task-sync-${++suffix}`;
+  const screen = render(
+    <TaskDescription taskId={id} description="<p>Initial</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  screen.rerender(
+    <TaskDescription taskId={id} description="<p>Remote update</p>" canEdit />,
+  );
+  await tick();
+  expect(currentEditor().getHTML()).toBe("<p>Remote update</p>");
+  expect(http.patch).not.toHaveBeenCalled();
+  act(() => {
+    currentEditor().commands.setContent("<p>Local draft</p>");
+  });
+  screen.rerender(
+    <TaskDescription
+      taskId={id}
+      description="<p>Another remote update</p>"
+      canEdit
+    />,
+  );
+  await tick();
+  expect(currentEditor().getHTML()).toBe("<p>Local draft</p>");
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
+    json: { description: "<p>Local draft</p>" },
+    context: { expectedUserId: "task-editor-user" },
+  });
+  expect(currentEditor().getHTML()).toBe("<p>Local draft</p>");
+});
+
+it("a refetch of the just-saved description keeps the caret in place", async () => {
+  const id = `task-caret-${++suffix}`;
+  const screen = render(
+    <TaskDescription taskId={id} description="<p>Hello</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  const editor = currentEditor();
+  act(() => {
+    editor.commands.setContent("<p>Hello world again</p>");
+    editor.commands.setTextSelection(6);
+  });
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
+  // The detail GET invalidated by the save returns the text that was saved.
+  screen.rerender(
+    <TaskDescription
+      taskId={id}
+      description="<p>Hello world again</p>"
+      canEdit
+    />,
+  );
+  await tick();
+  expect(editor.getHTML()).toBe("<p>Hello world again</p>");
+  expect(editor.state.selection.from).toBe(6);
+  await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
+});
+
 it("does not persist a prior identity's pending task description under a new identity", async () => {
   const id = `task-identity-${++suffix}`;
   const screen = render(
@@ -236,5 +298,43 @@ it("a failed description is only resent when the user retries it", async () => {
   offline = false;
   screen.unmount();
   await tick(801);
+  expect(http.patch).toHaveBeenCalledTimes(1);
+});
+
+it("idle sync shows a newer description while a set-aside draft stays offered and unsent", async () => {
+  const id = `task-sync-parked-${++suffix}`;
+  let offline = true;
+  const patch = http.patch.getMockImplementation()!;
+  http.patch.mockImplementation((path: string, options: any) =>
+    offline
+      ? {
+          json: async () => {
+            throw new TypeError("Failed to fetch");
+          },
+        }
+      : patch(path, options),
+  );
+  const first = render(
+    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  act(() => {
+    currentEditor().commands.setContent("<p>Set aside</p>");
+  });
+  first.unmount();
+  await tick();
+  offline = false;
+  const reopened = render(
+    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  reopened.rerender(
+    <TaskDescription taskId={id} description="<p>Newer</p>" canEdit />,
+  );
+  await tick(801);
+  expect(currentEditor().getHTML()).toBe("<p>Newer</p>");
+  expect(reopened.getByText("Restore changes")).toBeTruthy();
   expect(http.patch).toHaveBeenCalledTimes(1);
 });

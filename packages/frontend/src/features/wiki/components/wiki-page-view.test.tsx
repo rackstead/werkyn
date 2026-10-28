@@ -20,6 +20,7 @@ vi.mock("./wiki-editor", async () => {
       recoveredContent,
       onChange,
       readOnly,
+      hasUnsavedChanges,
     }: any) => {
       const [value, setValue] = React.useState(
         JSON.stringify(recoveredContent ?? initialContent),
@@ -27,6 +28,7 @@ vi.mock("./wiki-editor", async () => {
       return (
         <textarea
           aria-label="Page body"
+          data-dirty={String(hasUnsavedChanges)}
           disabled={readOnly}
           value={value}
           onChange={(event) => {
@@ -545,6 +547,21 @@ describe("entity-bound Wiki autosave", () => {
     await tick(801);
     expect(written).toHaveLength(2);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["wiki-pages"] });
+  });
+
+  it("a pending title does not hold back a refreshed page body", async () => {
+    const id = `title-only-${++suffix}`;
+    const screen = render(view(id), { wrapper });
+    const body = screen.getByLabelText("Page body");
+    const heading = screen.getByRole("heading");
+    heading.textContent = `${id} renamed`;
+    fireEvent.input(heading);
+    expect(screen.getByText("Saving changes…")).toBeTruthy();
+    expect(body.getAttribute("data-dirty")).toBe("false");
+    fireEvent.change(body, { target: { value: "body edit" } });
+    expect(body.getAttribute("data-dirty")).toBe("true");
+    await tick(801);
+    expect(body.getAttribute("data-dirty")).toBe("false");
   });
 
   it("reverting or clearing an unsent title edit sends nothing", async () => {

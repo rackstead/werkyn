@@ -2,6 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
+import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
 import type {
   CreateTaskInput,
@@ -127,9 +128,14 @@ export function useCreateTask(pid: string) {
 
 export function useUpdateTask() {
   return useMutation({
-    mutationFn: ({ id, ...data }: UpdateTaskInput & { id: string }) =>
-      api.patch(`tasks/${id}`, { json: data }).json<{ data: Task }>(),
-    onSuccess: (res) => {
+    mutationFn: ({ id, expectedUserId, ...data }: UpdateTaskInput & { id: string; expectedUserId?: string }) => {
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) {
+        throw new Error("Sign in as the author to save these changes");
+      }
+      return api.patch(`tasks/${id}`, { json: data, ...(expectedUserId ? { context: { expectedUserId } } : {}) }).json<{ data: Task }>();
+    },
+    onSuccess: (res, { expectedUserId }) => {
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
       // PATCH returns a summary, not the relations supplied by GET /tasks/:id.
       // Keep the complete cached detail visible while refreshing it.
       queryClient.invalidateQueries({ queryKey: queryKeys.task(res.data.id) });
@@ -139,7 +145,9 @@ export function useUpdateTask() {
       });
       invalidateMyTasks();
     },
-    onError: (err) => {
+    onError: (err, { expectedUserId }) => {
+      // Editor autosaves report failures through their own retry notice.
+      if (expectedUserId) return;
       toast.error(`Failed to update task: ${err.message}`);
     },
   });

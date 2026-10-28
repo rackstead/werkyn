@@ -43,7 +43,7 @@ export function WikiPageTreeItem({
   const children = childrenData?.data ?? [];
 
   const createPage = useCreateWikiPage(page.spaceId);
-  const updatePage = useUpdateWikiPage(page.id);
+  const updatePage = useUpdateWikiPage();
   const deletePage = useDeleteWikiPage(page.spaceId);
 
   useEffect(() => {
@@ -56,7 +56,7 @@ export function WikiPageTreeItem({
   const handleRenameSubmit = () => {
     const trimmed = renameValue.trim();
     if (trimmed && trimmed !== page.title) {
-      updatePage.mutate({ title: trimmed });
+      updatePage.mutate({ pageId: page.id, title: trimmed });
     }
     setIsRenaming(false);
   };
@@ -177,7 +177,7 @@ export function WikiPageTreeItem({
             <EmojiPicker
               value={page.icon ?? null}
               onChange={(emoji) => {
-                updatePage.mutate({ icon: emoji });
+                updatePage.mutate({ pageId: page.id, icon: emoji });
                 setShowEmojiPicker(false);
               }}
               open={showEmojiPicker}

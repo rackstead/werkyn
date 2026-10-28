@@ -1,4 +1,12 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { queryKeys } from "@/lib/query-keys";
+import { useAuthStore } from "@/stores/auth-store";
+import { useEntityAutosave } from "@/hooks/use-entity-autosave";
+import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
+import type { UpdateWikiPageInput } from "@pm/shared";
 import { ChevronRight, FileText, History, Lock, MessageSquare, Share2, Smile } from "lucide-react";
 import { EmojiPicker } from "@/components/shared/emoji-picker";
 import {
@@ -22,10 +30,57 @@ interface WikiPageViewProps {
 }
 
 export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageViewProps) {
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  return (
+    <WikiPageSession
+      key={`${userId}:${pageId}`}
+      pageId={pageId}
+      workspaceId={workspaceId}
+      onNavigatePage={onNavigatePage}
+    />
+  );
+}
+
+function WikiPageSession({
+  pageId,
+  workspaceId,
+  onNavigatePage,
+}: WikiPageViewProps) {
   const { data: pageData, isLoading } = useWikiPage(pageId);
   const { data: breadcrumbsData } = useWikiPageBreadcrumbs(pageId);
-  const updatePage = useUpdateWikiPage(pageId);
-  const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(pageId);
+  const { mutateAsync: updatePage } = useUpdateWikiPage();
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  const save = useCallback(
+    (patch: UpdateWikiPageInput) => {
+      if (useAuthStore.getState().user?.id !== userId) {
+        return Promise.reject(
+          new Error("Sign in as the author to save these changes"),
+        );
+      }
+      return updatePage({ ...patch, pageId, expectedUserId: userId });
+    },
+    [pageId, updatePage, userId],
+  );
+  // Only a session that currently holds the page lock may write. The backend
+  // does not enforce locks, so this is what keeps a retained draft from being
+  // replayed over another editor's work.
+  const holdsLock = useRef(false);
+  const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save, {
+    author: userId,
+    canSave: () =>
+      holdsLock.current ? null : "Start editing to save these changes",
+    retryFailedAutomatically: true,
+  });
+  const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(
+    pageId,
+    autosave.flush,
+  );
+  holdsLock.current = isLockedByMe;
+  const queryClient = useQueryClient();
+  // Remounts the editor and title when their document is replaced wholesale.
+  const [documentVersion, setDocumentVersion] = useState(0);
+  const router = useRouter({ warn: false });
+  const [finishing, setFinishing] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [showShare, setShowShare] = useState(false);
@@ -33,38 +88,72 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
   const page = pageData?.data;
   const breadcrumbs = breadcrumbsData?.data ?? [];
 
-  const readOnly = !isLockedByMe;
+  const readOnly = !isLockedByMe || finishing || showVersions;
 
-  // Debounced auto-save
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Losing the lock (or no longer being able to confirm it) sets unsaved
+  // changes aside: the page shows the stored document again, and the changes
+  // are only sent if the user restores them while holding the lock.
+  useEffect(() => {
+    if (isLockedByMe) return;
+    if (autosave.status !== "error" && autosave.status !== "pending") return;
+    autosave.park();
+    setDocumentVersion((version) => version + 1);
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.wikiPage(pageId),
+    });
+  }, [isLockedByMe, autosave.status, autosave.park, queryClient, pageId]);
+
+  const restoreParked = () => {
+    void autosave.restoreParked().catch(() => {});
+    setDocumentVersion((version) => version + 1);
+  };
 
   const handleContentChange = useCallback(
     (content: Block[]) => {
-      if (saveTimer.current !== null) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => {
-        updatePage.mutate({ content });
-      }, 800);
+      if (readOnly) return;
+      autosave.schedule({ content: structuredClone(content) });
     },
-    [updatePage],
+    [autosave.schedule, readOnly],
   );
 
-  const handleTitleBlur = useCallback(
-    (e: React.FocusEvent<HTMLHeadingElement>) => {
+  const handleTitleChange = useCallback(
+    (title: string) => {
       if (readOnly) return;
-      const title = e.currentTarget.textContent?.trim();
-      if (title && title !== page?.title) {
-        updatePage.mutate({ title });
-      }
+      // An emptied heading keeps the saved title, as before. Returning to the
+      // saved title drops an unsent change; one already being saved gets a
+      // corrective update instead, so an abandoned value never wins.
+      const next = title || page?.title;
+      if (!next) return;
+      if (next === page?.title && autosave.discard("title")) return;
+      autosave.schedule({ title: next });
     },
-    [updatePage, page?.title, readOnly],
+    [autosave.discard, autosave.schedule, page?.title, readOnly],
   );
 
   const handleStartEditing = () => {
-    acquire();
+    void acquire().catch(() =>
+      toast.error("Could not start editing this page"),
+    );
   };
 
+  const finishEditing = useCallback(async () => {
+    setFinishing(true);
+    try {
+      await release();
+    } finally {
+      setFinishing(false);
+    }
+  }, [release]);
+
+  // Leaving needs every change stored. If only the lock release fails after
+  // that, the lock simply expires, so it does not hold the user on the page.
+  const leaveEditing = useCallback(async () => {
+    await autosave.flush();
+    await finishEditing().catch(() => {});
+  }, [autosave.flush, finishEditing]);
+
   const handleStopEditing = () => {
-    release();
+    void finishEditing().catch(() => {});
   };
 
   if (isLoading) {
@@ -87,6 +176,12 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
 
   return (
     <div className="mx-auto max-w-4xl p-8">
+      {router && (
+        <EditorNavigationGuard
+          beforeLeave={leaveEditing}
+          hasUnsavedChanges={autosave.hasUnsavedChanges}
+        />
+      )}
       {/* Breadcrumbs (ancestors only, current page shown as h1 below) */}
       {breadcrumbs.length > 1 && (
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-6">
@@ -117,6 +212,30 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
         </div>
       )}
 
+      {/* Changes set aside after a failed save or a lost lock */}
+      {autosave.parked && (
+        <div
+          role="status"
+          className="mb-4 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-2 text-sm text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
+        >
+          <span className="flex-1">
+            Earlier changes to this page were not saved.
+            {!isLockedByMe && " Start editing to restore them."}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!isLockedByMe}
+            onClick={restoreParked}
+          >
+            Restore changes
+          </Button>
+          <Button size="sm" variant="ghost" onClick={autosave.discardParked}>
+            Discard
+          </Button>
+        </div>
+      )}
+
       {/* Toolbar */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
@@ -127,9 +246,39 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
             </Button>
           )}
           {isLockedByMe && (
-            <Button size="sm" variant="outline" onClick={handleStopEditing}>
-              Done Editing
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={finishing}
+              onClick={handleStopEditing}
+            >
+              {finishing ? "Saving…" : "Done Editing"}
             </Button>
+          )}
+        </div>
+        <div aria-live="polite" className="text-xs text-muted-foreground">
+          {autosave.status === "error" ? (
+            <span role="alert">
+              Changes not saved.{" "}
+              <button
+                className="underline disabled:no-underline disabled:opacity-60"
+                disabled={!isLockedByMe}
+                title={
+                  isLockedByMe
+                    ? undefined
+                    : "Saving needs the editing lock for this page"
+                }
+                onClick={() => {
+                  void autosave.retry().catch(() => {});
+                }}
+              >
+                Retry save
+              </button>
+            </span>
+          ) : autosave.hasUnsavedChanges ? (
+            "Saving changes…"
+          ) : autosave.parked ? null : (
+            "All changes saved"
           )}
         </div>
         <div className="flex items-center gap-1">
@@ -152,7 +301,22 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => { setShowVersions(!showVersions); setShowComments(false); }}
+            disabled={finishing}
+            onClick={() => {
+              if (showVersions) {
+                setShowVersions(false);
+                return;
+              }
+              setFinishing(true);
+              void autosave
+                .flush()
+                .then(() => {
+                  setShowVersions(true);
+                  setShowComments(false);
+                })
+                .catch(() => {})
+                .finally(() => setFinishing(false));
+            }}
           >
             <History className="h-3.5 w-3.5 mr-1" />
             History
@@ -162,10 +326,10 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
 
       {/* Icon */}
       <div className="mb-2 group/icon">
-        {page.icon ? (
+        {page.icon && !readOnly ? (
           <EmojiPicker
             value={page.icon}
-            onChange={(emoji) => updatePage.mutate({ icon: emoji })}
+            onChange={(emoji) => autosave.schedule({ icon: emoji })}
           >
             <button
               type="button"
@@ -174,11 +338,13 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
               {page.icon}
             </button>
           </EmojiPicker>
+        ) : page.icon ? (
+          <span className="text-5xl leading-none p-1">{page.icon}</span>
         ) : (
           !readOnly && (
             <EmojiPicker
               value={null}
-              onChange={(emoji) => emoji && updatePage.mutate({ icon: emoji })}
+              onChange={(emoji) => emoji && autosave.schedule({ icon: emoji })}
             >
               <button
                 type="button"
@@ -193,14 +359,14 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
       </div>
 
       {/* Title */}
-      <h1
-        contentEditable={!readOnly}
-        suppressContentEditableWarning
-        onBlur={handleTitleBlur}
-        className="text-3xl font-bold outline-none mb-1 empty:before:content-['Untitled'] empty:before:text-muted-foreground"
-      >
-        {page.title}
-      </h1>
+      <EditableWikiTitle
+        key={documentVersion}
+        title={page.title}
+        recoveredTitle={autosave.draft?.title}
+        readOnly={readOnly}
+        hasUnsavedChanges={autosave.hasUnsavedChanges}
+        onChange={handleTitleChange}
+      />
 
       {/* Meta info */}
       <div className="flex items-center gap-2 text-xs text-muted-foreground mb-6">
@@ -216,8 +382,9 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
 
       {/* Editor */}
       <WikiEditor
-        key={pageId}
+        key={`${pageId}:${documentVersion}`}
         initialContent={page.content}
+        recoveredContent={autosave.draft?.content}
         readOnly={readOnly}
         workspaceId={workspaceId}
         spaceId={page.spaceId}
@@ -247,5 +414,53 @@ export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageVi
         pageId={pageId}
       />
     </div>
+  );
+}
+
+function EditableWikiTitle({
+  title,
+  recoveredTitle,
+  readOnly,
+  hasUnsavedChanges,
+  onChange,
+}: {
+  title: string;
+  recoveredTitle?: string;
+  readOnly: boolean;
+  hasUnsavedChanges: boolean;
+  onChange: (title: string) => void;
+}) {
+  const element = useRef<HTMLHeadingElement>(null);
+  const initialTitle = useRef(recoveredTitle ?? title);
+  const wasDirty = useRef(hasUnsavedChanges);
+  useEffect(() => {
+    if (hasUnsavedChanges) {
+      wasDirty.current = true;
+      return;
+    }
+    if (wasDirty.current) {
+      wasDirty.current = false;
+      return;
+    }
+    if (
+      !hasUnsavedChanges &&
+      element.current &&
+      element.current.textContent !== title
+    ) {
+      element.current.textContent = title;
+    }
+  }, [title, hasUnsavedChanges]);
+  return (
+    <h1
+      ref={element}
+      contentEditable={!readOnly}
+      suppressContentEditableWarning
+      onInput={(event) =>
+        onChange(event.currentTarget.textContent?.trim() ?? "")
+      }
+      className="text-3xl font-bold outline-none mb-1 empty:before:content-['Untitled'] empty:before:text-muted-foreground"
+    >
+      {initialTitle.current}
+    </h1>
   );
 }

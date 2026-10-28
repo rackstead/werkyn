@@ -1,0 +1,256 @@
+export type SaveStatus = "saved" | "pending" | "saving" | "error";
+
+export interface SaveSnapshot<T> {
+  status: SaveStatus;
+  error: Error | null;
+  /** Unsaved fields of the live editing session: queued, being sent or failed. */
+  draft: T | undefined;
+  hasUnsavedChanges: boolean;
+  /**
+   * Unsaved fields whose editing session ended (or lost the right to save)
+   * before they were stored. They are never sent automatically: the user
+   * restores or discards them.
+   */
+  parked: T | undefined;
+}
+
+export interface AutosavePolicy {
+  /** Why nothing may be sent right now (for example, no page lock), or null. */
+  canSave: () => string | null;
+  /** Whether automatic flushes may resend a draft whose last attempt failed. */
+  retryFailedAutomatically: boolean;
+}
+
+export interface AutosaveCallbacks {
+  /** A save attempt failed while an editor was open. */
+  onError: (error: Error, retry: () => Promise<void>) => void;
+  /** Nothing is queued, retained or open; the queue can be forgotten. */
+  onIdle: () => void;
+  /** Every retained change was stored. */
+  onSaved: () => void;
+  /** Unsaved changes were set aside; `closed` when no editor is open. */
+  onParked: (closed: boolean) => void;
+}
+
+/** Rejects a flush that was not allowed to send anything. */
+export class AutosaveBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AutosaveBlockedError";
+  }
+}
+
+/** Serializes one entity's patches; newer fields replace older queued fields. */
+export class AutosaveQueue<T extends object> {
+  private pending: T | undefined;
+  private inFlight: T | undefined;
+  private parked: T | undefined;
+  // The pending fields include a draft whose last attempt failed or was blocked.
+  private failed = false;
+  private running: Promise<void> | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private listeners = new Set<() => void>();
+  private policy: AutosavePolicy = {
+    canSave: () => null,
+    retryFailedAutomatically: true,
+  };
+  private snapshot: SaveSnapshot<T> = {
+    status: "saved",
+    error: null,
+    draft: undefined,
+    hasUnsavedChanges: false,
+    parked: undefined,
+  };
+
+  constructor(
+    private save: (patch: T) => Promise<unknown>,
+    private delay: number,
+    private callbacks: AutosaveCallbacks,
+  ) {}
+
+  setSave(save: (patch: T) => Promise<unknown>) {
+    this.save = save;
+  }
+
+  setPolicy(policy: AutosavePolicy) {
+    this.policy = policy;
+  }
+
+  getSnapshot = () => this.snapshot;
+
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+      if (this.listeners.size) return;
+      // A failed draft must not outlive its editor as something that is sent
+      // automatically later; keep it for an explicit restore instead.
+      if (this.snapshot.status === "error" && !this.running) this.park();
+      else if (!this.snapshot.hasUnsavedChanges && !this.parked)
+        this.callbacks.onIdle();
+    };
+  };
+
+  private publish(
+    status: SaveStatus,
+    draft: T | undefined,
+    error: Error | null = null,
+  ) {
+    this.snapshot = {
+      status,
+      draft,
+      error,
+      hasUnsavedChanges: status !== "saved",
+      parked: this.parked,
+    };
+    for (const listener of this.listeners) listener();
+    if (status === "saved" && !this.parked && !this.listeners.size)
+      this.callbacks.onIdle();
+  }
+
+  private clearTimer() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  /** Queues an edit made in the open editor. */
+  schedule = (patch: T) => {
+    // The user is editing the document that shows this draft, so it is live again.
+    this.failed = false;
+    this.pending = { ...this.pending, ...patch };
+    this.publish(this.running ? "saving" : "pending", {
+      ...this.snapshot.draft,
+      ...patch,
+    });
+    this.clearTimer();
+    this.timer = setTimeout(() => {
+      void this.flush().catch(() => {});
+    }, this.delay);
+  };
+
+  /**
+   * Drops an unsent field, for example a title edited back to its saved value.
+   * Returns false when that field is being saved right now; the caller should
+   * then schedule a corrective value instead.
+   */
+  discard = (key: keyof T): boolean => {
+    if (this.inFlight && key in this.inFlight) return false;
+    if (!this.pending || !(key in this.pending)) return true;
+    const pending = { ...this.pending };
+    delete pending[key];
+    this.pending = Object.keys(pending).length ? pending : undefined;
+    const draft = this.snapshot.draft && { ...this.snapshot.draft };
+    if (draft) delete draft[key];
+    if (this.pending || this.running) {
+      this.publish(this.snapshot.status, draft, this.snapshot.error);
+    } else {
+      this.clearTimer();
+      this.failed = false;
+      this.publish("saved", undefined);
+      this.callbacks.onSaved();
+    }
+    return true;
+  };
+
+  /**
+   * Sets unsent changes aside. They stay in this tab (and keep the unload
+   * warning) but are only sent again through `restoreParked`.
+   */
+  park = () => {
+    this.clearTimer();
+    if (!this.pending) return;
+    const closed = !this.listeners.size;
+    this.parked = { ...this.parked, ...this.pending };
+    this.pending = undefined;
+    this.failed = false;
+    // Only a request already on the wire can still be in progress.
+    this.publish(this.inFlight ? "saving" : "saved", this.inFlight);
+    this.callbacks.onParked(closed);
+  };
+
+  /** Puts set-aside changes back into the editor's queue and saves them. */
+  restoreParked = (): Promise<void> => {
+    if (!this.parked) return Promise.resolve();
+    // The restored draft replaces whatever the reopened editor holds.
+    this.pending = { ...this.pending, ...this.parked } as T;
+    this.parked = undefined;
+    this.failed = false;
+    this.publish(this.running ? "saving" : "pending", {
+      ...this.snapshot.draft,
+      ...this.pending,
+    });
+    return this.flush({ explicit: true });
+  };
+
+  discardParked = () => {
+    if (!this.parked) return;
+    this.parked = undefined;
+    this.publish(
+      this.snapshot.status,
+      this.snapshot.draft,
+      this.snapshot.error,
+    );
+    if (this.snapshot.status === "saved") this.callbacks.onSaved();
+  };
+
+  /** A user-requested attempt; it may resend a failed draft. */
+  retry = () => this.flush({ explicit: true });
+
+  flush = ({
+    explicit = false,
+  }: { explicit?: boolean } = {}): Promise<void> => {
+    this.clearTimer();
+    if (this.running) return this.running;
+    if (!this.pending) return Promise.resolve();
+    if (this.failed && !explicit && !this.policy.retryFailedAutomatically) {
+      return Promise.reject(
+        new AutosaveBlockedError(
+          "These changes were not saved. Retry them first.",
+        ),
+      );
+    }
+
+    // Begin in a microtask so even an immediately failing save retains running's identity.
+    this.running = Promise.resolve()
+      .then(async () => {
+        while (this.pending) {
+          const blocked = this.policy.canSave();
+          if (blocked) {
+            this.failed = true;
+            const error = new AutosaveBlockedError(blocked);
+            this.publish("error", this.snapshot.draft ?? this.pending, error);
+            if (!this.listeners.size) this.park();
+            throw error;
+          }
+          const patch = this.pending;
+          this.pending = undefined;
+          this.publish("saving", this.snapshot.draft);
+          this.inFlight = patch;
+          try {
+            await this.save(patch);
+          } catch (cause) {
+            this.inFlight = undefined;
+            this.pending = Object.assign({}, patch, this.pending) as T;
+            this.failed = true;
+            const error =
+              cause instanceof Error
+                ? cause
+                : new Error("Changes could not be saved");
+            this.publish("error", this.snapshot.draft ?? this.pending, error);
+            if (this.listeners.size) this.callbacks.onError(error, this.retry);
+            else this.park();
+            throw error;
+          } finally {
+            this.inFlight = undefined;
+          }
+        }
+        this.failed = false;
+        this.publish("saved", undefined);
+        this.callbacks.onSaved();
+      })
+      .finally(() => {
+        this.running = null;
+      });
+    return this.running;
+  };
+}

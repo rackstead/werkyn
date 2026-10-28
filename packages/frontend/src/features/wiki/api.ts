@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
+import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
 import type {
   CreateWikiSpaceInput,
@@ -272,15 +273,32 @@ export function useCreateWikiPage(sid: string) {
   });
 }
 
-export function useUpdateWikiPage(pgid: string) {
+export function useUpdateWikiPage() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: UpdateWikiPageInput) =>
-      api
-        .patch(`wiki/pages/${pgid}`, { json: data })
-        .json<{ data: WikiPage }>(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.wikiPage(pgid) });
+    mutationFn: ({ pageId, expectedUserId, ...data }: UpdateWikiPageInput & { pageId: string; expectedUserId?: string }) => {
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) {
+        throw new Error("Sign in as the author to save these changes");
+      }
+      return api
+        .patch(`wiki/pages/${pageId}`, { json: data, ...(expectedUserId ? { context: { expectedUserId } } : {}) })
+        .json<{ data: WikiPage }>();
+    },
+    onSuccess: async (result, { pageId, expectedUserId, ...data }) => {
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
+      // PATCH returns the full page. Prevent an older GET from replacing it.
+      await qc.cancelQueries({ queryKey: queryKeys.wikiPage(pageId) });
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
+      qc.setQueryData(queryKeys.wikiPage(pageId), result);
+      // A content save is already in the cache; a new title or icon also
+      // shows in the page tree and breadcrumbs.
+      if ("title" in data || "icon" in data)
+        qc.invalidateQueries({ queryKey: ["wiki-pages"] });
+    },
+    onError: (error, { expectedUserId }) => {
+      // Editor autosaves report failures through their own retry notice.
+      if (expectedUserId) return;
+      toast.error(error.message || "Something went wrong");
     },
   });
 }
@@ -389,32 +407,32 @@ export function useWikiPageLock(pgid: string | undefined) {
 
 // ─── Lock Mutations ─────────────────────────────────────
 
-export function useAcquireWikiLock(pgid: string) {
+export function useAcquireWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
-      api.post(`wiki/pages/${pgid}/lock`).json<{ data: WikiPageLock }>(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["wiki-lock", pgid] });
+    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
+      api.post(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).json<{ data: WikiPageLock }>(),
+    onSuccess: (_, { pageId }) => {
+      qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
 }
 
-export function useReleaseWikiLock(pgid: string) {
+export function useReleaseWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
-      api.delete(`wiki/pages/${pgid}/lock`).then(() => {}),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["wiki-lock", pgid] });
+    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
+      api.delete(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).then(() => {}),
+    onSuccess: (_, { pageId }) => {
+      qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
 }
 
-export function useHeartbeatWikiLock(pgid: string) {
+export function useHeartbeatWikiLock() {
   return useMutation({
-    mutationFn: () =>
-      api.patch(`wiki/pages/${pgid}/lock/heartbeat`).then(() => {}),
+    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
+      api.patch(`wiki/pages/${pageId}/lock/heartbeat`, { context: { expectedUserId } }).then(() => {}),
   });
 }
 

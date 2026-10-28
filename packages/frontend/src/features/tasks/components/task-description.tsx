@@ -5,7 +5,10 @@ import Placeholder from "@tiptap/extension-placeholder";
 import DOMPurify from "dompurify";
 import { SafeHtml } from "@/components/safe-html";
 import { useUpdateTask } from "../api";
-import { useDebouncedCallback } from "@/hooks/use-debounced-callback";
+import { useEntityAutosave } from "@/hooks/use-entity-autosave";
+import { useAuthStore } from "@/stores/auth-store";
+import { useRouter } from "@tanstack/react-router";
+import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
 
 interface TaskDescriptionProps {
   taskId: string;
@@ -18,17 +21,45 @@ export function TaskDescription({
   description,
   canEdit,
 }: TaskDescriptionProps) {
-  const updateTask = useUpdateTask();
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  return (
+    <TaskDescriptionEditor
+      key={`${userId}:${taskId}`}
+      taskId={taskId}
+      description={description}
+      canEdit={canEdit}
+    />
+  );
+}
 
-  const debouncedSave = useDebouncedCallback(
-    useCallback(
-      (...args: unknown[]) => {
-        const html = args[0] as string;
-        updateTask.mutate({ id: taskId, description: html || null });
-      },
-      [taskId, updateTask],
-    ),
-    800,
+function TaskDescriptionEditor({
+  taskId,
+  description,
+  canEdit,
+}: TaskDescriptionProps) {
+  const { mutateAsync: updateTask } = useUpdateTask();
+  const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  const router = useRouter({ warn: false });
+  const save = useCallback(
+    (patch: { description: string | null }) => {
+      if (useAuthStore.getState().user?.id !== userId) {
+        return Promise.reject(
+          new Error("Sign in as the author to save these changes"),
+        );
+      }
+      return updateTask({ ...patch, id: taskId, expectedUserId: userId });
+    },
+    [taskId, updateTask, userId],
+  );
+  const autosave = useEntityAutosave(
+    `task-description:${userId}:${taskId}`,
+    save,
+    {
+      author: userId,
+      // Tasks have no edit lock, so a description that failed to save is only
+      // sent again when the user asks; it could otherwise replace a newer one.
+      retryFailedAutomatically: false,
+    },
   );
 
   const editor = useEditor({
@@ -36,17 +67,24 @@ export function TaskDescription({
       StarterKit,
       Placeholder.configure({ placeholder: "Add a description..." }),
     ],
-    content: description ? DOMPurify.sanitize(description) : "",
+    content: DOMPurify.sanitize(
+      (autosave.draft && "description" in autosave.draft
+        ? autosave.draft.description
+        : description) ?? "",
+    ),
     editable: canEdit,
     onUpdate: ({ editor: e }) => {
-      debouncedSave(e.getHTML());
+      autosave.schedule({ description: e.getHTML() || null });
+    },
+    onBlur: () => {
+      void autosave.flush().catch(() => {});
     },
   });
 
   // Update editable state if canEdit changes
   useEffect(() => {
     if (editor) {
-      editor.setEditable(canEdit);
+      editor.setEditable(canEdit, false);
     }
   }, [editor, canEdit]);
 
@@ -67,7 +105,55 @@ export function TaskDescription({
 
   return (
     <div className="rounded-md border p-3 min-h-[100px] [&_.tiptap]:outline-none [&_.tiptap_p.is-editor-empty:first-child::before]:text-muted-foreground [&_.tiptap_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)] [&_.tiptap_p.is-editor-empty:first-child::before]:float-left [&_.tiptap_p.is-editor-empty:first-child::before]:h-0 [&_.tiptap_p.is-editor-empty:first-child::before]:pointer-events-none">
+      {router && (
+        <EditorNavigationGuard
+          beforeLeave={autosave.flush}
+          hasUnsavedChanges={autosave.hasUnsavedChanges}
+        />
+      )}
+      {autosave.parked && (
+        <div
+          role="status"
+          className="mb-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
+        >
+          <span className="flex-1">
+            Earlier changes to this description were not saved.
+          </span>
+          <button
+            className="underline"
+            onClick={() => {
+              const restored = autosave.parked?.description ?? "";
+              editor?.commands.setContent(DOMPurify.sanitize(restored), {
+                emitUpdate: false,
+              });
+              void autosave.restoreParked().catch(() => {});
+            }}
+          >
+            Restore changes
+          </button>
+          <button className="underline" onClick={autosave.discardParked}>
+            Discard
+          </button>
+        </div>
+      )}
       <EditorContent editor={editor} className="text-sm" />
+      <div className="mt-2 text-xs text-muted-foreground" aria-live="polite">
+        {autosave.status === "error" ? (
+          <span role="alert">
+            Changes not saved.{" "}
+            <button
+              className="underline"
+              onClick={() => {
+                void autosave.retry().catch(() => {});
+              }}
+            >
+              Retry save
+            </button>
+          </span>
+        ) : autosave.hasUnsavedChanges ? (
+          "Saving changes…"
+        ) : null}
+      </div>
     </div>
   );
 }

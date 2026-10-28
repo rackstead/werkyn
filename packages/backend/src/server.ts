@@ -90,12 +90,15 @@ async function start() {
       app.log.error(err, "Failed to start Dex");
     });
 
-    // Graceful shutdown: failures and timeouts are logged and exit non-zero
+    // Graceful shutdown: failures and timeouts are logged and exit non-zero.
+    // Each step has its own budget inside the 8 s overall deadline, so a
+    // stalled cleanup batch cannot keep Dex from being signalled. Dex's own
+    // stop sends SIGKILL 5 s after SIGTERM, inside its 5.5 s budget.
     const shutdown = createShutdownHandler({
       log: app.log,
       steps: [
-        { name: "blob cleanup", run: () => blobCleanup.stop() },
-        { name: "dex", run: () => dexManager.stop() },
+        { name: "blob cleanup", run: () => blobCleanup.stop(), timeoutMs: 1_000 },
+        { name: "dex", run: () => dexManager.stop(), timeoutMs: 5_500 },
         { name: "http server", run: () => app.close() },
       ],
     });

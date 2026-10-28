@@ -8,6 +8,31 @@ type ShutdownLog = {
 export interface ShutdownStep {
   name: string;
   run: () => unknown;
+  /**
+   * The step's own budget. When it runs out the step is logged as failed and
+   * the next step starts, so one stalled step cannot keep later ones (such as
+   * signalling Dex) from running before the overall deadline.
+   */
+  timeoutMs?: number;
+}
+
+async function runStep(step: ShutdownStep): Promise<void> {
+  if (step.timeoutMs === undefined) {
+    await step.run();
+    return;
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const budget = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${step.name} did not finish within ${step.timeoutMs} ms`)),
+      step.timeoutMs,
+    );
+  });
+  try {
+    await Promise.race([Promise.resolve().then(step.run), budget]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export interface ShutdownOptions {
@@ -54,21 +79,27 @@ export function createShutdownHandler({
     startedAt = Date.now();
     log.info({ signal }, "Shutting down...");
 
+    let current: string | undefined;
     const deadline = setTimeout(() => {
-      log.fatal({ timeoutMs }, "Shutdown did not finish in time; exiting");
+      log.fatal(
+        { timeoutMs, step: current },
+        `Shutdown did not finish in time (waiting on ${current ?? "nothing"}); exiting`,
+      );
       finish(1);
     }, timeoutMs);
     deadline.unref?.();
 
     let failed = false;
     for (const step of steps) {
+      current = step.name;
       try {
-        await step.run();
+        await runStep(step);
       } catch (err) {
         failed = true;
         log.error({ err, step: step.name }, `Shutdown step failed: ${step.name}`);
       }
     }
+    current = undefined;
     clearTimeout(deadline);
 
     if (failed) {

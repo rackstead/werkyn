@@ -50,6 +50,27 @@ test("a failing step is logged, later steps still run, and the exit code is 1", 
   assert.equal(logged.args[0].step, "dex");
 });
 
+test("a stalled step with its own budget does not keep later steps from running", async () => {
+  const { log, entries, exits, exit } = recorder();
+  const order = [];
+  const shutdown = createShutdownHandler({
+    log,
+    exit,
+    timeoutMs: 1000,
+    steps: [
+      { name: "blob cleanup", run: () => new Promise(() => {}), timeoutMs: 30 },
+      { name: "dex", run: async () => order.push("dex"), timeoutMs: 30 },
+      { name: "http server", run: async () => order.push("http") },
+    ],
+  });
+  await shutdown("SIGTERM");
+  assert.deepEqual(order, ["dex", "http"], "Dex must still be signalled");
+  assert.deepEqual(exits, [1]);
+  const failure = entries.find((entry) => entry.level === "error");
+  assert.equal(failure.args[0].step, "blob cleanup");
+  assert.match(failure.args[0].err.message, /blob cleanup did not finish within 30 ms/);
+});
+
 test("a hung step hits the deadline and exits 1 instead of waiting forever", async () => {
   const { log, entries, exits, exit } = recorder();
   const shutdown = createShutdownHandler({
@@ -61,7 +82,10 @@ test("a hung step hits the deadline and exits 1 instead of waiting forever", asy
   shutdown("SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, 120));
   assert.deepEqual(exits, [1]);
-  assert.ok(entries.some((entry) => entry.level === "fatal"));
+  const fatal = entries.find((entry) => entry.level === "fatal");
+  assert.ok(fatal, "the deadline must be logged");
+  assert.equal(fatal.args[0].step, "http", "the deadline log names the step that hung");
+  assert.match(fatal.args[1], /waiting on http/);
 });
 
 test("a duplicate signal is ignored, while a later one forces a non-zero exit", async () => {

@@ -21,6 +21,14 @@ function flag(name: string) {
     .optional();
 }
 
+// zod's default enum message repeats the received value; name the choices
+// instead so a secret pasted into the wrong variable is never logged.
+function oneOf<const T extends [string, ...string[]]>(name: string, values: T) {
+  return z.enum(values, {
+    errorMap: () => ({ message: `${name} must be one of: ${values.join(", ")}` }),
+  });
+}
+
 function parseHttpUrl(value: string): URL | undefined {
   try {
     const url = new URL(value);
@@ -108,8 +116,8 @@ const COOKIE_DOMAIN_PATTERN = new RegExp(`^\\.?(?:${DOMAIN_LABEL}\\.)*${DOMAIN_L
 
 const envSchema = z.object({
   PORT: port("PORT", 3000),
-  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
-  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  NODE_ENV: oneOf("NODE_ENV", ["development", "production", "test"]).default("development"),
+  LOG_LEVEL: oneOf("LOG_LEVEL", ["debug", "info", "warn", "error"]).default("info"),
 
   DATABASE_URL: databaseUrl,
 
@@ -127,7 +135,7 @@ const envSchema = z.object({
       "COOKIE_DOMAIN must be a bare domain such as example.com (no scheme, port or path)",
     ),
   COOKIE_SECURE: flag("COOKIE_SECURE"),
-  COOKIE_SAMESITE: z.enum(["lax", "strict", "none"]).default("lax"),
+  COOKIE_SAMESITE: oneOf("COOKIE_SAMESITE", ["lax", "strict", "none"]).default("lax"),
 
   CORS_ORIGIN: corsOrigins,
 
@@ -147,7 +155,7 @@ const envSchema = z.object({
   DEX_BINARY_PATH: z.string().min(1, "DEX_BINARY_PATH must not be empty").default("/usr/local/bin/dex"),
   DEX_CONFIG_DIR: z.string().min(1, "DEX_CONFIG_DIR must not be empty").default("/app/data/dex"),
   DEX_INTERNAL_PORT: port("DEX_INTERNAL_PORT", 5556),
-  DEX_STORAGE_TYPE: z.enum(["sqlite3", "postgres"]).default("sqlite3"),
+  DEX_STORAGE_TYPE: oneOf("DEX_STORAGE_TYPE", ["sqlite3", "postgres"]).default("sqlite3"),
   DEX_CLIENT_SECRET: z.string().optional(),
 }).superRefine((values, ctx) => {
   // Browsers drop SameSite=None cookies that are not Secure, so sign-in

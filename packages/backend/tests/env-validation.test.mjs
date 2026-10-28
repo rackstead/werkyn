@@ -123,6 +123,14 @@ test("URL settings must be usable http(s) URLs and origins", () => {
   accepts({ COOKIE_DOMAIN: ".example.com" });
 });
 
+test("enumerated settings name their choices without repeating the value", () => {
+  const pasted = "pasted-secret-in-the-wrong-variable";
+  for (const name of ["NODE_ENV", "LOG_LEVEL", "COOKIE_SAMESITE", "DEX_STORAGE_TYPE"]) {
+    const result = rejects({ [name]: pasted }, name, /must be one of/);
+    assert.equal(JSON.stringify(result.errors).includes(pasted), false, JSON.stringify(result.errors));
+  }
+});
+
 test("SameSite=None cookies require Secure in every mode", () => {
   rejects({ COOKIE_SAMESITE: "none" }, "COOKIE_SAMESITE", /COOKIE_SECURE=true/);
   rejects({ COOKIE_SAMESITE: "none", COOKIE_SECURE: "false" }, "COOKIE_SAMESITE", /COOKIE_SECURE=true/, production);

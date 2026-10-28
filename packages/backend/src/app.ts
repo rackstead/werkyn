@@ -69,7 +69,7 @@ export async function buildApp() {
   await app.register(storagePlugin);
   await app.register(dexProxyPlugin);
 
-  // Liveness (/api/health) and readiness (/api/ready) probes
+  // Probes: liveness (/api/live), readiness (/api/ready) and database health (/api/health)
   await app.register(healthPlugin);
 
   // Module routes

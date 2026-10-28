@@ -37,7 +37,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "date-fns": "^4.1.0",
-    "dompurify": "^3.3.1",
+    "dompurify": "^3.4.17",
     "framer-motion": "^12.33.0",
     "ky": "^1.7.5",
     "lucide-react": "^0.474.0",

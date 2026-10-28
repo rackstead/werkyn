@@ -2,6 +2,12 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import type { TimeReportQuery } from "@pm/shared";
 import * as userRatesService from "./user-rates.service.js";
 import { timeEntryProjectWhere } from "./time-entries.service.js";
+import {
+  csvDecimal,
+  csvIsoDate,
+  encodeCsv,
+  type CsvCell,
+} from "../../utils/csv.js";
 
 export interface CurrencyAmount {
   currency: string;
@@ -230,31 +236,32 @@ export async function exportReportCSV(
 ) {
   const report = await generateReport(prisma, workspaceId, userId, query);
 
-  const rows: string[] = [
-    "Date,User,Project,Task,Hours,Billable,Rate,Currency,Cost,Description",
+  const header = [
+    "Date",
+    "User",
+    "Project",
+    "Task",
+    "Hours",
+    "Billable",
+    "Rate",
+    "Currency",
+    "Cost",
+    "Description",
   ];
+  const records = report.groups.flatMap((group) =>
+    group.entries.map((entry): CsvCell[] => [
+      csvIsoDate(entry.date),
+      entry.userName,
+      entry.projectName,
+      entry.taskTitle,
+      csvDecimal(entry.hours),
+      entry.billable ? "Yes" : "No",
+      entry.rate === null ? null : csvDecimal(entry.rate),
+      entry.currency,
+      entry.cost === null ? null : csvDecimal(entry.cost),
+      entry.description,
+    ]),
+  );
 
-  for (const group of report.groups) {
-    for (const entry of group.entries) {
-      const desc = entry.description
-        ? `"${entry.description.replace(/"/g, '""')}"`
-        : "";
-      rows.push(
-        [
-          entry.date,
-          `"${entry.userName}"`,
-          entry.projectName ? `"${entry.projectName}"` : "",
-          entry.taskTitle ? `"${entry.taskTitle}"` : "",
-          entry.hours.toFixed(2),
-          entry.billable ? "Yes" : "No",
-          entry.rate === null ? "" : entry.rate.toFixed(2),
-          entry.currency ?? "",
-          entry.cost === null ? "" : entry.cost.toFixed(2),
-          desc,
-        ].join(","),
-      );
-    }
-  }
-
-  return rows.join("\n");
+  return encodeCsv(header, records);
 }

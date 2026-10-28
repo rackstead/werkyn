@@ -35,14 +35,25 @@ type Client = PrismaClient | Prisma.TransactionClient;
 type Tx = Prisma.TransactionClient;
 
 // Locking relies on READ COMMITTED: each statement after a lock wait sees the
-// rows the previous holder committed. Lock waits count toward the transaction
-// budget; holders keep a family lock for a few statements, so it runs out only
-// when the database is stalled.
+// rows the previous holder committed. Holders keep a family lock for a few
+// statements, so the budget runs out only when the database is stalled.
 export const refreshTransactionOptions = {
   isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
   maxWait: 5_000,
   timeout: 10_000,
 };
+
+// Prisma's timeout does not cancel a statement already waiting on a lock; the
+// request would only fail once the holder lets go. Each lock wait is therefore
+// capped below the transaction timeout and fails with 55P03 instead.
+export const refreshLockLimits = { lockTimeoutMs: 8_000 };
+
+/** Caps every lock wait for the rest of the caller's transaction. */
+export async function limitLockWaits(tx: Tx) {
+  await tx.$executeRaw`
+    SELECT set_config('lock_timeout', ${`${refreshLockLimits.lockTimeoutMs}ms`}, true)
+  `;
+}
 
 /**
  * Starts a new family for the user and returns its first raw refresh token.
@@ -55,10 +66,10 @@ export async function createRefreshSession(
   userId: string,
 ): Promise<string> {
   if ("$transaction" in client)
-    return client.$transaction(
-      (tx) => createRefreshSession(tx, userId),
-      refreshTransactionOptions,
-    );
+    return client.$transaction(async (tx) => {
+      await limitLockWaits(tx);
+      return createRefreshSession(tx, userId);
+    }, refreshTransactionOptions);
   await client.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR SHARE`;
   const refreshToken = generateRefreshToken();
   // The family is never visible without its first token.
@@ -120,13 +131,19 @@ export type RotationResult =
   | { status: "expired" }
   | { status: "invalid" };
 
-// The interactive transaction ran out of its budget (or was closed) and was
-// rolled back, so nothing it did is committed. Answered 503: unlike a
-// superseded token (409), the presented cookie is unchanged.
-function isTransactionTimeout(error: unknown) {
+// The transaction hit a lock timeout (55P03; raw queries report it in
+// meta.code, model queries only in the message) or ran out of its budget
+// (P2028) and was rolled back, so nothing it did is committed. Answered 503:
+// unlike a superseded token (409), the presented cookie is unchanged.
+function isBusy(error: unknown) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError)
+    return (
+      error.code === "P2028" ||
+      (error.meta as { code?: unknown } | undefined)?.code === "55P03"
+    );
   return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2028"
+    error instanceof Prisma.PrismaClientUnknownRequestError &&
+    /\b55P03\b/.test(error.message)
   );
 }
 
@@ -140,6 +157,7 @@ export function rotateRefreshToken(
 ): Promise<RotationResult> {
   const tokenHash = hashToken(rawToken);
   const rotation = prisma.$transaction(async (tx): Promise<RotationResult> => {
+    await limitLockWaits(tx);
     const familyId = await findFamilyId(tx, tokenHash);
     if (!familyId) return { status: "invalid" };
     const family = await lockFamily(tx, familyId);
@@ -183,7 +201,7 @@ export function rotateRefreshToken(
     return { status: "invalid" };
   }, refreshTransactionOptions);
   return rotation.catch((error: unknown): RotationResult => {
-    if (isTransactionTimeout(error)) return { status: "busy" };
+    if (isBusy(error)) return { status: "busy" };
     throw error;
   });
 }
@@ -196,6 +214,7 @@ export async function revokeRefreshFamily(
 ) {
   const tokenHash = hashToken(rawToken);
   await prisma.$transaction(async (tx) => {
+    await limitLockWaits(tx);
     const familyId = await findFamilyId(tx, tokenHash);
     if (!familyId || !(await lockFamily(tx, familyId))) return;
     await revokeLockedFamily(tx, familyId, reason);
@@ -204,7 +223,7 @@ export async function revokeRefreshFamily(
 
 /**
  * Revokes every family of a user inside the caller's READ COMMITTED
- * transaction. Families are locked in id order, waiting for in-flight
+ * transaction, which should start with limitLockWaits. Families are locked in id order, waiting for in-flight
  * rotations to commit, so their successors are deleted as well.
  */
 export async function revokeUserRefreshSessions(

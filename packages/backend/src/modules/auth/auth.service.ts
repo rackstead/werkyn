@@ -7,6 +7,7 @@ import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
 import {
   createRefreshSession,
+  limitLockWaits,
   refreshTransactionOptions,
   revokeRefreshFamily,
   revokeUserRefreshSessions,
@@ -289,6 +290,7 @@ export async function login(
   // held (FOR SHARE) until the new session commits, so a concurrent password
   // change or reset either rejects this login or revokes the new session.
   const refreshToken = await prisma.$transaction(async (tx) => {
+    await limitLockWaits(tx);
     const [current] = await tx.$queryRaw<
       Array<{ passwordHash: string | null }>
     >`
@@ -414,6 +416,7 @@ export async function resetPassword(
   const passwordHash = await hashPassword(newPassword);
 
   await prisma.$transaction(async (tx) => {
+    await limitLockWaits(tx);
     await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },

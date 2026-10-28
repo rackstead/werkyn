@@ -44,7 +44,7 @@ const { buildApp } = await import("../../src/app.ts");
 const { hashToken } = await import("../../src/utils/tokens.ts");
 const { hashPassword } = await import("../../src/utils/passwords.ts");
 const authService = await import("../../src/modules/auth/auth.service.ts");
-const { refreshTransactionOptions } =
+const { refreshLockLimits, refreshTransactionOptions } =
   await import("../../src/modules/auth/refresh-sessions.ts");
 
 // Policy under test: a rotated token presented within this window of its
@@ -648,6 +648,47 @@ test("a refresh that exhausts its transaction budget is a retryable 503 that cha
   }
   assert.equal(response.statusCode, 503, response.body);
   assert.match(response.json().message, /busy/i);
+  assert.equal(cookieOf(response), undefined);
+  assert.deepEqual(await activeTokens(familyId), [hashToken(session.refresh)]);
+  assert.equal((await familyRecord(familyId)).revokedAt, null);
+  await rotate(session.refresh);
+});
+
+test("a refresh blocked on a held family lock is answered 503 before the lock is released", async () => {
+  const user = await makeUser();
+  const session = await signIn(user);
+  const familyId = await familyOf(session.refresh);
+  const limit = refreshLockLimits.lockTimeoutMs;
+  let response, elapsed;
+  refreshLockLimits.lockTimeoutMs = 300;
+  try {
+    await withControlLock(familyRowLock(familyId), async (start) => {
+      const started = performance.now();
+      const pending = start(() => refresh(session.refresh));
+      await waitForLockWaiters(1);
+      // The control still holds the lock: the answer must not wait for it.
+      let timer;
+      try {
+        response = await Promise.race([
+          pending,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("refresh waited for the lock holder")),
+              5_000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      elapsed = performance.now() - started;
+    });
+  } finally {
+    refreshLockLimits.lockTimeoutMs = limit;
+  }
+  assert.equal(response.statusCode, 503, response.body);
+  assert.match(response.json().message, /busy/i);
+  assert(elapsed < 3_000, `answered after ${Math.round(elapsed)} ms`);
   assert.equal(cookieOf(response), undefined);
   assert.deepEqual(await activeTokens(familyId), [hashToken(session.refresh)]);
   assert.equal((await familyRecord(familyId)).revokedAt, null);

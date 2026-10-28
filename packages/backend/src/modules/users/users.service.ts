@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
+  limitLockWaits,
   refreshTransactionOptions,
   revokeUserRefreshSessions,
 } from "../auth/refresh-sessions.js";
@@ -92,6 +93,7 @@ export async function changePassword(
   const passwordHash = await hashPassword(data.newPassword);
 
   await prisma.$transaction(async (tx) => {
+    await limitLockWaits(tx);
     await tx.user.update({
       where: { id: userId },
       data: { passwordHash },

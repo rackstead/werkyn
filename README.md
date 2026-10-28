@@ -39,6 +39,9 @@ Put the three generated values in `.env` as `JWT_SECRET`, `COOKIE_SECRET`, and
 `POSTGRES_PASSWORD`. Keep the database password hexadecimal, as it is embedded in
 the database URL. The environment file is ignored by git. For a remote HTTPS
 installation, also set `COOKIE_SECURE=true`, `FRONTEND_URL`, and `CORS_ORIGIN`.
+Configure outgoing email under Admin > Email, or with the `SMTP_*` variables.
+Without SMTP, the server does not send verification or password-reset email and logs
+an error. Only `NODE_ENV=development` falls back to the Ethereal test inbox.
 
 3. Start the application:
 ```bash
@@ -184,6 +187,9 @@ pnpm db:generate
 pnpm db:migrate
 pnpm db:seed  # Optional: seed with sample data
 ```
+The seed creates sample accounts with a published password. It refuses to run with
+`NODE_ENV=production` or against a database that already has other accounts or
+workspaces. `SEED_FORCE=true` replaces only previously seeded data.
 
 5. Start development servers:
 ```bash
@@ -210,7 +216,7 @@ This will start both the backend and frontend in development mode:
 - `pnpm start` - Start production server
 - `pnpm db:migrate` - Run database migrations
 - `pnpm db:generate` - Generate Prisma client
-- `pnpm db:seed` - Seed database with sample data
+- `pnpm db:seed` - Seed an empty development database with sample data
 - `pnpm db:studio` - Open Prisma Studio
 
 **Frontend (`packages/frontend`):**

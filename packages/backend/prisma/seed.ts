@@ -1,23 +1,51 @@
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcrypt";
+import {
+  SEED_PASSWORD,
+  SEED_USER_EMAILS,
+  SEED_WORKSPACE_SLUGS,
+  countVerifiedSeedUsers,
+  decideSeed,
+  environmentRefusal,
+} from "./seed-guard.js";
 
 const prisma = new PrismaClient();
 
 const SALT_ROUNDS = 12;
 
-async function main() {
-  // Idempotency check
-  const existing = await prisma.user.findUnique({
-    where: { email: "alice@test.com" },
-  });
+class SeedRefused extends Error {}
 
-  if (existing && process.env.SEED_FORCE !== "true") {
-    console.log("Seed data already exists. Set SEED_FORCE=true to reseed.");
+async function main() {
+  // Refuse before any database connection is made.
+  const refusal = environmentRefusal(process.env.NODE_ENV);
+  if (refusal) throw new SeedRefused(refusal);
+
+  const [users, seedAddressUsers, workspaces, seedWorkspaces] = await Promise.all([
+    prisma.user.count(),
+    prisma.user.findMany({
+      where: { email: { in: [...SEED_USER_EMAILS] } },
+      select: { passwordHash: true },
+    }),
+    prisma.workspace.count(),
+    prisma.workspace.count({ where: { slug: { in: [...SEED_WORKSPACE_SLUGS] } } }),
+  ]);
+  const seedUsers = await countVerifiedSeedUsers(seedAddressUsers, bcrypt.compare);
+  const decision = decideSeed(
+    { users, seedUsers, workspaces, seedWorkspaces },
+    process.env.SEED_FORCE === "true",
+  );
+
+  if (decision.action === "refuse") throw new SeedRefused(decision.reason);
+  if (decision.action === "skip") {
+    console.log(decision.reason);
     return;
   }
 
-  if (existing) {
-    console.log("SEED_FORCE=true: Cleaning existing data...");
+  if (decision.action === "reseed") {
+    // decideSeed only allows this when every account is a seed address that
+    // still has the published seed password and every workspace is a seed
+    // workspace, so all remaining data belongs to the demo accounts.
+    console.log("SEED_FORCE=true: Cleaning existing seed data...");
     // Delete in order respecting constraints
     // Wiki tables (best-effort — may not exist if migrations haven't been applied)
     await prisma.wikiPageShare.deleteMany().catch(() => {});
@@ -48,7 +76,7 @@ async function main() {
     await prisma.user.deleteMany();
   }
 
-  const passwordHash = await bcrypt.hash("password123", SALT_ROUNDS);
+  const passwordHash = await bcrypt.hash(SEED_PASSWORD, SALT_ROUNDS);
 
   // ─── Users ───────────────────────────────────────────
   console.log("Creating users...");
@@ -1526,8 +1554,9 @@ async function main() {
 
 main()
   .catch((e) => {
-    console.error("Seed failed:", e);
-    process.exit(1);
+    if (e instanceof SeedRefused) console.error(`Seed refused: ${e.message}`);
+    else console.error("Seed failed:", e);
+    process.exitCode = 1;
   })
   .finally(async () => {
     await prisma.$disconnect();

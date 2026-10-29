@@ -255,6 +255,16 @@ export async function removeMember(
     await tx.groupMember.deleteMany({
       where: { userId: targetUserId, group: { workspaceId } },
     });
+    // Assignments end with access, as on project removal. An assignment that
+    // held the membership rows committed before the delete above, so these
+    // later statements see and clear it (task-references.ts).
+    await tx.taskAssignee.deleteMany({
+      where: { userId: targetUserId, task: { project: { workspaceId } } },
+    });
+    await tx.subtask.updateMany({
+      where: { assigneeId: targetUserId, task: { project: { workspaceId } } },
+      data: { assigneeId: null },
+    });
   });
 
   revokeWorkspaceAccess(targetUserId, workspaceId);

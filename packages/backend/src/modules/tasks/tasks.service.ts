@@ -595,33 +595,38 @@ export async function addAssignee(
     throw new ForbiddenError("Members can only assign themselves");
   }
 
-  await assertProjectAssignees(prisma, task.projectId, [data.userId]);
+  // The access check holds the assignee's membership rows until the insert
+  // commits, so a concurrent removal either waits and then clears this
+  // assignment or commits first and the check fails.
+  return prisma.$transaction(async (tx) => {
+    await assertProjectAssignees(tx, task.projectId, [data.userId]);
 
-  // Check if already assigned
-  const existing = await prisma.taskAssignee.findUnique({
-    where: { taskId_userId: { taskId, userId: data.userId } },
-  });
-  if (existing) {
-    throw new ConflictError("User is already assigned to this task");
-  }
+    // Check if already assigned
+    const existing = await tx.taskAssignee.findUnique({
+      where: { taskId_userId: { taskId, userId: data.userId } },
+    });
+    if (existing) {
+      throw new ConflictError("User is already assigned to this task");
+    }
 
-  const assignee = await prisma.taskAssignee.create({
-    data: { taskId, userId: data.userId },
-    include: {
-      user: {
-        select: { id: true, displayName: true, avatarUrl: true },
+    const assignee = await tx.taskAssignee.create({
+      data: { taskId, userId: data.userId },
+      include: {
+        user: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
       },
-    },
-  });
+    });
 
-  await logActivity(prisma, {
-    taskId,
-    actorId,
-    action: "assigned",
-    details: { userId: data.userId },
-  });
+    await logActivity(tx, {
+      taskId,
+      actorId,
+      action: "assigned",
+      details: { userId: data.userId },
+    });
 
-  return assignee;
+    return assignee;
+  });
 }
 
 export async function removeAssignee(

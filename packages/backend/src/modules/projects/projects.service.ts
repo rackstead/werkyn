@@ -7,6 +7,7 @@ import type {
   AddProjectMemberInput,
 } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { revokeProjectAccess } from "../realtime/realtime.service.js";
 
 const DEFAULT_STATUSES = [
@@ -187,36 +188,41 @@ export async function addProjectMember(
   workspaceId: string,
   data: AddProjectMemberInput,
 ) {
-  // Validate target is a workspace member
-  const wsMember = await prisma.workspaceMember.findUnique({
-    where: {
-      userId_workspaceId: { userId: data.userId, workspaceId },
-    },
-  });
-  if (!wsMember) {
-    throw new NotFoundError("User is not a workspace member");
-  }
+  // Under the workspace lock, so a concurrent workspace removal of the same
+  // user either commits first (and the membership check fails) or waits for
+  // this row and then deletes it with the user's other project rows.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    // Validate target is a workspace member
+    const wsMember = await tx.workspaceMember.findUnique({
+      where: {
+        userId_workspaceId: { userId: data.userId, workspaceId },
+      },
+    });
+    if (!wsMember) {
+      throw new NotFoundError("User is not a workspace member");
+    }
 
-  // Check if already a project member
-  const existing = await prisma.projectMember.findUnique({
-    where: { projectId_userId: { projectId, userId: data.userId } },
-  });
-  if (existing) {
-    throw new ConflictError("User is already a project member");
-  }
+    // Check if already a project member
+    const existing = await tx.projectMember.findUnique({
+      where: { projectId_userId: { projectId, userId: data.userId } },
+    });
+    if (existing) {
+      throw new ConflictError("User is already a project member");
+    }
 
-  return prisma.projectMember.create({
-    data: { projectId, userId: data.userId },
-    include: {
-      user: {
-        select: {
-          id: true,
-          email: true,
-          displayName: true,
-          avatarUrl: true,
+    return tx.projectMember.create({
+      data: { projectId, userId: data.userId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            displayName: true,
+            avatarUrl: true,
+          },
         },
       },
-    },
+    });
   });
 }
 
@@ -225,14 +231,26 @@ export async function removeProjectMember(
   projectId: string,
   targetUserId: string,
 ) {
-  const member = await prisma.projectMember.findUnique({
-    where: { projectId_userId: { projectId, userId: targetUserId } },
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { workspaceId: true },
   });
-  if (!member) {
-    throw new NotFoundError("Project member not found");
+  if (!project) {
+    throw new NotFoundError("Project not found");
   }
 
-  await prisma.$transaction(async (tx) => {
+  // Workspace lock first, as for every membership change. Deleting the
+  // membership row before clearing assignments makes the removal wait for any
+  // assignment that already holds the row (task-references.ts) and makes any
+  // later one see the user without access, so no assignment survives.
+  await withWorkspaceLock(prisma, project.workspaceId, async (tx) => {
+    const removed = await tx.projectMember.deleteMany({
+      where: { projectId, userId: targetUserId },
+    });
+    if (removed.count === 0) {
+      throw new NotFoundError("Project member not found");
+    }
+
     // Unassign from all tasks in this project
     await tx.taskAssignee.deleteMany({
       where: {
@@ -249,8 +267,6 @@ export async function removeProjectMember(
       },
       data: { assigneeId: null },
     });
-
-    await tx.projectMember.delete({ where: { id: member.id } });
   });
   revokeProjectAccess(targetUserId, projectId);
 }

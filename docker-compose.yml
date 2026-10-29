@@ -1,4 +1,28 @@
+x-werkyn-data-paths: &werkyn-data-paths
+  STORAGE_DIR: /app/storage
+  DEX_CONFIG_DIR: /app/data/dex
+
+x-werkyn-data-volumes: &werkyn-data-volumes
+  - werkyn-storage:/app/storage
+  - werkyn-dex-data:/app/data/dex
+
 services:
+  # The app runs as the unprivileged user werkyn. Earlier images ran as root, so
+  # this one-off step hands files owned by root in the data volumes to werkyn
+  # before every start, then exits. It changes nothing else and has no network.
+  werkyn-permissions:
+    container_name: werkyn-permissions
+    build: .
+    user: "0"
+    command: ["fix-permissions"]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    environment: *werkyn-data-paths
+    volumes: *werkyn-data-volumes
+
   werkyn:
     container_name: werkyn-app
     build: .
@@ -6,9 +30,12 @@ services:
     ports:
       - "3000:3000"
     depends_on:
+      werkyn-permissions:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
+      <<: *werkyn-data-paths
       NODE_ENV: production
       PORT: 3000
       DATABASE_URL: postgresql://user:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/projectapp
@@ -18,12 +45,8 @@ services:
       COOKIE_SAMESITE: lax
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
-      STORAGE_DIR: /app/storage
       DEX_STORAGE_TYPE: postgres
-      DEX_CONFIG_DIR: /app/data/dex
-    volumes:
-      - werkyn-storage:/app/storage
-      - werkyn-dex-data:/app/data/dex
+    volumes: *werkyn-data-volumes
 
   postgres:
     container_name: werkyn-postgres

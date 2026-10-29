@@ -5,6 +5,9 @@ import { assertProjectAccess } from "../../utils/project-access.js";
 
 interface ConnectionInfo {
   userId: string;
+  // The sign-in session (refresh-token family) of the access token that
+  // opened the socket. Ending that session closes the socket.
+  sessionId: string;
   // Each subscription remembers its workspace so a workspace revocation can
   // drop every dependent subscription without another database read.
   projects: Map<string, string>;
@@ -22,6 +25,16 @@ interface ConnectionInfo {
 
 const connections = new Map<WebSocket, ConnectionInfo>();
 const userConnectionCounts = new Map<string, number>();
+
+// Authentications whose session lookup is in flight. Ending a session marks
+// them, so a lookup that read the session just before its revocation
+// committed cannot register a socket after the revocation closed the others.
+interface PendingAuthentication {
+  userId: string;
+  sessionId: string;
+  ended: boolean;
+}
+const pendingAuthentications = new Set<PendingAuthentication>();
 
 const MAX_CONNECTIONS_PER_USER = 5;
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
@@ -42,19 +55,42 @@ export const WS_CLOSE = {
 
 type CloseReason = (typeof WS_CLOSE)[keyof typeof WS_CLOSE];
 
+/**
+ * Authenticates a socket with an access token whose session is still live.
+ *
+ * Close codes: 4002 for an invalid or expired token; 4004 for a token that
+ * names no session (issued before access tokens carried `sid`), so the client
+ * refreshes and reconnects with a session-bound token; 4005 for a token whose
+ * session has ended (logout, password change or reset, password login
+ * elsewhere, refresh-token reuse, or a deleted account).
+ */
 export async function authenticate(
   ws: WebSocket,
   token: string,
   prisma: PrismaClient,
 ): Promise<string | null> {
+  let payload: ReturnType<typeof verifyAccessToken>;
   try {
-    const payload = verifyAccessToken(token);
-    const userId = payload.sub;
+    payload = verifyAccessToken(token);
     if (typeof payload.exp !== "number") throw new Error("Access token has no expiry");
+  } catch {
+    ws.close(WS_CLOSE.AUTH_FAILED.code, WS_CLOSE.AUTH_FAILED.reason);
+    return null;
+  }
+  const userId = payload.sub;
+  const sessionId = payload.sid;
+  // A token without a session could never be closed with it.
+  if (typeof sessionId !== "string" || sessionId === "") {
+    ws.close(WS_CLOSE.SESSION_EXPIRED.code, WS_CLOSE.SESSION_EXPIRED.reason);
+    return null;
+  }
 
-    // Check user exists
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
+  const pending: PendingAuthentication = { userId, sessionId, ended: false };
+  pendingAuthentications.add(pending);
+  try {
+    // A live session implies the account exists: families cascade with it.
+    const session = await prisma.refreshTokenFamily.findFirst({
+      where: { id: sessionId, userId, revokedAt: null },
       select: { id: true },
     });
 
@@ -62,8 +98,10 @@ export async function authenticate(
     // would leak a connection slot that no close event will ever release.
     if (ws.readyState !== ws.OPEN) return null;
 
-    if (!user) {
-      ws.close(WS_CLOSE.AUTH_FAILED.code, WS_CLOSE.AUTH_FAILED.reason);
+    // `ended` is set by a revocation that committed after the lookup read
+    // the session; nothing awaits between this check and registration.
+    if (!session || pending.ended) {
+      ws.close(WS_CLOSE.SESSION_REVOKED.code, WS_CLOSE.SESSION_REVOKED.reason);
       return null;
     }
 
@@ -76,6 +114,7 @@ export async function authenticate(
 
     const conn: ConnectionInfo = {
       userId,
+      sessionId,
       projects: new Map(),
       workspaceIds: new Set(),
       channels: new Map(),
@@ -92,6 +131,8 @@ export async function authenticate(
   } catch {
     ws.close(WS_CLOSE.AUTH_FAILED.code, WS_CLOSE.AUTH_FAILED.reason);
     return null;
+  } finally {
+    pendingAuthentications.delete(pending);
   }
 }
 
@@ -283,11 +324,36 @@ export function revokeWorkspaceAccess(userId: string, workspaceId: string): void
   }
 }
 
+// ─── Session end ───────────────────────────────────────
+// Call these after the revocation has committed. They close the affected
+// sockets in this process with 4005 before the caller responds, and refuse
+// authentications of those sessions whose lookup is still in flight.
+
 /**
- * Closes every socket the user has open, for session-wide revocation such as
- * a password change or reset. Clients must authenticate again to reconnect.
+ * Closes every socket opened with an access token of one of these sessions
+ * (refresh-token family ids). Sockets of the user's other sessions stay open.
+ */
+export function endSessions(sessionIds: Iterable<string>): void {
+  const ended = new Set(sessionIds);
+  if (ended.size === 0) return;
+  for (const pending of pendingAuthentications) {
+    if (ended.has(pending.sessionId)) pending.ended = true;
+  }
+  for (const [ws, conn] of connections) {
+    if (ended.has(conn.sessionId)) terminate(ws, WS_CLOSE.SESSION_REVOKED);
+  }
+}
+
+/**
+ * Closes every socket the user has open in any session. No route calls it
+ * today: there is no account deletion or deactivation endpoint, and a deleted
+ * account's sessions are deleted with it, so its sockets could not
+ * authenticate again.
  */
 export function disconnectUserSockets(userId: string): void {
+  for (const pending of pendingAuthentications) {
+    if (pending.userId === userId) pending.ended = true;
+  }
   for (const [ws, conn] of connections) {
     if (conn.userId === userId) terminate(ws, WS_CLOSE.SESSION_REVOKED);
   }

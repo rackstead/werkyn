@@ -50,6 +50,7 @@ process.env.SMTP_SECURE = "false";
 const { PrismaClient } = await import("@prisma/client");
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.ts");
 const { resetTransporter } = await import("../../src/utils/mailer.ts");
 
 const suffix = crypto.randomBytes(5).toString("hex");
@@ -269,6 +270,9 @@ async function assertNoWorkspaceAccess(user, workspace) {
 }
 
 async function subscribeWorkspace(user, workspace) {
+  // Realtime requires an access token bound to a live sign-in session.
+  const { familyId } = await startRefreshSession(app.prisma, user.id);
+  const token = signAccessToken({ sub: user.id, email: user.email, sid: familyId });
   const socket = await app.injectWS("/api/ws");
   const messages = [];
   const waiters = [];
@@ -293,7 +297,7 @@ async function subscribeWorkspace(user, workspace) {
     ]).finally(() => clearTimeout(timer));
   };
   try {
-    socket.send(JSON.stringify({ type: "auth", token: user.token }));
+    socket.send(JSON.stringify({ type: "auth", token }));
     await next("authenticated");
     socket.send(
       JSON.stringify({ type: "subscribe_workspace", workspaceId: workspace.id }),

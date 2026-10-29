@@ -18,10 +18,18 @@ const SCOPES = {
 } as const;
 type Scope = keyof typeof SCOPES;
 
+// The server closes a socket with these codes when the session behind its
+// access token expired (4004) or ended (4005: logout, password change or
+// reset, sign-in elsewhere, refresh-token reuse).
+const SESSION_CLOSE_CODES = new Set([4004, 4005]);
+
 interface WebSocketClientOptions {
   url: string;
   getToken: () => string | null;
   onReconnect?: () => void;
+  // Called once per socket closed with a session close code. Reconnecting
+  // with the same token cannot succeed; the owner renews or ends the session.
+  onSessionEnded?: (code: number) => void;
 }
 
 export class WebSocketClient {
@@ -29,6 +37,7 @@ export class WebSocketClient {
   private url: string;
   private getToken: () => string | null;
   private onReconnect?: () => void;
+  private onSessionEnded?: (code: number) => void;
   private handlers = new Map<string, Set<EventHandler>>();
   private reconnectAttempts = 0;
   private maxReconnectDelay = 30_000;
@@ -55,6 +64,7 @@ export class WebSocketClient {
     this.url = options.url;
     this.getToken = options.getToken;
     this.onReconnect = options.onReconnect;
+    this.onSessionEnded = options.onSessionEnded;
 
     // Reconnect on tab focus
     this.handleVisibility = this.handleVisibility.bind(this);
@@ -98,12 +108,14 @@ export class WebSocketClient {
         this.dispatch("*", msg);
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event) => {
         this.ws = null;
         this.connected = false;
-        if (!this.destroyed) {
-          this.scheduleReconnect();
-        }
+        if (this.destroyed) return;
+        // The normal backoff still applies, so a renewal that keeps the same
+        // token cannot turn into a reconnect loop.
+        this.scheduleReconnect();
+        if (SESSION_CLOSE_CODES.has(event.code)) this.onSessionEnded?.(event.code);
       };
 
       this.ws.onerror = () => {

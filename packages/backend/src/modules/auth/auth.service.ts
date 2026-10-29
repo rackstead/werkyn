@@ -6,14 +6,15 @@ import { logger } from "../../utils/logger.js";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
 import {
-  createRefreshSession,
   isBusy,
   limitLockWaits,
   refreshTransactionOptions,
   revokeRefreshFamily,
   revokeUserRefreshSessions,
   rotateRefreshToken,
+  startRefreshSession,
 } from "./refresh-sessions.js";
+import { endSessions } from "../realtime/realtime.service.js";
 import {
   sendVerificationEmail,
   sendPasswordResetEmail,
@@ -30,6 +31,7 @@ import {
 export {
   REFRESH_REUSE_GRACE_MS,
   createRefreshSession,
+  startRefreshSession,
 } from "./refresh-sessions.js";
 
 // Progressive lockout thresholds
@@ -72,8 +74,8 @@ async function createTokenPair(
   userId: string,
   email: string,
 ) {
-  const accessToken = signAccessToken({ sub: userId, email });
-  const refreshToken = await createRefreshSession(prisma, userId);
+  const { refreshToken, familyId } = await startRefreshSession(prisma, userId);
+  const accessToken = signAccessToken({ sub: userId, email, sid: familyId });
   return { accessToken, refreshToken };
 }
 
@@ -293,7 +295,7 @@ export async function login(
   // concurrent logins (which find no family to lock on a fresh account) run
   // one after another, so only the last one's session remains. The lock still
   // admits the KEY SHARE checks of in-flight rotations.
-  const refreshToken = await prisma.$transaction(async (tx) => {
+  const signIn = await prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     const [current] = await tx.$queryRaw<
       Array<{ passwordHash: string | null }>
@@ -301,12 +303,19 @@ export async function login(
       SELECT "passwordHash" FROM "User" WHERE id = ${user.id} FOR NO KEY UPDATE
     `;
     if (current?.passwordHash !== user.passwordHash) return null;
-    await revokeUserRefreshSessions(tx, user.id, "login");
-    return createRefreshSession(tx, user.id);
+    const replaced = await revokeUserRefreshSessions(tx, user.id, "login");
+    return { replaced, session: await startRefreshSession(tx, user.id) };
   }, refreshTransactionOptions);
-  if (!refreshToken) throw new UnauthorizedError("Invalid email or password");
+  if (!signIn) throw new UnauthorizedError("Invalid email or password");
+  // The replaced sessions' sockets close now that their revocation committed.
+  endSessions(signIn.replaced);
+  const { refreshToken, familyId } = signIn.session;
 
-  const accessToken = signAccessToken({ sub: user.id, email: user.email });
+  const accessToken = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    sid: familyId,
+  });
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
   const { passwordHash: _, ...userWithoutPassword } = user;
@@ -335,6 +344,11 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
   if (rotation.status === "expired") {
     throw new UnauthorizedError("Refresh token expired");
   }
+  if (rotation.status === "reused") {
+    // A replayed rotated token ended its session; so do its sockets.
+    endSessions([rotation.familyId]);
+    throw new UnauthorizedError("Invalid refresh token");
+  }
   if (rotation.status !== "rotated") {
     throw new UnauthorizedError("Invalid refresh token");
   }
@@ -357,16 +371,22 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
     throw new UnauthorizedError("User not found");
   }
 
-  const accessToken = signAccessToken({ sub: user.id, email: user.email });
+  const accessToken = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    sid: rotation.familyId,
+  });
   const workspaces = await getUserWorkspaces(prisma, user.id);
 
   return { user, accessToken, refreshToken: rotation.refreshToken, workspaces };
 }
 
 // Ends the cookie's whole session (family), whether the presented token is the
-// current one or was already rotated. Unknown tokens are a no-op.
+// current one or was already rotated, and closes that session's sockets. The
+// account's other sessions are untouched. Unknown tokens are a no-op.
 export async function logout(prisma: PrismaClient, rawToken: string) {
-  await revokeRefreshFamily(prisma, rawToken, "logout");
+  const familyId = await revokeRefreshFamily(prisma, rawToken, "logout");
+  if (familyId) endSessions([familyId]);
 }
 
 export async function forgotPassword(prisma: PrismaClient, email: string) {
@@ -486,9 +506,9 @@ export async function resetPassword(
       where: { id: resetToken.userId },
       data: { passwordHash },
     });
-    await revokeUserRefreshSessions(tx, resetToken.userId, "password_reset");
+    return revokeUserRefreshSessions(tx, resetToken.userId, "password_reset");
   }, refreshTransactionOptions);
-  await resetting.catch(retryLinkWhenBusy);
+  endSessions(await resetting.catch(retryLinkWhenBusy));
 }
 
 function assertVerificationTokenUsable<T extends { expiresAt: Date }>(

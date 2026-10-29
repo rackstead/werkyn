@@ -6,6 +6,7 @@ import {
   refreshTransactionOptions,
   revokeUserRefreshSessions,
 } from "../auth/refresh-sessions.js";
+import { endSessions } from "../realtime/realtime.service.js";
 import {
   AppError,
   ForbiddenError,
@@ -115,9 +116,9 @@ export async function changePassword(
       where: { id: userId },
       data: { passwordHash },
     });
-    await revokeUserRefreshSessions(tx, userId, "password_change");
+    return revokeUserRefreshSessions(tx, userId, "password_change");
   }, refreshTransactionOptions);
-  await changing.catch((error: unknown) => {
+  const revoked = await changing.catch((error: unknown) => {
     // A lock wait past the lock timeout, or a transaction past its budget,
     // was rolled back without changing anything; the request can be retried.
     if (isBusy(error))
@@ -128,6 +129,9 @@ export async function changePassword(
       );
     throw error;
   });
+  // Every session ended, including the one that made the change; their
+  // sockets close now that the revocation has committed.
+  endSessions(revoked);
 
   return { message: "Password updated" };
 }

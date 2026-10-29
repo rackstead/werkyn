@@ -35,6 +35,14 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
         // Invalidate all queries to catch missed events
         queryClient.invalidateQueries();
       },
+      // The session behind the token expired or ended (4004/4005). One
+      // refresh yields a token that rebuilds this client, or signs out.
+      onSessionEnded: () => {
+        const auth = useAuthStore.getState();
+        void auth.refresh().then((refreshed) => {
+          if (!refreshed) return auth.logout();
+        });
+      },
     });
 
     setClient(wsClient);

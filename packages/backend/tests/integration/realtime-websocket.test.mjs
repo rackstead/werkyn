@@ -19,6 +19,7 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-realtime-ws-"));
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 
 let app, port, member, outsider, workspace, foreignWorkspace, token;
 
@@ -39,7 +40,9 @@ before(async () => {
   foreignWorkspace = await app.prisma.workspace.create({
     data: { name: "Realtime foreign", slug: `rt-foreign-${suffix}`, members: { create: { userId: outsider.id, role: "ADMIN" } } },
   });
-  token = signAccessToken({ sub: member.id, email: member.email });
+  // Sockets require an access token bound to a live sign-in session.
+  const { familyId } = await startRefreshSession(app.prisma, member.id);
+  token = signAccessToken({ sub: member.id, email: member.email, sid: familyId });
 });
 
 after(async () => {

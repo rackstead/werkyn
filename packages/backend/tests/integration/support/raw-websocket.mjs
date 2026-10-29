@@ -4,9 +4,10 @@ import net from "node:net";
 
 // Minimal RFC 6455 client over a plain TCP socket. It runs on every supported
 // Node.js release (Node 20 has no global WebSocket client) and lets the tests
-// control framing, including fragmented and oversized messages.
-export async function openRawSocket(port) {
-  const socket = net.connect(port, "127.0.0.1");
+// control framing, including fragmented and oversized messages. A distinct
+// loopback `localAddress` keeps the per-IP rate limit out of busy tests.
+export async function openRawSocket(port, { localAddress } = {}) {
+  const socket = net.connect({ port, host: "127.0.0.1", ...(localAddress ? { localAddress } : {}) });
   let buffered = Buffer.alloc(0);
   let ended = false;
   const waiters = [];

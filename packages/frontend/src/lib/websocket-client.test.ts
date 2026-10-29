@@ -165,3 +165,54 @@ describe("shared subscriptions", () => {
     ]);
   });
 });
+
+describe("session close codes", () => {
+  function clientReporting(onSessionEnded: (code: number) => void) {
+    const reporting = new WebSocketClient({
+      url: "ws://test/api/ws",
+      getToken: () => "token",
+      onSessionEnded,
+    });
+    reporting.connect();
+    const opened = FakeWebSocket.latest();
+    opened.accept();
+    return { reporting, opened };
+  }
+
+  it.each([4004, 4005])("reports close %i once and keeps the normal backoff", async (code) => {
+    vi.useFakeTimers();
+    const onSessionEnded = vi.fn();
+    const { reporting, opened } = clientReporting(onSessionEnded);
+    try {
+      opened.closeWith(code);
+      expect(onSessionEnded).toHaveBeenCalledTimes(1);
+      expect(onSessionEnded).toHaveBeenCalledWith(code);
+      const before = FakeWebSocket.instances.length;
+      await vi.advanceTimersByTimeAsync(999);
+      expect(FakeWebSocket.instances).toHaveLength(before);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(FakeWebSocket.instances).toHaveLength(before + 1);
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it.each([1006, 1000, 4002, 4009])("does not report close %i", (code) => {
+    const onSessionEnded = vi.fn();
+    const { reporting, opened } = clientReporting(onSessionEnded);
+    try {
+      opened.closeWith(code);
+      expect(onSessionEnded).not.toHaveBeenCalled();
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it("does not report a close after the client was disconnected", () => {
+    const onSessionEnded = vi.fn();
+    const { reporting, opened } = clientReporting(onSessionEnded);
+    reporting.disconnect();
+    opened.closeWith(4005);
+    expect(onSessionEnded).not.toHaveBeenCalled();
+  });
+});

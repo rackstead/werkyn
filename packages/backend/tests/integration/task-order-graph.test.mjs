@@ -74,7 +74,7 @@ after(async () => {
 let currentToken = null;
 
 /** One request on its own TCP connection, from its own loopback address (per-IP rate limit). */
-function call(method, url, body) {
+function call(method, url, body, token = currentToken) {
   const n = ++requests;
   const localAddress = `127.78.${Math.floor(n / 250) % 250}.${(n % 250) + 1}`;
   const payload = body === undefined ? undefined : JSON.stringify(body);
@@ -88,7 +88,7 @@ function call(method, url, body) {
         localAddress,
         agent: false,
         headers: {
-          authorization: `Bearer ${currentToken}`,
+          authorization: `Bearer ${token}`,
           ...(payload === undefined
             ? {}
             : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }),
@@ -157,7 +157,7 @@ async function fixture({ columns = ["Open", "Review", "Done"], tasks = {}, ids =
       });
     }
   }
-  return { admin, workspace, project, column, task };
+  return { admin, workspace, project, column, task, token: currentToken };
 }
 
 // ─── Real PostgreSQL lock barriers ─────────────────────────
@@ -533,6 +533,64 @@ test("an ordering write that PostgreSQL aborts to break a deadlock is retried an
   expectStatus(response, 200, "deadlocked move: ");
   assert.deepEqual(await boardOrder(f.column.Review.id), ["Mover", "Parked"]);
   await assertValidOrder(f, "retried move", { contiguous: true });
+});
+
+test("requests queued on a project held past the lock bound give up and leave connections to other projects", async () => {
+  // Every pooled connection of the app waits for the hot project's lock, which
+  // a control transaction holds for longer than the 10 s transaction timeout.
+  const pool = Number(actorUrl.searchParams.get("connection_limit"));
+  const HOLD_MS = 12_000;
+  const hot = await fixture({ tasks: { Open: ["Existing"] } });
+  const other = await fixture({ tasks: { Open: ["Other"] } });
+  const hotTasks = () => app.prisma.task.count({ where: { projectId: hot.project.id } });
+  const tasksBefore = await hotTasks();
+  let holderPid = null;
+  let ready;
+  const isReady = new Promise((resolve) => (ready = resolve));
+  const holder = control.$transaction(
+    async (tx) => {
+      [{ pid: holderPid }] = await tx.$queryRaw`SELECT pg_backend_pid()::int AS pid`;
+      await lockRow("Project", hot.project.id)(tx);
+      ready();
+      await sleep(HOLD_MS);
+    },
+    { timeout: 30_000, maxWait: 5_000 },
+  );
+  await isReady;
+  const started = performance.now();
+  const timed = (pending) => pending.then((r) => ({ ...r, ms: Math.round(performance.now() - started) }));
+  const queued = Array.from({ length: pool }, (_, i) =>
+    timed(call("POST", `/projects/${hot.project.id}/tasks`, { title: `Queued ${i}` }, hot.token)));
+  assert(
+    await until(async () => (await lockWaiters(holderPid)).length >= pool, 8000),
+    "the creates never queued on the project lock",
+  );
+  // Another project's read and write, sent while every connection is waiting.
+  const [read, write] = await Promise.all([
+    timed(call("GET", `/projects/${other.project.id}/tasks`, undefined, other.token)),
+    timed(call("POST", `/projects/${other.project.id}/tasks`, { title: "Unrelated" }, other.token)),
+  ]);
+  const answers = await Promise.all(queued);
+  await holder;
+  console.info("held project", JSON.stringify({
+    hold: HOLD_MS,
+    queued: answers.map((r) => [r.status, r.ms]),
+    otherRead: [read.status, read.ms],
+    otherWrite: [write.status, write.ms],
+  }));
+  for (const answer of answers) {
+    expectStatus(answer, 503, "queued create: ");
+    assert.deepEqual(JSON.parse(answer.body), {
+      statusCode: 503, error: "Service Unavailable", message: "The project is busy. Try again in a moment.",
+    });
+    // It waited for the lock bound, and gave up well before the holder let go.
+    assert(answer.ms >= 4_000 && answer.ms < HOLD_MS - 3_000, `a queued create answered after ${answer.ms} ms`);
+  }
+  expectStatus(read, 200, "unrelated read: ");
+  expectStatus(write, 201, "unrelated create: ");
+  assert(Math.max(read.ms, write.ms) < HOLD_MS - 3_000, "the unrelated project waited for the held one");
+  assert.equal(await hotTasks(), tasksBefore, "a queued create stored a task");
+  assert.equal(await app.prisma.task.count({ where: { projectId: other.project.id, title: "Unrelated" } }), 1);
 });
 
 // ─── Bulk changes and column deletion keep the order ───────

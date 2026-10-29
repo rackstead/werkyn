@@ -162,7 +162,7 @@ export async function createTask(
     } else {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
       });
       if (!firstColumn) {
         throw new ValidationError("Project has no status columns");
@@ -944,7 +944,7 @@ export async function duplicateTask(
     if (!sourceStatus) {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId: source.projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
         select: { id: true },
       });
       if (!firstColumn) throw new ValidationError("Project has no status columns");

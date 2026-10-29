@@ -122,7 +122,7 @@ export async function deleteStatus(
     // Find the lowest-position remaining column to move tasks to
     const targetColumn = await tx.statusColumn.findFirst({
       where: { projectId, id: { not: statusId } },
-      orderBy: { position: "asc" },
+      orderBy: [{ position: "asc" }, { id: "asc" }],
     });
 
     // Move this project's tasks to the target column, the active ones after
@@ -145,7 +145,7 @@ export async function deleteStatus(
     if (status.isCompletion) {
       const highestRemaining = await tx.statusColumn.findFirst({
         where: { projectId, id: { not: statusId } },
-        orderBy: { position: "desc" },
+        orderBy: [{ position: "desc" }, { id: "desc" }],
       });
       if (highestRemaining) {
         await tx.statusColumn.update({
@@ -192,7 +192,7 @@ export async function reorderStatuses(
 
     return tx.statusColumn.findMany({
       where: { projectId },
-      orderBy: { position: "asc" },
+      orderBy: [{ position: "asc" }, { id: "asc" }],
     });
   });
 }

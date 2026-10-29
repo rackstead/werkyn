@@ -202,7 +202,7 @@ export async function createTaskFromTemplate(
     if (!statusId) {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
       });
       if (!firstColumn) throw new ValidationError("Project has no status columns");
       statusId = firstColumn.id;

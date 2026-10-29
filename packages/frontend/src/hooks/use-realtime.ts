@@ -98,13 +98,14 @@ export function useRealtime(projectId: string | undefined) {
     });
 
     // Field definitions changed. Renaming or removing options also rewrites
-    // values on any task of the project, so this project's open tasks reload.
+    // values (and adds activity entries) on any task of the project, so the
+    // cached details and activity of this project's tasks reload.
     const customFieldHandler = forThisProject(() => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.customFields(projectId),
       });
       invalidateTaskLists();
-      queryClient.invalidateQueries({
+      const projectTaskDetails = queryClient.getQueryCache().findAll({
         predicate: (query) => {
           const [root, taskId] = query.queryKey;
           const detail = query.state.data as
@@ -118,6 +119,14 @@ export function useRealtime(projectId: string | undefined) {
           );
         },
       });
+      for (const query of projectTaskDetails) {
+        const taskId = query.queryKey[1] as string;
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.task(taskId),
+          exact: true,
+        });
+        queryClient.invalidateQueries({ queryKey: queryKeys.activity(taskId) });
+      }
     });
 
     const listeners: [string[], (msg: RealtimeEnvelope) => void][] = [

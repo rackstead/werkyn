@@ -289,18 +289,20 @@ describe("project events", () => {
   );
 
   it.each(["custom_field_created", "custom_field_updated", "custom_field_deleted"])(
-    "%s refreshes the field definitions, task lists and this project's open tasks",
+    "%s refreshes the field definitions, task lists and this project's open tasks and their activity",
     async (event) => {
       const send = await connect(() => useRealtime("project"));
       seed(queryKeys.customFields("project"), queryKeys.tasks("project"));
       queryClient.setQueryData(queryKeys.task("here"), { data: { id: "here", projectId: "project" } });
       queryClient.setQueryData(queryKeys.task("there"), { data: { id: "there", projectId: "elsewhere" } });
-      seed(queryKeys.subtasks("here"));
+      seed(queryKeys.subtasks("here"), queryKeys.activity("here"), queryKeys.activity("there"));
       send({ event, projectId: "project", data: { fieldId: "field" } });
       expect(stale(queryKeys.customFields("project"))).toBe(true);
       expect(stale(queryKeys.tasks("project"))).toBe(true);
       expect(stale(queryKeys.task("here"))).toBe(true);
+      expect(stale(queryKeys.activity("here"))).toBe(true);
       expect(stale(queryKeys.task("there"))).toBe(false);
+      expect(stale(queryKeys.activity("there"))).toBe(false);
       expect(stale(queryKeys.subtasks("here"))).toBe(false);
     },
   );

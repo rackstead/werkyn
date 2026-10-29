@@ -15,7 +15,7 @@ import {
 
 interface ThreadPanelProps {
   workspaceId: string;
-  channelId: string;
+  /** Replies go to this message's own channel. */
   parentMessage: ChatMessage;
   currentUserId: string;
   isAdmin?: boolean;
@@ -27,7 +27,6 @@ interface ThreadPanelProps {
 
 export function ThreadPanel({
   workspaceId,
-  channelId,
   parentMessage,
   currentUserId,
   isAdmin,
@@ -36,6 +35,7 @@ export function ThreadPanel({
   onEditMessage,
   onDeleteMessage,
 }: ThreadPanelProps) {
+  const { channelId } = parentMessage;
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } =
     useThreadReplies(workspaceId, parentMessage.id);
   const sendMessage = useSendMessage(workspaceId, channelId);

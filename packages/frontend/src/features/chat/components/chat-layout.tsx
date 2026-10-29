@@ -72,6 +72,23 @@ export function ChatLayout({
   const [showSearch, setShowSearch] = useState(false);
   const [attachMessageId, setAttachMessageId] = useState<string | null>(null);
 
+  // The thread, side panels and per-message dialogs belong to the channel
+  // they were opened in. Close them whenever the workspace or channel changes,
+  // however it changes (a click, a link, back/forward), so nothing opened in
+  // one channel is ever shown, or replied to, in another. The composer drops
+  // its draft on the same change (its scope is the channel).
+  const channelScope = `${workspaceId}/${channelId ?? ""}`;
+  const [openedIn, setOpenedIn] = useState(channelScope);
+  if (openedIn !== channelScope) {
+    setOpenedIn(channelScope);
+    setThreadMessage(null);
+    setShowPins(false);
+    setShowBookmarks(false);
+    setShowSearch(false);
+    setSettingsOpen(false);
+    setAttachMessageId(null);
+  }
+
   // Data queries
   const { data: channelsData, isLoading: channelsLoading } = useChannels(workspaceId);
   const channels = channelsData?.data ?? [];
@@ -389,8 +406,8 @@ export function ChatLayout({
         {/* Side panels (only one at a time) */}
         {threadMessage && channelId && !showPins && !showBookmarks && (
           <ThreadPanel
+            key={threadMessage.id}
             workspaceId={workspaceId}
-            channelId={channelId}
             parentMessage={threadMessage}
             currentUserId={currentUserId}
             isAdmin={isAdmin}

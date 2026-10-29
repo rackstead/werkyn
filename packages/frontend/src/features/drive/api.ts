@@ -3,8 +3,11 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
+import { queryClient } from "@/lib/query-client";
+import { useObjectUrl } from "@/lib/use-object-url";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 
@@ -408,8 +411,12 @@ export function useFileAttachmentCount(wid: string, fileId: string | null) {
   });
 }
 
+/**
+ * The thumbnail of a file as an object URL owned by the calling component.
+ * The query caches the Blob; each observer makes and revokes its own URL.
+ */
 export function useThumbnailUrl(wid: string, fileId: string | null, hasThumbnail?: boolean) {
-  return useQuery({
+  const { data: blob } = useQuery({
     queryKey: ["file-thumbnail", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
@@ -427,16 +434,21 @@ export function useThumbnailUrl(wid: string, fileId: string | null, hasThumbnail
 
       if (!response.ok) throw new Error("Thumbnail fetch failed");
 
-      const blob = await response.blob();
-      return URL.createObjectURL(blob);
+      return response.blob();
     },
     enabled: !!fileId && !!hasThumbnail,
     staleTime: 10 * 60 * 1000,
   });
+  return { data: useObjectUrl(blob) };
 }
 
+/**
+ * The content of a file for an inline preview as an object URL owned by the
+ * calling component; see useThumbnailUrl. A closed preview's Blob is dropped
+ * soon after, since whole files can be large.
+ */
 export function useFilePreviewUrl(wid: string, fileId: string | null, mimeType?: string | null) {
-  return useQuery({
+  const { data: blob } = useQuery({
     queryKey: ["file-preview", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
@@ -456,12 +468,27 @@ export function useFilePreviewUrl(wid: string, fileId: string | null, mimeType?:
 
       const rawBlob = await response.blob();
       // Ensure the blob has the correct MIME type (needed for PDF viewer in iframes)
-      const blob = mimeType ? new Blob([rawBlob], { type: mimeType }) : rawBlob;
-      return URL.createObjectURL(blob);
+      return mimeType ? new Blob([rawBlob], { type: mimeType }) : rawBlob;
     },
     enabled: !!fileId,
     staleTime: 5 * 60 * 1000,
+    gcTime: 60 * 1000,
   });
+  return { data: useObjectUrl(blob) };
+}
+
+/** Query keys of cached file contents: thumbnails, previews and text previews. */
+const FILE_CONTENT_QUERY_KEYS = [["file-thumbnail"], ["file-preview"], ["file-text"]];
+
+/**
+ * Drops every cached file content (thumbnail and preview Blobs, preview text)
+ * so the next viewer downloads them again with its own credentials. Object
+ * URLs belong to mounted components, which revoke them when they unmount, so
+ * there is nothing to revoke here. Run it whenever the signed-in identity
+ * changes (logout or switching accounts).
+ */
+export function clearFileContentCache(qc: QueryClient = queryClient) {
+  for (const queryKey of FILE_CONTENT_QUERY_KEYS) qc.removeQueries({ queryKey });
 }
 
 export function useFileTextContent(wid: string, fileId: string | null) {

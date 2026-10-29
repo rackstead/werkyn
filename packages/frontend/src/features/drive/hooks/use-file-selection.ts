@@ -6,6 +6,8 @@ export interface UseFileSelectionReturn {
   toggle: (id: string, fileIds: string[], event?: React.MouseEvent) => void;
   toggleAll: (fileIds: string[]) => void;
   clear: () => void;
+  /** Removes these files from the selection and keeps any others selected. */
+  deselect: (ids: Iterable<string>) => void;
   count: number;
   allSelected: (fileIds: string[]) => boolean;
 }
@@ -67,6 +69,14 @@ export function useFileSelection(): UseFileSelectionReturn {
     lastSelectedRef.current = null;
   }, []);
 
+  const deselect = useCallback((ids: Iterable<string>) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) next.delete(id);
+      return next.size === prev.size ? prev : next;
+    });
+  }, []);
+
   const allSelected = useCallback(
     (fileIds: string[]) =>
       fileIds.length > 0 && fileIds.every((id) => selectedIds.has(id)),
@@ -79,6 +89,7 @@ export function useFileSelection(): UseFileSelectionReturn {
     toggle,
     toggleAll,
     clear,
+    deselect,
     count: selectedIds.size,
     allSelected,
   };

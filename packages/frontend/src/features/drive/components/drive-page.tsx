@@ -8,7 +8,9 @@ import {
   type DragStartEvent,
   type DragEndEvent,
 } from "@dnd-kit/core";
+import { useIsMutating } from "@tanstack/react-query";
 import {
+  bulkTrashMutationKey,
   useFiles,
   useDownloadFile,
   useTrashFile,
@@ -43,7 +45,6 @@ import { TeamFoldersSection } from "./team-folders-section";
 import { StarredSection } from "./starred-section";
 import { RecentFilesSection } from "./recent-files-section";
 import { ShareFileDialog } from "./share-file-dialog";
-import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { SearchInput } from "@/components/shared/search-input";
 import { Button } from "@/components/ui/button";
 import {
@@ -147,7 +148,6 @@ export function DrivePage({
   const [previewFile, setPreviewFile] = useState<DriveFile | null>(null);
   const [activeDrag, setActiveDrag] = useState<DriveFile | null>(null);
   const [showTrashConfirm, setShowTrashConfirm] = useState(false);
-  const [isTrashingBatch, setIsTrashingBatch] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selection = useFileSelection();
 
@@ -240,11 +240,14 @@ export function DrivePage({
     [addRecent],
   );
 
-  // Clear search and selection when folder/teamFolder changes
+  // Clear search, selection and the trash confirmation when the folder or
+  // workspace changes. A batch still running for the old folder keeps going
+  // and reports through its toast.
   useEffect(() => {
     setSearchQuery("");
     selection.clear();
-  }, [folderId, teamFolderId]);
+    setShowTrashConfirm(false);
+  }, [workspaceId, folderId, teamFolderId]);
 
   const handleNavigate = useCallback(
     (id: string) => {
@@ -287,6 +290,14 @@ export function DrivePage({
     [files, selection.selectedIds],
   );
 
+  // The trash confirmation is for the selected files on screen; it closes
+  // when none are left (the selection was cleared, or a search hid them),
+  // except while its batch runs: that batch closes it once it settles.
+  const isTrashingBatch = useIsMutating({ mutationKey: bulkTrashMutationKey(workspaceId) }) > 0;
+  useEffect(() => {
+    if (selectedFiles.length === 0 && !isTrashingBatch) setShowTrashConfirm(false);
+  }, [selectedFiles.length, isTrashingBatch]);
+
   const handleMoveSelected = useCallback(() => {
     setMoveFileIds(Array.from(selection.selectedIds));
   }, [selection.selectedIds]);
@@ -294,6 +305,18 @@ export function DrivePage({
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // These shortcuts are the file list's. None applies while a dialog or
+      // slideover is open (even when focus has fallen to the page because a
+      // busy dialog disabled its focused button), to a key an open layer has
+      // already handled (Escape), or to a key pressed inside a menu. So no
+      // shortcut can change the selection or open a dialog under a batch.
+      if (
+        e.defaultPrevented ||
+        document.querySelector('[role="dialog"], [role="alertdialog"]') ||
+        (e.target instanceof Element && e.target.closest('[role="menu"]'))
+      ) {
+        return;
+      }
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
         return;
@@ -317,7 +340,15 @@ export function DrivePage({
       }
 
       // Delete/Backspace: trash selected
-      if ((e.key === "Delete" || e.key === "Backspace") && canEdit && selection.count > 0) {
+      // Like the toolbar's Trash button, Delete waits for a running bulk
+      // trash to settle, so no new confirmation can open under it (or be
+      // closed by it when it settles, even after a folder change).
+      if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        canEdit &&
+        selectedFiles.length > 0 &&
+        !isTrashingBatch
+      ) {
         e.preventDefault();
         setShowTrashConfirm(true);
       }
@@ -325,32 +356,7 @@ export function DrivePage({
 
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [previewFile, selection, fileIds, canEdit]);
-
-  const handleKeyboardTrash = useCallback(async () => {
-    const selected = Array.from(selection.selectedIds);
-    setIsTrashingBatch(true);
-    const results = await Promise.allSettled(
-      selected.map(
-        (fid) =>
-          new Promise<void>((resolve, reject) => {
-            trashFile.mutate(fid, {
-              onSuccess: () => resolve(),
-              onError: (err) => reject(err),
-            });
-          }),
-      ),
-    );
-    setIsTrashingBatch(false);
-    setShowTrashConfirm(false);
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed === 0) {
-      toast.success(`Moved ${selected.length} file${selected.length !== 1 ? "s" : ""} to trash`);
-    } else {
-      toast.error(`${failed} file${failed !== 1 ? "s" : ""} failed to trash`);
-    }
-    selection.clear();
-  }, [selection, trashFile]);
+  }, [previewFile, selection, fileIds, canEdit, selectedFiles.length, isTrashingBatch]);
 
   const dragOverlayIcon = activeDrag
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)
@@ -622,8 +628,8 @@ export function DrivePage({
         onClose={() => {
           setMoveFileDialog(null);
           setMoveFileIds([]);
-          if (moveFileIds.length > 0) selection.clear();
         }}
+        onMoved={selection.deselect}
         workspaceId={workspaceId}
       />
 
@@ -649,18 +655,6 @@ export function DrivePage({
         onDismiss={clearUploads}
       />
 
-      {/* Keyboard-triggered trash confirm */}
-      <ConfirmDialog
-        open={showTrashConfirm}
-        onClose={() => setShowTrashConfirm(false)}
-        onConfirm={handleKeyboardTrash}
-        title={`Move ${selection.count} item${selection.count !== 1 ? "s" : ""} to trash?`}
-        description="Items in trash can be restored later."
-        confirmLabel="Trash"
-        variant="destructive"
-        loading={isTrashingBatch}
-      />
-
       {/* Bulk Actions */}
       {selection.count > 0 && (
         <DriveBulkActions
@@ -668,6 +662,9 @@ export function DrivePage({
           selectedFiles={selectedFiles}
           onClear={selection.clear}
           onMoveSelected={handleMoveSelected}
+          trashConfirmOpen={showTrashConfirm}
+          onTrashConfirmOpenChange={setShowTrashConfirm}
+          onTrashed={selection.deselect}
           onShareSelected={() => {
             const ids = Array.from(selection.selectedIds);
             setShareTarget({

@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useIsMutating } from "@tanstack/react-query";
 import type { DriveFile } from "../api";
-import { useArchiveFiles, useTrashFile } from "../api";
+import { bulkTrashMutationKey, useArchiveFiles, useBulkTrashFiles } from "../api";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { X, FolderInput, Archive, Share2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { toastBulkFileResult } from "./bulk-result-toast";
 
 interface DriveBulkActionsProps {
   workspaceId: string;
@@ -12,6 +14,11 @@ interface DriveBulkActionsProps {
   onClear: () => void;
   onMoveSelected: () => void;
   onShareSelected?: () => void;
+  /** Whether the trash confirmation is open; the page's Delete shortcut opens it too. */
+  trashConfirmOpen: boolean;
+  onTrashConfirmOpenChange: (open: boolean) => void;
+  /** Called once a trash batch settles, with the files that were trashed. */
+  onTrashed: (fileIds: string[]) => void;
   parentId?: string | null;
   teamFolderId?: string;
 }
@@ -22,13 +29,24 @@ export function DriveBulkActions({
   onClear,
   onMoveSelected,
   onShareSelected,
+  trashConfirmOpen,
+  onTrashConfirmOpenChange,
+  onTrashed,
   parentId,
   teamFolderId,
 }: DriveBulkActionsProps) {
   const archiveFiles = useArchiveFiles(workspaceId);
-  const trashFile = useTrashFile(workspaceId);
-  const [showTrashConfirm, setShowTrashConfirm] = useState(false);
-  const [isTrashingBatch, setIsTrashingBatch] = useState(false);
+  const bulkTrash = useBulkTrashFiles(workspaceId);
+  // Busy while any toolbar's batch runs, so a toolbar mounted mid-batch
+  // cannot start a second one.
+  const trashingElsewhere = useIsMutating({ mutationKey: bulkTrashMutationKey(workspaceId) }) > 0;
+  const isTrashingBatch = bulkTrash.isPending || trashingElsewhere;
+  // The confirmation keeps naming the batch it started, even if a search
+  // changes which selected files are on screen while it runs.
+  const [batchSize, setBatchSize] = useState<number | null>(null);
+  // Set before the batch starts, so a second click before the busy render
+  // cannot start a second batch.
+  const batchRunning = useRef(false);
 
   const count = selectedFiles.length;
 
@@ -41,30 +59,26 @@ export function DriveBulkActions({
   };
 
   const handleTrashAll = async () => {
-    setIsTrashingBatch(true);
-    const results = await Promise.allSettled(
-      selectedFiles.map(
-        (file) =>
-          new Promise<void>((resolve, reject) => {
-            trashFile.mutate(file.id, {
-              onSuccess: () => resolve(),
-              onError: (err) => reject(err),
-            });
-          }),
-      ),
-    );
-    setIsTrashingBatch(false);
-    setShowTrashConfirm(false);
-
-    const succeeded = results.filter((r) => r.status === "fulfilled").length;
-    const failed = results.filter((r) => r.status === "rejected").length;
-
-    if (failed === 0) {
-      toast.success(`Moved ${succeeded} file${succeeded !== 1 ? "s" : ""} to trash`);
-    } else {
-      toast.error(`${failed} file${failed !== 1 ? "s" : ""} failed to trash`);
+    if (batchRunning.current || isTrashingBatch) return;
+    const fileIds = selectedFiles.map((f) => f.id);
+    if (fileIds.length === 0) {
+      onTrashConfirmOpenChange(false);
+      return;
     }
-    onClear();
+    batchRunning.current = true;
+    setBatchSize(fileIds.length);
+    try {
+      const result = await bulkTrash.mutateAsync(fileIds);
+      toastBulkFileResult(result, "trash");
+      // Trashed files leave the selection; failed ones stay selected to retry.
+      onTrashed(result.succeeded);
+    } catch {
+      // Not a per-file failure; the client-wide mutation handler reported it.
+    } finally {
+      batchRunning.current = false;
+      setBatchSize(null);
+      onTrashConfirmOpenChange(false);
+    }
   };
 
   return (
@@ -99,7 +113,8 @@ export function DriveBulkActions({
         <Button
           variant="destructive"
           size="sm"
-          onClick={() => setShowTrashConfirm(true)}
+          onClick={() => onTrashConfirmOpenChange(true)}
+          disabled={count === 0 || isTrashingBatch}
         >
           <Trash2 className="h-4 w-4 mr-1" />
           Trash
@@ -115,10 +130,13 @@ export function DriveBulkActions({
       </div>
 
       <ConfirmDialog
-        open={showTrashConfirm}
-        onClose={() => setShowTrashConfirm(false)}
+        open={trashConfirmOpen}
+        onClose={() => {
+          // The batch is already under way; the dialog shows it until it settles.
+          if (!isTrashingBatch) onTrashConfirmOpenChange(false);
+        }}
         onConfirm={handleTrashAll}
-        title={`Move ${count} item${count !== 1 ? "s" : ""} to trash?`}
+        title={`Move ${batchSize ?? count} item${(batchSize ?? count) !== 1 ? "s" : ""} to trash?`}
         description="Items in trash can be restored later."
         confirmLabel="Trash"
         variant="destructive"

@@ -7,6 +7,7 @@ import type {
   AddProjectMemberInput,
 } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { clearAssignments } from "../../utils/task-references.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { revokeProjectAccess } from "../realtime/realtime.service.js";
 
@@ -251,22 +252,8 @@ export async function removeProjectMember(
       throw new NotFoundError("Project member not found");
     }
 
-    // Unassign from all tasks in this project
-    await tx.taskAssignee.deleteMany({
-      where: {
-        userId: targetUserId,
-        task: { projectId },
-      },
-    });
-
-    // Unassign from all subtasks in this project
-    await tx.subtask.updateMany({
-      where: {
-        assigneeId: targetUserId,
-        task: { projectId },
-      },
-      data: { assigneeId: null },
-    });
+    // Unassign from all tasks and subtasks in this project
+    await clearAssignments(tx, targetUserId, { projectId });
   });
   revokeProjectAccess(targetUserId, projectId);
 }

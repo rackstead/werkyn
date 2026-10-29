@@ -10,15 +10,16 @@ import { after, before, test } from "node:test";
 if (!process.env.TEST_DATABASE_URL)
   throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 // The free-running races keep up to five requests in flight, each holding at
-// most one pooled connection (two of them waiting on PostgreSQL locks in the
-// barrier cases). The lock holder and the pg_stat_activity observer use their
-// own two-connection pool, so blocked actors can never starve the control
-// connection that has to release them.
+// most one pooled connection at a time (at most two of them waiting on
+// PostgreSQL locks in the barrier cases), so five connections are enough; the
+// full suite runs with exactly five. The lock holder and the pg_stat_activity
+// observer use their own two-connection pool, so blocked actors can never
+// starve the control connection that has to release them.
 const actorUrl = new URL(process.env.TEST_DATABASE_URL);
-if (!actorUrl.searchParams.has("connection_limit")) actorUrl.searchParams.set("connection_limit", "8");
+if (!actorUrl.searchParams.has("connection_limit")) actorUrl.searchParams.set("connection_limit", "6");
 assert(
-  Number(actorUrl.searchParams.get("connection_limit")) >= 6,
-  "Assignment race fixtures require connection_limit>=6",
+  Number(actorUrl.searchParams.get("connection_limit")) >= 5,
+  "Assignment race fixtures require connection_limit>=5",
 );
 const controlUrl = new URL(actorUrl);
 controlUrl.searchParams.set("connection_limit", "2");
@@ -363,6 +364,14 @@ const writers = [
       call(f.admin, "POST", `/projects/${f.project.id}/templates/${f.template.id}/create-task`, { assigneeIds: [f.racer.id] }),
     pause: (f) => lockRow("StatusColumn", f.open.id),
   },
+  {
+    // A MEMBER instantiating a template is assigned to the new task themselves.
+    name: "member instantiates template",
+    ok: 201,
+    notifies: true,
+    send: (f) => call(f.racer, "POST", `/projects/${f.project.id}/templates/${f.template.id}/create-task`, {}),
+    pause: (f) => lockRow("StatusColumn", f.open.id),
+  },
 ];
 
 const removeFromProject = (f) => call(f.admin, "DELETE", `/projects/${f.project.id}/members/${f.racer.id}`);
@@ -489,6 +498,138 @@ test("a project deletion and a task write in that project never deadlock", async
     expectStatus(second, [400, 404], `${context}: `);
     assert.equal(await app.prisma.task.count({ where: { projectId: f.project.id } }), 0);
     assertSerialized(observed, context);
+  }
+});
+
+test("bulk updates and member removals take assignment rows in the same order", async () => {
+  for (const [name, remove] of [["workspace removal", removeFromWorkspace], ["project removal", removeFromProject]]) {
+    const f = await fixture();
+    await app.prisma.taskAssignee.create({ data: { taskId: f.target.id, userId: f.racer.id } });
+    const [low, high] = [f.held.id, f.target.id].sort();
+    // The client lists the tasks in descending id order and replaces RACER by ADMIN on both.
+    const bulk = () =>
+      call(f.admin, "POST", `/projects/${f.project.id}/tasks/bulk-update`, { taskIds: [high, low], assigneeIds: [f.admin.id] });
+    const context = `bulk un-assign first, then ${name}`;
+    // The bulk update parks on the foreign-key check of its last insert, holding RACER's assignment rows.
+    const { first, second, observed } = await race(lockRow("Task", high), bulk, () => remove(f));
+    expectStatus(first, 200, `${context}: `);
+    expectStatus(second, 204, `${context}: `);
+    await assertNoAssignmentWithoutAccess(f, context);
+    const admins = await app.prisma.taskAssignee.count({ where: { userId: f.admin.id, taskId: { in: [low, high] } } });
+    assert.equal(admins, 2, `${context}: the bulk update was not applied`);
+    assertSerialized(observed, context);
+  }
+  {
+    const f = await fixture();
+    const make = (title) =>
+      app.prisma.subtask.create({ data: { taskId: f.target.id, title, assigneeId: f.racer.id } });
+    const [a, b] = [(await make("First")).id, (await make("Second")).id].sort();
+    const reorder = () => call(f.admin, "POST", `/tasks/${f.target.id}/subtasks/reorder`, { orderedIds: [b, a, f.subtask.id] });
+    const context = "subtask reorder first, then project removal";
+    const { first, second, observed } = await race(lockRow("Subtask", b), reorder, () => removeFromProject(f));
+    expectStatus(first, 200, `${context}: `);
+    expectStatus(second, 204, `${context}: `);
+    await assertNoAssignmentWithoutAccess(f, context);
+    assertSerialized(observed, context);
+  }
+});
+
+test("a task move and a delete of its column queue instead of deadlocking", async () => {
+  const deleteReview = (f) => call(f.admin, "DELETE", `/projects/${f.project.id}/statuses/${f.review.id}`);
+  // Moving `target` to the top of Review renumbers the task already there.
+  const move = (f) => call(f.admin, "PATCH", `/tasks/${f.target.id}/move`, { statusId: f.review.id, position: 0 });
+  {
+    const f = await fixture();
+    const context = "move first, then column delete";
+    // The move parks on its own row after renumbering the destination column.
+    const { first, second, observed } = await race(lockRow("Task", f.target.id), () => move(f), () => deleteReview(f));
+    expectStatus(first, 200, `${context}: `);
+    expectStatus(second, 204, `${context}: `);
+    const tasks = await app.prisma.task.findMany({ where: { projectId: f.project.id }, select: { statusId: true } });
+    assert(tasks.every((t) => t.statusId === f.open.id), `${context}: a task still points at the deleted column`);
+    assertSerialized(observed, context);
+  }
+  {
+    const f = await fixture();
+    const context = "column delete first, then move";
+    // The delete parks while moving the column's existing task.
+    const { first, second, observed } = await race(lockRow("Task", f.parked.id), () => deleteReview(f), () => move(f));
+    expectStatus(first, 204, `${context}: `);
+    expectStatus(second, 400, `${context}: `);
+    assert.match(second.body, /Status column not found in this project/);
+    const target = await app.prisma.task.findUniqueOrThrow({ where: { id: f.target.id } });
+    assert.equal(target.statusId, f.open.id, `${context}: the refused move changed the task`);
+    assertSerialized(observed, context);
+  }
+});
+
+/**
+ * The control transaction holds `first`, waits until the request blocks on it,
+ * then requests `second`, which the request already holds. PostgreSQL detects
+ * the cycle in the request's backend first (it has waited longest) and aborts
+ * the request's transaction.
+ */
+async function deadlockRequest(first, second, send) {
+  let ready;
+  const isReady = new Promise((resolve) => (ready = resolve));
+  let holderPid = null;
+  let response;
+  const holder = control.$transaction(
+    async (tx) => {
+      [{ pid: holderPid }] = await tx.$queryRaw`SELECT pg_backend_pid()::int AS pid`;
+      await first(tx);
+      ready();
+      await until(async () => (await lockWaiters(holderPid)).some((w) => w.blockers.includes(holderPid)));
+      await second(tx);
+    },
+    { timeout: 20_000, maxWait: 5_000 },
+  );
+  await isReady;
+  response = await send();
+  await holder;
+  return response;
+}
+
+test("a transaction PostgreSQL aborts to break a deadlock is reported as a retryable 409", async () => {
+  const busy = { statusCode: 409, error: "Conflict", message: "The request conflicted with a concurrent change; try again" };
+  {
+    // Aborted in a model query: the assignment insert waits for the task row.
+    const f = await fixture();
+    const response = await deadlockRequest(
+      lockRow("Task", f.target.id),
+      lockRow("ProjectMember", f.membership.id),
+      () => writers[0].send(f),
+    );
+    expectStatus(response, 409, "model query deadlock: ");
+    assert.deepEqual(JSON.parse(response.body), busy);
+    assert.equal(await app.prisma.taskAssignee.count({ where: { taskId: f.target.id } }), 0);
+  }
+  {
+    // Aborted in a raw query: the membership lock waits for RACER's workspace row.
+    const f = await fixture();
+    const wsMember = await app.prisma.workspaceMember.findFirstOrThrow({ where: { userId: f.racer.id, workspaceId: f.workspace.id } });
+    const response = await deadlockRequest(
+      (tx) => tx.$queryRaw`SELECT id FROM "WorkspaceMember" WHERE id = ${wsMember.id} FOR UPDATE`,
+      lockRow("Project", f.project.id),
+      () => writers[0].send(f),
+    );
+    expectStatus(response, 409, "raw query deadlock: ");
+    assert.deepEqual(JSON.parse(response.body), busy);
+    assert.equal(await app.prisma.taskAssignee.count({ where: { taskId: f.target.id } }), 0);
+  }
+  {
+    // Aborted inside withWorkspaceLock: the removal waits for an assignment row.
+    const f = await fixture();
+    const response = await deadlockRequest(
+      lockRow("TaskAssignee", f.heldAssignment.id),
+      lockRow("ProjectMember", f.membership.id),
+      () => removeFromProject(f),
+    );
+    expectStatus(response, 409, "workspace-lock deadlock: ");
+    assert.deepEqual(JSON.parse(response.body), {
+      statusCode: 409, error: "Conflict", message: "The workspace is busy. Please try again.",
+    });
+    assert.equal(await canOpenProject(f), true, "the aborted removal was partly applied");
   }
 });
 

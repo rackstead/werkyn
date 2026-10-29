@@ -163,8 +163,10 @@ export async function createTaskFromTemplate(
     if (overrides?.assigneeIds) await assertProjectAssignees(tx, projectId, overrides.assigneeIds);
     let assigneeIds = overrides?.assigneeIds ?? (stored.assigneeIds as string[]);
 
-    // Auto-include actor for MEMBER role
+    // Auto-include actor for MEMBER role, checked and locked like any other
+    // assignee so a concurrent removal cannot leave them assigned without access
     if (actorId && actorRole === "MEMBER" && !assigneeIds.includes(actorId)) {
+      await assertProjectAssignees(tx, projectId, [actorId]);
       assigneeIds = [actorId, ...assigneeIds];
     }
 

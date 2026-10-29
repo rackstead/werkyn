@@ -169,8 +169,12 @@ export async function reorderSubtasks(
     }
   }
 
+  // Update in subtask id order, the order in which member removals lock
+  // subtask rows (clearAssignments), so the two cannot deadlock.
+  const positions = orderedIds.map((id, index) => ({ id, index }));
+  positions.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   await prisma.$transaction(
-    orderedIds.map((id, index) =>
+    positions.map(({ id, index }) =>
       prisma.subtask.update({
         where: { id },
         data: { position: index },

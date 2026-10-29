@@ -368,13 +368,16 @@ test("symlink entries are imported as inert bytes, never followed or created", a
   assert.equal((await readFile(full)).toString(), "/etc/passwd");
 });
 
-/** Rejected archives are refused by preview and restore with no side effect. */
-async function assertRejected(label, zip) {
+const ARCHIVE_INVALID = "Invalid backup ZIP: the archive is damaged or uses unsupported ZIP features";
+const ARCHIVE_TOO_LARGE = "Invalid backup ZIP: the archive exceeds the restore limits";
+
+/** Rejected archives get a 400 from preview and restore with no side effect. */
+async function assertRejected(label, zip, message = ARCHIVE_INVALID) {
   const before = await tree();
   for (const action of ["preview", "restore"]) {
     const response = await upload(crafted.id, action, zip);
-    assert.notEqual(response.statusCode, 200, `${label} ${action}: ${response.body}`);
-    assert.ok(response.statusCode >= 400, `${label} ${action}: ${response.statusCode}`);
+    assert.equal(response.statusCode, 400, `${label} ${action}: ${response.body}`);
+    assert.equal(response.json().message, message, `${label} ${action}`);
   }
   assert.deepEqual(await added(before), [], label);
   assert.equal(
@@ -419,26 +422,17 @@ test("declared sizes never allocate more than the stored bytes", async () => {
     ]),
   );
 
-  // A 4 GiB declaration over honest bytes yields exactly those bytes.
+  // A 4 GiB declaration over honest bytes exceeds the restore budget, so it
+  // is refused before anything is inflated.
   const honest = `${label} honest`;
-  const zip = craftZip([
-    {
-      name: "backup.json",
-      content: backupJson(honest, ["assets/stored.png", "assets/deflated.png"]),
-      size: 0xffffffff,
-    },
-    { name: "assets/stored.png", content, size: 0xffffffff },
-    { name: "assets/deflated.png", content, method: DEFLATED, size: 0xffffffff },
-  ]);
-  const before = await tree();
-  const response = await upload(crafted.id, "restore", zip);
-  assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json().data.images, 2);
-  const newFiles = await added(before);
-  assert.equal(newFiles.length, 2);
-  for (const rel of newFiles)
-    assert.deepEqual(await readFile(path.join(root, rel)), content);
-  assert.equal((await spaces(honest)).length, 1);
+  await assertRejected(
+    honest,
+    craftZip([
+      { name: "backup.json", content: backupJson(honest, ["assets/deflated.png"]) },
+      { name: "assets/deflated.png", content, method: DEFLATED, size: 0xfffffffe },
+    ]),
+    ARCHIVE_TOO_LARGE,
+  );
 });
 
 test("a declared size of zero does not lift the decompression cap", async () => {

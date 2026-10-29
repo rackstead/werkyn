@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
-import nodemailer from "nodemailer";
+import nodemailer, { type TransportOptions } from "nodemailer";
 import * as emailService from "./email.service.js";
 import type { UpdateEmailConfigInput } from "@pm/shared";
 import { env } from "../../config/env.js";
@@ -48,7 +48,7 @@ export async function sendTestEmailHandler(
     });
   }
 
-  const options: nodemailer.TransportOptions & {
+  const options: TransportOptions & {
     host: string;
     port: number;
     secure: boolean;

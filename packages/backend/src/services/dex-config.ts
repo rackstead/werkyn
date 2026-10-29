@@ -32,6 +32,16 @@ const PRISMA_SCHEMA_DIR = fileURLToPath(
   new URL("../../prisma/", import.meta.url),
 );
 
+// The DATABASE_URL parameters that decide Dex's PostgreSQL TLS settings.
+const TLS_PARAMETERS = [
+  "sslmode",
+  "sslaccept",
+  "sslcert",
+  "sslrootcert",
+  "sslkey",
+  "sslidentity",
+] as const;
+
 interface DexPostgresSsl {
   mode: "disable" | "require" | "verify-ca" | "verify-full";
   caFile?: string;
@@ -50,8 +60,22 @@ interface DexPostgresSsl {
  * - verify-ca or verify-full: TLS required with certificate verification.
  * The trusted certificate is sslrootcert or, in Prisma's format, sslcert. A
  * libpq client certificate (sslcert with sslkey) is passed on as well.
+ *
+ * A TLS parameter given more than once is rejected: Prisma uses the last
+ * value and URLSearchParams.get the first, so Dex could otherwise run with a
+ * weaker setting than Werkyn (sslmode=disable&sslmode=require gave Dex
+ * plaintext while Werkyn used TLS). Prisma does not document how it reads
+ * repeated parameters, so Dex does not guess.
  */
 export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
+  for (const name of TLS_PARAMETERS) {
+    if (params.getAll(name).length > 1) {
+      throw new Error(
+        `DATABASE_URL gives "${name}" more than once; give each TLS parameter once so Werkyn and Dex use the same setting`,
+      );
+    }
+  }
+
   const requested = (params.get("sslmode") ?? "disable").toLowerCase();
   let mode: DexPostgresSsl["mode"];
   switch (requested) {

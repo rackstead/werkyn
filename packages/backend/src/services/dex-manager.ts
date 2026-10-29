@@ -45,14 +45,17 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
  *
  * start(), restart() and stop() are serialized: each lifecycle change waits for
  * the previous one, so at most one Dex process exists at a time. Restarts that
- * are requested while another is still waiting to run share it, and a restart
- * that begins after stop() does not spawn Dex.
+ * are requested while another is still waiting to run share it. stop()
+ * supersedes every restart requested before it, and a restart that begins
+ * after stop() does not spawn Dex until start() is called again.
  */
 export class DexManager {
   private process: ChildProcess | null = null;
   private prisma: PrismaClient | null = null;
   private logger: FastifyBaseLogger | null = null;
   private stopped = false;
+  // Counts stop() calls, so a reconcile can tell that a stop came after it.
+  private stops = 0;
   private queue: Promise<void> = Promise.resolve();
   private queuedReconcile: Promise<void> | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
@@ -96,6 +99,10 @@ export class DexManager {
   /** Stops Dex and keeps it stopped until start() is called again. */
   stop(): Promise<void> {
     this.stopped = true;
+    this.stops += 1;
+    // Requests made after the stop queue behind it instead of sharing a
+    // reconcile queued before it, which the stop cancels.
+    this.queuedReconcile = null;
     this.clearRestartTimer();
     return this.enqueue(() => this.stopProcess());
   }
@@ -110,20 +117,27 @@ export class DexManager {
     // Requests made before a queued reconcile starts read the settings it
     // reads, so they can share it.
     if (this.queuedReconcile) return this.queuedReconcile;
+    const stops = this.stops;
     const run = this.enqueue(async () => {
-      this.queuedReconcile = null;
-      await this.applySettings();
+      if (this.queuedReconcile === run) this.queuedReconcile = null;
+      await this.applySettings(stops);
     });
     this.queuedReconcile = run;
     return run;
   }
 
-  private async applySettings(): Promise<void> {
+  /** stops is the stop() count when this reconcile was requested. */
+  private async applySettings(stops: number): Promise<void> {
+    // A stop() requested after this reconcile cancels it; the stop itself
+    // ends any running Dex.
+    const cancelled = () => this.stopped || this.stops !== stops;
+    if (this.stops !== stops) return;
+
     this.clearRestartTimer();
     await this.stopProcess();
 
     const prisma = this.prisma;
-    if (this.stopped || !prisma) return;
+    if (cancelled() || !prisma) return;
 
     if (!(await this.canStart(prisma))) {
       this.logger?.info(
@@ -131,7 +145,7 @@ export class DexManager {
       );
       return;
     }
-    if (this.stopped) return;
+    if (cancelled()) return;
 
     let configPath: string;
     try {
@@ -140,7 +154,7 @@ export class DexManager {
       this.logger?.error(err, "Failed to generate Dex config");
       return;
     }
-    if (this.stopped) return;
+    if (cancelled()) return;
 
     this.spawnProcess(configPath);
   }

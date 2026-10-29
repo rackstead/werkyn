@@ -178,6 +178,39 @@ for (const [label, binary, code] of [
   });
 }
 
+test("a DATABASE_URL repeating a TLS parameter stops Dex from starting with a logged error", async () => {
+  const { logger, entries } = createLogger();
+  const attempts = [];
+  const manager = new dexModule.DexManager({
+    restartDelayMs: 20,
+    binaryPath: () => {
+      attempts.push(Date.now());
+      return fakeDex;
+    },
+  });
+  const original = {
+    storage: env.DEX_STORAGE_TYPE,
+    url: env.DATABASE_URL,
+  };
+  env.DEX_STORAGE_TYPE = "postgres";
+  env.DATABASE_URL =
+    "postgresql://u:p@db.example.net/werkyn?sslmode=disable&sslmode=require";
+  try {
+    await manager.start(prisma, logger);
+    await delay(200);
+    assert.equal(manager.isRunning, false);
+    assert.deepEqual(attempts, [], "Dex was spawned");
+    const errors = entries.filter((e) => e.level === "error");
+    assert.equal(errors.length, 1, JSON.stringify(errors));
+    assert.match(errors[0].args.at(-1), /Failed to generate Dex config/);
+    assert.match(errors[0].args[0].message, /"sslmode" more than once/);
+  } finally {
+    env.DEX_STORAGE_TYPE = original.storage;
+    env.DATABASE_URL = original.url;
+    await manager.stop();
+  }
+});
+
 test("start and a settings save racing at boot leave exactly one Dex running", async () => {
   const { logger } = createLogger();
   env.DEX_BINARY_PATH = fakeDex;
@@ -246,6 +279,67 @@ test("stopping during an in-flight restart leaves no Dex running", async () => {
     `live Dex processes: ${JSON.stringify(events())}`,
   );
   assert.equal(dexManager.isRunning, false);
+});
+
+test("start after a stop starts Dex even when restarts were still queued before the stop", async () => {
+  const { logger } = createLogger();
+  const manager = new dexModule.DexManager({ binaryPath: () => fakeDex });
+  try {
+    await manager.start(prisma, logger);
+    await waitFor(() => livePids().length === 1, "Dex did not start");
+    const [first] = livePids();
+
+    await Promise.all([
+      manager.restart(prisma),
+      manager.restart(prisma),
+      manager.stop(),
+      manager.start(prisma, logger),
+    ]);
+    assert.equal(
+      manager.isRunning,
+      true,
+      "start() after stop() left Dex stopped",
+    );
+    await delay(SETTLE_MS);
+
+    const live = livePids();
+    assert.equal(
+      live.length,
+      1,
+      `live Dex processes: ${JSON.stringify(events())}`,
+    );
+    assert.notEqual(live[0], first);
+    // The stop supersedes the restarts queued before it, so they do not
+    // spawn a Dex that the stop then has to kill.
+    assert.equal(
+      startedPids().length,
+      2,
+      `Dex starts: ${JSON.stringify(events())}`,
+    );
+  } finally {
+    await manager.stop();
+  }
+});
+
+test("a restart queued before a stop does not start Dex once the stop has run", async () => {
+  const { logger } = createLogger();
+  const manager = new dexModule.DexManager({ binaryPath: () => fakeDex });
+  try {
+    await manager.start(prisma, logger);
+    await waitFor(() => livePids().length === 1, "Dex did not start");
+
+    await Promise.all([
+      manager.restart(prisma),
+      manager.stop(),
+      manager.restart(prisma),
+    ]);
+    await delay(SETTLE_MS);
+    assert.equal(manager.isRunning, false);
+    assert.deepEqual(livePids(), []);
+    assert.equal(startedPids().length, 1);
+  } finally {
+    await manager.stop();
+  }
 });
 
 test("stop sends SIGKILL to a Dex that ignores SIGTERM and waits for it to exit", async () => {

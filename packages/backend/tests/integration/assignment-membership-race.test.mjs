@@ -472,14 +472,12 @@ test("a project deletion and a task write in that project never deadlock", async
   {
     const f = await fixture();
     const context = "task create first, then project delete";
-    const started = performance.now();
-    // The create parks on its own new row's foreign-key check after validating.
+    // The create parks on the column lock after taking the project row. Were
+    // the delete to deadlock with it, PostgreSQL would abort one of the two.
     const { first, second, observed } = await race(lockRow("StatusColumn", f.review.id), () => create(f), () => deleteProject(f));
     expectStatus(first, 201, `${context}: `);
     expectStatus(second, 204, `${context}: `);
     assert.equal(await app.prisma.project.count({ where: { id: f.project.id } }), 0);
-    // A deadlock is only detected after deadlock_timeout (1 s by default).
-    assert(performance.now() - started < 1000, `${context}: took ${Math.round(performance.now() - started)} ms`);
     assertSerialized(observed, context);
   }
   {

@@ -507,12 +507,15 @@ test("a late monthly row whose missing occurrence is today is moved back unless 
   const edited = await schedule("late-edited-today", legacy);
   // Advanced by a run today (as an upgrade-day row generated before the upgrade).
   const ranToday = await schedule("ran-today", legacy);
+  // Last run dated in the future by a clock that ran ahead, since corrected.
+  const clockAhead = await schedule("clock-ahead", legacy);
   const lastRun = (id, date) =>
     app.prisma.$executeRawUnsafe(`UPDATE "RecurringTaskConfig" SET "lastRunDate" = $1 WHERE "id" = $2`, date, id);
   try {
     await lastRun(late.id, day(0));
     await lastRun(edited.id, day(0));
     await lastRun(ranToday.id, "2027-03-15");
+    await lastRun(clockAhead.id, "2027-04-20");
     setNow(MAR_15);
     tokens.ADMIN = signAccessToken({ sub: users.ADMIN.id, email: users.ADMIN.email });
     const patched = await request("ADMIN", "PATCH", `/api/projects/${project.id}/recurring/${edited.id}`, { endDate: "2027-12-31" });
@@ -524,6 +527,7 @@ test("a late monthly row whose missing occurrence is today is moved back unless 
     await tick(A);
     assert.deepEqual(await dueDatesOf(late.name), ["2027-03-15"], "the missing occurrence is generated today");
     assert.deepEqual(await dueDatesOf(edited.name), ["2027-03-15"], "an edit today does not hide it");
+    assert.deepEqual(await dueDatesOf(clockAhead.name), ["2027-03-15"], "a future-dated last run does not hide it");
     assert.equal((await configOf(late.id)).nextRunDate, "2027-04-15");
     assert.equal((await configOf(late.id)).lastRunDate, "2027-03-15");
     assert.deepEqual(await dueDatesOf(ranToday.name), [], "a row a run already handled today is left alone");

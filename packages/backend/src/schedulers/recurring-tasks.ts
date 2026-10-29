@@ -206,7 +206,11 @@ async function repairLateMonthlySchedules(
       if (signal?.aborted) break;
       const expected = calculateNextRunDate("MONTHLY", row.startDate, null, row.dayOfMonth, today);
       if (expected < today || expected >= row.nextRunDate) continue;
-      if (expected === today && (row.lastRunDate ?? "") >= today) continue;
+      // Only a run on this exact day counts (a later date left by a clock
+      // that ran ahead proves nothing about today). Moving back onto a date a
+      // run did generate is harmless anyway: its occurrence row stops a
+      // second task.
+      if (expected === today && row.lastRunDate === today) continue;
       // Only if the row is unchanged since it was read: an edit in between
       // (even one that kept nextRunDate) keeps its own result.
       const { count } = await prisma.recurringTaskConfig.updateMany({

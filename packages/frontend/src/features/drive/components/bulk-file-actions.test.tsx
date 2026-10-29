@@ -334,6 +334,24 @@ describe("drive page bulk trash", () => {
     });
   });
 
+  it("keeps a running batch's confirmation open when a pending search then hides its files", async () => {
+    renderPage();
+    await select("File 1.txt", "File 2.txt");
+    // The search applies after its debounce, by when the batch is running.
+    fireEvent.change(screen.getByPlaceholderText("Search files..."), { target: { value: "zzz" } });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await screen.findByRole("alertdialog", { name: "Move 2 items to trash?" });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await waitFor(() => expect(screen.queryByText("File 1.txt")).toBeNull());
+    await flush();
+    expect(screen.getByRole("alertdialog", { name: "Move 2 items to trash?" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await answerAll("forward", new Set());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(toasts.success).toHaveBeenCalledWith("Moved 2 files to trash");
+  });
+
   it("still clears the selection with Escape when no dialog is open", async () => {
     renderPage();
     await select("File 1.txt");

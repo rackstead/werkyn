@@ -8,7 +8,9 @@ import {
   type DragStartEvent,
   type DragEndEvent,
 } from "@dnd-kit/core";
+import { useIsMutating } from "@tanstack/react-query";
 import {
+  bulkTrashMutationKey,
   useFiles,
   useDownloadFile,
   useTrashFile,
@@ -286,10 +288,12 @@ export function DrivePage({
   );
 
   // The trash confirmation is for the selected files on screen; it closes
-  // when none are left (the selection was cleared, or a search hid them).
+  // when none are left (the selection was cleared, or a search hid them),
+  // except while its batch runs: that batch closes it once it settles.
+  const isTrashingBatch = useIsMutating({ mutationKey: bulkTrashMutationKey(workspaceId) }) > 0;
   useEffect(() => {
-    if (selectedFiles.length === 0) setShowTrashConfirm(false);
-  }, [selectedFiles.length]);
+    if (selectedFiles.length === 0 && !isTrashingBatch) setShowTrashConfirm(false);
+  }, [selectedFiles.length, isTrashingBatch]);
 
   const handleMoveSelected = useCallback(() => {
     setMoveFileIds(Array.from(selection.selectedIds));

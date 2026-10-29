@@ -39,15 +39,35 @@ fix_permissions() {
         continue
         ;;
     esac
-    # find does not follow symbolic links or cross into other mounts, and
-    # chown -h changes a link itself. A file with several hard links may also
-    # exist outside the directory, so it is left for the operator to check.
-    count=$(find "$real" -xdev -user 0 \( -type d -o -links 1 \) | wc -l)
+    # Other mounts below the directory, including bind mounts from the same
+    # filesystem that -xdev cannot tell apart, are pruned from every walk;
+    # each is handed over only when it is a configured directory itself.
+    set -f
+    set --
+    for mount in $(awk -v root="$real/" 'index($5, root) == 1 { print $5 }' /proc/self/mountinfo); do
+      case "$mount" in
+        *[\\*?[]*)
+          echo "Not handing over $real: cannot exclude the mount at $mount." >&2
+          exit 1
+          ;;
+      esac
+      echo "Not walking the mount at $mount; hand it over separately." >&2
+      set -- "$@" -o -path "$mount"
+    done
+    set +f
+    if [ $# -gt 0 ]; then
+      shift
+      set -- \( "$@" \) -prune -o
+    fi
+    # find does not follow symbolic links and chown -h changes a link itself.
+    # A file with several hard links may also exist outside the directory, so
+    # it is left for the operator to check.
+    count=$(find "$real" -xdev "$@" -user 0 \( -type d -o -links 1 \) -print | wc -l)
     if [ "$count" -gt 0 ]; then
       echo "Giving $count root-owned entries under $real to $APP_USER..."
-      find "$real" -xdev -user 0 \( -type d -o -links 1 \) -exec chown -h "$APP_USER:$APP_USER" {} +
+      find "$real" -xdev "$@" -user 0 \( -type d -o -links 1 \) -exec chown -h "$APP_USER:$APP_USER" {} +
     fi
-    linked=$(find "$real" -xdev -user 0 ! -type d -links +1 | wc -l)
+    linked=$(find "$real" -xdev "$@" -user 0 ! -type d -links +1 -print | wc -l)
     if [ "$linked" -gt 0 ]; then
       echo "Not changing $linked root-owned files with several hard links under $real; check and chown them yourself." >&2
     fi

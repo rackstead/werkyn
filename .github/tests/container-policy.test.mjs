@@ -117,11 +117,13 @@ test("the root handover leaves directories outside the data roots alone", () => 
   }
 });
 
-test("the handover skips other mounts and multiply linked files", () => {
+test("the handover prunes other mounts and skips multiply linked files", () => {
   // Behaviour is checked against a built image; this keeps both walks aligned.
   const walks = entrypoint.match(/find "\$real" [^\n|]*-user 0[^\n|]*/g) ?? [];
   assert.equal(walks.length, 3, walks.join("\n"));
-  for (const walk of walks) assert.match(walk, /-xdev/);
+  // "$@" carries the prune expression for other mounts below the directory.
+  for (const walk of walks) assert.match(walk, /-xdev "\$@" -user 0/, walk);
+  assert.match(entrypoint, /\/proc\/self\/mountinfo/);
   const [counted, changed] = walks.filter((walk) => !walk.includes("-links +1"));
   for (const walk of [counted, changed])
     assert.match(walk, /\\\( -type d -o -links 1 \\\)/, walk);

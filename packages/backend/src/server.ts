@@ -55,12 +55,12 @@ async function start() {
         initialDelayMs: 120_000,
         intervalMs: 24 * 60 * 60 * 1000,
         log: app.log,
-        run: () => processTrashPurge(app.prisma, app.storage),
+        run: (signal) => processTrashPurge(app.prisma, app.storage, { signal }),
       }),
     ];
 
     // Retry notifications whose first delivery failed, every 30s
-    const notificationDeliveries = startNotificationDeliveryWorker(app);
+    scheduledJobs.push(startNotificationDeliveryWorker(app));
 
     // Remove queued stored blobs after 30s, then every 5 minutes
     const blobCleanup = startBlobCleanupWorker(app);
@@ -78,19 +78,20 @@ async function start() {
     // Each step has its own budget inside the 8 s overall deadline, so a
     // stalled cleanup batch cannot keep Dex from being signalled. Dex's own
     // stop sends SIGKILL 5 s after SIGTERM, inside its 5.5 s budget. The
-    // scheduled jobs stop first, so none starts new work against a closing
-    // database. Every interrupted job is safe: recurring occurrences and
-    // reminder batches are single transactions that roll back, and chat and
-    // notification deliveries are retried after their lease expires.
+    // scheduled jobs and the notification delivery worker stop first, all at
+    // once, so none starts new work against a closing database; each returns
+    // at its next unit of work (an occurrence, a reminder batch, a delivery, a
+    // trash candidate). Work cut off by a budget is safe: occurrences,
+    // reminder batches and purges are single transactions that roll back, and
+    // chat and notification deliveries are retried after their lease expires.
     const shutdown = createShutdownHandler({
       log: app.log,
       steps: [
         {
           name: "scheduled jobs",
           run: () => Promise.all(scheduledJobs.map((job) => job.stop())),
-          timeoutMs: 400,
+          timeoutMs: 500,
         },
-        { name: "notification deliveries", run: () => notificationDeliveries.stop(), timeoutMs: 200 },
         { name: "blob cleanup", run: () => blobCleanup.stop(), timeoutMs: 1_000 },
         { name: "chat deliveries", run: () => chatDeliveries.stop(), timeoutMs: 500 },
         { name: "dex", run: () => dexManager.stop(), timeoutMs: 5_500 },

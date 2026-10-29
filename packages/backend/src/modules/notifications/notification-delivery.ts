@@ -112,30 +112,38 @@ export async function enqueueNotifications(
   return rows.map((row) => row.id);
 }
 
-// The rule notify() has always applied: recipients must be able to read every
-// project the data names, including the actual project of a named task (a
-// task that no longer exists notifies no one). Evaluated when the
-// notifications are created, so a delayed retry uses current access.
+// Recipients must still be able to read every scope the data names, as the
+// notification list requires: every project it names, including the actual
+// project of a named task (a task that no longer exists notifies no one), and
+// its workspace. Evaluated when the notifications are created, so a delayed
+// retry never reaches someone who lost access in the meantime.
 async function currentRecipients(db: Db, data: Prisma.JsonValue, userIds: string[]) {
   let recipients = userIds;
+  const scope: Prisma.JsonObject = data && typeof data === "object" && !Array.isArray(data) ? data : {};
   const projectIds = new Set<string>();
-  if (data && typeof data === "object" && !Array.isArray(data)) {
-    if (typeof data.projectId === "string") projectIds.add(data.projectId);
-    if (typeof data.taskId === "string") {
-      const task = await db.task.findUnique({
-        where: { id: data.taskId },
-        select: { projectId: true },
-      });
-      if (!task) return [];
-      projectIds.add(task.projectId);
-    }
+  if (typeof scope.projectId === "string") projectIds.add(scope.projectId);
+  if (typeof scope.taskId === "string") {
+    const task = await db.task.findUnique({
+      where: { id: scope.taskId },
+      select: { projectId: true },
+    });
+    if (!task) return [];
+    projectIds.add(task.projectId);
   }
   for (const projectId of projectIds) {
     recipients = await filterProjectRecipients(db, projectId, recipients);
   }
-  if (projectIds.size === 0 && recipients.length > 0) {
-    // Only workspace members pass the project filter. Without one, skip users
-    // deleted since the request instead of failing every retry on the key.
+  if (recipients.length === 0) return [];
+  if (typeof scope.workspaceId === "string") {
+    const members = await db.workspaceMember.findMany({
+      where: { workspaceId: scope.workspaceId, userId: { in: recipients } },
+      select: { userId: true },
+    });
+    const current = new Set(members.map((member) => member.userId));
+    recipients = recipients.filter((id) => current.has(id));
+  } else if (projectIds.size === 0) {
+    // With no scope to check, still skip users deleted since the request
+    // instead of failing every retry on the foreign key.
     const users = await db.user.findMany({
       where: { id: { in: recipients } },
       select: { id: true },

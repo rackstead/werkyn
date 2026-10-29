@@ -36,7 +36,7 @@ const DAY_MS = 86_400_000;
 const NOW = Date.parse("2027-03-10T12:00:00Z");
 const BARRIER_KEY = 710_424_242;
 
-let app, workspace, project, archivedProject, status, archivedStatus, workerB, barrierHolder;
+let app, workspace, project, archivedProject, status, archivedStatus, workerB, barrierHolder, observer;
 const users = {}, tokens = {};
 const events = [], pushes = [], loggedErrors = [];
 let requestNumber = 0;
@@ -146,8 +146,10 @@ async function holdBarrier() {
   return async () => { release(); await held; };
 }
 
+// Observed from its own connection: the scheduler pools under test may all
+// be blocked at the barrier.
 async function barrierWaiters() {
-  return app.prisma.$queryRawUnsafe(`
+  return observer.$queryRawUnsafe(`
     SELECT l."pid" FROM pg_locks l JOIN pg_database d ON d."oid" = l."database"
     WHERE d."datname" = current_database() AND l."locktype" = 'advisory'
       AND l."objid" = ${BARRIER_KEY} AND NOT l."granted"`);
@@ -225,6 +227,7 @@ before(async () => {
   app.broadcastToUser = (...args) => pushes.push(["app", ...args]);
   workerB = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
   barrierHolder = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+  observer = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
   A = worker(app.prisma, "A");
   B = worker(workerB, "B");
 
@@ -261,6 +264,7 @@ after(async () => {
     mock.timers.reset();
     await workerB?.$disconnect();
     await barrierHolder?.$disconnect();
+    await observer?.$disconnect();
     await app?.close();
     await rm(storageDir, { recursive: true, force: true });
   }
@@ -353,7 +357,7 @@ for (const barrier of ["Task:INSERT", "RecurringTaskConfig:UPDATE"]) {
       // PostgreSQL only notices the dead client when the waiting session
       // ends: end it, as the server does once the connection drops.
       for (const { pid } of await barrierWaiters()) {
-        await app.prisma.$executeRawUnsafe(`SELECT pg_terminate_backend(${pid})`);
+        await observer.$executeRawUnsafe(`SELECT pg_terminate_backend(${pid})`);
       }
       assert(await waitFor(async () => (await barrierWaiters()).length === 0), "crashed session ended");
     } finally {
@@ -517,6 +521,32 @@ test("shutdown during a running scheduler pass waits for the occurrence in progr
   await retireSchedules();
 });
 
+test("trash purge stops between candidates once its stop signal is aborted", async () => {
+  const { processTrashPurge } = await import("../../src/schedulers/trash-purge.js");
+  const trashedAt = new Date(NOW - 40 * DAY_MS);
+  const files = [];
+  for (let i = 0; i < 3; i++) {
+    files.push(await app.prisma.file.create({
+      data: { workspaceId: workspace.id, name: `trashed-${i}`, storagePath: `b04/${uid()}`, uploadedById: users.ADMIN.id, trashedAt },
+    }));
+  }
+  const remaining = () => app.prisma.file.count({ where: { id: { in: files.map((f) => f.id) } } });
+  // Stops as soon as the first purged candidate's blob is removed.
+  const controller = new AbortController();
+  const storage = { delete: async () => { controller.abort(); } };
+  const stopped = new AbortController();
+  stopped.abort();
+  assert.equal(await processTrashPurge(app.prisma, storage, { signal: stopped.signal }), 0, "a stopped run purges nothing");
+  assert.equal(await remaining(), 3);
+  // The purge is global: another suite's leftover candidate may come first.
+  // Either way the run stops after the candidate whose blob aborted it.
+  assert.ok((await processTrashPurge(app.prisma, storage, { signal: controller.signal })) >= 1);
+  assert.equal(controller.signal.aborted, true);
+  assert.ok((await remaining()) >= 2, "no candidate starts after the abort");
+  await processTrashPurge(app.prisma, { delete: async () => {} });
+  assert.equal(await remaining(), 0);
+});
+
 // ─── Notifications ─────────────────────────────────────────────────────────
 
 async function assignedTask(label, dueDate = day(1)) {
@@ -651,6 +681,32 @@ test("a delivery whose completion fails is retried without a second notification
   assert.equal(refreshes.length, 1);
   assert.equal(refreshes[0][1], users.MEMBER.id);
   assert.equal(await app.prisma.notificationDelivery.count({ where: { title } }), 0);
+});
+
+test("a file-share notification retried after its recipient left the workspace is not created for them", async () => {
+  const leaver = await app.prisma.user.create({
+    data: { email: `durable-jobs-leaver-${uid()}@example.test`, displayName: "Leaver", emailVerified: true },
+  });
+  await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: leaver.id, role: "MEMBER" } });
+  const title = `Shared "secret plan.pdf" ${uid()}`;
+  try {
+    await setHook("fault", "Notification:INSERT");
+    try {
+      await notify(app.prisma, A.fastify, {
+        recipients: [leaver.id, users.MEMBER.id], type: "FILE_SHARED", title,
+        data: { fileId: `file-${uid()}`, workspaceId: workspace.id },
+      });
+    } finally {
+      await clearHooks();
+    }
+    await app.prisma.workspaceMember.deleteMany({ where: { workspaceId: workspace.id, userId: leaver.id } });
+    await drain();
+    const rows = await app.prisma.notification.findMany({ where: { title } });
+    assert.deepEqual(rows.map((r) => r.userId), [users.MEMBER.id]);
+    assert.equal(pushes.filter(([, userId]) => userId === leaver.id).length, 0, "nothing pushed to the former member");
+  } finally {
+    await app.prisma.user.delete({ where: { id: leaver.id } });
+  }
 });
 
 test("a title longer than the stored limit is shortened instead of dropping the notification", async () => {

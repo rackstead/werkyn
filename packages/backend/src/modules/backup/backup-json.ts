@@ -8,8 +8,9 @@ const MiB = 1024 * 1024;
  * What one `backup.json` may ask the server to parse. JSON.parse and schema
  * validation cost heap per value and per object, not just per byte, so all
  * three are limited. Together the limits keep the most expensive file they
- * accept within a 256 MiB heap, including the app, and each leaves headroom
- * over a large realistic export (see docs/remediation/sec-028.md).
+ * accept within a 224 MiB heap, including the app, which leaves at least
+ * 32 MiB of a 256 MiB heap free. Each leaves headroom over a large realistic
+ * export (see docs/remediation/sec-028.md).
  */
 export const BACKUP_JSON_LIMITS = Object.freeze({
   /**
@@ -20,9 +21,11 @@ export const BACKUP_JSON_LIMITS = Object.freeze({
   /**
    * `{`, `[`, `,` and `:` outside strings, plus one. This is an upper bound on
    * the values and member names JSON.parse can create. Exports average 22 to
-   * 24 bytes per token.
+   * 24 bytes per token, so 24 MiB of export holds about 1.1 million. One array
+   * of strings that validation checks element by element is the most
+   * expensive use of tokens.
    */
-  maxTokens: 1_500_000,
+  maxTokens: 1_100_000,
   /**
    * `{` outside strings. A validated object is the most expensive value.
    * Exports average about 300 bytes per object; a file of minimal objects

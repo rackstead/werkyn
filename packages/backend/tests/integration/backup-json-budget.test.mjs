@@ -406,6 +406,19 @@ test("the most expensive accepted backup.json files preview in a 256 MiB heap", 
     objects: content(
       `[${Array(L.maxObjects - 10).fill("{}").concat(Array(Math.floor(L.maxTokens / 2) - L.maxObjects - 30).fill("[]")).join(",")}]`,
     ),
+    // One array of distinct strings that Zod validates element by element.
+    // Validation holds a result per element until the array is done, so this
+    // is the most expensive shape per token.
+    assignees: fill(
+      `{"metadata":${meta()},"projects":[{"project":{"name":"p"},"tasks":[{"_originalId":"t","title":"t","priority":"NONE","position":0,"statusRef":"s","assignees":[`,
+      (i) => `"${id(i)}"`,
+      "]}]}]}",
+    ),
+    labels: fill(
+      `{"metadata":${meta()},"projects":[{"project":{"name":"p"},"tasks":[{"_originalId":"t","title":"t","priority":"NONE","position":0,"statusRef":"s","labels":[`,
+      (i) => `"${id(i)}"`,
+      "]}]}]}",
+    ),
   };
   const uploads = [];
   for (const [label, json] of Object.entries(cases)) {

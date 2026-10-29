@@ -68,6 +68,8 @@ const logged = () =>
 function onlyHeaders(message, allowed) {
   const names = message.headers.map((header) => header.name.toLowerCase());
   for (const name of names) assert.ok(allowed.includes(name), `unexpected header ${name}: ${message.headerLines.join(" | ")}`);
+  // An injected line could reuse an allowed name, and each of these appears once.
+  assert.equal(new Set(names).size, names.length, `repeated header: ${message.headerLines.join(" | ")}`);
 }
 
 beforeEach(() => {
@@ -245,6 +247,8 @@ test("a configured sender carrying CRLF never adds headers or recipients", async
     assert.deepEqual(envelope.to, [`<${RECIPIENT}>`]);
     const message = parseMessage(data);
     onlyHeaders(message, ACCOUNT_HEADERS);
+    assert.equal(message.get("To"), RECIPIENT);
+    assert.equal(message.get("Subject"), "Reset your password");
     for (const line of message.headerLines) assert.doesNotMatch(line, /^(bcc|x-injected):/i);
   }
 });

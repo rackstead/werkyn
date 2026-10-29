@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
 import { useState } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DriveFile } from "../api";
+import { useAuthStore } from "@/stores/auth-store";
 import { DriveBulkActions } from "./drive-bulk-actions";
+import { DrivePage } from "./drive-page";
 import { MoveDialog } from "./move-dialog";
 
 // A fake network that holds every file PATCH open until the test finishes it,
@@ -18,7 +20,8 @@ const net = vi.hoisted(() => ({
   calls: [] as Array<{ fileId: string; body: Record<string, unknown> }>,
   inFlight: 0,
   maxInFlight: 0,
-  folders: [] as unknown[],
+  /** The listing of the root folder; a search finds nothing. */
+  root: [] as unknown[],
 }));
 
 vi.mock("@/lib/api-client", () => ({
@@ -36,9 +39,12 @@ vi.mock("@/lib/api-client", () => ({
     get: (url: string) => ({
       json: () =>
         Promise.resolve(
-          url.includes("team-folders")
+          url.includes("team-folders") || url.includes("share-status")
             ? { data: [] }
-            : { data: url.includes("parentId=") ? [] : net.folders, nextCursor: null },
+            : {
+                data: url.includes("parentId=") || url.includes("search=") ? [] : net.root,
+                nextCursor: null,
+              },
         ),
     }),
   },
@@ -93,7 +99,7 @@ beforeEach(() => {
   net.calls = [];
   net.inFlight = 0;
   net.maxInFlight = 0;
-  net.folders = [];
+  net.root = [];
   clientWideError = vi.fn();
   client = new QueryClient({
     defaultOptions: {
@@ -229,6 +235,122 @@ describe("bulk trash lifecycle", () => {
       description: "file-2 is locked",
     });
   });
+
+  it("closes a confirmation with no files on screen to trash, sending nothing", async () => {
+    const onTrashed = vi.fn();
+    render(<BulkToolbar files={[]} onTrashed={onTrashed} initiallyOpen />, { wrapper: Providers });
+    expect((screen.queryAllByRole("button", { name: "Trash", hidden: true })[0] as HTMLButtonElement).disabled).toBe(true);
+    await screen.findByRole("alertdialog", { name: "Move 0 items to trash?" });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(net.calls).toEqual([]);
+    expect(onTrashed).not.toHaveBeenCalled();
+  });
+
+  it("stays busy in a toolbar mounted while another toolbar's batch runs", async () => {
+    const first = render(<BulkToolbar files={[driveFile(1)]} onTrashed={vi.fn()} />, { wrapper: Providers });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await screen.findByRole("alertdialog");
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await flush();
+    first.unmount();
+
+    render(<BulkToolbar files={[driveFile(1)]} onTrashed={vi.fn()} initiallyOpen />, { wrapper: Providers });
+    await screen.findByRole("alertdialog");
+    const confirm = screen.getByRole("button", { name: "..." }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.click(confirm);
+    await answerAll("forward", new Set());
+    expect(net.calls.map((c) => c.fileId)).toEqual(["file-1"]);
+  });
+});
+
+describe("drive page bulk trash", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    useAuthStore.setState({
+      user: { id: "u-1" } as never,
+      workspaces: [{ role: "MEMBER", workspace: { id: "w", slug: "acme" } }] as never,
+    });
+    net.root = [1, 2].map((i) => ({
+      ...driveFile(i),
+      size: 10,
+      starred: false,
+      thumbnailPath: null,
+      createdAt: "2026-10-01T00:00:00Z",
+      updatedAt: "2026-10-01T00:00:00Z",
+      uploadedBy: { id: "u-1", displayName: "Ana", avatarUrl: null },
+    }));
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const renderPage = () =>
+    render(
+      <DrivePage
+        workspaceId="w"
+        workspaceSlug="acme"
+        view="list"
+        trash={false}
+        section="drive"
+        onNavigate={vi.fn()}
+        onViewChange={vi.fn()}
+        onTrashToggle={vi.fn()}
+      />,
+      { wrapper: Providers },
+    );
+
+  async function select(...names: string[]) {
+    for (const name of names) {
+      const row = (await screen.findByText(name)).closest("tr, [role='row'], div[class*='group/row']")!;
+      fireEvent.click(within(row as HTMLElement).getByRole("checkbox"));
+    }
+  }
+
+  it("keeps a running Delete-key batch, and the failed file selected, when Escape is pressed", async () => {
+    renderPage();
+    await select("File 1.txt", "File 2.txt");
+    expect(screen.getByText("2 selected")).toBeTruthy();
+
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await screen.findByRole("alertdialog", { name: "Move 2 items to trash?" });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await flush();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(screen.getByText("2 selected")).toBeTruthy();
+
+    await answerAll("reverse", new Set(["file-2"]));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(screen.getByText("1 selected")).toBeTruthy();
+    expect(toasts.error).toHaveBeenCalledWith("Moved 1 of 2 files to trash; 1 failed", {
+      description: "file-2 is locked",
+    });
+  });
+
+  it("still clears the selection with Escape when no dialog is open", async () => {
+    renderPage();
+    await select("File 1.txt");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByText("1 selected")).toBeNull();
+  });
+
+  it("does not offer to trash selected files that a search hides", async () => {
+    renderPage();
+    await select("File 1.txt");
+    fireEvent.change(screen.getByPlaceholderText("Search files..."), { target: { value: "zzz" } });
+    await waitFor(() => expect(screen.queryByText("File 1.txt")).toBeNull());
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(net.calls).toEqual([]);
+  });
 });
 
 describe.each([1, 2, 50])("moving %i selected file(s)", (n) => {
@@ -240,7 +362,7 @@ describe.each([1, 2, 50])("moving %i selected file(s)", (n) => {
   };
 
   async function startMove() {
-    net.folders = [{ id: "folder-archive", name: "Archive", isFolder: true, workspaceId: "w" }];
+    net.root = [{ id: "folder-archive", name: "Archive", isFolder: true, workspaceId: "w" }];
     const onClose = vi.fn();
     const onMoved = vi.fn();
     const invalidate = vi.spyOn(client, "invalidateQueries");

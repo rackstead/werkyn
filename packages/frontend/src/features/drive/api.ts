@@ -6,8 +6,8 @@ import {
 } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
-import { useAuthStore } from "@/stores/auth-store";
 import { settleWithConcurrency } from "@/lib/settle-with-concurrency";
+import { useAuthStore } from "@/stores/auth-store";
 
 export interface DriveFile {
   id: string;
@@ -394,6 +394,9 @@ async function runBulkFileAction(
   return outcome;
 }
 
+/** Identifies a workspace's running bulk trash to every component that asks. */
+export const bulkTrashMutationKey = (wid: string) => ["files", "bulk-trash", wid] as const;
+
 /**
  * Trashes many files as one mutation. Each file is its own request, so one
  * failure never hides the others: the result says which files were trashed
@@ -402,6 +405,7 @@ async function runBulkFileAction(
 export function useBulkTrashFiles(wid: string) {
   const qc = useQueryClient();
   return useMutation({
+    mutationKey: bulkTrashMutationKey(wid),
     mutationFn: (fileIds: readonly string[]) => {
       const trashedAt = new Date().toISOString();
       return runBulkFileAction(fileIds, (fileId) => trashFileRequest(wid, fileId, trashedAt));

@@ -1,5 +1,6 @@
+import { useIsMutating } from "@tanstack/react-query";
 import type { DriveFile } from "../api";
-import { useArchiveFiles, useBulkTrashFiles } from "../api";
+import { bulkTrashMutationKey, useArchiveFiles, useBulkTrashFiles } from "../api";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { X, FolderInput, Archive, Share2, Trash2 } from "lucide-react";
@@ -35,7 +36,10 @@ export function DriveBulkActions({
 }: DriveBulkActionsProps) {
   const archiveFiles = useArchiveFiles(workspaceId);
   const bulkTrash = useBulkTrashFiles(workspaceId);
-  const isTrashingBatch = bulkTrash.isPending;
+  // Busy while any toolbar's batch runs, so a toolbar mounted mid-batch
+  // cannot start a second one.
+  const trashingElsewhere = useIsMutating({ mutationKey: bulkTrashMutationKey(workspaceId) }) > 0;
+  const isTrashingBatch = bulkTrash.isPending || trashingElsewhere;
 
   const count = selectedFiles.length;
 
@@ -48,8 +52,12 @@ export function DriveBulkActions({
   };
 
   const handleTrashAll = async () => {
+    if (isTrashingBatch) return;
     const fileIds = selectedFiles.map((f) => f.id);
-    if (fileIds.length === 0 || bulkTrash.isPending) return;
+    if (fileIds.length === 0) {
+      onTrashConfirmOpenChange(false);
+      return;
+    }
     try {
       const result = await bulkTrash.mutateAsync(fileIds);
       toastBulkFileResult(result, "trash");
@@ -95,6 +103,7 @@ export function DriveBulkActions({
           variant="destructive"
           size="sm"
           onClick={() => onTrashConfirmOpenChange(true)}
+          disabled={count === 0}
         >
           <Trash2 className="h-4 w-4 mr-1" />
           Trash

@@ -238,11 +238,6 @@ export function DrivePage({
     [addRecent],
   );
 
-  // The trash confirmation belongs to a selection; it never outlives it.
-  useEffect(() => {
-    if (selection.count === 0) setShowTrashConfirm(false);
-  }, [selection.count]);
-
   // Clear search and selection when folder/teamFolder changes
   useEffect(() => {
     setSearchQuery("");
@@ -290,6 +285,12 @@ export function DrivePage({
     [files, selection.selectedIds],
   );
 
+  // The trash confirmation is for the selected files on screen; it closes
+  // when none are left (the selection was cleared, or a search hid them).
+  useEffect(() => {
+    if (selectedFiles.length === 0) setShowTrashConfirm(false);
+  }, [selectedFiles.length]);
+
   const handleMoveSelected = useCallback(() => {
     setMoveFileIds(Array.from(selection.selectedIds));
   }, [selection.selectedIds]);
@@ -297,6 +298,16 @@ export function DrivePage({
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // These shortcuts are the file list's. A key an open dialog, menu or
+      // slideover has already handled (Escape) or that is pressed inside one
+      // is not, so Escape cannot clear the selection under a running batch.
+      if (
+        e.defaultPrevented ||
+        (e.target instanceof Element &&
+          e.target.closest('[role="dialog"], [role="alertdialog"], [role="menu"]'))
+      ) {
+        return;
+      }
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
         return;
@@ -320,7 +331,7 @@ export function DrivePage({
       }
 
       // Delete/Backspace: trash selected
-      if ((e.key === "Delete" || e.key === "Backspace") && canEdit && selection.count > 0) {
+      if ((e.key === "Delete" || e.key === "Backspace") && canEdit && selectedFiles.length > 0) {
         e.preventDefault();
         setShowTrashConfirm(true);
       }
@@ -328,7 +339,7 @@ export function DrivePage({
 
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [previewFile, selection, fileIds, canEdit]);
+  }, [previewFile, selection, fileIds, canEdit, selectedFiles.length]);
 
   const dragOverlayIcon = activeDrag
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)

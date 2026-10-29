@@ -367,6 +367,12 @@ migration `20261029090000_add_refresh_token_families` adds the family table and
 backfills families for existing sessions, so users stay signed in. See
 [docs/remediation/sec-011.md](docs/remediation/sec-011.md).
 
+A password-reset link works once: when the same link is submitted several
+times at once, one request changes the password and ends the sessions, and the
+others get `410` and change nothing. An email-verification link is likewise
+consumed by exactly one request. See
+[docs/remediation/sec-026.md](docs/remediation/sec-026.md).
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

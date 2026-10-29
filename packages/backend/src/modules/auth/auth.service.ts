@@ -7,6 +7,7 @@ import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
 import {
   createRefreshSession,
+  isBusy,
   limitLockWaits,
   refreshTransactionOptions,
   revokeRefreshFamily,
@@ -395,6 +396,28 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   await sendPasswordResetEmail(user.email, token);
 }
 
+// A token transaction that waited past the lock timeout or its budget was
+// rolled back without using the token, so the same link can be retried.
+function retryLinkWhenBusy(error: unknown): never {
+  if (isBusy(error))
+    throw new AppError(
+      503,
+      "Service Unavailable",
+      "This link is busy. Try again in a moment.",
+    );
+  throw error;
+}
+
+function assertResetTokenUsable<
+  T extends { usedAt: Date | null; expiresAt: Date },
+>(resetToken: T | null, now: Date): asserts resetToken is T {
+  if (!resetToken) throw new NotFoundError("Invalid reset token");
+  if (resetToken.usedAt)
+    throw new GoneError("Reset token has already been used");
+  if (resetToken.expiresAt <= now)
+    throw new GoneError("Reset token has expired");
+}
+
 export async function resetPassword(
   prisma: PrismaClient,
   token: string,
@@ -402,80 +425,117 @@ export async function resetPassword(
 ) {
   const resetToken = await prisma.passwordResetToken.findUnique({
     where: { token },
+    select: { id: true, userId: true, usedAt: true, expiresAt: true },
   });
-
-  if (!resetToken) {
-    throw new NotFoundError("Invalid reset token");
-  }
-
-  if (resetToken.usedAt) {
-    throw new GoneError("Reset token has already been used");
-  }
-
-  if (resetToken.expiresAt < new Date()) {
-    throw new GoneError("Reset token has expired");
-  }
+  // Refuses unusable tokens before the password is hashed. Requests that pass
+  // this check together are decided by the claim below.
+  assertResetTokenUsable(resetToken, new Date());
 
   const passwordHash = await hashPassword(newPassword);
 
-  await prisma.$transaction(async (tx) => {
+  // A reset token is used once. The conditional update claims it in the same
+  // transaction that changes the password and revokes the sessions: a request
+  // that reaches the token row while another holds it waits, then re-checks
+  // usedAt and claims nothing, so it changes nothing and gets the reuse error.
+  // The token row is locked before the user row and the user row before the
+  // families (refresh-sessions.ts); no path locks a reset token while holding
+  // its user.
+  const resetting = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
+    const now = new Date();
+    const claimed = await tx.passwordResetToken.updateMany({
+      where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
+      data: { usedAt: now },
+    });
+    if (claimed.count !== 1) {
+      assertResetTokenUsable(
+        await tx.passwordResetToken.findUnique({
+          where: { id: resetToken.id },
+          select: { usedAt: true, expiresAt: true },
+        }),
+        now,
+      );
+      // Not reached: a usable token is always claimed by the update above.
+      throw new GoneError("Reset token has already been used");
+    }
+    // The claim may have waited for another holder of the token row past the
+    // token's expiry; rolling back leaves the token unused.
+    if (resetToken.expiresAt <= new Date())
+      throw new GoneError("Reset token has expired");
     await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },
     });
-    await tx.passwordResetToken.update({
-      where: { id: resetToken.id },
-      data: { usedAt: new Date() },
-    });
     await revokeUserRefreshSessions(tx, resetToken.userId, "password_reset");
   }, refreshTransactionOptions);
+  await resetting.catch(retryLinkWhenBusy);
+}
+
+function assertVerificationTokenUsable<T extends { expiresAt: Date }>(
+  verificationToken: T | null,
+  now: Date,
+): asserts verificationToken is T {
+  if (!verificationToken) throw new NotFoundError("Invalid verification token");
+  if (verificationToken.expiresAt <= now)
+    throw new GoneError("Verification token has expired");
 }
 
 export async function verifyEmail(prisma: PrismaClient, token: string) {
   const verificationToken = await prisma.emailVerificationToken.findUnique({
     where: { token },
+    select: { id: true, userId: true, expiresAt: true },
   });
+  assertVerificationTokenUsable(verificationToken, new Date());
 
-  if (!verificationToken) {
-    throw new NotFoundError("Invalid verification token");
-  }
-
-  if (verificationToken.expiresAt < new Date()) {
-    throw new GoneError("Verification token has expired");
-  }
-
-  // Check if already verified (idempotent)
-  const user = await prisma.user.findUnique({
-    where: { id: verificationToken.userId },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
-  });
-
-  if (!user) {
-    throw new NotFoundError("User not found");
-  }
-
-  if (!user.emailVerified) {
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { emailVerified: true },
+  // Deleting the token claims it: the account is verified only in the
+  // transaction whose delete removed it. A concurrent use of the same link,
+  // or one whose token a resend replaced meanwhile, changes nothing and gets
+  // the same error as a later reuse.
+  const verifying = prisma.$transaction(async (tx) => {
+    await limitLockWaits(tx);
+    const now = new Date();
+    const claimed = await tx.emailVerificationToken.deleteMany({
+      where: { id: verificationToken.id, expiresAt: { gt: now } },
     });
-    user.emailVerified = true;
-  }
+    if (claimed.count !== 1) {
+      assertVerificationTokenUsable(
+        await tx.emailVerificationToken.findUnique({
+          where: { id: verificationToken.id },
+          select: { expiresAt: true },
+        }),
+        now,
+      );
+      // Not reached: a usable token is always claimed by the delete above.
+      throw new NotFoundError("Invalid verification token");
+    }
+    if (verificationToken.expiresAt <= new Date())
+      throw new GoneError("Verification token has expired");
 
-  // Delete the token
-  await prisma.emailVerificationToken.delete({
-    where: { id: verificationToken.id },
-  });
+    const user = await tx.user.findUnique({
+      where: { id: verificationToken.userId },
+      select: {
+        id: true,
+        email: true,
+        displayName: true,
+        avatarUrl: true,
+        jobTitle: true,
+        phone: true,
+        timezone: true,
+        emailVerified: true,
+      },
+    });
+    if (!user) throw new NotFoundError("User not found");
+    // Already verified: the link still succeeds once (idempotent).
+    if (!user.emailVerified) {
+      await tx.user.update({
+        where: { id: user.id },
+        data: { emailVerified: true },
+      });
+      user.emailVerified = true;
+    }
+    return user;
+  }, refreshTransactionOptions);
+  const user = await verifying.catch(retryLinkWhenBusy);
 
   return { user };
 }

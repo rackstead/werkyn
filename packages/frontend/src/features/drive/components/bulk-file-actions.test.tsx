@@ -420,6 +420,12 @@ describe("drive page bulk trash", () => {
     await flush();
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(screen.getByText("1 selected")).toBeTruthy();
+    // No new trash prompt opens while the old batch runs, so the old batch
+    // can never close one when it settles.
+    expect((screen.getByRole("button", { name: "Trash" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
 
     await answerAll("forward", new Set(["file-2"]));
     await waitFor(() =>
@@ -429,6 +435,16 @@ describe("drive page bulk trash", () => {
     );
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(screen.getByText("1 selected")).toBeTruthy();
+
+    // Once it has settled, the new folder's own confirmation opens and stays.
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Trash" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await screen.findByRole("alertdialog", { name: "Move 1 item to trash?" });
+    await flush();
+    expect(screen.getByRole("alertdialog", { name: "Move 1 item to trash?" })).toBeTruthy();
+    expect(net.calls).toHaveLength(2);
   });
 
   it("still clears the selection with Escape when no dialog is open", async () => {

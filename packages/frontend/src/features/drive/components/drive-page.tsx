@@ -340,7 +340,15 @@ export function DrivePage({
       }
 
       // Delete/Backspace: trash selected
-      if ((e.key === "Delete" || e.key === "Backspace") && canEdit && selectedFiles.length > 0) {
+      // Like the toolbar's Trash button, Delete waits for a running bulk
+      // trash to settle, so no new confirmation can open under it (or be
+      // closed by it when it settles, even after a folder change).
+      if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        canEdit &&
+        selectedFiles.length > 0 &&
+        !isTrashingBatch
+      ) {
         e.preventDefault();
         setShowTrashConfirm(true);
       }
@@ -348,7 +356,7 @@ export function DrivePage({
 
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [previewFile, selection, fileIds, canEdit, selectedFiles.length]);
+  }, [previewFile, selection, fileIds, canEdit, selectedFiles.length, isTrashingBatch]);
 
   const dragOverlayIcon = activeDrag
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)

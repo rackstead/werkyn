@@ -112,7 +112,8 @@ export async function getProject(
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     include: {
-      statuses: { orderBy: { position: "asc" } },
+      // The same total order as the status list (statuses.service.ts).
+      statuses: { orderBy: [{ position: "asc" }, { id: "asc" }] },
       _count: { select: { members: true, tasks: true } },
     },
   });

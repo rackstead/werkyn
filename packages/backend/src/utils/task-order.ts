@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import { setTimeout as sleep } from "node:timers/promises";
 import { NotFoundError, ValidationError } from "./errors.js";
+import { logger } from "./logger.js";
 import { isRetryableDatabaseError } from "./retryable-database-errors.js";
 
 // Task order, column and dependency-graph changes of one project are
@@ -66,6 +67,18 @@ function shouldRetry(error: unknown) {
   return isRetryableDatabaseError(error);
 }
 
+/** The Prisma code, or the SQLSTATE it wraps; never the message, which quotes the query. */
+function errorCode(error: unknown) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    const state = error.meta?.code;
+    return typeof state === "string" ? state : error.code;
+  }
+  if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+    return /\bcode: "([0-9A-Z]{5})"/.exec(error.message)?.[1];
+  }
+  return undefined;
+}
+
 /**
  * Runs `work` with the project's order lock held: in a new READ COMMITTED
  * transaction retried up to ORDER_TRANSACTION_ATTEMPTS times, or inside the
@@ -88,6 +101,11 @@ export async function withProjectOrder<T>(
       return await db.$transaction(locked, ORDER_TRANSACTION_OPTIONS);
     } catch (error) {
       if (attempt >= ORDER_TRANSACTION_ATTEMPTS || !shouldRetry(error)) throw error;
+      // Recorded so contention on a project stays visible even when the retry succeeds.
+      logger.warn(
+        { projectId, attempt, attempts: ORDER_TRANSACTION_ATTEMPTS, code: errorCode(error) },
+        "Retrying a project order transaction the database aborted",
+      );
       // Short and jittered, so two aborted writers do not collide again in step.
       await sleep(attempt * (10 + Math.floor(Math.random() * 40)));
     }

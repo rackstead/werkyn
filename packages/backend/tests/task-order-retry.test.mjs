@@ -12,6 +12,20 @@ const { Prisma } = await import("@prisma/client");
 const { withProjectOrder, ORDER_TRANSACTION_ATTEMPTS } = await import("../src/utils/task-order.ts");
 const { isRetryableDatabaseError } = await import("../src/utils/retryable-database-errors.ts");
 const { NotFoundError, ValidationError } = await import("../src/utils/errors.ts");
+const { logger } = await import("../src/utils/logger.ts");
+
+/** Captures logger.warn calls made while `fn` runs. */
+async function capturingWarnings(fn) {
+  const warnings = [];
+  const original = logger.warn;
+  logger.warn = (...args) => { warnings.push(args); };
+  try {
+    await fn();
+  } finally {
+    logger.warn = original;
+  }
+  return warnings;
+}
 
 const clientVersion = "test";
 // The shape Prisma 6 produces for a deadlock inside an interactive transaction.
@@ -51,17 +65,25 @@ function fakeClient(project = { id: "p1", archived: false }) {
 
 test("a deadlocked or serialization-failed transaction is retried, up to the attempt limit", async () => {
   assert.equal(ORDER_TRANSACTION_ATTEMPTS, 3);
-  for (const failure of [deadlock, serialization, () => known("P2034")]) {
+  for (const [failure, code] of [[deadlock, "40P01"], [serialization, "40001"], [() => known("P2034"), "P2034"]]) {
     const client = fakeClient();
     let runs = 0;
-    const result = await withProjectOrder(client, "p1", async (tx, project) => {
-      runs++;
-      assert.equal(tx, client.tx);
-      assert.deepEqual(project, { id: "p1", archived: false });
-      if (runs < ORDER_TRANSACTION_ATTEMPTS) throw failure();
-      return "done";
+    let result;
+    const warnings = await capturingWarnings(async () => {
+      result = await withProjectOrder(client, "p1", async (tx, project) => {
+        runs++;
+        assert.equal(tx, client.tx);
+        assert.deepEqual(project, { id: "p1", archived: false });
+        if (runs < ORDER_TRANSACTION_ATTEMPTS) throw failure();
+        return "done";
+      });
     });
     assert.equal(result, "done");
+    // Each retry is logged with the project, the attempt and the database code (not the query).
+    assert.deepEqual(
+      warnings.map(([fields]) => fields),
+      [1, 2].map((attempt) => ({ projectId: "p1", attempt, attempts: ORDER_TRANSACTION_ATTEMPTS, code })),
+    );
     assert.equal(client.calls.transactions, ORDER_TRANSACTION_ATTEMPTS, "one transaction per attempt");
     // Every attempt locks the project row first, in a READ COMMITTED transaction.
     assert.equal(client.calls.locks.length, ORDER_TRANSACTION_ATTEMPTS);
@@ -88,8 +110,10 @@ test("expired transactions and ordinary errors are not retried", async () => {
     new Error("boom"),
   ]) {
     const client = fakeClient();
-    await assert.rejects(withProjectOrder(client, "p1", async () => { throw error; }), (thrown) => thrown === error);
+    const warnings = await capturingWarnings(() =>
+      assert.rejects(withProjectOrder(client, "p1", async () => { throw error; }), (thrown) => thrown === error));
     assert.equal(client.calls.transactions, 1, `${error.message} was retried`);
+    assert.equal(warnings.length, 0);
   }
 });
 

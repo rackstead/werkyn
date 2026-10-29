@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Dialog,
   DialogContent,
@@ -51,6 +51,9 @@ export function MoveDialog({
   const copyFile = useCopyFile(workspaceId);
   const bulkMove = useBulkMoveFiles(workspaceId);
   const isProcessingBatch = bulkMove.isPending;
+  // Set before the batch starts: a second click that lands before React
+  // re-renders the busy state must not start a second batch.
+  const batchRunning = useRef(false);
   const { data: teamFoldersData } = useTeamFolders(workspaceId);
   const teamFolders = teamFoldersData?.data ?? [];
 
@@ -85,7 +88,8 @@ export function MoveDialog({
 
   const handleAction = async () => {
     if (isBatch && fileIds) {
-      if (bulkMove.isPending) return;
+      if (batchRunning.current || bulkMove.isPending) return;
+      batchRunning.current = true;
       try {
         const result = await bulkMove.mutateAsync({
           fileIds,
@@ -97,6 +101,8 @@ export function MoveDialog({
         onMoved?.(result.succeeded);
       } catch {
         // Not a per-file failure; the client-wide mutation handler reported it.
+      } finally {
+        batchRunning.current = false;
       }
       onClose();
       return;

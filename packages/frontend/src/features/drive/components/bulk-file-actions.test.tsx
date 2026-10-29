@@ -22,6 +22,8 @@ const net = vi.hoisted(() => ({
   maxInFlight: 0,
   /** The listing of the root folder; a search finds nothing. */
   root: [] as unknown[],
+  /** Listings of other folders by id. */
+  folders: {} as Record<string, unknown[]>,
 }));
 
 vi.mock("@/lib/api-client", () => ({
@@ -42,7 +44,11 @@ vi.mock("@/lib/api-client", () => ({
           url.includes("team-folders") || url.includes("share-status")
             ? { data: [] }
             : {
-                data: url.includes("parentId=") || url.includes("search=") ? [] : net.root,
+                data: url.includes("search=")
+                  ? []
+                  : url.includes("parentId=")
+                    ? (net.folders[new URLSearchParams(url.split("?")[1]).get("parentId")!] ?? [])
+                    : net.root,
                 nextCursor: null,
               },
         ),
@@ -100,6 +106,7 @@ beforeEach(() => {
   net.inFlight = 0;
   net.maxInFlight = 0;
   net.root = [];
+  net.folders = {};
   clientWideError = vi.fn();
   client = new QueryClient({
     defaultOptions: {
@@ -290,6 +297,20 @@ describe("drive page bulk trash", () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
+  const page = (folderId?: string) => (
+    <DrivePage
+      workspaceId="w"
+      workspaceSlug="acme"
+      folderId={folderId}
+      view="list"
+      trash={false}
+      section="drive"
+      onNavigate={vi.fn()}
+      onViewChange={vi.fn()}
+      onTrashToggle={vi.fn()}
+    />
+  );
+
   const renderPage = () =>
     render(
       <DrivePage
@@ -350,6 +371,64 @@ describe("drive page bulk trash", () => {
     await answerAll("forward", new Set());
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(toasts.success).toHaveBeenCalledWith("Moved 2 files to trash");
+  });
+
+  it("ignores Delete and Ctrl+A on the page while a busy dialog is open", async () => {
+    net.root = [...net.root, { id: "folder-t", name: "Target", isFolder: true, workspaceId: "w" }];
+    renderPage();
+    await select("File 1.txt", "File 2.txt");
+
+    // A running bulk move: Delete must not open a trash confirmation over it.
+    fireEvent.click(screen.getByRole("button", { name: "Move" }));
+    const move = await screen.findByRole("dialog");
+    fireEvent.click(within(move).getByText("Target"));
+    fireEvent.click(within(move).getByRole("button", { name: "Move here" }));
+    await flush();
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    fireEvent.keyDown(document.body, { key: "a", ctrlKey: true });
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByText("2 selected")).toBeTruthy();
+    await answerAll("forward", new Set(["file-1", "file-2"]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    // A running bulk trash: Ctrl+A must not change the selection under it.
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await screen.findByRole("alertdialog", { name: "Move 2 items to trash?" });
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await flush();
+    fireEvent.keyDown(document.body, { key: "a", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "a", metaKey: true });
+    await flush();
+    expect(screen.getByRole("alertdialog", { name: "Move 2 items to trash?" })).toBeTruthy();
+    expect(screen.getByText("2 selected")).toBeTruthy();
+    await answerAll("forward", new Set());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  it("closes the confirmation when the folder changes mid-batch; the batch still reports", async () => {
+    net.folders["folder-x"] = [{ ...driveFile(9), parentId: "folder-x", name: "Other.txt", updatedAt: "2026-10-01T00:00:00Z", uploadedBy: { id: "u-1", displayName: "Ana", avatarUrl: null } }];
+    const view = render(page(), { wrapper: Providers });
+    await select("File 1.txt", "File 2.txt");
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await screen.findByRole("alertdialog");
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await flush();
+
+    view.rerender(page("folder-x"));
+    await select("Other.txt");
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByText("1 selected")).toBeTruthy();
+
+    await answerAll("forward", new Set(["file-2"]));
+    await waitFor(() =>
+      expect(toasts.error).toHaveBeenCalledWith("Moved 1 of 2 files to trash; 1 failed", {
+        description: "file-2 is locked",
+      }),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByText("1 selected")).toBeTruthy();
   });
 
   it("still clears the selection with Escape when no dialog is open", async () => {
@@ -425,6 +504,38 @@ describe.each([1, 2, 50])("moving %i selected file(s)", (n) => {
     expect(onMoved).toHaveBeenCalledTimes(1);
     expect(onMoved).toHaveBeenCalledWith(ids.filter((id) => !failed.includes(id)));
     expect(clientWideError).not.toHaveBeenCalled();
+  });
+});
+
+describe("double submission", () => {
+  it("starts one bulk move for two clicks on Move here with no render between them", async () => {
+    net.root = [{ id: "folder-archive", name: "Archive", isFolder: true, workspaceId: "w" }];
+    const onClose = vi.fn();
+    render(<MoveDialog file={null} fileIds={["file-1", "file-2"]} onClose={onClose} workspaceId="w" />, {
+      wrapper: Providers,
+    });
+    fireEvent.click(await screen.findByText("Archive"));
+    const button = screen.getByRole("button", { name: "Move here" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await answerAll("forward", new Set());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(net.calls.map((c) => c.fileId)).toEqual(["file-1", "file-2"]);
+    expect(toasts.success).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts one bulk trash for two confirm clicks with no render between them", async () => {
+    render(<BulkToolbar files={[driveFile(1), driveFile(2)]} onTrashed={vi.fn()} initiallyOpen />, {
+      wrapper: Providers,
+    });
+    const confirm = within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Trash" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    await answerAll("forward", new Set());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(net.calls.map((c) => c.fileId)).toEqual(["file-1", "file-2"]);
+    expect(toasts.success).toHaveBeenCalledTimes(1);
   });
 });
 

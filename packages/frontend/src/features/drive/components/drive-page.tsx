@@ -240,11 +240,14 @@ export function DrivePage({
     [addRecent],
   );
 
-  // Clear search and selection when folder/teamFolder changes
+  // Clear search, selection and the trash confirmation when the folder or
+  // workspace changes. A batch still running for the old folder keeps going
+  // and reports through its toast.
   useEffect(() => {
     setSearchQuery("");
     selection.clear();
-  }, [folderId, teamFolderId]);
+    setShowTrashConfirm(false);
+  }, [workspaceId, folderId, teamFolderId]);
 
   const handleNavigate = useCallback(
     (id: string) => {
@@ -302,13 +305,15 @@ export function DrivePage({
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // These shortcuts are the file list's. A key an open dialog, menu or
-      // slideover has already handled (Escape) or that is pressed inside one
-      // is not, so Escape cannot clear the selection under a running batch.
+      // These shortcuts are the file list's. None applies while a dialog or
+      // slideover is open (even when focus has fallen to the page because a
+      // busy dialog disabled its focused button), to a key an open layer has
+      // already handled (Escape), or to a key pressed inside a menu. So no
+      // shortcut can change the selection or open a dialog under a batch.
       if (
         e.defaultPrevented ||
-        (e.target instanceof Element &&
-          e.target.closest('[role="dialog"], [role="alertdialog"], [role="menu"]'))
+        document.querySelector('[role="dialog"], [role="alertdialog"]') ||
+        (e.target instanceof Element && e.target.closest('[role="menu"]'))
       ) {
         return;
       }

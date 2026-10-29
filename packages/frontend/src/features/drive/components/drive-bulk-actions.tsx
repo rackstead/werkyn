@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 import type { DriveFile } from "../api";
 import { bulkTrashMutationKey, useArchiveFiles, useBulkTrashFiles } from "../api";
@@ -44,6 +44,9 @@ export function DriveBulkActions({
   // The confirmation keeps naming the batch it started, even if a search
   // changes which selected files are on screen while it runs.
   const [batchSize, setBatchSize] = useState<number | null>(null);
+  // Set before the batch starts, so a second click before the busy render
+  // cannot start a second batch.
+  const batchRunning = useRef(false);
 
   const count = selectedFiles.length;
 
@@ -56,12 +59,13 @@ export function DriveBulkActions({
   };
 
   const handleTrashAll = async () => {
-    if (isTrashingBatch) return;
+    if (batchRunning.current || isTrashingBatch) return;
     const fileIds = selectedFiles.map((f) => f.id);
     if (fileIds.length === 0) {
       onTrashConfirmOpenChange(false);
       return;
     }
+    batchRunning.current = true;
     setBatchSize(fileIds.length);
     try {
       const result = await bulkTrash.mutateAsync(fileIds);
@@ -71,6 +75,7 @@ export function DriveBulkActions({
     } catch {
       // Not a per-file failure; the client-wide mutation handler reported it.
     } finally {
+      batchRunning.current = false;
       setBatchSize(null);
       onTrashConfirmOpenChange(false);
     }
@@ -109,7 +114,7 @@ export function DriveBulkActions({
           variant="destructive"
           size="sm"
           onClick={() => onTrashConfirmOpenChange(true)}
-          disabled={count === 0}
+          disabled={count === 0 || isTrashingBatch}
         >
           <Trash2 className="h-4 w-4 mr-1" />
           Trash

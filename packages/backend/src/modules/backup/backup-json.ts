@@ -6,19 +6,29 @@ const MiB = 1024 * 1024;
 
 /**
  * What one `backup.json` may ask the server to parse. JSON.parse and schema
- * validation cost heap per value, not per byte, so tokens are limited as well
- * as bytes. Every limit leaves headroom over a realistic large export (see
- * docs/remediation/sec-028.md).
+ * validation cost heap per value and per object, not just per byte, so all
+ * three are limited. Together the limits keep the most expensive file they
+ * accept within a 256 MiB heap, including the app, and each leaves headroom
+ * over a large realistic export (see docs/remediation/sec-028.md).
  */
 export const BACKUP_JSON_LIMITS = Object.freeze({
-  /** UTF-8 bytes. The largest measured export was 16.6 MiB. */
-  maxBytes: 32 * MiB,
+  /**
+   * UTF-8 bytes. The largest measured export was 16.6 MiB. Text with any
+   * character above U+00FF costs two bytes of heap per character, twice over.
+   */
+  maxBytes: 24 * MiB,
   /**
    * `{`, `[`, `,` and `:` outside strings, plus one. This is an upper bound on
    * the values and member names JSON.parse can create. Exports average 22 to
    * 24 bytes per token.
    */
-  maxTokens: 2_000_000,
+  maxTokens: 1_500_000,
+  /**
+   * `{` outside strings. A validated object is the most expensive value.
+   * Exports average about 300 bytes per object; a file of minimal objects
+   * would otherwise fit hundreds of thousands into the token limit.
+   */
+  maxObjects: 150_000,
   /**
    * Nesting of objects and arrays. Exports nest about 12 deep. The database
    * layer stores at most 123 levels in one JSON column, which puts a wiki
@@ -30,12 +40,14 @@ export const BACKUP_JSON_LIMITS = Object.freeze({
 export interface BackupJsonLimits {
   maxBytes: number;
   maxTokens: number;
+  maxObjects: number;
   maxDepth: number;
 }
 
 export interface BackupJsonStats {
   bytes: number;
   tokens: number;
+  objects: number;
   depth: number;
 }
 
@@ -71,6 +83,7 @@ export function inspectBackupJson(
 ): BackupJsonStats {
   if (json.length > limits.maxBytes) throw new BackupJsonError("json-size");
   let tokens = 1;
+  let objects = 0;
   let depth = 0;
   let maxDepth = 0;
   let inString = false;
@@ -87,6 +100,9 @@ export function inspectBackupJson(
         break;
       case OPEN_OBJECT:
       case OPEN_ARRAY:
+        if (byte === OPEN_OBJECT && ++objects > limits.maxObjects) {
+          throw new BackupJsonError("json-objects");
+        }
         if (++depth > maxDepth) {
           maxDepth = depth;
           if (maxDepth > limits.maxDepth) throw new BackupJsonError("json-depth");
@@ -103,7 +119,7 @@ export function inspectBackupJson(
         break;
     }
   }
-  return { bytes: json.length, tokens, depth: maxDepth };
+  return { bytes: json.length, tokens, objects, depth: maxDepth };
 }
 
 /** Problems quoted in the response; validation stops once it has this many. */

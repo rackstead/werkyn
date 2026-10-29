@@ -219,7 +219,8 @@ test("amplifying backup.json uploads get a 400 and the server stays up", async (
     const head = '{"metadata":{},"projects":[';
     return Buffer.from(`${head}${"{},".repeat(Math.floor((bytes - head.length - 4) / 3))}{}]}`);
   };
-  // Invalid tasks report five problems each. 750,000 of them are about 2 MiB.
+  // Invalid tasks report five problems each. 750,000 of them, about 2 MiB,
+  // exceed the object limit.
   const invalidTasks = Buffer.from(
     JSON.stringify({ metadata: META, projects: [{ project: { name: "p" }, tasks: [] }] }).replace(
       '"tasks":[]',
@@ -239,8 +240,8 @@ test("amplifying backup.json uploads get a 400 and the server stays up", async (
     { label: "zip-4mib", upload: zipOf(four), expect: TOO_LARGE },
     { label: "zip-24mib", upload: zipOf(twentyFour), expect: TOO_LARGE },
     { label: "json-24mib", upload: twentyFour, filename: "backup.json", expect: TOO_LARGE },
-    { label: "zip-invalid-tasks", upload: zipOf(invalidTasks), expect: FORMAT },
-    { label: "json-invalid-tasks", upload: invalidTasks, filename: "backup.json", expect: FORMAT },
+    { label: "zip-invalid-tasks", upload: zipOf(invalidTasks), expect: TOO_LARGE },
+    { label: "json-invalid-tasks", upload: invalidTasks, filename: "backup.json", expect: TOO_LARGE },
     { label: "enum-values", upload: channels, filename: "backup.json", expect: FORMAT },
     // The same process still restores a legitimate backup afterwards.
     { label: "legit-after", upload: zipOf(legit), expect: 200 },
@@ -257,13 +258,14 @@ test("amplifying backup.json uploads get a 400 and the server stays up", async (
   assert.equal(run.results.get("legit-after restore").body.data.wikiSpaces, 1);
 });
 
+const limits = () => import("../../src/modules/backup/backup-json.ts");
+const unlimited = { maxBytes: Infinity, maxTokens: Infinity, maxObjects: Infinity, maxDepth: Infinity };
+
 test("backup.json limits: exactly at each limit is accepted, one more is refused", async (t) => {
-  const { BACKUP_JSON_LIMITS: L, inspectBackupJson } = await import(
-    "../../src/modules/backup/backup-json.ts"
-  );
-  const measure = (json) =>
-    inspectBackupJson(json, { maxBytes: Infinity, maxTokens: Infinity, maxDepth: Infinity });
+  const { BACKUP_JSON_LIMITS: L, inspectBackupJson } = await limits();
+  const measure = (json) => inspectBackupJson(Buffer.from(json), unlimited);
   const label = (name) => `Limits ${name} ${suffix}`;
+  const single = (name) => JSON.stringify(spaceBackup(label(name), [0]));
 
   // Pad a valid backup with trailing whitespace to an exact size.
   const padded = (name, bytes) => {
@@ -272,9 +274,13 @@ test("backup.json limits: exactly at each limit is accepted, one more is refused
   };
   // Content [0,0,…] adds one token per element after the first.
   const tokens = (name, count) => {
-    const base = measure(Buffer.from(JSON.stringify(spaceBackup(label(name), [0])))).tokens;
-    const zeros = Array(count - base + 1).fill("0").join(",");
-    return Buffer.from(JSON.stringify(spaceBackup(label(name), [0])).replace('"content":[0]', `"content":[${zeros}]`));
+    const zeros = Array(count - measure(single(name)).tokens + 1).fill("0").join(",");
+    return Buffer.from(single(name).replace('"content":[0]', `"content":[${zeros}]`));
+  };
+  // Content [{},{},…] adds one object per element.
+  const objects = (name, count) => {
+    const empties = Array(count - measure(single(name)).objects).fill("{}").join(",");
+    return Buffer.from(single(name).replace('"content":[0]', `"content":[${empties}]`));
   };
   // The page sits five levels deep, so content nests `depth - 5` arrays.
   const nested = (name, depth) => {
@@ -291,30 +297,37 @@ test("backup.json limits: exactly at each limit is accepted, one more is refused
   const overBytes = padded("over-bytes", L.maxBytes + 1);
   const atTokens = tokens("at-tokens", L.maxTokens);
   const overTokens = tokens("over-tokens", L.maxTokens + 1);
+  const atObjects = objects("at-objects", L.maxObjects);
+  const overObjects = objects("over-objects", L.maxObjects + 1);
   const atDepth = nested("at-depth", L.maxDepth);
   const overDepth = nested("over-depth", L.maxDepth + 1);
   assert.equal(measure(atBytes).bytes, L.maxBytes);
   assert.equal(measure(atTokens).tokens, L.maxTokens);
   assert.equal(measure(overTokens).tokens, L.maxTokens + 1);
+  assert.equal(measure(atObjects).objects, L.maxObjects);
+  assert.equal(measure(overObjects).objects, L.maxObjects + 1);
   assert.equal(measure(atDepth).depth, L.maxDepth);
   assert.equal(measure(overDepth).depth, L.maxDepth + 1);
 
-  // The cheapest invalid element still costs a full parse before validation
-  // stops; these are the most expensive invalid uploads the limits allow.
-  const invalidAt = (head, tail, unit) => {
-    const base = measure(Buffer.from(`${head}${unit}${tail}`)).tokens;
-    const per = measure(Buffer.from(`[${unit},${unit}]`)).tokens - measure(Buffer.from(`[${unit}]`)).tokens;
-    const count = 1 + Math.floor((L.maxTokens - base) / per);
-    return Buffer.from(`${head}${Array(count).fill(unit).join(",")}${tail}`);
+  // Validation stops early, but the whole file is still parsed first. These
+  // are the most expensive invalid uploads the limits allow: `{}` up to the
+  // object limit, then `[]` up to the token limit.
+  const invalid = (head, tail) => {
+    const base = measure(`${head}{}${tail}`);
+    const empties = Array(1 + L.maxObjects - base.objects).fill("{}");
+    const arrays = Array(Math.floor((L.maxTokens - base.tokens - 2 * (empties.length - 1)) / 2)).fill("[]");
+    return Buffer.from(`${head}${empties.concat(arrays).join(",")}${tail}`);
   };
-  const invalidProjects = invalidAt('{"metadata":{},"projects":[', "]}", "{}");
-  const invalidTasks = invalidAt(
+  const invalidProjects = invalid('{"metadata":{},"projects":[', "]}");
+  const invalidTasks = invalid(
     `{"metadata":${JSON.stringify(META)},"projects":[{"project":{"name":"p"},"tasks":[`,
     "]}]}",
-    "{}",
   );
-  assert.ok(measure(invalidProjects).tokens <= L.maxTokens);
-  assert.ok(measure(invalidTasks).tokens > L.maxTokens - 3);
+  for (const json of [invalidProjects, invalidTasks]) {
+    const stats = measure(json);
+    assert.equal(stats.objects, L.maxObjects);
+    assert.ok(stats.tokens > L.maxTokens - 2 && stats.tokens <= L.maxTokens, `${stats.tokens}`);
+  }
 
   const cases = [
     { label: "at-bytes", upload: zipOf(atBytes), expect: 200, actions: ["preview"] },
@@ -323,10 +336,12 @@ test("backup.json limits: exactly at each limit is accepted, one more is refused
     { label: "over-bytes-json", upload: overBytes, filename: "backup.json", expect: TOO_LARGE },
     { label: "at-tokens", upload: zipOf(atTokens), expect: 200, actions: ["preview"] },
     { label: "over-tokens", upload: zipOf(overTokens), expect: TOO_LARGE },
+    { label: "at-objects", upload: zipOf(atObjects), expect: 200, actions: ["preview"] },
+    { label: "over-objects", upload: zipOf(overObjects), expect: TOO_LARGE },
     { label: "at-depth", upload: zipOf(atDepth), expect: 200 },
     { label: "over-depth", upload: zipOf(overDepth), expect: TOO_LARGE },
-    { label: "invalid-projects-at-tokens", upload: zipOf(invalidProjects), expect: FORMAT },
-    { label: "invalid-tasks-at-tokens", upload: invalidTasks, filename: "backup.json", expect: FORMAT },
+    { label: "invalid-projects-at-limits", upload: zipOf(invalidProjects), expect: FORMAT },
+    { label: "invalid-tasks-at-limits", upload: invalidTasks, filename: "backup.json", expect: FORMAT },
   ];
   const before = await rowCounts();
   const run = await runChild("limits", cases);
@@ -343,41 +358,67 @@ test("backup.json limits: exactly at each limit is accepted, one more is refused
   assert.equal(depth, L.maxDepth);
 });
 
-test("the most expensive accepted backup.json previews within a 384 MiB heap", async (t) => {
-  const { BACKUP_JSON_LIMITS: L, inspectBackupJson } = await import(
-    "../../src/modules/backup/backup-json.ts"
-  );
-  const measure = (json) =>
-    inspectBackupJson(json, { maxBytes: Infinity, maxTokens: Infinity, maxDepth: Infinity });
-  // Valid elements at the token limit, with the remaining bytes spent on one
-  // string that forces V8's two-byte representation (2 bytes per ASCII byte).
-  const meta = JSON.stringify({ ...META, sourceWorkspace: { name: "Ā", slug: "s" } });
-  const worst = (head, unit, tail) => {
-    const per = measure(Buffer.from(`[${unit},${unit}]`)).tokens - measure(Buffer.from(`[${unit}]`)).tokens;
-    const base = measure(Buffer.from(`${head}${unit}${tail}`)).tokens;
-    const body = Array(1 + Math.floor((L.maxTokens - base) / per)).fill(unit).join(",");
-    const shell = `${head}${body}${tail}`;
-    const fill = L.maxBytes - Buffer.byteLength(shell);
-    return Buffer.from(shell.replace("Ā", `Ā${"a".repeat(fill)}`));
+test("the most expensive accepted backup.json files preview in a 256 MiB heap", async (t) => {
+  const { BACKUP_JSON_LIMITS: L, inspectBackupJson } = await limits();
+  const measure = (json) => inspectBackupJson(Buffer.from(json), unlimited);
+  const id = (i) => i.toString(36);
+  // The bytes left over go to one string with a character above U+00FF, which
+  // makes V8 store the whole text, and that string, with two bytes per character.
+  const meta = () =>
+    '{"version":"1.1","exportedAt":"x","sourceWorkspace":{"name":"\u0100","slug":"s"},"userRefs":[]}';
+  const pad = (shell) =>
+    Buffer.from(shell.replace("\u0100", `\u0100${"a".repeat(L.maxBytes - Buffer.byteLength(shell))}`));
+  // As many elements as the object and token limits allow.
+  const fill = (head, unit, tail) => {
+    const one = measure(`[${unit(0)}]`);
+    const two = measure(`[${unit(0)},${unit(1)}]`);
+    const base = measure(`${head}${unit(0)}${tail}`);
+    let count = 1 + Math.floor((L.maxTokens - base.tokens) / (two.tokens - one.tokens));
+    const perObject = two.objects - one.objects;
+    if (perObject) count = Math.min(count, 1 + Math.floor((L.maxObjects - base.objects) / perObject));
+    return pad(`${head}${Array.from({ length: count }, (_, i) => unit(i)).join(",")}${tail}`);
   };
-  const projects = worst(`{"metadata":${meta},"projects":[`, '{"project":{"name":""}}', "]}");
-  const content = worst(
-    `{"metadata":${meta},"wikiSpaces":[{"space":{"name":"s"},"pages":[{"_originalId":"p","title":"t","position":0,"content":[`,
-    "{}",
-    "]}]}]}",
-  );
-  for (const json of [projects, content]) {
+  const content = (body) =>
+    pad(
+      `{"metadata":${meta()},"wikiSpaces":[{"space":{"name":"s"},"pages":[{"_originalId":"p","title":"t","position":0,"content":${body}}]}]}`,
+    );
+  const keys = Array.from({ length: L.maxTokens / 2 - 30 }, (_, i) => `"${id(i)}":0`).join(",");
+  const cases = {
+    tasks: fill(
+      `{"metadata":${meta()},"projects":[{"project":{"name":"p"},"tasks":[`,
+      () => '{"_originalId":"","title":"","priority":"","position":0,"statusRef":"s"}',
+      "]}]}",
+    ),
+    projects: fill(`{"metadata":${meta()},"projects":[`, () => '{"project":{"name":""}}', "]}"),
+    pages: fill(
+      `{"metadata":${meta()},"wikiSpaces":[{"space":{"name":"s"},"pages":[`,
+      (i) => `{"_originalId":"${id(i)}","title":"","position":0,"parentRef":"${id(i + 1)}"}`,
+      "]}]}",
+    ),
+    // Preview answers with one mapping per user reference.
+    userRefs: fill(
+      '{"metadata":{"version":"1.1","exportedAt":"x","sourceWorkspace":{"name":"\u0100","slug":"s"},"userRefs":[',
+      (i) => `{"originalId":"${id(i)}","email":"${id(i)}@x","displayName":"${id(i)}"}`,
+      "]}}",
+    ),
+    // Distinct member names, all in one object.
+    keys: content(`{${keys}}`),
+    objects: content(
+      `[${Array(L.maxObjects - 10).fill("{}").concat(Array(Math.floor(L.maxTokens / 2) - L.maxObjects - 30).fill("[]")).join(",")}]`,
+    ),
+  };
+  const uploads = [];
+  for (const [label, json] of Object.entries(cases)) {
     const stats = measure(json);
-    assert.equal(stats.bytes, L.maxBytes);
-    assert.ok(stats.tokens <= L.maxTokens && stats.tokens > L.maxTokens - 5, `${stats.tokens}`);
+    t.diagnostic(`${label}: ${stats.bytes} bytes, ${stats.tokens} tokens, ${stats.objects} objects`);
+    assert.equal(stats.bytes, L.maxBytes, label);
+    assert.ok(stats.tokens <= L.maxTokens && stats.objects <= L.maxObjects, label);
+    assert.ok(stats.tokens > L.maxTokens * 0.9 || stats.objects > L.maxObjects - 5, label);
+    uploads.push({ label, upload: zipOf(json), expect: 200, actions: ["preview"] });
   }
-  const cases = [
-    { label: "worst-projects", upload: zipOf(projects), expect: 200, actions: ["preview"] },
-    { label: "worst-content", upload: content, filename: "backup.json", expect: 200, actions: ["preview"] },
-  ];
-  const run = await runChild("worst", cases, 384);
-  expectResults(t, run, cases);
-  assert.ok(run.results.get("worst-projects preview").body.data.projects > 300_000);
+  const run = await runChild("worst", uploads);
+  expectResults(t, run, uploads);
+  assert.equal(run.results.get("projects preview").body.data.projects, Math.floor((L.maxObjects - 3) / 2));
 });
 
 test("a realistic large export restores byte for byte in a memory-limited server", async (t) => {
@@ -491,8 +532,9 @@ test("a realistic large export restores byte for byte in a memory-limited server
   const json = new AdmZip(zip).getEntry("backup.json").getData();
   const stats = inspectBackupJson(json);
   t.diagnostic(
-    `export: zip ${zip.length} bytes; backup.json ${stats.bytes} bytes, ${stats.tokens} tokens, depth ${stats.depth}; ` +
-      `headroom bytes ${(L.maxBytes / stats.bytes).toFixed(1)}x, tokens ${(L.maxTokens / stats.tokens).toFixed(1)}x, depth ${(L.maxDepth / stats.depth).toFixed(1)}x`,
+    `export: zip ${zip.length} bytes; backup.json ${stats.bytes} bytes, ${stats.tokens} tokens, ${stats.objects} objects, depth ${stats.depth}; ` +
+      `headroom bytes ${(L.maxBytes / stats.bytes).toFixed(1)}x, tokens ${(L.maxTokens / stats.tokens).toFixed(1)}x, ` +
+      `objects ${(L.maxObjects / stats.objects).toFixed(1)}x, depth ${(L.maxDepth / stats.depth).toFixed(1)}x`,
   );
 
   const cases = [{ label: "realistic", upload: zip, expect: 200 }];

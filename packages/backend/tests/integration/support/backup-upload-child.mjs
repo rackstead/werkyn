@@ -37,11 +37,15 @@ try {
     const zip = readFileSync(item.file);
     for (const action of item.actions) {
       const response = await upload(action, zip, item.filename ?? "backup.zip");
-      let body;
-      try {
-        body = response.json();
-      } catch {
-        body = response.body;
+      // A preview can list one user mapping per reference. Summarise large
+      // bodies so this driver does not keep extra copies in the server's heap.
+      let body = { bytes: response.body.length };
+      if (response.body.length <= 1 << 20) {
+        try {
+          body = response.json();
+        } catch {
+          body = response.body;
+        }
       }
       console.log(
         JSON.stringify({

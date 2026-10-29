@@ -17,7 +17,7 @@ const backendDir = new URL("..", import.meta.url);
 const scratch = await mkdtemp(path.join(os.tmpdir(), "werkyn-backup-json-"));
 after(() => rm(scratch, { recursive: true, force: true }));
 
-const unlimited = { maxBytes: Infinity, maxTokens: Infinity, maxDepth: Infinity };
+const unlimited = { maxBytes: Infinity, maxTokens: Infinity, maxObjects: Infinity, maxDepth: Infinity };
 const measure = (text) => inspectBackupJson(Buffer.from(text), unlimited);
 const META = {
   version: "1.1",
@@ -33,10 +33,11 @@ const emptyProjects = (count) =>
 const emptyTasks = (count) =>
   `{"metadata":${JSON.stringify(META)},"projects":[{"project":{"name":"p"},"tasks":[${Array(count).fill("{}").join(",")}]}]}`;
 
-/** Values and member names in a parsed document, and its empty containers. */
-function census(value, out = { nodes: 1, empty: 0 }) {
+/** Values and member names in a parsed document, its objects and empty containers. */
+function census(value, out = { nodes: 1, objects: 0, empty: 0 }) {
   if (value === null || typeof value !== "object") return out;
   const children = Array.isArray(value) ? value : Object.values(value);
+  if (!Array.isArray(value)) out.objects++;
   if (children.length === 0) out.empty++;
   // An object member is a name and a value.
   out.nodes += Array.isArray(value) ? children.length : children.length * 2;
@@ -45,24 +46,25 @@ function census(value, out = { nodes: 1, empty: 0 }) {
 }
 
 test("tokens bound the values and member names JSON.parse creates", () => {
-  assert.deepEqual(measure("0"), { bytes: 1, tokens: 1, depth: 0 });
-  assert.deepEqual(measure(" [ ] "), { bytes: 5, tokens: 2, depth: 1 });
-  assert.deepEqual(measure('{"a":[1,2,{"b":null}]}'), { bytes: 22, tokens: 8, depth: 3 });
+  assert.deepEqual(measure("0"), { bytes: 1, tokens: 1, objects: 0, depth: 0 });
+  assert.deepEqual(measure(" [ ] "), { bytes: 5, tokens: 2, objects: 0, depth: 1 });
+  assert.deepEqual(measure('{"a":[1,2,{"b":null}]}'), { bytes: 22, tokens: 8, objects: 2, depth: 3 });
   // Structural characters inside strings, escaped quotes and backslashes, and
   // multi-byte UTF-8 are all string content.
   const text = '["{[,:]}\\"[","\\\\","ü{\\u0022,","[\\\\\\"]"]';
   assert.equal(JSON.parse(text).length, 4);
-  assert.deepEqual(measure(text), { bytes: Buffer.byteLength(text), tokens: 5, depth: 1 });
+  assert.deepEqual(measure(text), { bytes: Buffer.byteLength(text), tokens: 5, objects: 0, depth: 1 });
 
-  // Exactly the values and names plus one per empty container.
+  // Exactly the values and names plus one per empty container, and the objects.
   const samples = [
     JSON.stringify({ metadata: META, projects: [], wikiSpaces: [{ space: { name: "s" }, pages: [{}] }] }),
     JSON.stringify([[[[]]], {}, { a: { b: [1, "x", true, null, { c: [] }] } }], null, 2),
     JSON.stringify({ "k,:{": ["v]}", { '"q"': "\\" }], e: {} }),
   ];
   for (const sample of samples) {
-    const { nodes, empty } = census(JSON.parse(sample));
+    const { nodes, objects, empty } = census(JSON.parse(sample));
     assert.equal(measure(sample).tokens, nodes + empty, sample);
+    assert.equal(measure(sample).objects, objects, sample);
   }
 });
 
@@ -80,11 +82,17 @@ test("each limit is inclusive and refuses one more with a fixed message", () => 
     );
   const json = JSON.stringify({ metadata: META, wikiSpaces: [{ space: { name: "s" }, pages: [] }] });
   const stats = measure(json);
-  assert.deepEqual(stats, { bytes: json.length, tokens: 26, depth: 4 });
-  const exact = { maxBytes: stats.bytes, maxTokens: stats.tokens, maxDepth: stats.depth };
+  assert.deepEqual(stats, { bytes: json.length, tokens: 26, objects: 5, depth: 4 });
+  const exact = {
+    maxBytes: stats.bytes,
+    maxTokens: stats.tokens,
+    maxObjects: stats.objects,
+    maxDepth: stats.depth,
+  };
   assert.equal(parseBackupJson(Buffer.from(json), exact).wikiSpaces.length, 1);
   assertTooLarge(json, "json-size", { ...exact, maxBytes: stats.bytes - 1 });
   assertTooLarge(json, "json-tokens", { ...exact, maxTokens: stats.tokens - 1 });
+  assertTooLarge(json, "json-objects", { ...exact, maxObjects: stats.objects - 1 });
   assertTooLarge(json, "json-depth", { ...exact, maxDepth: stats.depth - 1 });
 
   // The defaults, at and over each limit.
@@ -96,6 +104,10 @@ test("each limit is inclusive and refuses one more with a fixed message", () => 
   assert.equal(measure(zeros(L.maxTokens - 1)).tokens, L.maxTokens);
   assert.throws(() => parseBackupJson(Buffer.from(zeros(L.maxTokens - 1))), { message: /^Invalid backup file format: / });
   assertTooLarge(zeros(L.maxTokens), "json-tokens");
+  const objects = (count) => `[${Array(count).fill("{}").join(",")}]`;
+  assert.equal(measure(objects(L.maxObjects)).objects, L.maxObjects);
+  assert.throws(() => parseBackupJson(Buffer.from(objects(L.maxObjects))), { message: /^Invalid backup file format: / });
+  assertTooLarge(objects(L.maxObjects + 1), "json-objects");
   const nested = (depth) => `${"[".repeat(depth)}${"]".repeat(depth)}`;
   assert.throws(() => parseBackupJson(Buffer.from(nested(L.maxDepth))), { message: /^Invalid backup file format: / });
   assertTooLarge(nested(L.maxDepth + 1), "json-depth");
@@ -112,7 +124,7 @@ test("validation stops after five problems and never quotes the upload", () => {
     assert.fail("accepted");
   };
   const started = Date.now();
-  for (const text of [emptyProjects(500_000), emptyTasks(500_000)]) {
+  for (const text of [emptyProjects(140_000), emptyTasks(140_000)]) {
     const message = parse(text);
     assert.ok(message.startsWith(FORMAT), message);
     assert.deepEqual(message.slice(FORMAT.length).split("; "), Array(5).fill("Required"));
@@ -157,7 +169,12 @@ test("ZIP restore and export apply the same backup.json limits", async () => {
 
   // Export refuses exactly what restore would refuse.
   const stats = measure(json);
-  const exact = { maxBytes: stats.bytes, maxTokens: stats.tokens, maxDepth: stats.depth };
+  const exact = {
+    maxBytes: stats.bytes,
+    maxTokens: stats.tokens,
+    maxObjects: stats.objects,
+    maxDepth: stats.depth,
+  };
   new BackupExportBudget(BACKUP_ARCHIVE_LIMITS, exact).addBackupJson(json);
   for (const key of Object.keys(exact)) {
     assert.throws(
@@ -198,29 +215,40 @@ function runLimited(mode, files) {
 
 test("backup files that abort an unguarded parse are refused in a memory-limited process", async () => {
   const L = BACKUP_JSON_LIMITS;
-  // As many `{}` elements (two tokens each) as the token limit lets through.
-  const most = (build) => build(1 + Math.floor((L.maxTokens - measure(build(1)).tokens) / 2));
+  // `{}` elements up to the object limit, then `[]` up to the token limit.
+  const most = (build) => {
+    const base = measure(build(["{}"]));
+    const objects = Array(1 + L.maxObjects - base.objects).fill("{}");
+    const arrays = Array(Math.floor((L.maxTokens - base.tokens - 2 * (objects.length - 1)) / 2)).fill("[]");
+    return build(objects.concat(arrays));
+  };
   const cases = {
     // The review's 4 MiB reproduction, about 4 KB once deflated.
     amplify: emptyProjects(Math.floor((4 << 20) / 3)),
-    // The most expensive invalid documents the token limit lets through.
-    projects: most(emptyProjects),
-    tasks: most(emptyTasks),
+    // The most expensive invalid documents the limits let through.
+    projects: most((elements) => `{"metadata":{},"projects":[${elements.join(",")}]}`),
+    tasks: most(
+      (elements) =>
+        `{"metadata":${JSON.stringify(META)},"projects":[{"project":{"name":"p"},"tasks":[${elements.join(",")}]}]}`,
+    ),
   };
   const files = {};
   for (const [label, text] of Object.entries(cases)) {
     files[label] = path.join(scratch, `${label}.json`);
     await writeFile(files[label], text);
   }
-  for (const text of [cases.projects, cases.tasks])
-    assert.ok(measure(text).tokens > L.maxTokens - 2 && measure(text).tokens <= L.maxTokens);
+  for (const text of [cases.projects, cases.tasks]) {
+    const stats = measure(text);
+    assert.equal(stats.objects, L.maxObjects);
+    assert.ok(stats.tokens > L.maxTokens - 2 && stats.tokens <= L.maxTokens, `${stats.tokens}`);
+  }
 
   const guarded = runLimited("guarded", Object.values(files));
   assert.equal(guarded.status, 0, guarded.stderr);
   assert.deepEqual(
     guarded.lines.map((line) => [line.statusCode, line.reason ?? line.message.slice(0, FORMAT.length)]),
     [
-      [400, "json-tokens"],
+      [400, "json-objects"],
       [400, FORMAT],
       [400, FORMAT],
     ],

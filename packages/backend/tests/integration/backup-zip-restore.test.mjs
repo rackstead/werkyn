@@ -536,8 +536,14 @@ test("export refuses a backup.json that restore would refuse to parse", async ()
 
   const stats = inspectBackupJson(readBackupArchive((await exportWith({})).zipBuffer).jsonBuffer);
   assert.ok(stats.depth > 40, `${stats.depth}`);
-  const exact = { maxBytes: stats.bytes, maxTokens: stats.tokens, maxDepth: stats.depth };
-  // Exactly at the limits the export succeeds and its backup.json fits them.
+  const exact = {
+    maxBytes: stats.bytes,
+    maxTokens: stats.tokens,
+    maxObjects: stats.objects,
+    maxDepth: stats.depth,
+  };
+  // Exactly at the limits the export succeeds and its backup.json fits them;
+  // one byte, token, object or level less refuses it.
   const fitting = await exportWith(exact);
   assert.deepEqual(inspectBackupJson(readBackupArchive(fitting.zipBuffer).jsonBuffer, exact), stats);
   const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };

@@ -41,14 +41,20 @@ export async function updateCustomFieldHandler(
 ) {
   const params = request.params as { pid: string; id: string };
   const body = request.body as UpdateCustomFieldInput;
-  const field = await customFieldsService.updateCustomField(
+  const user = request.user as { id: string };
+  const { field, migratedValues, clearedValues } = await customFieldsService.updateCustomField(
     request.server.prisma,
     params.pid,
     params.id,
     body,
+    user.id,
   );
   request.server.broadcast(params.pid, "custom_field_updated", { fieldId: field.id });
-  return reply.send({ data: field });
+  if (migratedValues + clearedValues > 0) {
+    // Renamed or removed options rewrote task values.
+    request.server.broadcast(params.pid, "task_updated", { bulk: true });
+  }
+  return reply.send({ data: field, meta: { migratedValues, clearedValues } });
 }
 
 export async function deleteCustomFieldHandler(
@@ -101,7 +107,8 @@ export async function setFieldValueHandler(
     taskId: params.tid,
     actorId: user.id,
     action: "custom_field_changed",
-    details: { fieldId: params.fieldId, value: body.value },
+    // The stored value: an empty value is recorded as null (cleared).
+    details: { fieldId: params.fieldId, value: result ? result.value : null },
   });
 
   request.server.broadcast(params.pid, "task_updated", { taskId: params.tid });

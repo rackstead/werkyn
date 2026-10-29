@@ -1,18 +1,48 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import type { CustomField, PrismaClient, Prisma } from "@prisma/client";
 import { assertTaskEdit } from "../../utils/project-access.js";
 import {
-  isDateOnly,
+  checkCustomFieldValue,
+  customFieldOptionValues,
+  isSelectFieldType,
   type CreateCustomFieldInput,
   type UpdateCustomFieldInput,
   type ReorderCustomFieldsInput,
   type SetCustomFieldValueInput,
 } from "@pm/shared";
 import { ConflictError, NotFoundError, ValidationError } from "../../utils/errors.js";
+import { migrateOptionValue, optionTargets } from "./custom-field-options.js";
 
-type PrismaTransactionClient = Omit<
-  PrismaClient,
-  "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends"
->;
+// Lock order for custom-field writes, after the Project row (FOR KEY SHARE,
+// first as in utils/task-references.ts):
+//   - a value write holds its CustomField row FOR SHARE while it checks and
+//     stores the value, so concurrent value writes do not wait for each other;
+//   - a definition change holds the row FOR NO KEY UPDATE, then the tasks that
+//     have a value for the field (FOR KEY SHARE, by id), then rewrites values.
+// A value write therefore sees the options committed when it runs, and an
+// options edit sees, and migrates, every value committed before it. Locking the
+// tasks before reading the values keeps a concurrent task deletion from
+// deadlocking with the activity entries the migration writes.
+
+const CHUNK = 1000;
+
+function chunks<T>(items: readonly T[]): T[][] {
+  const result: T[][] = [];
+  for (let i = 0; i < items.length; i += CHUNK) result.push(items.slice(i, i + CHUNK));
+  return result;
+}
+
+async function lockProject(tx: Prisma.TransactionClient, projectId: string) {
+  await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR KEY SHARE`;
+}
+
+function isUniqueViolation(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: string }).code === "P2002"
+  );
+}
 
 export async function listCustomFields(
   prisma: PrismaClient,
@@ -35,7 +65,8 @@ export async function createCustomField(
     (data.type === "SELECT" || data.type === "MULTI_SELECT") &&
     (!data.options || data.options.length === 0)
   ) {
-    throw new ValidationError("SELECT and MULTI_SELECT fields require at least one option");
+    const message = "SELECT and MULTI_SELECT fields require at least one option";
+    throw new ValidationError(message, [{ field: "options", message }]);
   }
 
   // Compute next position
@@ -51,22 +82,27 @@ export async function createCustomField(
         projectId,
         name: data.name,
         type: data.type,
-        options: data.options as Prisma.InputJsonValue | undefined,
+        options: isSelectFieldType(data.type)
+          ? (data.options as Prisma.InputJsonValue)
+          : undefined,
         required: data.required,
         position,
       },
     });
   } catch (error: unknown) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error as { code: string }).code === "P2002"
-    ) {
+    if (isUniqueViolation(error)) {
       throw new ConflictError("A custom field with this name already exists in the project");
     }
     throw error;
   }
+}
+
+export interface CustomFieldUpdateResult {
+  field: CustomField;
+  /** Stored values moved to a renamed option, or that lost a removed option but kept others. */
+  migratedValues: number;
+  /** Stored values deleted because none of their options remain. */
+  clearedValues: number;
 }
 
 export async function updateCustomField(
@@ -74,32 +110,126 @@ export async function updateCustomField(
   projectId: string,
   fieldId: string,
   data: UpdateCustomFieldInput,
-) {
-  const field = await prisma.customField.findFirst({
-    where: { id: fieldId, projectId },
-  });
-  if (!field) {
-    throw new NotFoundError("Custom field not found");
-  }
+  actorId: string,
+): Promise<CustomFieldUpdateResult> {
+  try {
+    return await prisma.$transaction(
+      async (tx) => {
+        await lockProject(tx, projectId);
+        const locked = await tx.$queryRaw<{ id: string }[]>`
+          SELECT id FROM "CustomField" WHERE id = ${fieldId} AND "projectId" = ${projectId} FOR NO KEY UPDATE`;
+        if (locked.length === 0) {
+          throw new NotFoundError("Custom field not found");
+        }
+        const field = await tx.customField.findUniqueOrThrow({ where: { id: fieldId } });
 
-  // Check name uniqueness if name is being changed
-  if (data.name && data.name !== field.name) {
-    const existing = await prisma.customField.findUnique({
-      where: { projectId_name: { projectId, name: data.name } },
-    });
-    if (existing) {
+        if (data.type !== undefined && data.type !== field.type) {
+          const message = "The type of a custom field cannot be changed; create a new field instead";
+          throw new ValidationError(message, [{ field: "type", message }]);
+        }
+        if (data.options !== undefined && !isSelectFieldType(field.type)) {
+          const message = "Only SELECT and MULTI_SELECT fields have options";
+          throw new ValidationError(message, [{ field: "options", message }]);
+        }
+        const currentOptions = customFieldOptionValues(field.options);
+        data.renameOptions?.forEach((rename, index) => {
+          if (!currentOptions.includes(rename.from)) {
+            const message = "A renamed option must be one of the field's current options";
+            throw new ValidationError(message, [{ field: `renameOptions.${index}.from`, message }]);
+          }
+        });
+
+        // Check name uniqueness if name is being changed
+        if (data.name && data.name !== field.name) {
+          const existing = await tx.customField.findUnique({
+            where: { projectId_name: { projectId, name: data.name } },
+          });
+          if (existing) {
+            throw new ConflictError("A custom field with this name already exists in the project");
+          }
+        }
+
+        const updated = await tx.customField.update({
+          where: { id: fieldId },
+          data: {
+            name: data.name,
+            options: data.options as Prisma.InputJsonValue | undefined,
+            required: data.required,
+          },
+        });
+        if (data.options === undefined) {
+          return { field: updated, migratedValues: 0, clearedValues: 0 };
+        }
+
+        // Value writes for this field wait for the field lock; lock the tasks
+        // that hold values before reading them (see the lock order above).
+        await tx.$queryRaw`
+          SELECT t.id FROM "Task" t
+          WHERE t.id IN (SELECT v."taskId" FROM "CustomFieldValue" v WHERE v."fieldId" = ${fieldId})
+          ORDER BY t.id
+          FOR KEY SHARE`;
+        const rows = await tx.customFieldValue.findMany({
+          where: { fieldId },
+          select: { id: true, taskId: true, value: true },
+          orderBy: { id: "asc" },
+        });
+
+        const targets = optionTargets(data.options, data.renameOptions);
+        const cleared: string[] = [];
+        const updates = new Map<string, { value: string | string[]; ids: string[] }>();
+        const activity: Prisma.ActivityLogCreateManyInput[] = [];
+        for (const row of rows) {
+          const change = migrateOptionValue(field.type, row.value, targets);
+          if (change.action === "keep") continue;
+          if (change.action === "clear") {
+            cleared.push(row.id);
+          } else {
+            const key = JSON.stringify(change.value);
+            const group = updates.get(key) ?? { value: change.value, ids: [] };
+            group.ids.push(row.id);
+            updates.set(key, group);
+          }
+          activity.push({
+            taskId: row.taskId,
+            actorId,
+            action: "custom_field_changed",
+            details: {
+              fieldId,
+              value: change.action === "clear" ? null : change.value,
+              reason: change.reason,
+            },
+          });
+        }
+
+        for (const ids of chunks(cleared)) {
+          await tx.customFieldValue.deleteMany({ where: { id: { in: ids } } });
+        }
+        let migratedValues = 0;
+        for (const group of updates.values()) {
+          for (const ids of chunks(group.ids)) {
+            await tx.customFieldValue.updateMany({
+              where: { id: { in: ids } },
+              data: { value: group.value },
+            });
+          }
+          migratedValues += group.ids.length;
+        }
+        for (const entries of chunks(activity)) {
+          await tx.activityLog.createMany({ data: entries });
+        }
+
+        return { field: updated, migratedValues, clearedValues: cleared.length };
+      },
+      // A large field rewrites many values; value writes waiting on it give up
+      // with a retryable 409 at their own, shorter timeout.
+      { timeout: 60_000 },
+    );
+  } catch (error: unknown) {
+    if (isUniqueViolation(error)) {
       throw new ConflictError("A custom field with this name already exists in the project");
     }
+    throw error;
   }
-
-  return prisma.customField.update({
-    where: { id: fieldId },
-    data: {
-      name: data.name,
-      options: data.options as Prisma.InputJsonValue | undefined,
-      required: data.required,
-    },
-  });
 }
 
 export async function deleteCustomField(
@@ -167,6 +297,7 @@ export async function setFieldValue(
     }),
     prisma.customField.findFirst({
       where: { id: fieldId, projectId },
+      select: { id: true },
     }),
   ]);
   if (!task) {
@@ -178,71 +309,41 @@ export async function setFieldValue(
 
   await assertTaskEdit(prisma, taskId, actorId);
 
-  // Validate value type matches field type
-  if (data.value !== null) {
-    validateValueType(field.type, data.value);
-  }
+  return prisma.$transaction(async (tx) => {
+    // Check the value against the definition as committed now, and keep it
+    // until this write commits (see the lock order above).
+    await lockProject(tx, projectId);
+    const locked = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "CustomField" WHERE id = ${fieldId} AND "projectId" = ${projectId} FOR SHARE`;
+    if (locked.length === 0) {
+      throw new NotFoundError("Custom field not found in this project");
+    }
+    const definition = await tx.customField.findUniqueOrThrow({ where: { id: fieldId } });
 
-  // If value is null, delete the record
-  if (data.value === null) {
-    await prisma.customFieldValue.deleteMany({
-      where: { taskId, fieldId },
+    const checked = checkCustomFieldValue(definition, data.value);
+    if (!checked.ok) {
+      throw new ValidationError(checked.message, [{ field: "value", message: checked.message }]);
+    }
+
+    // Empty values are not stored: null, blank text and [] delete the record.
+    if (checked.value === null) {
+      await tx.customFieldValue.deleteMany({
+        where: { taskId, fieldId },
+      });
+      return null;
+    }
+
+    return tx.customFieldValue.upsert({
+      where: { taskId_fieldId: { taskId, fieldId } },
+      create: {
+        taskId,
+        fieldId,
+        value: checked.value,
+      },
+      update: {
+        value: checked.value,
+      },
+      include: { field: true },
     });
-    return null;
-  }
-
-  // Upsert the value
-  return prisma.customFieldValue.upsert({
-    where: { taskId_fieldId: { taskId, fieldId } },
-    create: {
-      taskId,
-      fieldId,
-      value: data.value as Prisma.InputJsonValue,
-    },
-    update: {
-      value: data.value as Prisma.InputJsonValue,
-    },
-    include: { field: true },
   });
-}
-
-function validateValueType(
-  fieldType: string,
-  value: string | number | boolean | string[],
-) {
-  switch (fieldType) {
-    case "TEXT":
-    case "URL":
-    case "DATE":
-      if (typeof value !== "string") {
-        throw new ValidationError(`${fieldType} field expects a string value`);
-      }
-      // The same calendar-date contract as every other date-only input.
-      if (fieldType === "DATE" && !isDateOnly(value)) {
-        throw new ValidationError(
-          "DATE field expects a real calendar date in YYYY-MM-DD format between 1900 and 2999",
-        );
-      }
-      break;
-    case "NUMBER":
-      if (typeof value !== "number") {
-        throw new ValidationError("NUMBER field expects a numeric value");
-      }
-      break;
-    case "CHECKBOX":
-      if (typeof value !== "boolean") {
-        throw new ValidationError("CHECKBOX field expects a boolean value");
-      }
-      break;
-    case "SELECT":
-      if (typeof value !== "string") {
-        throw new ValidationError("SELECT field expects a string value");
-      }
-      break;
-    case "MULTI_SELECT":
-      if (!Array.isArray(value)) {
-        throw new ValidationError("MULTI_SELECT field expects an array of strings");
-      }
-      break;
-  }
 }

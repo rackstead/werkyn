@@ -4,6 +4,7 @@ import type { PrismaClient } from "@prisma/client";
 import { BackupFileSchema, type BackupFile, type RestoreSummary } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import { IdMapper, UserMapper } from "./id-mapper.js";
+import { planCustomFieldRestore } from "./custom-field-restore.js";
 import {
   ForbiddenError,
   NotFoundError,
@@ -130,11 +131,13 @@ export async function previewRestore(
   let activityLogs = 0;
   let messages = 0;
   let reactions = 0;
+  const customFieldWarnings: string[] = [];
 
   for (const p of backup.projects) {
     statuses += p.statuses.length;
     labels += p.labels.length;
     customFields += p.customFields.length;
+    customFieldWarnings.push(...planCustomFieldRestore(p).warnings);
     tasks += p.tasks.length;
     for (const t of p.tasks) {
       subtasks += t.subtasks.length;
@@ -181,7 +184,7 @@ export async function previewRestore(
       mappedUserId: m.resolvedId,
       mappedName: m.resolvedName,
     })),
-    warnings: userMapper.getWarnings(),
+    warnings: [...userMapper.getWarnings(), ...customFieldWarnings],
   };
 }
 
@@ -311,19 +314,23 @@ export async function executeRestore(
           counts.labels++;
         }
 
-        // Custom Fields
-        for (const f of pEntry.customFields) {
+        // Custom Fields, with the same option and value checks as the API
+        const fieldPlan = planCustomFieldRestore(pEntry);
+        warnings.push(...fieldPlan.warnings);
+        const restoredFieldIds = new Map<string, string>();
+        for (const f of fieldPlan.fields) {
           const newField = await tx.customField.create({
             data: {
               projectId: newProject.id,
               name: f.name,
               type: toCustomFieldType(f.type),
-              options: toJsonValue(f.options),
+              options: f.options,
               required: f.required,
               position: f.position,
             },
           });
-          idMapper.set(f._originalId, newField.id);
+          idMapper.set(f.originalId, newField.id);
+          restoredFieldIds.set(f.originalId, newField.id);
           counts.customFields++;
         }
 
@@ -404,17 +411,17 @@ export async function executeRestore(
             counts.subtasks++;
           }
 
-          // Custom field values
-          for (const v of t.customFieldValues) {
-            const fieldId = idMapper.get(v.fieldRef);
+          // Custom field values (checked and de-duplicated by the plan)
+          for (const v of fieldPlan.values.get(t._originalId) ?? []) {
+            const fieldId = restoredFieldIds.get(v.fieldRef);
             if (!fieldId) continue;
             await tx.customFieldValue.create({
               data: {
                 taskId: newTask.id,
                 fieldId,
-                value: toJsonValue(v.value),
+                value: v.value,
               },
-            }).catch(() => {});
+            });
           }
 
           // Comments

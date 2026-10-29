@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isHttpUrl } from "@pm/shared";
 import {
   useUpdateTask,
   useAddAssignee,
@@ -263,6 +264,11 @@ function CustomFieldDisplayValue({
         </span>
       );
     case "URL":
+      // Only http(s) values are links; values saved before URL fields were
+      // checked may use other schemes such as javascript: or data:.
+      if (!isHttpUrl(String(value))) {
+        return <span className="text-sm">{String(value)}</span>;
+      }
       return (
         <a
           href={String(value)}

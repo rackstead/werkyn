@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isHttpUrl } from "@pm/shared";
 import { committedDate } from "@/lib/date-input";
 import { createColumnHelper } from "@tanstack/react-table";
 import type { Task } from "@/features/tasks/api";
@@ -401,6 +402,11 @@ function CustomFieldDisplay({
       );
     }
     case "URL":
+      // Only http(s) values are links; values saved before URL fields were
+      // checked may use other schemes such as javascript: or data:.
+      if (!isHttpUrl(String(value))) {
+        return <span className="text-xs truncate">{String(value)}</span>;
+      }
       return (
         <a
           href={String(value)}

@@ -34,7 +34,8 @@ export interface CustomFieldIssue {
 
 const ISSUES: Record<string, { description: string; repair: string }> = {
   custom_field_options: {
-    description: "Select field options are missing, malformed or repeated, or a non-select field has options",
+    description:
+      "Select field options are missing, malformed, repeated, longer than 100 characters or more than 200, or a non-select field has options",
     repair:
       "repair=rewrite_options: PATCH the field with each well-formed option once. repair=add_options: add at least one option. repair=drop_options: set options to NULL on the non-select field.",
   },
@@ -63,6 +64,10 @@ const ISSUES: Record<string, { description: string; repair: string }> = {
     repair:
       "repair=delete: delete the row, or first restore the option (or PATCH options with renameOptions) if the value should be kept.",
   },
+  custom_field_value_size: {
+    description: "MULTI_SELECT value lists more than 200 options",
+    repair: "repair=trim: after review, rewrite the list with at most 200 of its options.",
+  },
   custom_field_value_repeated: {
     description: "MULTI_SELECT value lists an option more than once",
     repair: "repair=dedupe: rewrite the list keeping the first occurrence of each option.",
@@ -76,6 +81,7 @@ const VALUE_ISSUE_KEYS: Record<Exclude<CustomFieldValueIssue, "required">, strin
   invalid_url: "custom_field_value_url",
   unknown_option: "custom_field_value_option",
   repeated_option: "custom_field_value_repeated",
+  too_many_options: "custom_field_value_size",
 };
 
 const PAGE = 500;
@@ -90,7 +96,12 @@ export function classifyStoredValue(
   if (checked.ok) return null;
   if (checked.issue === "required") return null; // unreachable: the check above ignores required
   const key = VALUE_ISSUE_KEYS[checked.issue];
-  const repair = checked.issue === "repeated_option" ? "dedupe" : checked.issue === "invalid_text" ? "strip" : "delete";
+  const repairs: Partial<Record<CustomFieldValueIssue, string>> = {
+    repeated_option: "dedupe",
+    invalid_text: "strip",
+    too_many_options: "trim",
+  };
+  const repair = repairs[checked.issue] ?? "delete";
   return { key, repair };
 }
 

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 import type { CustomField } from "@/features/projects/api";
@@ -36,6 +36,7 @@ const { queryClient } = await import("@/lib/query-client");
 const { useSetCustomFieldValue } = await import("@/features/projects/api");
 const { TaskFields } = await import("./task-fields");
 const { getColumns } = await import("@/features/list-view/components/columns");
+const { shouldSaveCustomFieldValue } = await import("../custom-field-save");
 
 afterEach(() => {
   cleanup();
@@ -95,4 +96,46 @@ it("a value the server rejects shows the server's message", async () => {
   });
   await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
   expect(http.put).toHaveBeenCalledWith("projects/p/tasks/t/custom-fields/spec", { json: { value: "example.com" } });
+});
+
+it("inline saves skip unchanged values and emptied required fields", () => {
+  const optional = { required: false };
+  const required = { required: true };
+  expect(shouldSaveCustomFieldValue(optional, "a", "b")).toBe(true);
+  expect(shouldSaveCustomFieldValue(optional, "a", "a")).toBe(false);
+  expect(shouldSaveCustomFieldValue(optional, ["a", "b"], ["a", "b"])).toBe(false);
+  expect(shouldSaveCustomFieldValue(optional, ["a"], ["a", "b"])).toBe(true);
+  expect(shouldSaveCustomFieldValue(optional, "a", null)).toBe(true);
+  expect(shouldSaveCustomFieldValue(optional, undefined, null)).toBe(false);
+  expect(shouldSaveCustomFieldValue(required, "a", null)).toBe(false);
+  expect(shouldSaveCustomFieldValue(required, undefined, null)).toBe(false);
+  expect(shouldSaveCustomFieldValue(required, "a", "b")).toBe(true);
+  expect(shouldSaveCustomFieldValue(required, false, true)).toBe(true);
+});
+
+it("leaving an emptied required field sends nothing and shows the stored value again", async () => {
+  http.put.mockReturnValue({ json: () => Promise.resolve({ data: null }) });
+  fields.push(
+    { id: "ticket", projectId: "p", name: "Ticket", type: "TEXT", options: null, required: true, position: 0 },
+    { id: "notes", projectId: "p", name: "Notes", type: "TEXT", options: null, required: false, position: 1 },
+  );
+  render(
+    <QueryClientProvider client={queryClient}>
+      <TaskFields task={taskWith([["ticket", "OPS-1"]])} canEdit />
+    </QueryClientProvider>,
+  );
+  const ticket = screen.getByLabelText("Ticket") as HTMLInputElement;
+  fireEvent.change(ticket, { target: { value: "" } });
+  fireEvent.blur(ticket);
+  expect(ticket.value).toBe("OPS-1");
+  fireEvent.blur(screen.getByLabelText("Notes")); // empty and left empty
+  fireEvent.blur(ticket); // unchanged
+  expect(http.put).not.toHaveBeenCalled();
+  expect(toastError).not.toHaveBeenCalled();
+
+  fireEvent.change(ticket, { target: { value: "OPS-2" } });
+  fireEvent.blur(ticket);
+  await waitFor(() =>
+    expect(http.put).toHaveBeenCalledWith("projects/p/tasks/t/custom-fields/ticket", { json: { value: "OPS-2" } }),
+  );
 });

@@ -7,7 +7,7 @@ import { classifyFieldOptions, classifyStoredValue } from "../src/scripts/custom
 const options = (...values) => values.map((value) => ({ value }));
 
 test("SELECT values follow renames, stay when kept and clear when removed", () => {
-  const targets = optionTargets(options("Low", "Medium"), [{ from: "Mid", to: "Medium" }]);
+  const targets = optionTargets(["Low", "Mid", "High"], options("Low", "Medium"), [{ from: "Mid", to: "Medium" }]);
   assert.deepEqual(migrateOptionValue("SELECT", "Mid", targets), { action: "update", value: "Medium", reason: "option_renamed" });
   assert.deepEqual(migrateOptionValue("SELECT", "Low", targets), { action: "keep" });
   assert.deepEqual(migrateOptionValue("SELECT", "High", targets), { action: "clear", reason: "option_removed" });
@@ -16,31 +16,60 @@ test("SELECT values follow renames, stay when kept and clear when removed", () =
   assert.deepEqual(migrateOptionValue("SELECT", ["Low"], targets), { action: "keep" });
 });
 
+test("values that name no option of the field before the edit are left alone", () => {
+  // Adding an option changes nothing, even for a value that is not an option.
+  const added = optionTargets(["A", "B"], options("A", "B", "C"));
+  assert.deepEqual(migrateOptionValue("SELECT", "OldName", added), { action: "keep" });
+  assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["A", "OldName"], added), { action: "keep" });
+  assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["A", "A"], added), { action: "keep" });
+
+  // Removing or renaming other options keeps the unknown value as it was.
+  const edited = optionTargets(["A", "B"], options("A2"), [{ from: "A", to: "A2" }]);
+  assert.deepEqual(migrateOptionValue("SELECT", "OldName", edited), { action: "keep" });
+  assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["A", "OldName"], edited), {
+    action: "update", value: ["A2", "OldName"], reason: "option_renamed",
+  });
+  assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["B", "OldName"], edited), {
+    action: "update", value: ["OldName"], reason: "option_removed",
+  });
+});
+
 test("renames apply at once: options can swap names or merge", () => {
-  const swap = optionTargets(options("A", "B"), [{ from: "A", to: "B" }, { from: "B", to: "A" }]);
+  const swap = optionTargets(["A", "B"], options("A", "B"), [{ from: "A", to: "B" }, { from: "B", to: "A" }]);
   assert.deepEqual(migrateOptionValue("SELECT", "A", swap), { action: "update", value: "B", reason: "option_renamed" });
   assert.deepEqual(migrateOptionValue("SELECT", "B", swap), { action: "update", value: "A", reason: "option_renamed" });
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["A", "B"], swap), { action: "update", value: ["B", "A"], reason: "option_renamed" });
 
-  const merge = optionTargets(options("AB"), [{ from: "A", to: "AB" }, { from: "B", to: "AB" }]);
+  const merge = optionTargets(["A", "B"], options("AB"), [{ from: "A", to: "AB" }, { from: "B", to: "AB" }]);
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["A", "B"], merge), { action: "update", value: ["AB"], reason: "option_renamed" });
 });
 
 test("MULTI_SELECT lists keep order, drop removed options and repeats, and clear when nothing is left", () => {
-  const targets = optionTargets(options("crimson", "green"), [{ from: "red", to: "crimson" }]);
+  const targets = optionTargets(["red", "green", "blue"], options("crimson", "green"), [{ from: "red", to: "crimson" }]);
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["red", "green"], targets), {
     action: "update", value: ["crimson", "green"], reason: "option_renamed",
   });
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["green", "blue"], targets), {
     action: "update", value: ["green"], reason: "option_removed",
   });
-  assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["green", "green"], targets), {
-    action: "update", value: ["green"], reason: "option_renamed",
-  });
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["blue"], targets), { action: "clear", reason: "option_removed" });
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", ["green"], targets), { action: "keep" });
   assert.deepEqual(migrateOptionValue("MULTI_SELECT", "green", targets), { action: "keep" });
   assert.deepEqual(migrateOptionValue("TEXT", "red", targets), { action: "keep" });
+});
+
+test("migrating a very long MULTI_SELECT list takes linear time", () => {
+  // Far beyond the caps, as a legacy row could be. A quadratic de-duplication
+  // needs seconds here; a linear one needs milliseconds.
+  const size = 100_000;
+  const previous = Array.from({ length: size }, (_, i) => `o${i}`);
+  const targets = optionTargets(previous, previous.map((value) => ({ value: `${value}!` })), previous.map((from) => ({ from, to: `${from}!` })));
+  const started = performance.now();
+  const change = migrateOptionValue("MULTI_SELECT", previous, targets);
+  const elapsed = performance.now() - started;
+  assert.equal(change.action, "update");
+  assert.equal(change.value.length, size);
+  assert.ok(elapsed < 1000, `took ${Math.round(elapsed)} ms`);
 });
 
 const backupTask = (customFieldValues, id = "t") => ({
@@ -96,6 +125,9 @@ test("the report proposes delete or dedupe for stored values and an options repa
   assert.deepEqual(classifyStoredValue({ type: "DATE", options: null }, "2026-13-01"), { key: "custom_field_value_date", repair: "delete" });
   assert.deepEqual(classifyStoredValue({ type: "CHECKBOX", options: null }, "yes"), { key: "custom_field_value_type", repair: "delete" });
   assert.deepEqual(classifyStoredValue({ type: "TEXT", options: null }, "a\u0001b"), { key: "custom_field_value_text", repair: "strip" });
+  const wide = { type: "MULTI_SELECT", options: Array.from({ length: 300 }, (_, i) => ({ value: `o${i}` })) };
+  assert.deepEqual(classifyStoredValue(wide, Array.from({ length: 201 }, (_, i) => `o${i}`)), { key: "custom_field_value_size", repair: "trim" });
+  assert.equal(classifyFieldOptions(wide), "rewrite_options");
 
   assert.equal(classifyFieldOptions(multi), null);
   assert.equal(classifyFieldOptions({ type: "SELECT", options: options("x", "x") }), "rewrite_options");

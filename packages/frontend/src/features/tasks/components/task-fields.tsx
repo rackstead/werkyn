@@ -21,6 +21,7 @@ import { UserAvatar } from "@/components/shared/user-avatar";
 import { UserPicker } from "@/components/shared/user-picker";
 import { LabelPicker } from "@/components/shared/label-picker";
 import { DatePicker } from "@/components/shared/date-picker";
+import { shouldSaveCustomFieldValue, type CustomFieldInput } from "../custom-field-save";
 import { cn } from "@/lib/utils";
 
 const PRIORITIES = ["NONE", "LOW", "MEDIUM", "HIGH", "URGENT"] as const;
@@ -295,8 +296,17 @@ function InlineCustomFieldEditor({
   const cfv = task.customFieldValues?.find((v) => v.fieldId === field.id);
   const value = cfv?.value;
 
-  const save = (newValue: string | number | boolean | string[] | null) => {
+  // Returns false when nothing was sent (no change, or a required field left
+  // empty); text inputs then show the stored value again.
+  const save = (newValue: CustomFieldInput) => {
+    if (!shouldSaveCustomFieldValue(field, value, newValue)) return false;
     setFieldValue.mutate({ fieldId: field.id, value: newValue });
+    return true;
+  };
+  const saveInput = (input: HTMLInputElement, newValue: CustomFieldInput) => {
+    if (!save(newValue)) {
+      input.value = typeof value === "string" || typeof value === "number" ? String(value) : "";
+    }
   };
 
   switch (field.type) {
@@ -375,15 +385,16 @@ function InlineCustomFieldEditor({
         <input
           type="number"
           aria-label={field.name}
+          aria-required={field.required}
           defaultValue={typeof value === "number" ? value : ""}
           onBlur={(e) => {
             const v = e.target.value;
-            save(v === "" ? null : Number(v));
+            saveInput(e.target, v === "" ? null : Number(v));
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
-              const v = (e.target as HTMLInputElement).value;
-              save(v === "" ? null : Number(v));
+              const input = e.target as HTMLInputElement;
+              saveInput(input, input.value === "" ? null : Number(input.value));
             }
           }}
           className="rounded-md border border-input bg-transparent px-2 py-1 text-sm max-w-[200px]"
@@ -397,10 +408,14 @@ function InlineCustomFieldEditor({
         <input
           type={field.type === "URL" ? "url" : "text"}
           aria-label={field.name}
+          aria-required={field.required}
           defaultValue={typeof value === "string" ? value : ""}
-          onBlur={(e) => save(e.target.value || null)}
+          onBlur={(e) => saveInput(e.target, e.target.value || null)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") save((e.target as HTMLInputElement).value || null);
+            if (e.key === "Enter") {
+              const input = e.target as HTMLInputElement;
+              saveInput(input, input.value || null);
+            }
           }}
           className="rounded-md border border-input bg-transparent px-2 py-1 text-sm w-full"
           placeholder={field.type === "URL" ? "https://..." : ""}

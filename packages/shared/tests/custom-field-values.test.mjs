@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CreateCustomFieldSchema,
+  MAX_CUSTOM_FIELD_OPTIONS,
+  MAX_CUSTOM_FIELD_OPTION_LENGTH,
+  MAX_MULTI_SELECT_VALUES,
+  SetCustomFieldValueSchema,
   UpdateCustomFieldSchema,
   checkCustomFieldValue,
   customFieldOptionValues,
@@ -139,4 +143,39 @@ test("field updates: options stay non-empty and unique, renames name a new optio
     options: [{ value: "ab" }], renameOptions: [{ from: "a", to: "ab" }, { from: "b", to: "ab" }],
   }).success, true);
   assert.equal(UpdateCustomFieldSchema.safeParse({ renameOptions: [] }).success, true);
+});
+
+test("option lists, option values and MULTI_SELECT values are capped", () => {
+  assert.equal(MAX_CUSTOM_FIELD_OPTIONS, 200);
+  assert.equal(MAX_CUSTOM_FIELD_OPTION_LENGTH, 100);
+  assert.equal(MAX_MULTI_SELECT_VALUES, 200);
+  const many = (n) => Array.from({ length: n }, (_, i) => ({ value: `option ${i}` }));
+  const create = (options) => CreateCustomFieldSchema.safeParse({ name: "S", type: "MULTI_SELECT", options });
+  assert.equal(create(many(200)).success, true);
+  assert.deepEqual(issues(create(many(201))), [["options", "A field can have at most 200 options"]]);
+  assert.equal(create([{ value: "x".repeat(100) }]).success, true);
+  assert.deepEqual(issues(create([{ value: "x".repeat(101) }])), [["options.0.value", "Option values must be 100 characters or less"]]);
+  assert.equal(issues(create([{ value: "x", color: "#".repeat(33) }]))[0][0], "options.0.color");
+
+  assert.equal(UpdateCustomFieldSchema.safeParse({ options: many(200) }).success, true);
+  assert.deepEqual(issues(UpdateCustomFieldSchema.safeParse({ options: many(201) })), [["options", "A field can have at most 200 options"]]);
+  assert.equal(issues(UpdateCustomFieldSchema.safeParse({
+    options: [{ value: "a" }], renameOptions: Array.from({ length: 201 }, (_, i) => ({ from: `o${i}`, to: "a" })),
+  }))[0][0], "renameOptions");
+  // An option stored before the caps can still be renamed into them.
+  assert.equal(UpdateCustomFieldSchema.safeParse({ options: [{ value: "a" }], renameOptions: [{ from: "x".repeat(500), to: "a" }] }).success, true);
+
+  const values = (n) => Array.from({ length: n }, (_, i) => `option ${i}`);
+  assert.equal(SetCustomFieldValueSchema.safeParse({ value: values(200) }).success, true);
+  assert.equal(SetCustomFieldValueSchema.safeParse({ value: values(201) }).success, false);
+  assert.equal(SetCustomFieldValueSchema.safeParse({ value: ["x".repeat(101)] }).success, false);
+  const legacy = field("MULTI_SELECT", { options: many(300) });
+  assert.deepEqual(checkCustomFieldValue(legacy, values(201)), {
+    ok: false, issue: "too_many_options", message: '"Field" can list at most 200 options',
+  });
+  assert.equal(checkCustomFieldValue(legacy, values(200)).ok, true);
+
+  const normalized = normalizeSelectOptions(many(250));
+  assert.equal(normalized.options.length, 200);
+  assert.equal(normalized.dropped, 50);
 });

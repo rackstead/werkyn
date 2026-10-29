@@ -258,8 +258,12 @@ test("renaming and removing options migrates or clears stored values, with an ac
   const logs = await app.prisma.activityLog.findMany({
     where: { action: "custom_field_changed", taskId: { in: [t1.id, t2.id] }, actorId: user.id }, orderBy: { createdAt: "desc" },
   });
-  assert.deepEqual(logs.filter((l) => l.taskId === t1.id)[0].details, { fieldId: priority.id, value: "Medium", reason: "option_renamed" });
-  assert.deepEqual(logs.filter((l) => l.taskId === t2.id)[0].details, { fieldId: priority.id, value: null, reason: "option_removed" });
+  assert.deepEqual(logs.filter((l) => l.taskId === t1.id)[0].details, {
+    fieldId: priority.id, value: "Medium", previousValue: "Mid", reason: "option_renamed",
+  });
+  assert.deepEqual(logs.filter((l) => l.taskId === t2.id)[0].details, {
+    fieldId: priority.id, value: null, previousValue: "High", reason: "option_removed",
+  });
 
   const recolored = body(await req("PATCH", fieldUrl(tags), {
     options: [{ value: "crimson" }, { value: "green" }], renameOptions: [{ from: "red", to: "crimson" }],
@@ -298,6 +302,69 @@ test("renaming and removing options migrates or clears stored values, with an ac
   // Deleting the field deletes every value it had.
   assert.equal((await req("DELETE", fieldUrl(tags))).statusCode, 204);
   assert.equal(await app.prisma.customFieldValue.count({ where: { fieldId: tags.id } }), 0);
+});
+
+test("an options edit leaves values that name no option of the field alone", async () => {
+  const stage = await createField({ name: "Legacy stage", type: "SELECT", options: [{ value: "A" }, { value: "B" }] });
+  const tags = await createField({ name: "Legacy tags", type: "MULTI_SELECT", options: [{ value: "A" }, { value: "B" }] });
+  const [t1, t2] = [await createTask("legacy 1"), await createTask("legacy 2")];
+  // Stored before values were checked, e.g. left behind by an old rename.
+  await app.prisma.customFieldValue.createMany({ data: [
+    { taskId: t1.id, fieldId: stage.id, value: "OldName" },
+    { taskId: t2.id, fieldId: stage.id, value: "A" },
+    { taskId: t1.id, fieldId: tags.id, value: ["A", "OldName"] },
+    { taskId: t2.id, fieldId: tags.id, value: ["OldName", "OldName"] },
+  ] });
+
+  // Adding an option rewrites nothing.
+  assert.deepEqual(body(await req("PATCH", fieldUrl(stage), { options: [{ value: "A" }, { value: "B" }, { value: "C" }] })).meta,
+    { migratedValues: 0, clearedValues: 0 });
+  assert.deepEqual(body(await req("PATCH", fieldUrl(tags), { options: [{ value: "A" }, { value: "B" }, { value: "C" }] })).meta,
+    { migratedValues: 0, clearedValues: 0 });
+  assert.equal(await storedValue(t1, stage), "OldName");
+  assert.deepEqual(await storedValue(t2, tags), ["OldName", "OldName"]);
+
+  // Removing or renaming options changes only the values that named them.
+  assert.deepEqual(body(await req("PATCH", fieldUrl(stage), { options: [{ value: "C" }] })).meta, { migratedValues: 0, clearedValues: 1 });
+  assert.deepEqual([await storedValue(t1, stage), await storedValue(t2, stage)], ["OldName", undefined]);
+  const renamed = body(await req("PATCH", fieldUrl(tags), {
+    options: [{ value: "A2" }, { value: "C" }], renameOptions: [{ from: "A", to: "A2" }],
+  }));
+  assert.deepEqual(renamed.meta, { migratedValues: 1, clearedValues: 0 });
+  assert.deepEqual([await storedValue(t1, tags), await storedValue(t2, tags)], [["A2", "OldName"], ["OldName", "OldName"]]);
+  const [log] = await app.prisma.activityLog.findMany({
+    where: { taskId: t1.id, action: "custom_field_changed" }, orderBy: { createdAt: "desc" }, take: 1,
+  });
+  assert.deepEqual(log.details, { fieldId: tags.id, value: ["A2", "OldName"], previousValue: ["A", "OldName"], reason: "option_renamed" });
+});
+
+test("option and value caps are enforced, and an options edit at the caps stays fast", async () => {
+  const caps = Array.from({ length: 200 }, (_, i) => ({ value: `${String(i).padStart(3, "0")}${"x".repeat(97)}` }));
+  await assertRejected([
+    ["201 options", () => req("POST", fieldsUrl(), { name: "Too many", type: "MULTI_SELECT", options: [...caps, { value: "extra" }] })],
+    ["101-character option", () => req("POST", fieldsUrl(), { name: "Too long", type: "SELECT", options: [{ value: "y".repeat(101) }] })],
+  ]);
+  const wide = await createField({ name: "At the caps", type: "MULTI_SELECT", options: caps });
+  const all = caps.map((option) => option.value);
+  const tasks = [];
+  for (let i = 0; i < 25; i++) tasks.push(await createTask(`caps ${i}`));
+  await setValue(tasks[0], wide, all);
+  await app.prisma.customFieldValue.createMany({ data: tasks.slice(1).map((task) => ({ taskId: task.id, fieldId: wide.id, value: all })) });
+  await assertRejected([
+    ["201 values", () => req("PUT", valueUrl(tasks[0], wide), { value: [...all, "extra"] })],
+    ["201 options on update", () => req("PATCH", fieldUrl(wide), { options: [...caps, { value: "extra" }] })],
+  ]);
+
+  // Worst case at the caps: every option renamed, so every element of every value changes.
+  const renamedOptions = caps.map((option) => ({ value: option.value.replace(/x$/, "y") }));
+  const started = performance.now();
+  const response = await req("PATCH", fieldUrl(wide), {
+    options: renamedOptions, renameOptions: caps.map((option, i) => ({ from: option.value, to: renamedOptions[i].value })),
+  });
+  const elapsed = performance.now() - started;
+  assert.deepEqual(body(response).meta, { migratedValues: 25, clearedValues: 0 });
+  assert.ok(elapsed < 3000, `options edit took ${Math.round(elapsed)} ms`);
+  assert.deepEqual(await storedValue(tasks[24], wide), renamedOptions.map((option) => option.value));
 });
 
 test("a value write waits for a concurrent option change and is checked against the new options", async () => {

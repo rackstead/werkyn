@@ -23,11 +23,21 @@ export function isSelectFieldType(type: string): type is "SELECT" | "MULTI_SELEC
 // one field must never share a value. Renaming an option therefore goes
 // through `renameOptions`, which moves the stored values along with it.
 
+/** Most options a SELECT or MULTI_SELECT field can have. */
+export const MAX_CUSTOM_FIELD_OPTIONS = 200;
+/** Longest option value, in UTF-16 code units (as for field names). */
+export const MAX_CUSTOM_FIELD_OPTION_LENGTH = 100;
+/** Longest option color, e.g. "#f59e0b" or "rgb(245, 158, 11)". */
+export const MAX_CUSTOM_FIELD_OPTION_COLOR_LENGTH = 32;
+/** Most options one MULTI_SELECT value can list (no more than a field can have). */
+export const MAX_MULTI_SELECT_VALUES = MAX_CUSTOM_FIELD_OPTIONS;
+
 export const SelectOptionSchema = z.object({
   value: singleLineText()
     .min(1)
+    .max(MAX_CUSTOM_FIELD_OPTION_LENGTH, `Option values must be ${MAX_CUSTOM_FIELD_OPTION_LENGTH} characters or less`)
     .refine((value) => value.trim() !== "", "Option value must not be blank"),
-  color: z.string().optional(),
+  color: z.string().max(MAX_CUSTOM_FIELD_OPTION_COLOR_LENGTH).optional(),
 });
 export type SelectOption = z.infer<typeof SelectOptionSchema>;
 
@@ -45,9 +55,12 @@ function addRepeatedOptionIssues(options: { value: string }[], ctx: z.Refinement
   });
 }
 
+const TOO_MANY_OPTIONS = `A field can have at most ${MAX_CUSTOM_FIELD_OPTIONS} options`;
+
 export const SelectOptionsSchema = z
   .array(SelectOptionSchema)
   .min(1, "SELECT and MULTI_SELECT fields require at least one option")
+  .max(MAX_CUSTOM_FIELD_OPTIONS, TOO_MANY_OPTIONS)
   .superRefine((options, ctx) => addRepeatedOptionIssues(options, ctx, []));
 
 /** The option values of a stored options list, skipping malformed entries. */
@@ -63,13 +76,15 @@ export function customFieldOptionValues(options: unknown): string[] {
 
 /**
  * The well-formed options of a stored or imported options list, each value
- * once (the first occurrence wins), and how many entries were dropped.
+ * once (the first occurrence wins), at most MAX_CUSTOM_FIELD_OPTIONS of them,
+ * and how many entries were dropped.
  */
 export function normalizeSelectOptions(options: unknown): { options: SelectOption[]; dropped: number } {
   if (!Array.isArray(options)) return { options: [], dropped: options == null ? 0 : 1 };
   const kept: SelectOption[] = [];
   const seen = new Set<string>();
   for (const option of options) {
+    if (kept.length === MAX_CUSTOM_FIELD_OPTIONS) break;
     const parsed = SelectOptionSchema.safeParse(option);
     if (!parsed.success || seen.has(parsed.data.value)) continue;
     seen.add(parsed.data.value);
@@ -86,7 +101,7 @@ export const CreateCustomFieldSchema = z
       .min(1, "Field name is required")
       .max(100, "Field name must be 100 characters or less"),
     type: CustomFieldTypeEnum,
-    options: z.array(SelectOptionSchema).optional(),
+    options: z.array(SelectOptionSchema).max(MAX_CUSTOM_FIELD_OPTIONS, TOO_MANY_OPTIONS).optional(),
     required: z.boolean().default(false),
   })
   .superRefine((data, ctx) => {
@@ -110,10 +125,14 @@ export const CreateCustomFieldSchema = z
   });
 export type CreateCustomFieldInput = z.infer<typeof CreateCustomFieldSchema>;
 
-/** Moves every stored `from` value to the option `to` of the new options list. */
+/**
+ * Moves every stored `from` value to the option `to` of the new options list.
+ * `from` has no length cap of its own, so an option stored before the caps
+ * can still be renamed to one within them.
+ */
 export const RenameOptionSchema = z.object({
   from: singleLineText().min(1),
-  to: singleLineText().min(1),
+  to: singleLineText().min(1).max(MAX_CUSTOM_FIELD_OPTION_LENGTH),
 });
 export type RenameOptionInput = z.infer<typeof RenameOptionSchema>;
 
@@ -126,7 +145,7 @@ export const UpdateCustomFieldSchema = z
     // The complete new options list. Stored values whose option is neither
     // kept nor renamed are cleared.
     options: SelectOptionsSchema.optional(),
-    renameOptions: z.array(RenameOptionSchema).optional(),
+    renameOptions: z.array(RenameOptionSchema).max(MAX_CUSTOM_FIELD_OPTIONS).optional(),
     required: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
@@ -174,7 +193,9 @@ export const SetCustomFieldValueSchema = z.object({
       multilineText(),
       z.number().finite(),
       z.boolean(),
-      z.array(singleLineText()),
+      z
+        .array(singleLineText().max(MAX_CUSTOM_FIELD_OPTION_LENGTH))
+        .max(MAX_MULTI_SELECT_VALUES, `A MULTI_SELECT value can list at most ${MAX_MULTI_SELECT_VALUES} options`),
     ])
     .nullable(),
 });
@@ -232,7 +253,8 @@ export type CustomFieldValueIssue =
   | "invalid_date"
   | "invalid_url"
   | "unknown_option"
-  | "repeated_option";
+  | "repeated_option"
+  | "too_many_options";
 
 export type CustomFieldValueCheck =
   | { ok: true; value: CustomFieldValue | null }
@@ -286,6 +308,9 @@ export function checkCustomFieldValue(field: CustomFieldDefinition, value: unkno
     case "MULTI_SELECT": {
       if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
         return fail("wrong_type", "must be a list of its options");
+      }
+      if (value.length > MAX_MULTI_SELECT_VALUES) {
+        return fail("too_many_options", `can list at most ${MAX_MULTI_SELECT_VALUES} options`);
       }
       const options = new Set(customFieldOptionValues(field.options));
       if (value.some((item) => !options.has(item))) return fail("unknown_option", "must only list its options");

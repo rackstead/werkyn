@@ -132,8 +132,9 @@ export async function updateCustomField(
           throw new ValidationError(message, [{ field: "options", message }]);
         }
         const currentOptions = customFieldOptionValues(field.options);
+        const currentOptionSet = new Set(currentOptions);
         data.renameOptions?.forEach((rename, index) => {
-          if (!currentOptions.includes(rename.from)) {
+          if (!currentOptionSet.has(rename.from)) {
             const message = "A renamed option must be one of the field's current options";
             throw new ValidationError(message, [{ field: `renameOptions.${index}.from`, message }]);
           }
@@ -174,9 +175,10 @@ export async function updateCustomField(
           orderBy: { id: "asc" },
         });
 
-        const targets = optionTargets(data.options, data.renameOptions);
+        // Only values naming an option this edit renamed or removed change.
+        const targets = optionTargets(currentOptions, data.options, data.renameOptions);
         const cleared: string[] = [];
-        const updates = new Map<string, { value: string | string[]; ids: string[] }>();
+        const updates = new Map<string, { value: Prisma.InputJsonValue; ids: string[] }>();
         const activity: Prisma.ActivityLogCreateManyInput[] = [];
         for (const row of rows) {
           const change = migrateOptionValue(field.type, row.value, targets);
@@ -185,7 +187,8 @@ export async function updateCustomField(
             cleared.push(row.id);
           } else {
             const key = JSON.stringify(change.value);
-            const group = updates.get(key) ?? { value: change.value, ids: [] };
+            const value = change.value as Prisma.InputJsonValue;
+            const group = updates.get(key) ?? { value, ids: [] };
             group.ids.push(row.id);
             updates.set(key, group);
           }
@@ -193,9 +196,11 @@ export async function updateCustomField(
             taskId: row.taskId,
             actorId,
             action: "custom_field_changed",
+            // The previous value keeps a rename or removal recoverable.
             details: {
               fieldId,
-              value: change.action === "clear" ? null : change.value,
+              value: change.action === "clear" ? null : (change.value as Prisma.InputJsonValue),
+              previousValue: row.value as Prisma.InputJsonValue,
               reason: change.reason,
             },
           });

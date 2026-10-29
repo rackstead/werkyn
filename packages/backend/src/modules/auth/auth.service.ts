@@ -433,15 +433,21 @@ export async function resetPassword(
 
   const passwordHash = await hashPassword(newPassword);
 
-  // A reset token is used once. The conditional update claims it in the same
-  // transaction that changes the password and revokes the sessions: a request
-  // that reaches the token row while another holds it waits, then re-checks
-  // usedAt and claims nothing, so it changes nothing and gets the reuse error.
-  // The token row is locked before the user row and the user row before the
-  // families (refresh-sessions.ts); no path locks a reset token while holding
-  // its user.
+  // A reset token is used once, and a successful reset ends the account's
+  // other unused links. Resets of one account run one at a time: the
+  // transaction first locks the user row (FOR NO KEY UPDATE, as password
+  // login and change do), then claims the token with a conditional update in
+  // the same transaction that changes the password and revokes the sessions.
+  // A request whose token was used or removed meanwhile claims nothing,
+  // changes nothing and gets the reuse or invalid-link error. Lock order: user
+  // row, reset tokens, families (refresh-sessions.ts). The statements that
+  // lock reset tokens without the user row (forgot-password and the cleanup
+  // job deleting tokens) never wait for a user row.
   const resetting = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
+    await tx.$queryRaw`
+      SELECT id FROM "User" WHERE id = ${resetToken.userId} FOR NO KEY UPDATE
+    `;
     const now = new Date();
     const claimed = await tx.passwordResetToken.updateMany({
       where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
@@ -458,10 +464,24 @@ export async function resetPassword(
       // Not reached: a usable token is always claimed by the update above.
       throw new GoneError("Reset token has already been used");
     }
-    // The claim may have waited for another holder of the token row past the
-    // token's expiry; rolling back leaves the token unused.
+    // The lock waits may have lasted past the token's expiry; rolling back
+    // leaves the token unused.
     if (resetToken.expiresAt <= new Date())
       throw new GoneError("Reset token has expired");
+    // The account's other unused links are deleted; a later use of one is
+    // answered 404, like a link replaced by forgot-password. No other reset
+    // can hold one, since it would hold the user row. A locked row is being
+    // deleted by forgot-password or the cleanup job and is skipped rather
+    // than waited for, so that the two deletes never wait for each other.
+    await tx.$executeRaw`
+      DELETE FROM "PasswordResetToken"
+      WHERE id IN (
+        SELECT id FROM "PasswordResetToken"
+        WHERE "userId" = ${resetToken.userId} AND "usedAt" IS NULL
+          AND id <> ${resetToken.id}
+        FOR UPDATE SKIP LOCKED
+      )
+    `;
     await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },

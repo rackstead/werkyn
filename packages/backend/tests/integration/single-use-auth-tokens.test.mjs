@@ -620,8 +620,8 @@ test("a reset with another token of the account, queued behind a successful rese
   const winner = candidatePassword("winner");
   const loser = candidatePassword("loser");
   const responses = await withControlLock(userRowLock(user), async (start) => {
-    // The first reset claims its token, removes the second and waits for the
-    // user row; the second reset then waits for its token.
+    // Both resets wait for the user row before claiming their tokens; the
+    // first then removes the second's token.
     start(() => reset(first, winner));
     await waitForLockWaiters(1);
     start(() => reset(second, loser));
@@ -639,7 +639,7 @@ test("a reset with another token of the account, queued behind a successful rese
   assert.equal(await resetTokenRow(second), null);
 });
 
-test("concurrent resets with different tokens of one account never deadlock and leave no unused token", async () => {
+test("concurrent resets with different tokens of one account: exactly one succeeds and no unused token is left", async () => {
   for (let round = 0; round < 3; round++) {
     const user = await makeUser();
     const tokens = [];
@@ -649,21 +649,14 @@ test("concurrent resets with different tokens of one account never deadlock and 
     const responses = await Promise.all(
       tokens.map((token, i) => reset(token, candidates[i])),
     );
-    for (const response of responses)
-      assert([200, 404].includes(response.statusCode), describe(...responses));
-    const winners = candidates.filter(
-      (_, i) => responses[i].statusCode === 200,
+    const statuses = responses.map((r) => r.statusCode);
+    assert.deepEqual(
+      [...statuses].sort(),
+      [200, ...Array(CONCURRENT - 1).fill(404)],
+      describe(...responses),
     );
-    assert(winners.length >= 1, describe(...responses));
-    const stored = await storedPasswordHash(user);
-    const kept = [];
-    for (const candidate of winners)
-      if (await verifyPassword(candidate, stored)) kept.push(candidate);
-    assert.equal(
-      kept.length,
-      1,
-      "the password of one successful reset is kept",
-    );
+    const winner = candidates[statuses.indexOf(200)];
+    assert(await verifyPassword(winner, await storedPasswordHash(user)));
     assert.equal(
       await control.passwordResetToken.count({
         where: { userId: user.id, usedAt: null },
@@ -671,6 +664,83 @@ test("concurrent resets with different tokens of one account never deadlock and 
       0,
     );
   }
+});
+
+test("a reset that rolls back after claiming its link leaves that link unusable once another reset succeeds", async () => {
+  const user = await makeUser();
+  const failing = await issueResetToken(user);
+  const succeeding = await issueResetToken(user);
+  const { id } = await resetTokenRow(failing);
+  assert.match(id, /^[A-Za-z0-9]+$/);
+  const gate = `reset_gate_${suffix}`;
+  const key = crypto.randomInt(1, 2 ** 31 - 1);
+  // The failing reset's claim pauses on an advisory lock while it holds its
+  // token row (and whatever the reset locked before), then fails, so its
+  // transaction rolls back after the other reset has run as far as it can.
+  await control.$executeRawUnsafe(
+    `CREATE OR REPLACE FUNCTION ${gate}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock_shared(${key}); RAISE EXCEPTION 'forced reset failure'; END $$`,
+  );
+  await control.$executeRawUnsafe(
+    `CREATE TRIGGER ${gate} BEFORE UPDATE ON "PasswordResetToken" FOR EACH ROW WHEN (OLD.id = '${id}') EXECUTE FUNCTION ${gate}()`,
+  );
+  const winner = candidatePassword("winner");
+  let failed, succeeded;
+  try {
+    let open;
+    const opened = new Promise((resolve) => {
+      open = resolve;
+    });
+    let gated;
+    const ready = new Promise((resolve) => {
+      gated = resolve;
+    });
+    const holder = control.$transaction(
+      async (tx) => {
+        [{ pid: holderPid }] =
+          await tx.$queryRaw`SELECT pg_backend_pid() AS pid`;
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(${key})`);
+        gated();
+        await opened;
+      },
+      { timeout: 15_000, maxWait: 2_000 },
+    );
+    try {
+      await ready;
+      const failing$ = reset(failing, candidatePassword("failing"));
+      await waitForLockWaiters(1);
+      const succeeding$ = reset(succeeding, winner);
+      // The second reset either waits for a lock the first one holds or
+      // finishes without waiting.
+      let settled = false;
+      succeeding$.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      const deadline = performance.now() + 5_000;
+      while (!settled && (await lockWaiterCount()) < 2) {
+        assert(performance.now() < deadline, "the second reset never waited");
+        await sleep(10);
+      }
+      open();
+      [failed, succeeded] = await Promise.all([failing$, succeeding$]);
+    } finally {
+      open();
+      await holder.catch(() => {});
+      holderPid = null;
+    }
+  } finally {
+    await control.$executeRawUnsafe(
+      `DROP TRIGGER IF EXISTS ${gate} ON "PasswordResetToken"`,
+    );
+    await control.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${gate}()`);
+  }
+  assert.equal(failed.statusCode, 500, failed.body);
+  assert.equal(succeeded.statusCode, 200, succeeded.body);
+  assert(await verifyPassword(winner, await storedPasswordHash(user)));
+  const late = await reset(failing, candidatePassword("late"));
+  assert.equal(late.statusCode, 404, late.body);
+  assert.match(late.json().message, /invalid reset token/i);
+  assert(await verifyPassword(winner, await storedPasswordHash(user)));
 });
 
 // ─── Email verification ────────────────────────────────────

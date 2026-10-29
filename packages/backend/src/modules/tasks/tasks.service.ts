@@ -452,6 +452,17 @@ export async function moveTask(
     if (!columns.has(data.statusId)) {
       throw new ValidationError("Status column not found in this project");
     }
+    // The source column was read before the transaction. If the task has left
+    // it since (a delete of that column moved it), renumbering it would be
+    // wrong; the client should retry with the current board. A column cannot
+    // be deleted while a task still uses it, so an unchanged statusId means
+    // the source column (now locked, unless it is a legacy column of another
+    // project) still holds the task.
+    const current = await tx.task.findUnique({ where: { id: taskId }, select: { statusId: true } });
+    if (!current) throw new NotFoundError("Task not found");
+    if (current.statusId !== task.statusId) {
+      throw new ConflictError("The task was moved at the same time; try again");
+    }
 
     const isSameColumn = task.statusId === data.statusId;
 

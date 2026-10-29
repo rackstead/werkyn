@@ -564,6 +564,76 @@ test("a task move and a delete of its column queue instead of deadlocking", asyn
 });
 
 /**
+ * The control transaction holds `lock`, starts the request, waits until it
+ * blocks on that lock, runs `meanwhile`, then releases the lock and returns
+ * the request's response.
+ */
+async function parkRequest(lock, send, meanwhile) {
+  let release, ready;
+  const released = new Promise((resolve) => (release = resolve));
+  const isReady = new Promise((resolve) => (ready = resolve));
+  let holderPid = null;
+  const holder = control.$transaction(
+    async (tx) => {
+      [{ pid: holderPid }] = await tx.$queryRaw`SELECT pg_backend_pid()::int AS pid`;
+      await lock(tx);
+      ready();
+      await released;
+    },
+    { timeout: 20_000, maxWait: 5_000 },
+  );
+  await isReady;
+  const pending = send();
+  try {
+    assert(
+      await until(async () => (await lockWaiters(holderPid)).some((w) => w.blockers.includes(holderPid))),
+      "the request never reached the control lock",
+    );
+    await meanwhile();
+  } finally {
+    release();
+  }
+  await holder;
+  return pending;
+}
+
+test("a move whose source column is deleted after the move read the task is refused with a retryable 409", async () => {
+  const f = await fixture();
+  // The move parks on the project row after reading the task (in Open), before
+  // its transaction locks any column; meanwhile Open is deleted and its tasks
+  // move to Review.
+  let deleted;
+  const response = await parkRequest(
+    lockRow("Project", f.project.id),
+    () => call(f.admin, "PATCH", `/tasks/${f.target.id}/move`, { statusId: f.review.id, position: 0 }),
+    async () => {
+      deleted = await call(f.admin, "DELETE", `/projects/${f.project.id}/statuses/${f.open.id}`);
+    },
+  );
+  expectStatus(deleted, 204, "column delete: ");
+  expectStatus(response, 409, "stale move: ");
+  assert.match(response.body, /The task was moved at the same time; try again/);
+  const after = await app.prisma.task.findUniqueOrThrow({ where: { id: f.target.id } });
+  assert.deepEqual({ statusId: after.statusId, position: after.position }, { statusId: f.review.id, position: f.target.position });
+});
+
+test("an assignment that waits past its transaction timeout gets the retryable 409", async () => {
+  const f = await fixture();
+  const wsMember = await app.prisma.workspaceMember.findFirstOrThrow({ where: { userId: f.racer.id, workspaceId: f.workspace.id } });
+  const response = await parkRequest(
+    (tx) => tx.$queryRaw`SELECT id FROM "WorkspaceMember" WHERE id = ${wsMember.id} FOR UPDATE`,
+    () => writers[0].send(f),
+    // Longer than Prisma's default five-second interactive transaction timeout.
+    () => sleep(5_500),
+  );
+  expectStatus(response, 409, "expired transaction: ");
+  assert.deepEqual(JSON.parse(response.body), {
+    statusCode: 409, error: "Conflict", message: "The request conflicted with a concurrent change; try again",
+  });
+  assert.equal(await app.prisma.taskAssignee.count({ where: { taskId: f.target.id } }), 0);
+});
+
+/**
  * The control transaction holds `first`, waits until the request blocks on it,
  * then requests `second`, which the request already holds. PostgreSQL detects
  * the cycle in the request's backend first (it has waited longest) and aborts

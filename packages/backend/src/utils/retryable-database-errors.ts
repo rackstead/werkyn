@@ -19,9 +19,16 @@ function sqlState(error: unknown): string | undefined {
   return undefined;
 }
 
-/** True when the database abandoned the transaction so that another could proceed. */
+/**
+ * True when the database abandoned the transaction so that another could
+ * proceed (P2034, 40P01, 40001), or the transaction expired or could not start
+ * in time (P2028), for example while it waited for a row lock.
+ */
 export function isRetryableDatabaseError(error: unknown): boolean {
-  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+  if (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    (error.code === "P2034" || error.code === "P2028")
+  ) {
     return true;
   }
   const state = sqlState(error);

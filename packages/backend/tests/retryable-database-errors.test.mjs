@@ -35,6 +35,8 @@ test("deadlocks and serialization failures are retryable under every Prisma erro
     assert.equal(isRetryableDatabaseError(raw(state)), true, `raw query error ${state}`);
   }
   assert.equal(isRetryableDatabaseError(known("P2034")), true);
+  // An interactive transaction that expired, for example while waiting for a row lock.
+  assert.equal(isRetryableDatabaseError(known("P2028")), true);
 
   assert.equal(isRetryableDatabaseError(unknown("22021")), false);
   assert.equal(isRetryableDatabaseError(raw("23505")), false);
@@ -54,7 +56,7 @@ test("the error handler answers a deadlock with the retryable 409 and no interna
   });
   await app.ready();
   try {
-    for (const error of [unknown("40P01"), raw("40P01"), unknown("40001")]) {
+    for (const error of [unknown("40P01"), raw("40P01"), unknown("40001"), known("P2028")]) {
       next = error;
       const response = await app.inject({ method: "GET", url: "/fail" });
       assert.equal(response.statusCode, 409);

@@ -4,16 +4,40 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { env } from "../config/env.js";
 import { dexManager } from "../services/dex-manager.js";
 
+// Request headers that are not forwarded to Dex: Werkyn's own credentials, and
+// the hop-by-hop fields a proxy removes (RFC 9110, section 7.6.1). reply-from
+// already removes Connection, the fields it names and Transfer-Encoding;
+// undici refuses to send Keep-Alive, Upgrade or Expect, which turned such
+// requests into a 502. Node has already answered Expect: 100-continue.
+const STRIPPED_REQUEST_HEADERS = [
+  "authorization",
+  "expect",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "upgrade",
+];
+
+function isMalformedTarget(url: string): boolean {
+  // Dex is addressed by path only. reply-from fails with a 500 for an
+  // absolute-form target (http://host/dex/...) naming any host but Dex.
+  if (!url.startsWith("/")) return true;
+  // reply-from decodes the whole target, query included, to check for path
+  // traversal, and throws on malformed percent-escapes.
+  try {
+    decodeURIComponent(url);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 async function forwardToDex(request: FastifyRequest, reply: FastifyReply) {
   if (!dexManager.isRunning) {
     return reply.code(503).send({ error: "SSO service is not running" });
   }
 
-  // reply-from decodes the whole target, query included, to check for path
-  // traversal, and throws on malformed percent-escapes.
-  try {
-    decodeURIComponent(request.url);
-  } catch {
+  if (isMalformedTarget(request.url)) {
     return reply.code(400).send({ error: "Malformed request URL" });
   }
 
@@ -23,8 +47,9 @@ async function forwardToDex(request: FastifyRequest, reply: FastifyReply) {
       : request.body;
   return reply.from(request.url, {
     rewriteRequestHeaders: (_request, headers) => {
-      const { authorization, ...rest } = headers;
-      return rest;
+      const forwarded = { ...headers };
+      for (const name of STRIPPED_REQUEST_HEADERS) delete forwarded[name];
+      return forwarded;
     },
     // reply-from reports a refused or reset connection to Dex as a 500 and a
     // DNS failure as a 503. Report them as a gateway failure instead.

@@ -29,7 +29,8 @@ Object.assign(process.env, {
   DEX_STORAGE_TYPE: "postgres",
 });
 const { env } = await import("../src/config/env.ts");
-const { generateDexConfig } = await import("../src/services/dex-config.ts");
+const { dexPostgresSsl, generateDexConfig } =
+  await import("../src/services/dex-config.ts");
 
 const prisma = {
   ssoConfig: {
@@ -178,6 +179,82 @@ test("relative certificate paths resolve against the Prisma schema directory, as
   assert.deepEqual(storage.ssl, {
     mode: "verify-full",
     caFile: path.join(prismaDir, "certs/ca.pem"),
+  });
+});
+
+const sslFor = (query) =>
+  dexPostgresSsl(
+    new URL(`postgresql://u:p@db.example.net/werkyn?${query}`).searchParams,
+  );
+
+test("a repeated TLS parameter is rejected, since Werkyn and Dex could read different values", async () => {
+  // Prisma reads the last value and URLSearchParams.get the first, so each of
+  // these could leave Dex weaker than Werkyn (or the reverse).
+  for (const [query, name] of [
+    ["sslmode=disable&sslmode=require", "sslmode"],
+    ["sslmode=prefer&sslmode=require", "sslmode"],
+    ["sslmode=require&sslmode=disable", "sslmode"],
+    ["sslmode=require&sslmode=allow", "sslmode"],
+    ["sslmode=require&sslmode=require", "sslmode"],
+    ["sslmode=verify-full&sslmode=require", "sslmode"],
+    // Percent-encoded names decode to the same parameter for both parsers.
+    ["sslmode=disable&ssl%6Dode=require", "sslmode"],
+    [
+      "sslmode=require&sslaccept=accept_invalid_certs&sslaccept=strict",
+      "sslaccept",
+    ],
+    [
+      "sslmode=require&sslaccept=strict&sslaccept=accept_invalid_certs",
+      "sslaccept",
+    ],
+    [
+      "sslmode=require&sslaccept=strict&sslcert=/etc/ssl/ca.pem&sslcert=/etc/ssl/other-ca.pem",
+      "sslcert",
+    ],
+    [
+      "sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem&sslrootcert=system",
+      "sslrootcert",
+    ],
+    [
+      "sslmode=verify-full&sslcert=/etc/ssl/client.pem&sslkey=/etc/ssl/a.key&sslkey=/etc/ssl/b.key",
+      "sslkey",
+    ],
+    ["sslmode=require&sslidentity=a.p12&sslidentity=b.p12", "sslidentity"],
+    // Rejected even where Dex would ignore the value today.
+    [
+      "sslmode=disable&sslcert=/etc/ssl/a.pem&sslcert=/etc/ssl/b.pem",
+      "sslcert",
+    ],
+    ["sslrootcert=/etc/ssl/a.pem&sslrootcert=/etc/ssl/b.pem", "sslrootcert"],
+  ]) {
+    assert.throws(
+      () => sslFor(query),
+      (err) =>
+        err.message.includes(`"${name}"`) && /more than once/.test(err.message),
+      query,
+    );
+  }
+
+  // The error surfaces when the Dex config is generated, so Dex is not
+  // started with either reading.
+  env.DATABASE_URL =
+    "postgresql://u:p@db.example.net/werkyn?sslmode=disable&sslmode=require";
+  await assert.rejects(generateDexConfig(prisma), /"sslmode".*more than once/);
+});
+
+test("parameters that are not TLS settings may repeat, and names are case-sensitive as in Prisma", () => {
+  assert.deepEqual(
+    sslFor(
+      "schema=a&schema=b&connection_limit=1&connection_limit=2&sslmode=require",
+    ),
+    { mode: "require" },
+  );
+  // Prisma ignores parameter names in another case, so these are not repeats.
+  assert.deepEqual(sslFor("SSLMODE=disable&sslmode=require"), {
+    mode: "require",
+  });
+  assert.deepEqual(sslFor("sslmode=require&SslMode=disable"), {
+    mode: "require",
   });
 });
 

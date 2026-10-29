@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import http from "node:http";
+import net from "node:net";
 import { after, before, test } from "node:test";
 import Fastify from "fastify";
 
@@ -108,6 +109,54 @@ function send(method, path, headers = {}, body, targetPort = port) {
     );
     req.on("error", reject);
     req.end(body);
+  });
+}
+
+// Writes a request to a raw socket, so no client library adds, drops or
+// rewrites anything, and resolves with the final response once its body has
+// arrived. With continueBody the body is sent only after 100 Continue.
+function rawRequest(request, { continueBody } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const statuses = [];
+    let buffer = Buffer.alloc(0);
+    let response = null;
+    const finish = (body) => {
+      socket.destroy();
+      resolve({ ...response, statuses, body: body.toString("utf8") });
+    };
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (!response) {
+        const end = buffer.indexOf("\r\n\r\n");
+        if (end === -1) return;
+        const head = buffer.subarray(0, end).toString("latin1");
+        buffer = buffer.subarray(end + 4);
+        const status = Number(head.slice(9, 12));
+        statuses.push(status);
+        if (status >= 200) {
+          response = { status, head };
+        } else if (status === 100 && continueBody !== undefined) {
+          socket.write(continueBody);
+        }
+      }
+      const length = /^content-length: *(\d+)$/im.exec(response.head);
+      if (length && buffer.length >= Number(length[1])) {
+        finish(buffer.subarray(0, Number(length[1])));
+      } else if (
+        /^transfer-encoding: *chunked$/im.test(response.head) &&
+        buffer.includes("\r\n0\r\n\r\n")
+      ) {
+        finish(buffer);
+      }
+    });
+    socket.on("end", () => {
+      if (response) finish(buffer);
+      else reject(new Error("connection closed before a response"));
+    });
+    socket.on("error", reject);
+    socket.setTimeout(5_000, () => socket.destroy(new Error("timed out")));
+    socket.write(request);
   });
 }
 
@@ -340,6 +389,68 @@ test("requests are refused without contacting Dex while it is stopped", async ()
     }
   } finally {
     dexRunning = true;
+  }
+  assert.equal(forwarded.length, 0);
+});
+
+test("hop-by-hop request headers are removed instead of failing the request", async () => {
+  // Undici refuses to send Keep-Alive and Upgrade, which reached it as a 502.
+  for (const [header, value] of [
+    ["Keep-Alive", "timeout=5, max=100"],
+    ["Upgrade", "h2c"],
+    ["Upgrade", "websocket"],
+    ["Proxy-Connection", "keep-alive"],
+    ["TE", "trailers"],
+  ]) {
+    forwarded.length = 0;
+    const response = await rawRequest(
+      "GET /dex/token?probe=1 HTTP/1.1\r\n" +
+        "Host: werkyn.test\r\n" +
+        `${header}: ${value}\r\n` +
+        "X-End-To-End: kept\r\n" +
+        "Connection: close\r\n\r\n",
+    );
+    assert.equal(response.status, 200, `${header}: ${response.body}`);
+    assert.equal(forwarded.length, 1, header);
+    assert.equal(forwarded[0].url, "/dex/token?probe=1");
+    assert.equal(forwarded[0].headers[header.toLowerCase()], undefined, header);
+    assert.equal(forwarded[0].headers["x-end-to-end"], "kept", header);
+  }
+});
+
+test("a POST sent with Expect: 100-continue is forwarded once its body arrives", async () => {
+  forwarded.length = 0;
+  const form = "login=fixture%40example.test&password=secret";
+  const response = await rawRequest(
+    "POST /dex/auth/ldap/login?state=fixture HTTP/1.1\r\n" +
+      "Host: werkyn.test\r\n" +
+      "Content-Type: application/x-www-form-urlencoded\r\n" +
+      `Content-Length: ${Buffer.byteLength(form)}\r\n` +
+      "Expect: 100-continue\r\n" +
+      "Connection: close\r\n\r\n",
+    { continueBody: form },
+  );
+  assert.deepEqual(response.statuses, [100, 303], response.body);
+  assert.equal(forwarded.length, 1);
+  assert.equal(forwarded[0].body, form);
+  assert.equal(forwarded[0].headers.expect, undefined);
+});
+
+test("an absolute-form request target is a client error, not forwarded", async () => {
+  forwarded.length = 0;
+  const dexOrigin = `http://127.0.0.1:${dex.address().port}`;
+  for (const target of [
+    "http://evil.example/dex/auth?client_id=werkyn",
+    "https://werkyn.test/dex/auth",
+    `${dexOrigin}/dex/auth`,
+  ]) {
+    const response = await rawRequest(
+      `GET ${target} HTTP/1.1\r\n` +
+        "Host: werkyn.test\r\n" +
+        "Connection: close\r\n\r\n",
+    );
+    assert.equal(response.status, 400, `${target}: ${response.body}`);
+    assert.match(response.body, /Malformed request URL/, target);
   }
   assert.equal(forwarded.length, 0);
 });

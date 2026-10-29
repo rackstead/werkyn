@@ -2,6 +2,7 @@ import {
   MutationCache,
   notifyManager,
   QueryClient,
+  type MutationObserver,
   type Mutation,
   type MutationOptions,
   type MutationState,
@@ -41,6 +42,13 @@ function withinIdentity<TData, TError, TVariables, TOnMutateResult>(
   };
 }
 
+// The observers (useMutation hooks) attached to each mutation. Callbacks passed
+// to `mutate(variables, callbacks)` run through the observer rather than the
+// mutation's options, so on an identity change the observers of every pending
+// mutation are reset: they detach and report idle.
+type AnyMutationObserver = MutationObserver<any, any, any, any>;
+const mutationObservers = new WeakMap<object, Set<AnyMutationObserver>>();
+
 class IdentityScopedMutationCache extends MutationCache {
   build<TData, TError, TVariables, TOnMutateResult>(
     client: QueryClient,
@@ -54,6 +62,18 @@ class IdentityScopedMutationCache extends MutationCache {
     const setOptions = mutation.setOptions.bind(mutation);
     mutation.setOptions = (next) => setOptions(withinIdentity(next, generation));
     mutation.setOptions(mutation.options);
+    const observers = new Set<AnyMutationObserver>();
+    mutationObservers.set(mutation, observers);
+    const addObserver = mutation.addObserver.bind(mutation);
+    const removeObserver = mutation.removeObserver.bind(mutation);
+    mutation.addObserver = (observer) => {
+      observers.add(observer);
+      addObserver(observer);
+    };
+    mutation.removeObserver = (observer) => {
+      observers.delete(observer);
+      removeObserver(observer);
+    };
     return mutation;
   }
 }
@@ -81,6 +101,10 @@ export const queryClient = new QueryClient({
 // also emptied: nothing mounted keeps displaying the previous account's data.
 onIdentityChange(() => {
   const queries = queryClient.getQueryCache().getAll();
+  for (const mutation of queryClient.getMutationCache().getAll()) {
+    for (const observer of [...(mutationObservers.get(mutation) ?? [])])
+      observer.reset();
+  }
   queryClient.clear();
   notifyManager.batch(() => {
     for (const query of queries) query.reset();

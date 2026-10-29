@@ -80,6 +80,30 @@ function assertRequestGeneration(context: object) {
   else if (started !== current) throw new IdentityChangedError();
 }
 
+/** `AbortSignal.any`, with a fallback for browsers that predate it. */
+function anySignal(signals: AbortSignal[]): {
+  signal: AbortSignal;
+  release: () => void;
+} {
+  if (typeof AbortSignal.any === "function")
+    return { signal: AbortSignal.any(signals), release: () => {} };
+  const controller = new AbortController();
+  const unlisten: (() => void)[] = [];
+  for (const source of signals) {
+    if (source.aborted) {
+      controller.abort(source.reason);
+      break;
+    }
+    const abort = () => controller.abort(source.reason);
+    source.addEventListener("abort", abort, { once: true });
+    unlisten.push(() => source.removeEventListener("abort", abort));
+  }
+  return {
+    signal: controller.signal,
+    release: () => unlisten.forEach((remove) => remove()),
+  };
+}
+
 // Requests are bound to the identity they were sent for: an identity change
 // aborts them at once, even if the underlying fetch ignores the abort, so a
 // late response cannot reach the next account's caches or callbacks.
@@ -94,10 +118,14 @@ function fetchForCurrentIdentity(
   return new Promise<Response>((resolve, reject) => {
     const abort = () => reject(identity.reason);
     identity.addEventListener("abort", abort, { once: true });
+    const combined = anySignal(signals);
     globalThis
-      .fetch(input, { ...init, signal: AbortSignal.any(signals) })
+      .fetch(input, { ...init, signal: combined.signal })
       .then(resolve, reject)
-      .finally(() => identity.removeEventListener("abort", abort));
+      .finally(() => {
+        identity.removeEventListener("abort", abort);
+        combined.release();
+      });
   });
 }
 

@@ -74,6 +74,7 @@ type Handler = (call: Call) => Response | Promise<Response>;
 
 const handlers = new Map<string, Handler>();
 const calls: Call[] = [];
+const signals: (AbortSignal | null)[] = [];
 
 function json(status: number, body: unknown) {
   return new Response(status === 204 ? null : JSON.stringify(body), {
@@ -113,6 +114,7 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
     token: request.headers.get("Authorization")?.replace(/^Bearer /, "") ?? null,
   };
   calls.push(call);
+  signals.push(init?.signal ?? request.signal);
   const handler = handlers.get(`${call.method} ${call.path}`);
   if (!handler) return json(404, { statusCode: 404, message: "Not found" });
   return handler(call);
@@ -276,6 +278,7 @@ beforeEach(() => {
   FakeWebSocket.reset();
   handlers.clear();
   calls.length = 0;
+  signals.length = 0;
   announced.length = 0;
   serveDefaults();
   localStorage.clear();
@@ -640,5 +643,200 @@ describe("sign-out", () => {
     logoutRequest.resolve(json(204, null));
     await settle();
     expect(ready).toBe(true);
+  });
+});
+
+// ─── Review follow-ups ──────────────────────────────────
+
+describe("review follow-ups", () => {
+  it("retries a refresh another tab superseded while signing out with an expired token", async () => {
+    signIn(alice, "alice-token");
+    const logouts: (string | null)[] = [];
+    on("POST", "auth/logout", ({ token }) => {
+      logouts.push(token);
+      return token === "alice-token-2" ? json(204, null) : json(401, { statusCode: 401 });
+    });
+    let refreshes = 0;
+    on("POST", "auth/refresh", () =>
+      ++refreshes === 1
+        ? json(409, { statusCode: 409 })
+        : json(200, { data: { user: alice, accessToken: "alice-token-2", workspaces: [acme] } }),
+    );
+    let done = false;
+    act(() => {
+      void useAuthStore
+        .getState()
+        .logout()
+        .then(() => (done = true));
+    });
+    await settle();
+    expect(done).toBe(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    await settle();
+    expect(done).toBe(true);
+    expect(refreshes).toBe(2);
+    expect(logouts).toEqual(["alice-token", "alice-token-2"]);
+    expect(useAuthStore.getState().user).toBeNull();
+  });
+
+  it("an announcement from an earlier build cannot sign an account back in", async () => {
+    signIn(alice, "alice-token");
+    // An earlier build's tab renews this account's token: adopted.
+    otherTab.postMessage({
+      type: "refresh",
+      data: { user: alice, accessToken: "alice-token-2", workspaces: [acme] },
+    });
+    await deliverMessages();
+    expect(useAuthStore.getState().accessToken).toBe("alice-token-2");
+
+    act(() => void useAuthStore.getState().logout());
+    // Its refresh from before the sign-out arrives afterwards: ignored.
+    otherTab.postMessage({
+      type: "refresh",
+      data: { user: alice, accessToken: "alice-token-3", workspaces: [acme] },
+    });
+    // Nor can it switch this tab to another account.
+    signIn(bob, "bob-token");
+    otherTab.postMessage({
+      type: "refresh",
+      data: { user: alice, accessToken: "alice-token-3", workspaces: [acme] },
+    });
+    await deliverMessages();
+    expect(useAuthStore.getState()).toMatchObject({ user: bob, accessToken: "bob-token" });
+  });
+
+  it("a sign-out aborts the refresh it overtakes", async () => {
+    signIn(alice, "alice-token");
+    on("POST", "auth/refresh", () => new Promise<Response>(() => {}));
+    let result: boolean | undefined;
+    void useAuthStore
+      .getState()
+      .refresh()
+      .then((value) => (result = value));
+    await settle();
+    const refreshSignal = signals[calls.findIndex((c) => c.path === "auth/refresh")];
+    expect(refreshSignal?.aborted).toBe(false);
+    act(() => void useAuthStore.getState().logout());
+    expect(refreshSignal?.aborted).toBe(true);
+    await settle();
+    expect(result).toBe(false);
+    expect(useAuthStore.getState().user).toBeNull();
+  });
+
+  it("a sign-in waits for cookie-setting requests still running in another tab", async () => {
+    localStorage.setItem("pm-auth-busy:other-tab", String(Date.now() + 3000));
+    let ready = false;
+    void whenLoggedOut().then(() => (ready = true));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(ready).toBe(false);
+    // The other tab's request finishes and it removes its marker.
+    localStorage.removeItem("pm-auth-busy:other-tab");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(ready).toBe(true);
+
+    // A marker left by a closed tab only holds sign-in until its deadline.
+    localStorage.setItem("pm-auth-busy:closed-tab", String(Date.now() + 2000));
+    ready = false;
+    void whenLoggedOut().then(() => (ready = true));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100);
+    });
+    expect(ready).toBe(true);
+    expect(localStorage.getItem("pm-auth-busy:closed-tab")).toBeNull();
+  });
+
+  it("a sign-out stops before touching a session another tab signed in meanwhile", async () => {
+    signIn(alice, "alice-token");
+    const firstLogout = deferred<Response>();
+    on("POST", "auth/logout", () => firstLogout.promise);
+    on("POST", "auth/refresh", () =>
+      json(200, { data: { user: alice, accessToken: "alice-token-2", workspaces: [acme] } }),
+    );
+    let done = false;
+    act(() => {
+      void useAuthStore
+        .getState()
+        .logout()
+        .then(() => (done = true));
+    });
+    // Another tab signs the same account in again while this sign-out runs.
+    otherTab.postMessage({
+      type: "refresh",
+      epoch: { at: Date.now() + 1000, tab: "other" },
+      data: { user: alice, accessToken: "alice-new-session", workspaces: [acme] },
+    });
+    await deliverMessages();
+    firstLogout.resolve(json(401, { statusCode: 401 }));
+    await settle();
+    expect(done).toBe(true);
+    expect(calls.map((c) => c.path)).toEqual(["auth/logout"]);
+    expect(useAuthStore.getState().accessToken).toBe("alice-new-session");
+  });
+
+  it("callbacks passed to mutate() do not run after the account changed", async () => {
+    signIn(alice, "alice-token");
+    const response = deferred<Response>();
+    on("POST", "mark-read", () => response.promise);
+    const callbacks = vi.fn();
+    const { useMutation } = await import("@tanstack/react-query");
+    function MarkRead() {
+      const mutation = useMutation({ mutationFn: () => api.post("mark-read").json() });
+      return (
+        <button
+          onClick={() =>
+            mutation.mutate(undefined, {
+              onSuccess: () => callbacks("success"),
+              onError: () => callbacks("error"),
+              onSettled: () => callbacks("settled"),
+            })
+          }
+        >
+          Mark read {mutation.status}
+        </button>
+      );
+    }
+    // Mounted outside any identity boundary, so it stays mounted throughout.
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MarkRead />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByText("Mark read idle"));
+    await settle();
+    expect(screen.getByText("Mark read pending")).toBeTruthy();
+    signIn(bob, "bob-token");
+    await settle();
+    expect(screen.getByText("Mark read idle")).toBeTruthy();
+    response.resolve(json(200, { ok: true }));
+    await settle();
+    expect(callbacks).not.toHaveBeenCalled();
+    expect(screen.getByText("Mark read idle")).toBeTruthy();
+  });
+
+  it("binds requests to the identity where AbortSignal.any is missing", async () => {
+    const original = AbortSignal.any;
+    Object.defineProperty(AbortSignal, "any", { value: undefined, configurable: true });
+    try {
+      signIn(alice, "alice-token");
+      on("GET", "users/me", perAccount((user) => json(200, { data: user })));
+      await expect(api.get("users/me").json()).resolves.toEqual({ data: alice });
+      const pending = deferred<Response>();
+      on("GET", "users/me", () => pending.promise);
+      const request = api.get("users/me").json();
+      const rejected = expect(request).rejects.toBeInstanceOf(IdentityChangedError);
+      await settle();
+      const signal = signals.at(-1);
+      signIn(bob, "bob-token");
+      await rejected;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      Object.defineProperty(AbortSignal, "any", { value: original, configurable: true });
+    }
   });
 });

@@ -104,8 +104,9 @@ function isEpoch(value: unknown): value is Epoch {
 
 /**
  * Accepts an announcement's epoch unless it is older than one already known.
- * Messages from tabs still running an earlier build carry no epoch; they are
- * taken as current, which is how every message was treated before.
+ * Messages from tabs still running an earlier build carry no epoch and cannot
+ * be ordered: the message handler lets them sign out, or renew the token of
+ * the account already signed in, but never sign an account in.
  */
 function acceptEpoch(value: unknown): boolean {
   if (!isEpoch(value)) return true;
@@ -176,12 +177,38 @@ function isStale(start: RefreshStart) {
   );
 }
 
+// Refresh requests in flight in this tab. A sign-out aborts them: the session
+// they would renew is being revoked, and a response arriving later could set
+// its cookie over the cookie of the next sign-in.
+const refreshAborts = new Set<AbortController>();
+
+function abortRefreshes() {
+  for (const controller of refreshAborts) controller.abort();
+  refreshAborts.clear();
+}
+
 async function requestRefresh(start: RefreshStart) {
   const sentAt = Date.now();
-  const res = await fetch(apiUrl("auth/refresh"), {
-    method: "POST",
-    credentials: "include",
-  });
+  const controller = new AbortController();
+  refreshAborts.add(controller);
+  // Settles on abort even if the network layer ignores the signal.
+  const aborted = new Promise<never>((_, reject) =>
+    controller.signal.addEventListener(
+      "abort",
+      () => reject(controller.signal.reason),
+      { once: true },
+    ),
+  );
+  const res = await cookieRequest(() =>
+    Promise.race([
+      fetch(apiUrl("auth/refresh"), {
+        method: "POST",
+        credentials: "include",
+        signal: controller.signal,
+      }),
+      aborted,
+    ]),
+  ).finally(() => refreshAborts.delete(controller));
   // A stale answer says nothing about the cookie of the current session.
   if (isStale(start)) return res;
   // A 409 for a cookie sent before a newer refresh landed says nothing about
@@ -212,25 +239,85 @@ function wakeRefreshWaiters() {
   for (const wake of [...broadcastWaiters]) wake();
 }
 
-// ─── Logout ───────────────────────────────────────────────
+// ─── Cookie-setting requests ─────────────────────────────
+//
+// A refresh or a sign-out still in flight sets or clears the shared refresh
+// cookie when its response arrives, possibly after a new sign-in in this or
+// another tab has set the new session's cookie. While such a request runs,
+// its tab records a deadline in localStorage under its own key, and a sign-in
+// in any tab first waits (bounded) until none is left, so the new session's
+// cookie is the last one set.
 
-// Server-side revocation runs after local state is already cleared. It is
-// bounded so that a hung network cannot keep it, or a sign-in waiting for it,
-// pending indefinitely.
 const LOGOUT_TIMEOUT_MS = 10_000;
+const BUSY_KEY_PREFIX = "pm-auth-busy:";
+const busyKey = `${BUSY_KEY_PREFIX}${tabId}`;
+let cookieRequests = 0;
+
+function writeBusy(value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(busyKey);
+    else localStorage.setItem(busyKey, value);
+  } catch {
+    // Storage unavailable: only this tab's own work is waited for.
+  }
+}
+
+async function cookieRequest<T>(run: () => Promise<T>): Promise<T> {
+  cookieRequests += 1;
+  writeBusy(String(Date.now() + LOGOUT_TIMEOUT_MS));
+  try {
+    return await run();
+  } finally {
+    cookieRequests -= 1;
+    if (cookieRequests === 0) writeBusy(null);
+  }
+}
+
+/** The latest deadline of a cookie-setting request in flight in any tab. */
+function busyUntil(): number {
+  let until = 0;
+  const now = Date.now();
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index--) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(BUSY_KEY_PREFIX)) continue;
+      const deadline = Number(localStorage.getItem(key)) || 0;
+      // Left behind by a tab that closed mid-request.
+      if (deadline <= now) localStorage.removeItem(key);
+      else until = Math.max(until, deadline);
+    }
+  } catch {
+    // Storage unavailable
+  }
+  return until;
+}
+
 let pendingLogout: Promise<void> | null = null;
 
 /**
- * Settles once a sign-out's server revocation has finished or given up. A new
- * sign-in waits for it, so the sign-out's cookie removal cannot arrive after,
- * and remove, the new session's cookie.
+ * Settles once no sign-out or refresh, in this tab or another, can still set
+ * or clear the session cookie: when those requests have finished or reached
+ * their deadline. A new sign-in waits for it, so its cookie is the last set.
  */
-export function whenLoggedOut(): Promise<void> {
-  return pendingLogout ?? Promise.resolve();
+export async function whenLoggedOut(): Promise<void> {
+  await (pendingLogout ?? Promise.resolve());
+  const giveUpAt = Date.now() + LOGOUT_TIMEOUT_MS;
+  while (Date.now() < Math.min(busyUntil(), giveUpAt)) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
-async function revokeSession(accessToken: string | null, userId: string) {
+const LOGOUT_REFRESH_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+
+async function revokeSession(
+  accessToken: string | null,
+  userId: string,
+  logoutEpoch: Epoch,
+) {
   const controller = new AbortController();
+  // Another tab announced a newer sign-in or sign-out: the cookie may now
+  // belong to that session, which this sign-out must not touch.
+  const overtaken = () => compareEpochs(knownEpoch, logoutEpoch) > 0;
   const signOut = (token: string | null) =>
     fetch(apiUrl("auth/logout"), {
       method: "POST",
@@ -238,23 +325,34 @@ async function revokeSession(accessToken: string | null, userId: string) {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       signal: controller.signal,
     });
-  const revoke = async () => {
-    const res = await signOut(accessToken);
-    if (res.status !== 401) return;
-    // The server only accepts a sign-out with a current access token. When
-    // ours has expired, exchange the cookie for one, without signing this
-    // tab back in, and sign out with that, unless the cookie now belongs to
-    // another account (signed in from another tab meanwhile).
-    const refreshed = await fetch(apiUrl("auth/refresh"), {
+  const refreshCookie = () =>
+    fetch(apiUrl("auth/refresh"), {
       method: "POST",
       credentials: "include",
       signal: controller.signal,
     });
-    if (!refreshed.ok) return;
+  const revoke = async () => {
+    const res = await signOut(accessToken);
+    if (res.status !== 401 || overtaken()) return;
+    // The server only accepts a sign-out with a current access token. When
+    // ours has expired, exchange the cookie for one, without signing this
+    // tab back in, and sign out with that, unless the cookie now belongs to
+    // another account (signed in from another tab meanwhile). A cookie that
+    // another tab has just rotated (409) or a busy session (503) is retried
+    // with the browser's current cookie, within the deadline.
+    let refreshed = await refreshCookie();
+    for (const delay of LOGOUT_REFRESH_RETRY_DELAYS_MS) {
+      if (!retryable(refreshed) || overtaken()) break;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (overtaken()) return;
+      refreshed = await refreshCookie();
+    }
+    if (!refreshed.ok || overtaken()) return;
     const body = (await refreshed.json()) as {
       data?: { user?: { id?: string }; accessToken?: string };
     };
     if (body.data?.user?.id !== userId || !body.data.accessToken) return;
+    if (overtaken()) return;
     await signOut(body.data.accessToken);
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -266,7 +364,7 @@ async function revokeSession(accessToken: string | null, userId: string) {
     }, LOGOUT_TIMEOUT_MS);
   });
   try {
-    await Promise.race([revoke(), deadline]);
+    await cookieRequest(() => Promise.race([revoke(), deadline]));
   } catch {
     // Local state is already cleared; the network may be unavailable.
   } finally {
@@ -290,6 +388,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
   /** Clears the session here and tells other tabs at `epoch` or older. */
   function endSession(epoch: Epoch) {
+    abortRefreshes();
     lastRefreshTime = 0;
     supersededSince = null;
     set({ user: null, accessToken: null, workspaces: [] });
@@ -299,14 +398,19 @@ export const useAuthStore = create<AuthState>((set, get) => {
   // Listen for cross-tab messages
   channel?.addEventListener("message", (event: MessageEvent) => {
     const message = event.data as Partial<AuthMessage> | null;
-    if (!message || !acceptEpoch(message.epoch)) return;
+    if (!message) return;
+    const legacy = !isEpoch(message.epoch);
+    if (!acceptEpoch(message.epoch)) return;
     if (message.type === "logout") {
+      abortRefreshes();
       lastRefreshTime = 0;
       supersededSince = null;
       set({ user: null, accessToken: null, workspaces: [], isHydrated: true });
       wakeRefreshWaiters();
     } else if (message.type === "refresh" && message.data) {
       const { user, accessToken, workspaces } = message.data;
+      // Unordered (earlier build): it may only renew this account's token.
+      if (legacy && get().user?.id !== user.id) return;
       lastRefreshTime = Date.now();
       supersededSince = null;
       set({ user, accessToken, workspaces });
@@ -356,9 +460,10 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
     logout: () => {
       const { user, accessToken } = get();
-      endSession(advanceEpoch(Date.now()));
-      if (!user) return whenLoggedOut();
-      const revoking = revokeSession(accessToken, user.id);
+      const epoch = advanceEpoch(Date.now());
+      endSession(epoch);
+      if (!user) return pendingLogout ?? Promise.resolve();
+      const revoking = revokeSession(accessToken, user.id, epoch);
       pendingLogout = revoking;
       void revoking.then(() => {
         if (pendingLogout === revoking) pendingLogout = null;
@@ -429,7 +534,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
           applySession(session, epoch);
           return true;
         } catch {
-          return false;
+          // A sign-out aborts the refreshes it overtakes.
+          return isStale(start) ? overtaken() : false;
         }
       };
       const promise: Promise<boolean> = run().finally(() => {

@@ -82,7 +82,8 @@ async function runNextOccurrence(
       // creation touches. Project and workspace deletion lock the Project row
       // before cascading to the schedule; taking the schedule first could
       // deadlock with them. A key-share lock does not block project updates
-      // such as archiving.
+      // such as archiving; task creation then strengthens it to the project's
+      // order lock (utils/task-order.ts) until this transaction commits.
       await tx.$queryRaw`
         SELECT p."id" FROM "Project" p
         JOIN "RecurringTaskConfig" c ON c."projectId" = p."id"

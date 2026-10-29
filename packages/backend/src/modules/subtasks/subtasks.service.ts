@@ -4,11 +4,12 @@ import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
 import { assertTaskEdit } from "../../utils/project-access.js";
 import { assertProjectAssignees } from "../../utils/task-references.js";
+import { assertCompleteOrder, withProjectOrder } from "../../utils/task-order.js";
 
 export async function listSubtasks(prisma: PrismaClient, taskId: string) {
   return prisma.subtask.findMany({
     where: { taskId },
-    orderBy: { position: "asc" },
+    orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
     include: {
       assignee: {
         select: { id: true, displayName: true, avatarUrl: true },
@@ -31,8 +32,10 @@ export async function createSubtask(
   if (!task) throw new NotFoundError("Task not found");
 
   // The assignee's membership rows stay locked until the subtask commits, so a
-  // concurrent project or workspace removal cannot slip in between.
-  const subtask = await prisma.$transaction(async (tx) => {
+  // concurrent project or workspace removal cannot slip in between. The
+  // project's order lock keeps the chosen position last until then
+  // (utils/task-order.ts).
+  const subtask = await withProjectOrder(prisma, task.projectId, async (tx) => {
     if (data.assigneeId !== undefined) {
       await assertProjectAssignees(tx, task.projectId, [data.assigneeId]);
     }
@@ -157,30 +160,33 @@ export async function reorderSubtasks(
   });
   if (!task) throw new NotFoundError("Task not found");
 
-  // Validate all IDs belong to this task
-  const subtasks = await prisma.subtask.findMany({
-    where: { taskId },
-    select: { id: true },
-  });
-  const validIds = new Set(subtasks.map((s) => s.id));
-  for (const id of orderedIds) {
-    if (!validIds.has(id)) {
-      throw new ValidationError(`Subtask ${id} does not belong to this task`);
+  // Under the project's order lock, so a subtask created meanwhile is either
+  // listed here or created after the reorder (utils/task-order.ts).
+  await withProjectOrder(prisma, task.projectId, async (tx) => {
+    // Validate all IDs belong to this task
+    const subtasks = await tx.subtask.findMany({
+      where: { taskId },
+      select: { id: true },
+    });
+    const validIds = new Set(subtasks.map((s) => s.id));
+    for (const id of orderedIds) {
+      if (!validIds.has(id)) {
+        throw new ValidationError(`Subtask ${id} does not belong to this task`);
+      }
     }
-  }
+    assertCompleteOrder(orderedIds, validIds, "subtask of the task");
 
-  // Update in subtask id order, the order in which member removals lock
-  // subtask rows (clearAssignments), so the two cannot deadlock.
-  const positions = orderedIds.map((id, index) => ({ id, index }));
-  positions.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  await prisma.$transaction(
-    positions.map(({ id, index }) =>
-      prisma.subtask.update({
+    // Update in subtask id order, the order in which member removals lock
+    // subtask rows (clearAssignments), so the two cannot deadlock.
+    const positions = orderedIds.map((id, index) => ({ id, index }));
+    positions.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const { id, index } of positions) {
+      await tx.subtask.update({
         where: { id },
         data: { position: index },
-      }),
-    ),
-  );
+      });
+    }
+  });
 
   return task.projectId;
 }

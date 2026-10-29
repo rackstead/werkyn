@@ -597,24 +597,30 @@ async function parkRequest(lock, send, meanwhile) {
   return pending;
 }
 
-test("a move whose source column is deleted after the move read the task is refused with a retryable 409", async () => {
+test("a move that waits for a delete of its task's column moves the task from where the delete put it", async () => {
   const f = await fixture();
-  // The move parks on the project row after reading the task (in Open), before
-  // its transaction locks any column; meanwhile Open is deleted and its tasks
-  // move to Review.
-  let deleted;
-  const response = await parkRequest(
-    lockRow("Project", f.project.id),
+  // Deleting Open moves its tasks after Review's; the delete parks while doing
+  // so, holding the project's order lock. The move of `target` (read in Open)
+  // waits for that lock and then reads the task's column again, so it reorders
+  // Review instead of renumbering a column the task has left.
+  const { first, second, observed } = await race(
+    lockRow("Task", f.held.id),
+    () => call(f.admin, "DELETE", `/projects/${f.project.id}/statuses/${f.open.id}`),
     () => call(f.admin, "PATCH", `/tasks/${f.target.id}/move`, { statusId: f.review.id, position: 0 }),
-    async () => {
-      deleted = await call(f.admin, "DELETE", `/projects/${f.project.id}/statuses/${f.open.id}`);
-    },
   );
-  expectStatus(deleted, 204, "column delete: ");
-  expectStatus(response, 409, "stale move: ");
-  assert.match(response.body, /The task was moved at the same time; try again/);
-  const after = await app.prisma.task.findUniqueOrThrow({ where: { id: f.target.id } });
-  assert.deepEqual({ statusId: after.statusId, position: after.position }, { statusId: f.review.id, position: f.target.position });
+  expectStatus(first, 204, "column delete: ");
+  expectStatus(second, 200, "move: ");
+  const review = await app.prisma.task.findMany({
+    where: { projectId: f.project.id },
+    orderBy: { position: "asc" },
+    select: { id: true, statusId: true, position: true },
+  });
+  assert.deepEqual(review, [
+    { id: f.target.id, statusId: f.review.id, position: 0 },
+    { id: f.parked.id, statusId: f.review.id, position: 1 },
+    { id: f.held.id, statusId: f.review.id, position: 2 },
+  ]);
+  assertSerialized(observed, "column delete, then a move of its task");
 });
 
 test("an assignment that waits past its transaction timeout gets the retryable 409", async () => {

@@ -58,6 +58,12 @@ each invalid variable. See `docs/remediation/ops-009.md` for the accepted format
 reachable and all migrations are applied. `GET /api/health` still reports whether
 the database is reachable.
 
+The container runs the migrations, the server and Dex as the unprivileged user
+`werkyn` (uid 10001). Older images ran as root; on upgrade, the Compose file's
+one-off `werkyn-permissions` service gives the root-owned files in the storage and
+Dex volumes to that user before the app starts. See `docs/remediation/ops-004.md`
+for `docker run`, host directories and other setups.
+
 When upgrading an existing installation, back up the database and storage first.
 Set new JWT and cookie secrets to invalidate credentials signed with the published
 sample secrets. Changing `POSTGRES_PASSWORD` in `.env` does not change the password

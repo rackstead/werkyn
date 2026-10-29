@@ -1,4 +1,11 @@
-// Week utilities — weeks start on Monday
+import { isDateOnly } from "@pm/shared";
+
+// Week utilities — weeks start on Monday.
+//
+// Time entry dates are calendar dates (YYYY-MM-DD) in the user's own time
+// zone. Dates here are local: build them with local fields and read them back
+// with local fields, never through toISOString(), which converts to UTC and
+// moves local midnight to the previous day east of UTC.
 
 export function getMonday(date: Date): Date {
   const d = new Date(date);
@@ -15,16 +22,24 @@ export function getSunday(monday: Date): Date {
   return d;
 }
 
+/** The local calendar date of `date` as YYYY-MM-DD. */
 export function formatDateISO(date: Date): string {
-  return date.toISOString().slice(0, 10);
+  const y = String(date.getFullYear()).padStart(4, "0");
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** Local midnight of a YYYY-MM-DD calendar date, or null if it is not one. */
+export function parseDateISO(value: string): Date | null {
+  if (!isDateOnly(value)) return null;
+  const [y, m, d] = value.split("-").map(Number);
+  return new Date(y, m - 1, d);
 }
 
 export function parseWeekParam(week?: string): Date {
-  if (week) {
-    const d = new Date(week + "T00:00:00");
-    if (!isNaN(d.getTime())) return getMonday(d);
-  }
-  return getMonday(new Date());
+  const d = week ? parseDateISO(week) : null;
+  return getMonday(d ?? new Date());
 }
 
 export function getWeekDays(monday: Date): Date[] {

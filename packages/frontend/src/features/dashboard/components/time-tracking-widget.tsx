@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useTimeEntries, type TimeEntry } from "@/features/time/api";
+import { formatDateISO, getMonday } from "@/features/time/utils";
 import { useAuthStore } from "@/stores/auth-store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -9,20 +10,14 @@ interface TimeTrackingWidgetProps {
   workspaceId: string;
 }
 
-function getMonday(d: Date): string {
-  const date = new Date(d);
-  const day = date.getDay();
-  const diff = day === 0 ? -6 : 1 - day;
-  date.setDate(date.getDate() + diff);
-  return date.toISOString().split("T")[0];
-}
-
 export function TimeTrackingWidget({ workspaceId }: TimeTrackingWidgetProps) {
   const user = useAuthStore((s) => s.user);
   const userId = user?.id;
 
-  const today = new Date().toISOString().split("T")[0];
-  const weekStart = getMonday(new Date());
+  // Entry dates are the user's local calendar dates.
+  const now = new Date();
+  const today = formatDateISO(now);
+  const weekStart = formatDateISO(getMonday(now));
 
   const { data: entries, isLoading } = useTimeEntries(workspaceId, weekStart, today, userId);
 

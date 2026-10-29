@@ -222,24 +222,24 @@ test("scheduler ticks create one task per occurrence and advance through short m
   assert.deepEqual(await tick("2027-03-28"), { "monthly-28": 1 });
   assert.deepEqual(await tick("2027-03-30"), { "monthly-edited": 1 });
   assert.deepEqual(await tick("2027-03-31"), { "monthly-31": 1 });
+  // Apr 7 and Apr 21 had no tick; the catch-up tick generates both.
   assert.deepEqual(await tick("2027-04-30"), {
     "monthly-31": 1,
     "monthly-28": 1,
     "monthly-edited": 1,
-    biweekly: 1,
+    biweekly: 2,
   });
   assert.deepEqual(await nextRunDates(), {
     "monthly-31": "2027-05-31",
     "monthly-28": "2027-05-28",
     "monthly-edited": "2027-05-30",
-    // Apr 7 had no tick; the catch-up tick handled that one occurrence only.
-    biweekly: "2027-04-21",
+    biweekly: "2027-05-05",
   });
   assert.deepEqual(await generatedTasks(), {
     "monthly-31": 4,
     "monthly-28": 3,
     "monthly-edited": 3,
-    biweekly: 5,
+    biweekly: 6,
   });
 
   // Pausing a schedule does not recompute or move its next run.
@@ -251,7 +251,7 @@ test("scheduler ticks create one task per occurrence and advance through short m
     "monthly-31": "2027-05-31",
     "monthly-28": "2027-05-28",
     "monthly-edited": "2027-05-30",
-    biweekly: "2027-04-21",
+    biweekly: "2027-05-05",
   });
 });
 

@@ -43,21 +43,29 @@ export async function createNotification(
   });
 }
 
+export interface NotificationDraft {
+  userId: string;
+  type: NotificationType;
+  title: string;
+  body?: string;
+  data?: Prisma.InputJsonValue;
+}
+
+/**
+ * Stores the notifications their recipients' preferences allow, all or none:
+ * they are written in one statement, so a failure rejects instead of silently
+ * dropping some recipients. Pass a transaction client to make the write part
+ * of a larger atomic change (the notification outbox does).
+ */
 export async function createNotifications(
-  prisma: PrismaClient,
-  notifications: Array<{
-    userId: string;
-    type: NotificationType;
-    title: string;
-    body?: string;
-    data?: Prisma.InputJsonValue;
-  }>,
-) {
+  db: PrismaClient | Prisma.TransactionClient,
+  notifications: NotificationDraft[],
+): Promise<Notification[]> {
   if (notifications.length === 0) return [];
 
   // Fetch preferences for all target users
   const userIds = [...new Set(notifications.map((n) => n.userId))];
-  const prefs = await prisma.notificationPreference.findMany({
+  const prefs = await db.notificationPreference.findMany({
     where: { userId: { in: userIds } },
   });
   const prefMap = new Map(prefs.map((p) => [p.userId, p]));
@@ -72,24 +80,15 @@ export async function createNotifications(
 
   if (filtered.length === 0) return [];
 
-  // Create all notifications (use allSettled so one failure doesn't block all)
-  const results = await Promise.allSettled(
-    filtered.map((n) =>
-      prisma.notification.create({
-        data: {
-          userId: n.userId,
-          type: n.type,
-          title: n.title,
-          body: n.body,
-          data: n.data,
-        },
-      }),
-    ),
-  );
-
-  return results
-    .filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof prisma.notification.create>>> => r.status === "fulfilled")
-    .map((r) => r.value);
+  return db.notification.createManyAndReturn({
+    data: filtered.map((n) => ({
+      userId: n.userId,
+      type: n.type,
+      title: n.title,
+      body: n.body,
+      data: n.data,
+    })),
+  });
 }
 
 // Same rule as projectAccessWhere: current workspace membership, plus ADMIN

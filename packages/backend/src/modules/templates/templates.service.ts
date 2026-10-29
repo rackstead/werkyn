@@ -133,13 +133,47 @@ export async function deleteTemplate(prisma: PrismaClient, projectId: string, te
   await prisma.taskTemplate.delete({ where: { id: templateId, projectId } });
 }
 
+/** Runs fn in a new transaction, or in the caller's when given a transaction client. */
+function inTransaction<T>(
+  db: PrismaClient | Prisma.TransactionClient,
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  return "$transaction" in db ? db.$transaction(fn) : fn(db);
+}
+
+/**
+ * The date `days` after a calendar date (YYYY-MM-DD), or after today (UTC)
+ * when no date is given.
+ */
+function addDaysUTC(date: string | undefined, days: number): string {
+  let d = new Date();
+  if (date) {
+    const [y, m, day] = date.split("-").map(Number);
+    d = new Date(Date.UTC(y, m - 1, day));
+  }
+  d.setUTCDate(d.getUTCDate() + days);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * Creates a task from a template. Pass a transaction client to create it
+ * inside the caller's transaction (the recurring scheduler does, so the task
+ * and its occurrence record commit together). `dueOffsetFrom` is the date the
+ * template's dueOffset counts from, defaulting to today; a recurring schedule
+ * passes the occurrence date, so a late-generated occurrence keeps its own due
+ * date.
+ */
 export async function createTaskFromTemplate(
-  prisma: PrismaClient,
+  prisma: PrismaClient | Prisma.TransactionClient,
   projectId: string,
   templateId: string,
   actorId: string | null,
   actorRole: string,
   overrides?: InstantiateTemplateInput,
+  dueOffsetFrom?: string,
 ) {
   const template = await prisma.taskTemplate.findFirst({
     where: { id: templateId, projectId },
@@ -155,7 +189,7 @@ export async function createTaskFromTemplate(
     throw new ValidationError("Cannot create tasks in an archived project");
   }
 
-  return prisma.$transaction(async (tx) => {
+  return inTransaction(prisma, async (tx) => {
     // Explicit overrides are validated like any other write; stored values are
     // copied only while still valid in this project.
     const stored = await scopeTemplate(tx, projectId, template);
@@ -186,12 +220,7 @@ export async function createTaskFromTemplate(
     // Calculate dueDate from dueOffset
     let dueDate = overrides?.dueDate;
     if (!dueDate && template.dueOffset !== null) {
-      const d = new Date();
-      d.setUTCDate(d.getUTCDate() + template.dueOffset);
-      const y = d.getUTCFullYear();
-      const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-      const day = String(d.getUTCDate()).padStart(2, "0");
-      dueDate = `${y}-${m}-${day}`;
+      dueDate = addDaysUTC(dueOffsetFrom, template.dueOffset);
     }
 
     // Calculate position

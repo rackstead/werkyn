@@ -7,9 +7,16 @@ import { blobPaths, cleanupBlobsNow } from "../services/blob-cleanup.js";
 const BATCH_SIZE = 100;
 const PURGE_AFTER_DAYS = 30;
 
+/**
+ * Purges files trashed more than 30 days ago. A run stops between candidates
+ * once its signal is aborted (shutdown); each candidate's delete is one
+ * transaction and its blobs are queued durably, so the rest waits for the
+ * next run.
+ */
 export async function processTrashPurge(
   prisma: PrismaClient,
   storage: StorageProvider,
+  options: { signal?: AbortSignal } = {},
 ) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - PURGE_AFTER_DAYS);
@@ -21,7 +28,7 @@ export async function processTrashPurge(
   // Pages by id so a candidate that cannot be purged (a malformed or
   // over-budget tree, or a busy workspace) is skipped for this run instead of
   // being selected first forever and blocking every other workspace.
-  while (true) {
+  pages: while (!options.signal?.aborted) {
     const files = await prisma.file.findMany({
       where: {
         trashedAt: { lt: cutoff },
@@ -38,6 +45,7 @@ export async function processTrashPurge(
     // another, and is re-read after it: it may have been restored, or already
     // removed by a parent cascade.
     for (const file of files) {
+      if (options.signal?.aborted) break pages;
       let storagePaths: string[] | null;
       try {
         storagePaths = await withWorkspaceLock(

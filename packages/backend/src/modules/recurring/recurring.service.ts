@@ -7,9 +7,13 @@ import {
 } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 
+// Scheduler bookkeeping, not part of the API.
+const configOmit = { lastRunDate: true } as const;
+
 export async function listRecurringConfigs(prisma: PrismaClient, projectId: string) {
   return prisma.recurringTaskConfig.findMany({
     where: { projectId },
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },
@@ -47,6 +51,7 @@ export async function createRecurringConfig(
       endDate: data.endDate,
       nextRunDate,
     },
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },
@@ -95,16 +100,53 @@ export async function updateRecurringConfig(
     const freq = data.frequency ?? existing.frequency;
     const dow = data.dayOfWeek !== undefined ? data.dayOfWeek : existing.dayOfWeek;
     const dom = data.dayOfMonth !== undefined ? data.dayOfMonth : existing.dayOfMonth;
-    updateData.nextRunDate = calculateNextRunDate(freq, existing.startDate, dow, dom);
+    updateData.nextRunDate = await firstUngeneratedRun(
+      prisma,
+      { ...existing, frequency: freq, dayOfWeek: dow, dayOfMonth: dom },
+      calculateNextRunDate(freq, existing.startDate, dow, dom),
+    );
+  } else if (data.isActive === true && !existing.isActive) {
+    // Resuming a paused schedule: dates that passed while it was paused are
+    // skipped, not generated late. The next run moves forward on the stored
+    // cycle to the first date on or after today.
+    const today = todayUTC();
+    let next = existing.nextRunDate;
+    while (next < today) {
+      next = advanceNextRunDate(existing.frequency, next, existing.dayOfWeek, existing.dayOfMonth);
+    }
+    updateData.nextRunDate = await firstUngeneratedRun(prisma, existing, next);
   }
 
   return prisma.recurringTaskConfig.update({
     where: { id: configId, projectId },
     data: updateData,
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },
   });
+}
+
+/**
+ * The first run on or after `date` that the scheduler has not generated yet.
+ * A recalculated next run can land on a date already generated today (an
+ * edit or a resume after that day's run); it moves on to the next one.
+ */
+async function firstUngeneratedRun(
+  prisma: PrismaClient,
+  config: { id: string; frequency: string; dayOfWeek: number | null; dayOfMonth: number | null },
+  date: string,
+) {
+  let next = date;
+  while (
+    await prisma.recurringTaskOccurrence.findUnique({
+      where: { configId_occurrenceDate: { configId: config.id, occurrenceDate: next } },
+      select: { configId: true },
+    })
+  ) {
+    next = advanceNextRunDate(config.frequency, next, config.dayOfWeek, config.dayOfMonth);
+  }
+  return next;
 }
 
 export async function deleteRecurringConfig(prisma: PrismaClient, projectId: string, configId: string) {
@@ -132,15 +174,16 @@ export async function deleteRecurringConfig(prisma: PrismaClient, projectId: str
 // calculateNextRunDate returns the first occurrence on or after the later of
 // startDate and today. advanceNextRunDate returns the occurrence following a
 // stored nextRunDate; the scheduler calls it once per generated task.
+//
+// The scheduler records each generated date (RecurringTaskOccurrence), so a
+// date is generated at most once even when an edit or a resume moves
+// nextRunDate back to it.
 
 const DAY_MS = 86_400_000;
 
-function todayUTC(): string {
-  const d = new Date();
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+/** The UTC calendar date (YYYY-MM-DD) of an instant, by default now. */
+export function todayUTC(now = new Date()): string {
+  return formatDate(now);
 }
 
 function parseDate(dateStr: string): Date {
@@ -181,8 +224,8 @@ export function calculateNextRunDate(
   startDate: string,
   dayOfWeek?: number | null,
   dayOfMonth?: number | null,
+  today: string = todayUTC(),
 ): string {
-  const today = todayUTC();
   const earliest = startDate >= today ? startDate : today;
   const from = parseDate(earliest);
 

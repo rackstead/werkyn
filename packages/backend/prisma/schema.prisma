@@ -477,6 +477,7 @@ model Task {
   activities     ActivityLog[]
   remindersSent  TaskReminderSent[]
   timeEntries    TimeEntry[]
+  recurringOccurrences RecurringTaskOccurrence[]
 
   @@index([projectId])
   @@index([statusId])
@@ -590,6 +591,28 @@ model Notification {
   @@index([userId, createdAt])
 }
 
+/// Outbox for notifications created through notify(). The row is retried
+/// until its notifications exist (written in the same transaction that sets
+/// notifiedAt, so at most once) and their realtime push has run, then
+/// deleted. An exhausted row keeps lastError with a null nextAttemptAt.
+model NotificationDelivery {
+  id              String           @id @default(cuid())
+  type            NotificationType
+  title           String           @db.VarChar(255)
+  body            String?          @db.VarChar(1000)
+  data            Json?
+  recipientIds    String[]
+  attempts        Int              @default(0)
+  nextAttemptAt   DateTime?        @default(now())
+  lockedUntil     DateTime?
+  notifiedAt      DateTime?
+  notificationIds String[]         @default([])
+  lastError       String?
+  createdAt       DateTime         @default(now())
+
+  @@index([nextAttemptAt])
+}
+
 model NotificationPreference {
   id                    String  @id @default(cuid())
   userId                String  @unique
@@ -685,13 +708,35 @@ model RecurringTaskConfig {
   endDate     String?
   nextRunDate String
   isActive    Boolean             @default(true)
+  /// UTC date (YYYY-MM-DD) of the last scheduler run that advanced or ended
+  /// this schedule. Written only by the scheduler, never by edits.
+  lastRunDate String?
   createdAt   DateTime            @default(now())
   updatedAt   DateTime            @updatedAt
 
   project  Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
   template TaskTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  occurrences RecurringTaskOccurrence[]
   @@index([projectId])
   @@index([isActive, nextRunDate])
+}
+
+/// One row per schedule date the scheduler has generated. The key makes
+/// generation idempotent: it is written in the same transaction as the task
+/// and the advanced nextRunDate, so a date is never generated twice, even
+/// across workers, crashes and edits that move nextRunDate back to it.
+model RecurringTaskOccurrence {
+  configId       String
+  occurrenceDate String
+  /// The generated task; null once that task is deleted.
+  taskId         String?
+  createdAt      DateTime @default(now())
+
+  config RecurringTaskConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+  task   Task?               @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@id([configId, occurrenceDate])
+  @@index([taskId])
 }
 
 // ─── Files (Drive) ─────────────────────────────────────

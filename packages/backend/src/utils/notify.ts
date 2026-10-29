@@ -1,58 +1,25 @@
-import type { PrismaClient, NotificationType, Prisma } from "@prisma/client";
+import type { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
-import { createNotifications } from "../modules/notifications/notifications.service.js";
-import { filterProjectRecipients } from "./project-access.js";
+import {
+  deliverNotification,
+  enqueueNotification,
+  type NotificationDeliveryResult,
+  type NotificationRequest,
+} from "../modules/notifications/notification-delivery.js";
 
-interface NotifyOptions {
-  recipients: string[];
-  type: NotificationType;
-  title: string;
-  body?: string;
-  data?: Prisma.InputJsonValue;
-  excludeUserId?: string;
-}
-
+/**
+ * Queues a notification in the durable outbox and runs its first delivery
+ * attempt. Recipients are filtered (actor, project access, preferences) when
+ * the notifications are created. A failed attempt is recorded and retried by
+ * the notification delivery worker, so the result is "pending" rather than a
+ * rejection; the promise rejects only when the outbox row cannot be written.
+ */
 export async function notify(
   prisma: PrismaClient,
-  fastify: FastifyInstance,
-  options: NotifyOptions,
-) {
-  const { recipients, type, title, body, data, excludeUserId } = options;
-
-  // Filter out the actor
-  let targetUserIds = excludeUserId
-    ? recipients.filter((id) => id !== excludeUserId)
-    : recipients;
-
-  if (data && typeof data === "object" && !Array.isArray(data)) {
-    const projectIds = new Set<string>();
-    if ("projectId" in data && typeof data.projectId === "string") projectIds.add(data.projectId);
-    // Reminders and legacy callers may supply only a task ID. Resolve the
-    // actual parent rather than relying on an optional project metadata hint.
-    if ("taskId" in data && typeof data.taskId === "string") {
-      const task = await prisma.task.findUnique({ where: { id: data.taskId }, select: { projectId: true } });
-      if (!task) return;
-      projectIds.add(task.projectId);
-    }
-    for (const projectId of projectIds) {
-      targetUserIds = await filterProjectRecipients(prisma, projectId, targetUserIds);
-    }
-  }
-
-  if (targetUserIds.length === 0) return;
-
-  const notifications = targetUserIds.map((userId) => ({
-    userId,
-    type,
-    title,
-    body,
-    data,
-  }));
-
-  const created = await createNotifications(prisma, notifications);
-
-  // Push real-time notification to each recipient
-  for (const notification of created) {
-    fastify.broadcastToUser(notification.userId, "notification_new", notification);
-  }
+  fastify: Pick<FastifyInstance, "broadcastToUser" | "log">,
+  options: NotificationRequest,
+): Promise<NotificationDeliveryResult> {
+  const id = await enqueueNotification(prisma, options);
+  if (!id) return "skipped";
+  return deliverNotification(prisma, fastify, id, { log: fastify.log });
 }

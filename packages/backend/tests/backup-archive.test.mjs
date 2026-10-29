@@ -20,6 +20,8 @@ const {
   ARCHIVE_TOO_LARGE_MESSAGE,
   BACKUP_ARCHIVE_LIMITS,
   BackupArchiveError,
+  BackupExportBudget,
+  EXPORT_TOO_LARGE_MESSAGE,
   inspectBackupArchive,
   readBackupArchive,
 } = await import("../src/modules/backup/backup-archive.ts");
@@ -351,6 +353,28 @@ test("rejections never quote entry names or adm-zip messages", () => {
     statusCode: 400,
     message: "Invalid backup ZIP: missing backup.json",
   });
+});
+
+test("the export budget counts entries the way the restore inspection does", () => {
+  const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
+  const counted = new BackupExportBudget({ ...BACKUP_ARCHIVE_LIMITS, maxEntries: 4 });
+  for (const name of ["backup.json", "assets/a.png", "assets/a.png", "assets/b.png"]) counted.add(name, 1);
+  // backup.json, assets/, a.png and b.png are four entries.
+  assert.throws(() => counted.add("assets/c.png", 1), tooLarge);
+
+  const sized = new BackupExportBudget({ ...BACKUP_ARCHIVE_LIMITS, maxTotalBytes: 100 });
+  sized.add("backup.json", 40);
+  sized.add("assets/a.png", 30);
+  // The same name again replaces its size instead of adding to it.
+  sized.add("assets/a.png", 30);
+  sized.add("assets/b.png", 30);
+  assert.throws(() => sized.add("assets/b.png", 31), tooLarge);
+
+  const limits = { ...BACKUP_ARCHIVE_LIMITS, maxEntryBytes: 10 };
+  assert.throws(() => new BackupExportBudget(limits).add("assets/x", 11), tooLarge);
+  assert.throws(() => new BackupExportBudget().add(`assets/${"x".repeat(1018)}`, 1), tooLarge);
+  // archiver stores a backslash as a folder separator.
+  assert.throws(() => new BackupExportBudget().add(`assets/${"d\\".repeat(15)}x`, 1), tooLarge);
 });
 
 /** Run the child under a 1 GiB data-segment limit and a 256 MiB heap. */

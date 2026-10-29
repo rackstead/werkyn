@@ -279,6 +279,44 @@ function checkLocalHeader(
   return dataEnd;
 }
 
+export const EXPORT_TOO_LARGE_MESSAGE =
+  "This export would exceed the backup restore limits. Select fewer projects, channels or wiki spaces, or leave out files.";
+
+/**
+ * Counts an export's entries as `inspectBackupArchive` will, so export stops
+ * as soon as the archive could no longer be restored.
+ */
+export class BackupExportBudget {
+  private readonly sizes = new Map<string, number>();
+  private readonly nodes = new Set<string>();
+  private totalBytes = 0;
+
+  constructor(private readonly limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS) {}
+
+  /** Add or replace the entry `name`; throws a 400 once over the budget. */
+  add(name: string, size: number) {
+    this.totalBytes += size - (this.sizes.get(name) ?? 0);
+    this.sizes.set(name, size);
+    // archiver stores backslashes as forward slashes.
+    const stored = name.replace(/\\/g, "/");
+    this.nodes.add(stored);
+    const folders = stored.split("/");
+    folders.pop();
+    for (let depth = 1; depth <= folders.length; depth++) {
+      this.nodes.add(`${folders.slice(0, depth).join("/")}/`);
+    }
+    if (
+      this.nodes.size > this.limits.maxEntries ||
+      Buffer.byteLength(name) > this.limits.maxNameBytes ||
+      name.split(/[\\/]/).length > this.limits.maxPathSegments ||
+      size > this.limits.maxEntryBytes ||
+      this.totalBytes > this.limits.maxTotalBytes
+    ) {
+      throw new ValidationError(EXPORT_TOO_LARGE_MESSAGE);
+    }
+  }
+}
+
 export interface BackupArchiveContents {
   jsonBuffer: Buffer;
   assets: Map<string, Buffer>;

@@ -35,6 +35,9 @@ await writeFile(path.join(outsideDir, "sentinel.txt"), "unchanged");
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
+const { exportBackup } = await import("../../src/modules/backup/backup.service.ts");
+const { BACKUP_ARCHIVE_LIMITS, EXPORT_TOO_LARGE_MESSAGE, inspectBackupArchive, readBackupArchive } =
+  await import("../../src/modules/backup/backup-archive.ts");
 
 const suffix = crypto.randomUUID().slice(0, 8);
 const MiB = 1 << 20;
@@ -463,4 +466,49 @@ test("checksum mismatches and truncated entries are rejected", async () => {
     `${label} json`,
     craftZip([{ name: "backup.json", content: corrupt, crc: crc32(corrupt) ^ 1 }]),
   );
+});
+
+test("export refuses an archive that restore would refuse", async () => {
+  const space = await app.prisma.wikiSpace.create({
+    data: { workspaceId: source.id, name: `Budget wiki ${suffix}`, slug: `budget-${suffix}` },
+  });
+  const urls = [];
+  for (const size of [1000, 2000]) {
+    const stored = await app.storage.save(
+      `${source.id}/uploads/wiki`,
+      space.id,
+      crypto.randomUUID(),
+      ".png",
+      crypto.randomBytes(size),
+    );
+    urls.push(`/storage/${stored}`);
+  }
+  await app.prisma.wikiPage.create({
+    data: {
+      spaceId: space.id,
+      title: "Budget page",
+      createdById: admin.id,
+      content: urls.map((url) => ({ type: "image", props: { url } })),
+    },
+  });
+  const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
+  const exportWith = (limits) =>
+    exportBackup(app.prisma, source.id, request, app.storage, admin.id, { ...BACKUP_ARCHIVE_LIMITS, ...limits });
+
+  const { zipBuffer } = await exportWith({});
+  const entries = inspectBackupArchive(zipBuffer);
+  const total = entries.reduce((sum, entry) => sum + entry.size, 0);
+  const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
+
+  // Exactly at the limits the export succeeds and restores under them.
+  const exact = { maxTotalBytes: total, maxEntries: 4, maxEntryBytes: Math.max(...entries.map((e) => e.size)) };
+  const fitting = await exportWith(exact);
+  assert.equal(readBackupArchive(fitting.zipBuffer, { ...BACKUP_ARCHIVE_LIMITS, ...exact }).assets.size, 2);
+
+  await assert.rejects(exportWith({ maxTotalBytes: total - 1 }), tooLarge);
+  // backup.json, the implied assets/ folder and two files are four entries.
+  await assert.rejects(exportWith({ maxEntries: 3 }), tooLarge);
+  assert.ok(entries.find((e) => e.name === "backup.json").size < 1999);
+  await assert.rejects(exportWith({ maxEntryBytes: 1999 }), tooLarge);
+  await assert.rejects(exportWith({ maxNameBytes: entries[1].name.length - 1 }), tooLarge);
 });

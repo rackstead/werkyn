@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryClient } from "@/lib/query-client";
 import { clearFileContentCache, useFilePreviewUrl, useThumbnailUrl, type DriveFile } from "./api";
+import { FileCard } from "./components/file-card";
 import { FilePreviewSlideover } from "./components/file-preview-slideover";
 
 // jsdom has no object URL registry; this one records every URL's lifetime.
@@ -11,6 +12,8 @@ const registry = {
   created: [] as string[],
   revoked: [] as string[],
   live: new Set<string>(),
+  /** URLs revoked while a mounted element still showed them. */
+  revokedWhileShown: [] as string[],
 };
 const original = {
   create: URL.createObjectURL,
@@ -23,6 +26,7 @@ beforeEach(() => {
   registry.created = [];
   registry.revoked = [];
   registry.live.clear();
+  registry.revokedWhileShown = [];
   let n = 0;
   URL.createObjectURL = vi.fn(() => {
     const url = `blob:test/${++n}`;
@@ -31,6 +35,9 @@ beforeEach(() => {
     return url;
   });
   URL.revokeObjectURL = vi.fn((url: string) => {
+    if ([...document.querySelectorAll("[src]")].some((el) => el.getAttribute("src") === url)) {
+      registry.revokedWhileShown.push(url);
+    }
     registry.revoked.push(url);
     registry.live.delete(url);
   });
@@ -53,8 +60,12 @@ afterAll(() => {
   URL.revokeObjectURL = original.revoke;
 });
 
-/** Every URL revoked was created, none twice, and none is still registered. */
+/**
+ * Every URL revoked was created, none twice, none while still shown, and none
+ * is still registered.
+ */
 function expectBackToBaseline() {
+  expect(registry.revokedWhileShown).toEqual([]);
   expect(new Set(registry.revoked).size).toBe(registry.revoked.length);
   expect([...registry.revoked].sort()).toEqual([...registry.created].sort());
   expect(registry.live.size).toBe(0);
@@ -202,6 +213,50 @@ describe("thumbnail object URLs", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     unmount();
     expectBackToBaseline();
+  });
+});
+
+describe("many thumbnails at once", () => {
+  it("renders 300 file cards whose thumbnails arrive in the same tick without a React update-depth error", async () => {
+    const errors: string[] = [];
+    const consoleError = vi.spyOn(console, "error").mockImplementation((...args) => {
+      errors.push(args.map(String).join(" "));
+    });
+    const onUncaught = (e: unknown) => errors.push(String((e as Error)?.message ?? e));
+    process.on("uncaughtException", onUncaught);
+    const noop = () => {};
+    try {
+      const { unmount } = render(
+        <>
+          {Array.from({ length: 300 }, (_, i) => (
+            <FileCard
+              key={i}
+              file={{ ...image(`g${i}`), thumbnailPath: `t/g${i}`, isFolder: false } as DriveFile}
+              canEdit={false}
+              onNavigate={noop}
+              onDownload={noop}
+              onRename={noop}
+              onMove={noop}
+              onTrash={noop}
+            />
+          ))}
+        </>,
+        { wrapper: Providers },
+      );
+      await waitFor(() => expect(document.querySelectorAll('img[src^="blob:"]')).toHaveLength(300), {
+        timeout: 10_000,
+      });
+      await act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+      document.querySelectorAll('img[src^="blob:"]').forEach((img) => liveSrc(img as HTMLElement));
+      expect(registry.created).toHaveLength(300);
+      unmount();
+      expectBackToBaseline();
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      consoleError.mockRestore();
+    }
+    expect(errors.filter((e) => e.includes("Maximum update depth"))).toEqual([]);
+    expect(errors).toEqual([]);
   });
 });
 

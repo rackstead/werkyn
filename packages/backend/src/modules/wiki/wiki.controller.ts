@@ -172,11 +172,8 @@ export async function updatePageHandler(
   const { pgid } = request.params as { pgid: string };
   const body = request.body as UpdateWikiPageInput;
 
-  // Fire-and-forget auto-save version
-  versionsService
-    .createAutoSaveVersion(request.server.prisma, pgid, request.user!.id)
-    .catch((err) => request.log.error(err, "Failed to auto-save wiki version"));
-
+  // Refuses (409) a stale expectedRevision or another user's edit lock, and
+  // records the occasional auto-save version in the same transaction.
   const page = await pagesService.updatePage(
     request.server.prisma,
     pgid,

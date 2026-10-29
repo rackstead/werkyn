@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
+import { isEditConflict } from "@/lib/edit-conflict";
 import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
 import type { UpdateWikiPageInput } from "@pm/shared";
@@ -51,25 +52,33 @@ function WikiPageSession({
   const { mutateAsync: updatePage } = useUpdateWikiPage();
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
   const save = useCallback(
-    (patch: UpdateWikiPageInput) => {
+    async (patch: UpdateWikiPageInput, expectedRevision: number | undefined) => {
       if (useAuthStore.getState().user?.id !== userId) {
-        return Promise.reject(
-          new Error("Sign in as the author to save these changes"),
-        );
+        throw new Error("Sign in as the author to save these changes");
       }
-      return updatePage({ ...patch, pageId, expectedUserId: userId });
+      // The server refuses (409) a save based on an older revision, or one
+      // made while another user holds the lock, instead of overwriting.
+      const result = await updatePage({
+        ...patch,
+        ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        pageId,
+        expectedUserId: userId,
+      });
+      return result.data.revision;
     },
     [pageId, updatePage, userId],
   );
-  // Only a session that currently holds the page lock may write. The backend
-  // does not enforce locks, so this is what keeps a retained draft from being
-  // replayed over another editor's work.
+  // Only a session that currently holds the page lock sends saves, so a
+  // retained draft is not even attempted over another editor's work; the
+  // server enforces the lock and the revision as well.
   const holdsLock = useRef(false);
   const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save, {
     author: userId,
     canSave: () =>
       holdsLock.current ? null : "Start editing to save these changes",
     retryFailedAutomatically: true,
+    revision: pageData?.data.revision,
+    isConflict: isEditConflict,
   });
   const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(
     pageId,
@@ -103,8 +112,33 @@ function WikiPageSession({
     });
   }, [isLockedByMe, autosave.status, autosave.park, queryClient, pageId]);
 
+  // A refused save was set aside. Show the stored document again, now and
+  // once its newer version is fetched; for a lock conflict, also the lock.
+  const conflict = autosave.conflict;
+  useEffect(() => {
+    if (!conflict) return;
+    setDocumentVersion((version) => version + 1);
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.wikiPage(pageId),
+    });
+    if (isEditConflict(conflict) && conflict.code === "EDIT_LOCKED")
+      void queryClient.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
+  }, [conflict, queryClient, pageId]);
+
+  // An editor remounted on the stored document of this render bases later
+  // edits on its revision. One remounted on a restored draft does not: that
+  // draft is saved on the revision already known.
+  const pageRevision = page?.revision;
+  const remountShowsDraft = useRef(false);
+  useEffect(() => {
+    if (!remountShowsDraft.current) autosave.adoptRevision(pageRevision);
+    remountShowsDraft.current = false;
+    // Only when the editor is remounted, not on every refetch.
+  }, [documentVersion, autosave.adoptRevision]);
+
   const restoreParked = () => {
     void autosave.restoreParked().catch(() => {});
+    remountShowsDraft.current = true;
     setDocumentVersion((version) => version + 1);
   };
 
@@ -219,7 +253,8 @@ function WikiPageSession({
           className="mb-4 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-2 text-sm text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
         >
           <span className="flex-1">
-            Earlier changes to this page were not saved.
+            {conflictMessage(autosave.conflict) ??
+              "Earlier changes to this page were not saved."}
             {!isLockedByMe && " Start editing to restore them."}
           </span>
           <Button
@@ -417,6 +452,16 @@ function WikiPageSession({
       />
     </div>
   );
+}
+
+/** Explains why the set-aside changes were refused, or null if they were not. */
+function conflictMessage(conflict: Error | null) {
+  if (!isEditConflict(conflict)) return null;
+  if (conflict.code === "EDIT_LOCKED") {
+    const editor = conflict.current?.lockedBy?.displayName ?? "Another user";
+    return `${editor} is editing this page, so your changes were not saved. The stored page is shown.`;
+  }
+  return "This page was changed elsewhere while you were editing, so your changes were not saved. The stored page is shown; restoring your changes replaces it.";
 }
 
 function EditableWikiTitle({

@@ -1,71 +1,24 @@
 import type { PrismaClient } from "@prisma/client";
 import { NotFoundError } from "../../utils/errors.js";
+import {
+  PAGE_WRITE_TRANSACTION,
+  assertNotLockedByOther,
+  lockPageRow,
+  snapshotPage,
+} from "./wiki-page-writes.js";
+import { pageWithContentSelect } from "./wiki-pages.service.js";
 
-export async function createAutoSaveVersion(
-  prisma: PrismaClient,
-  pageId: string,
-  actorId: string,
-) {
-  const page = await prisma.wikiPage.findUnique({
-    where: { id: pageId },
-    select: { id: true, title: true, content: true },
-  });
-  if (!page) return null;
-
-  // Check if last auto-save was within 5 minutes
-  const recent = await prisma.wikiPageVersion.findFirst({
-    where: { pageId, isAutoSave: true },
-    orderBy: { createdAt: "desc" },
-    select: { createdAt: true },
-  });
-
-  if (recent) {
-    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-    if (recent.createdAt > fiveMinAgo) return null;
-  }
-
-  const nextVersion = await getNextVersionNumber(prisma, pageId);
-
-  return prisma.wikiPageVersion.create({
-    data: {
-      pageId,
-      title: page.title,
-      content: page.content ?? undefined,
-      versionNumber: nextVersion,
-      isAutoSave: true,
-      createdById: actorId,
-    },
-  });
-}
-
+/** Records the page as stored now, numbered after every earlier version. */
 export async function createNamedVersion(
   prisma: PrismaClient,
   pageId: string,
   actorId: string,
   name: string,
 ) {
-  const page = await prisma.wikiPage.findUnique({
-    where: { id: pageId },
-    select: { id: true, title: true, content: true },
-  });
-  if (!page) throw new NotFoundError("Wiki page not found");
-
-  const nextVersion = await getNextVersionNumber(prisma, pageId);
-
-  return prisma.wikiPageVersion.create({
-    data: {
-      pageId,
-      title: page.title,
-      content: page.content ?? undefined,
-      versionNumber: nextVersion,
-      name,
-      isAutoSave: false,
-      createdById: actorId,
-    },
-    include: {
-      createdBy: { select: { id: true, displayName: true, avatarUrl: true } },
-    },
-  });
+  return prisma.$transaction(async (tx) => {
+    await lockPageRow(tx, pageId);
+    return snapshotPage(tx, pageId, actorId, { name });
+  }, PAGE_WRITE_TRANSACTION);
 }
 
 export async function listVersions(
@@ -104,42 +57,38 @@ export async function getVersion(prisma: PrismaClient, versionId: string) {
   return version;
 }
 
+/**
+ * Replaces the page title and content with a version's as a new revision, so
+ * a save based on the replaced revision is refused instead of undoing the
+ * restore. Another user's edit lock refuses it like a save. The replaced
+ * content is always recorded as a version first, however recent the last
+ * auto-save version is.
+ */
 export async function restoreVersion(
   prisma: PrismaClient,
   versionId: string,
   actorId: string,
 ) {
-  const version = await prisma.wikiPageVersion.findUnique({
-    where: { id: versionId },
-    select: { id: true, pageId: true, title: true, content: true },
-  });
-  if (!version) throw new NotFoundError("Version not found");
+  return prisma.$transaction(async (tx) => {
+    const version = await tx.wikiPageVersion.findUnique({
+      where: { id: versionId },
+      select: { id: true, pageId: true, title: true, content: true },
+    });
+    if (!version) throw new NotFoundError("Version not found");
 
-  // Create a snapshot of current state before restoring
-  await createAutoSaveVersion(prisma, version.pageId, actorId);
+    const current = await lockPageRow(tx, version.pageId);
+    await assertNotLockedByOther(tx, version.pageId, actorId, current);
+    await snapshotPage(tx, version.pageId, actorId);
 
-  // Restore the page
-  return prisma.wikiPage.update({
-    where: { id: version.pageId },
-    data: {
-      title: version.title,
-      content: version.content ?? undefined,
-      lastEditedById: actorId,
-    },
-    select: {
-      id: true,
-      spaceId: true,
-      title: true,
-      content: true,
-      updatedAt: true,
-    },
-  });
-}
-
-async function getNextVersionNumber(prisma: PrismaClient, pageId: string) {
-  const maxVersion = await prisma.wikiPageVersion.aggregate({
-    where: { pageId },
-    _max: { versionNumber: true },
-  });
-  return (maxVersion._max.versionNumber ?? 0) + 1;
+    return tx.wikiPage.update({
+      where: { id: version.pageId },
+      data: {
+        title: version.title,
+        content: version.content ?? undefined,
+        lastEditedById: actorId,
+        revision: { increment: 1 },
+      },
+      select: pageWithContentSelect,
+    });
+  }, PAGE_WRITE_TRANSACTION);
 }

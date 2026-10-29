@@ -25,6 +25,8 @@ export interface Task {
   statusId: string;
   title: string;
   description: string | null;
+  /** Advances with every stored description change. */
+  descriptionRevision?: number;
   priority: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "URGENT";
   dueDate: string | null;
   startDate: string | null;

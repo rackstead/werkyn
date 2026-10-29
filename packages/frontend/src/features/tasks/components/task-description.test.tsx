@@ -2,7 +2,7 @@ import { type ReactNode } from "react";
 import { act, cleanup, render } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/react";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UpdateTaskSchema } from "@pm/shared";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
@@ -553,4 +553,126 @@ it("real Tiptap: a legacy description with control characters saves after the ne
   expect(serverAccepts(sentDescriptions()[0])).toBe(true);
   expect(screen.queryByRole("alert")).toBeNull();
   expect(toast.error).not.toHaveBeenCalled();
+});
+
+describe("description revisions and edit conflicts", () => {
+  type Stored = { description: string; descriptionRevision: number };
+  const sent: Array<Record<string, unknown>> = [];
+  // Stands in for the server's compare-and-set on the description revision.
+  function serve(id: string, stored: Stored) {
+    sent.length = 0;
+    http.patch.mockImplementation(
+      (_path: string, options: { json: Record<string, unknown> }) => ({
+        json: async () => {
+          sent.push(options.json);
+          const expected = options.json.expectedDescriptionRevision;
+          if (expected !== undefined && expected !== stored.descriptionRevision)
+            throw Object.assign(new Error("Refused"), {
+              statusCode: 409,
+              code: "REVISION_CONFLICT",
+              current: {
+                revision: stored.descriptionRevision,
+                updatedAt: "2026-10-30T00:00:00.000Z",
+              },
+            });
+          stored.description = options.json.description as string;
+          stored.descriptionRevision += 1;
+          // PATCH returns a summary; the cached detail stays stale until its
+          // refetch.
+          return { data: { id, projectId: "project", ...stored } };
+        },
+      }),
+    );
+  }
+  function view(id: string, description: string, revision: number) {
+    return (
+      <TaskDescription
+        taskId={id}
+        description={description}
+        descriptionRevision={revision}
+        canEdit
+      />
+    );
+  }
+
+  it("sends the revision it is based on and its own save's revision while the detail is stale", async () => {
+    const id = `task-revision-${++suffix}`;
+    const stored = { description: "<p>Start</p>", descriptionRevision: 3 };
+    serve(id, stored);
+    const screen = render(view(id, "<p>Start</p>", 3), { wrapper });
+    await tick();
+    act(() => {
+      currentEditor().commands.setContent("<p>One</p>");
+    });
+    await tick(801);
+    act(() => {
+      currentEditor().commands.setContent("<p>Two</p>");
+    });
+    await tick(801);
+    expect(sent.map((body) => body.expectedDescriptionRevision)).toEqual([3, 4]);
+    expect(stored).toEqual({ description: "<p>Two</p>", descriptionRevision: 5 });
+    // The refetch catches up, then another user's newer description arrives
+    // while idle: it is shown, and the next edit is based on it.
+    screen.rerender(view(id, "<p>Two</p>", 5));
+    await tick();
+    Object.assign(stored, { description: "<p>Theirs</p>", descriptionRevision: 8 });
+    screen.rerender(view(id, "<p>Theirs</p>", 8));
+    await tick();
+    expect(currentEditor().getHTML()).toBe("<p>Theirs</p>");
+    act(() => {
+      currentEditor().commands.setContent("<p>Theirs and mine</p>");
+    });
+    await tick(801);
+    expect(sent.at(-1)).toEqual({
+      description: "<p>Theirs and mine</p>",
+      expectedDescriptionRevision: 8,
+    });
+    expect(stored.descriptionRevision).toBe(9);
+  });
+
+  it("a description refused for an older revision is set aside, the stored one shown, and never resent", async () => {
+    const id = `task-conflict-${++suffix}`;
+    const stored = { description: "<p>Base</p>", descriptionRevision: 1 };
+    serve(id, stored);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const screen = render(view(id, "<p>Base</p>", 1), { wrapper });
+    await tick();
+    // Someone else saves revision 2 first.
+    Object.assign(stored, { description: "<p>Theirs</p>", descriptionRevision: 2 });
+    act(() => {
+      currentEditor().commands.setContent("<p>Mine</p>");
+    });
+    await tick(801);
+    expect(sent).toEqual([
+      { description: "<p>Mine</p>", expectedDescriptionRevision: 1 },
+    ]);
+    expect(stored.description).toBe("<p>Theirs</p>");
+    expect(screen.getByRole("status").textContent).toContain(
+      "This description was changed elsewhere while you were editing",
+    );
+    expect(currentEditor().getHTML()).toBe("<p>Base</p>");
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["tasks", id] });
+    expect(screen.queryByText("Retry save")).toBeNull();
+    expect(toast.error).not.toHaveBeenCalled();
+    act(() => {
+      currentEditor().commands.blur();
+    });
+    await tick(5000);
+    expect(sent).toHaveLength(1);
+
+    // The refetch shows the newer description; restoring replaces it on purpose.
+    screen.rerender(view(id, "<p>Theirs</p>", 2));
+    await tick();
+    expect(currentEditor().getHTML()).toBe("<p>Theirs</p>");
+    act(() => {
+      screen.getByText("Restore changes").click();
+    });
+    await tick();
+    expect(currentEditor().getHTML()).toBe("<p>Mine</p>");
+    expect(sent.at(-1)).toEqual({
+      description: "<p>Mine</p>",
+      expectedDescriptionRevision: 2,
+    });
+    expect(stored).toEqual({ description: "<p>Mine</p>", descriptionRevision: 3 });
+  });
 });

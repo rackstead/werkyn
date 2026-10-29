@@ -46,6 +46,31 @@ export class ConflictError extends AppError {
   }
 }
 
+/** The stored state an edit conflicted with, returned with the 409. */
+export interface EditConflictState {
+  revision: number;
+  updatedAt: Date;
+  /** Set when another user's unexpired edit lock refused the write. */
+  lockedBy?: { id: string; displayName: string };
+  lockExpiresAt?: Date;
+}
+
+/**
+ * A write based on a revision older than the stored one (REVISION_CONFLICT),
+ * or refused because another user holds the edit lock (EDIT_LOCKED). Nothing
+ * was written; the response carries the current revision so that a client
+ * can reload instead of retrying the same overwrite.
+ */
+export class EditConflictError extends ConflictError {
+  constructor(
+    message: string,
+    readonly code: "REVISION_CONFLICT" | "EDIT_LOCKED",
+    readonly current: EditConflictState,
+  ) {
+    super(message);
+  }
+}
+
 export class GoneError extends AppError {
   constructor(message = "Gone") {
     super(410, "Gone", message);

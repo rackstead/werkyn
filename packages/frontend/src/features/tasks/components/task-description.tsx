@@ -10,7 +10,10 @@ import { useUpdateTask } from "../api";
 import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { useAuthStore } from "@/stores/auth-store";
 import { useRouter } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
+import { isEditConflict } from "@/lib/edit-conflict";
+import { queryKeys } from "@/lib/query-keys";
 
 // The server rejects control characters other than tab, line feed and carriage
 // return in a description. A plain-text paste keeps them (Word's manual line
@@ -31,12 +34,15 @@ function savableDescription(html: string | null) {
 interface TaskDescriptionProps {
   taskId: string;
   description: string | null;
+  /** The stored revision of `description`, when the server reports one. */
+  descriptionRevision?: number;
   canEdit: boolean;
 }
 
 export function TaskDescription({
   taskId,
   description,
+  descriptionRevision,
   canEdit,
 }: TaskDescriptionProps) {
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
@@ -45,6 +51,7 @@ export function TaskDescription({
       key={`${userId}:${taskId}`}
       taskId={taskId}
       description={description}
+      descriptionRevision={descriptionRevision}
       canEdit={canEdit}
     />
   );
@@ -53,23 +60,32 @@ export function TaskDescription({
 function TaskDescriptionEditor({
   taskId,
   description,
+  descriptionRevision,
   canEdit,
 }: TaskDescriptionProps) {
   const { mutateAsync: updateTask } = useUpdateTask();
+  const queryClient = useQueryClient();
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
   const router = useRouter({ warn: false });
   const save = useCallback(
-    (patch: { description: string | null }) => {
+    async (
+      patch: { description: string | null },
+      expectedDescriptionRevision: number | undefined,
+    ) => {
       if (useAuthStore.getState().user?.id !== userId) {
-        return Promise.reject(
-          new Error("Sign in as the author to save these changes"),
-        );
+        throw new Error("Sign in as the author to save these changes");
       }
-      return updateTask({
+      // The server refuses (409) a description based on an older revision
+      // instead of replacing the newer one.
+      const result = await updateTask({
         description: savableDescription(patch.description),
+        ...(expectedDescriptionRevision === undefined
+          ? {}
+          : { expectedDescriptionRevision }),
         id: taskId,
         expectedUserId: userId,
       });
+      return result.data.descriptionRevision;
     },
     [taskId, updateTask, userId],
   );
@@ -81,6 +97,8 @@ function TaskDescriptionEditor({
       // Tasks have no edit lock, so a description that failed to save is only
       // sent again when the user asks; it could otherwise replace a newer one.
       retryFailedAutomatically: false,
+      revision: descriptionRevision,
+      isConflict: isEditConflict,
     },
   );
   const appliedSource = useRef(description);
@@ -138,6 +156,20 @@ function TaskDescriptionEditor({
     editor.commands.setContent(next, { emitUpdate: false });
   }, [editor, description, autosave.hasUnsavedChanges]);
 
+  // A refused description was set aside: show the stored one again, base
+  // later edits on it, and fetch the newer description that was refused for.
+  const conflict = autosave.conflict;
+  useEffect(() => {
+    if (!editor || !conflict) return;
+    appliedSource.current = description;
+    editor.commands.setContent(sanitizeDescriptionHtml(description ?? ""), {
+      emitUpdate: false,
+    });
+    autosave.adoptRevision(descriptionRevision);
+    void queryClient.invalidateQueries({ queryKey: queryKeys.task(taskId) });
+    // Once per refusal, with the description loaded at that moment.
+  }, [editor, conflict]);
+
   if (!canEdit && !description) {
     return (
       <p className="text-sm text-muted-foreground italic">No description</p>
@@ -167,7 +199,9 @@ function TaskDescriptionEditor({
           className="mb-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
         >
           <span className="flex-1">
-            Earlier changes to this description were not saved.
+            {isEditConflict(autosave.conflict)
+              ? "This description was changed elsewhere while you were editing, so your changes were not saved. The stored description is shown; restoring your changes replaces it."
+              : "Earlier changes to this description were not saved."}
           </span>
           <button
             className="underline"

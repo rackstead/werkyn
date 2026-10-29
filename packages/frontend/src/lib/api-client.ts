@@ -1,24 +1,33 @@
 import ky, { type KyResponse } from "ky";
 import { useAuthStore } from "@/stores/auth-store";
+import type { EditConflictState } from "@/lib/edit-conflict";
 
 export class ApiError extends Error {
   statusCode: number;
   error: string;
   details?: Array<{ field: string; message: string }>;
+  /** Machine-readable reason, for example REVISION_CONFLICT or EDIT_LOCKED. */
+  code?: string;
+  /** The stored state a 409 edit conflict was checked against. */
+  current?: EditConflictState;
 
   constructor(
     statusCode: number,
     error: string,
     message: string,
     details?: Array<{ field: string; message: string }>,
+    conflict?: { code?: string; current?: EditConflictState },
   ) {
     super(message);
     this.statusCode = statusCode;
     this.error = error;
     this.details = details;
+    this.code = conflict?.code;
+    this.current = conflict?.current;
     this.name = "ApiError";
   }
 }
+
 
 export function mapApiErrorToForm(
   error: unknown,
@@ -40,12 +49,15 @@ async function parseErrorResponse(response: KyResponse): Promise<ApiError> {
       error?: string;
       message?: string;
       details?: Array<{ field: string; message: string }>;
+      code?: string;
+      current?: EditConflictState;
     };
     return new ApiError(
       body.statusCode ?? response.status,
       body.error ?? "Error",
       body.message ?? "An error occurred",
       body.details,
+      { code: body.code, current: body.current },
     );
   } catch {
     return new ApiError(

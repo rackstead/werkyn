@@ -39,12 +39,17 @@ fix_permissions() {
         continue
         ;;
     esac
-    # find does not follow symbolic links and chown -h changes a link itself,
-    # so nothing outside the directory is touched.
-    count=$(find "$real" -user 0 | wc -l)
+    # find does not follow symbolic links or cross into other mounts, and
+    # chown -h changes a link itself. A file with several hard links may also
+    # exist outside the directory, so it is left for the operator to check.
+    count=$(find "$real" -xdev -user 0 \( -type d -o -links 1 \) | wc -l)
     if [ "$count" -gt 0 ]; then
       echo "Giving $count root-owned entries under $real to $APP_USER..."
-      find "$real" -user 0 -exec chown -h "$APP_USER:$APP_USER" {} +
+      find "$real" -xdev -user 0 \( -type d -o -links 1 \) -exec chown -h "$APP_USER:$APP_USER" {} +
+    fi
+    linked=$(find "$real" -xdev -user 0 ! -type d -links +1 | wc -l)
+    if [ "$linked" -gt 0 ]; then
+      echo "Not changing $linked root-owned files with several hard links under $real; check and chown them yourself." >&2
     fi
   done
 }
@@ -64,18 +69,31 @@ fi
 
 echo "Preparing data directories..."
 mkdir -p "$STORAGE_PATH" "$DEX_PATH" 2>/dev/null || true
+uid=$(id -u)
 for dir in "$STORAGE_PATH" "$DEX_PATH"; do
   if [ ! -w "$dir" ] || [ -n "$(find "$dir" -user 0 -print -quit 2>/dev/null)" ]; then
-    cat >&2 <<EOF
-$dir is not writable by uid $(id -u), or holds files owned by root that an
-older image (which ran as root) created. The bundled docker-compose.yml hands
-them to the werkyn user before every start. Otherwise do it once with
+    echo "$dir is not writable by uid $uid, or holds files owned by root (for example" >&2
+    echo "from an older image, which ran as root, or a volume root created by root)." >&2
+    real=$(cd "$dir" 2>/dev/null && pwd -P || printf '%s' "$dir")
+    # fix-permissions only helps werkyn, and only under the data roots.
+    case "$uid:$real" in
+      10001:/app/storage | 10001:/app/storage/* | 10001:/app/data | 10001:/app/data/*)
+        cat >&2 <<EOF
+The bundled docker-compose.yml hands them to the werkyn user before every
+start. Otherwise do it once with
 
   docker run --rm --user 0 -v <volume>:$dir <image> fix-permissions
-
-or start this container once with --user 0: it hands the files over and then
-runs as werkyn. See docs/remediation/ops-004.md.
 EOF
+        ;;
+      *)
+        cat >&2 <<EOF
+fix-permissions gives only /app/storage and /app/data to werkyn (uid 10001), so
+give this directory and everything in it to uid $uid yourself, for example
+chown -Rh $uid:$(id -g) on the host directory or volume.
+EOF
+        ;;
+    esac
+    echo "See docs/remediation/ops-004.md." >&2
     exit 1
   fi
 done

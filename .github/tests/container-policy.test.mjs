@@ -117,6 +117,30 @@ test("the root handover leaves directories outside the data roots alone", () => 
   }
 });
 
+test("the handover skips other mounts and multiply linked files", () => {
+  // Behaviour is checked against a built image; this keeps both walks aligned.
+  const walks = entrypoint.match(/find "\$real" [^\n|]*-user 0[^\n|]*/g) ?? [];
+  assert.equal(walks.length, 3, walks.join("\n"));
+  for (const walk of walks) assert.match(walk, /-xdev/);
+  const [counted, changed] = walks.filter((walk) => !walk.includes("-links +1"));
+  for (const walk of [counted, changed])
+    assert.match(walk, /\\\( -type d -o -links 1 \\\)/, walk);
+  assert.match(changed, /-exec chown -h/);
+});
+
+test("a non-root start outside the data roots is told to chown, not to run fix-permissions", (t) => {
+  if (process.getuid?.() === 0) return t.skip("needs a non-root user");
+  const result = spawnSync("sh", ["docker-entrypoint.sh"], {
+    cwd: new URL("../../", import.meta.url),
+    env: { PATH: process.env.PATH, STORAGE_DIR: "/etc", DEX_CONFIG_DIR: "/etc" },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /\/etc is not writable by uid \d+/);
+  assert.match(result.stderr, new RegExp(`chown -Rh ${process.getuid()}:${process.getgid()} `));
+  assert.doesNotMatch(result.stderr, /<image> fix-permissions/);
+});
+
 test("Compose runs the app as the image user after handing over root-owned data", () => {
   const { werkyn, "werkyn-permissions": permissions } = compose.services;
   assert.equal(werkyn.user, undefined, "the app must keep the image's non-root user");

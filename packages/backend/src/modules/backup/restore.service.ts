@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import type { PrismaClient } from "@prisma/client";
-import { BackupFileSchema, type BackupFile, type RestoreSummary } from "@pm/shared";
+import type { BackupFile, RestoreSummary } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
 import { IdMapper, UserMapper } from "./id-mapper.js";
 import {
@@ -13,22 +13,13 @@ import { lockWorkspace } from "../../utils/workspace-lock.js";
 import { rewriteUrls } from "./backup-assets.js";
 import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
+import { parseBackupJson } from "./backup-json.js";
 
-/** Parse and validate a backup JSON buffer. */
+/** Parse and validate a backup JSON buffer within the restore limits. */
 function parseBackupFile(buffer: Buffer): BackupFile {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(buffer.toString("utf-8"));
-  } catch {
-    throw new ValidationError("Invalid JSON file");
-  }
-  const result = BackupFileSchema.safeParse(raw);
-  if (!result.success) {
-    const issues = result.error.issues.slice(0, 5).map((i) => i.message).join("; ");
-    throw new ValidationError(`Invalid backup file format: ${issues}`);
-  }
-  validateWikiGraph(result.data);
-  return result.data;
+  const backup = parseBackupJson(buffer);
+  validateWikiGraph(backup);
+  return backup;
 }
 
 /**

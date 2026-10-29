@@ -512,3 +512,41 @@ test("export refuses an archive that restore would refuse", async () => {
   await assert.rejects(exportWith({ maxEntryBytes: 1999 }), tooLarge);
   await assert.rejects(exportWith({ maxNameBytes: entries[1].name.length - 1 }), tooLarge);
 });
+
+test("export refuses a backup.json that restore would refuse to parse", async () => {
+  const { BACKUP_JSON_LIMITS, inspectBackupJson } = await import(
+    "../../src/modules/backup/backup-json.ts"
+  );
+  const space = await app.prisma.wikiSpace.create({
+    data: { workspaceId: source.id, name: `JSON budget wiki ${suffix}`, slug: `json-budget-${suffix}` },
+  });
+  // A list nested twenty levels deep, as the editor stores it.
+  let content = [{ type: "paragraph", content: [{ type: "text", text: "deepest", styles: {} }] }];
+  for (let level = 0; level < 20; level++)
+    content = [{ type: "bulletListItem", content: [{ type: "text", text: `level ${level}` }], children: content }];
+  await app.prisma.wikiPage.create({
+    data: { spaceId: space.id, title: "JSON budget page", createdById: admin.id, content },
+  });
+  const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
+  const exportWith = (jsonLimits) =>
+    exportBackup(app.prisma, source.id, request, app.storage, admin.id, BACKUP_ARCHIVE_LIMITS, {
+      ...BACKUP_JSON_LIMITS,
+      ...jsonLimits,
+    });
+
+  const stats = inspectBackupJson(readBackupArchive((await exportWith({})).zipBuffer).jsonBuffer);
+  assert.ok(stats.depth > 40, `${stats.depth}`);
+  const exact = {
+    maxBytes: stats.bytes,
+    maxTokens: stats.tokens,
+    maxObjects: stats.objects,
+    maxDepth: stats.depth,
+  };
+  // Exactly at the limits the export succeeds and its backup.json fits them;
+  // one byte, token, object or level less refuses it.
+  const fitting = await exportWith(exact);
+  assert.deepEqual(inspectBackupJson(readBackupArchive(fitting.zipBuffer).jsonBuffer, exact), stats);
+  const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
+  for (const key of Object.keys(exact))
+    await assert.rejects(exportWith({ [key]: exact[key] - 1 }), tooLarge, key);
+});

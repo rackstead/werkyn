@@ -159,11 +159,14 @@ async function runNextOccurrence(
 /**
  * Rows written by the old monthly arithmetic can hold a first run one month
  * late (docs/remediation/dat-007.md). When an active MONTHLY schedule's next
- * run is later than the first occurrence on or after today, and that
- * occurrence is still in the future, the stored date skips an occurrence that
- * cannot have been generated yet: move it back. Rows written by the current
- * code never match, because their next run always is the first occurrence
- * after the last generated or skipped date.
+ * run is later than the first occurrence on or after today, the stored date
+ * skips that occurrence: move it back. An occurrence in the future cannot
+ * have been generated yet. One due today counts as missing only if nothing
+ * wrote the row today: a run that generated today's date (also before the
+ * upgrade, which recorded no occurrence) or skipped it for an archived
+ * project advanced the row today. Rows written by the current code never
+ * match, because their next run always is the first occurrence after the
+ * last generated or skipped date.
  */
 async function repairLateMonthlySchedules(
   prisma: PrismaClient,
@@ -184,16 +187,27 @@ async function repairLateMonthlySchedules(
       },
       orderBy: { id: "asc" },
       take: REPAIR_PAGE_SIZE,
-      select: { id: true, startDate: true, dayOfMonth: true, nextRunDate: true },
+      select: { id: true, startDate: true, dayOfMonth: true, nextRunDate: true, updatedAt: true },
     });
     if (rows.length === 0) break;
     cursor = rows[rows.length - 1].id;
     for (const row of rows) {
       if (signal?.aborted) break;
       const expected = calculateNextRunDate("MONTHLY", row.startDate, null, row.dayOfMonth, today);
-      if (expected <= today || expected >= row.nextRunDate) continue;
+      if (expected < today || expected >= row.nextRunDate) continue;
+      if (expected === today && todayUTC(row.updatedAt) >= today) continue;
+      // Only if the row is unchanged since it was read: an edit in between
+      // (even one that kept nextRunDate) keeps its own result.
       const { count } = await prisma.recurringTaskConfig.updateMany({
-        where: { id: row.id, isActive: true, nextRunDate: row.nextRunDate },
+        where: {
+          id: row.id,
+          isActive: true,
+          frequency: "MONTHLY",
+          startDate: row.startDate,
+          dayOfMonth: row.dayOfMonth,
+          nextRunDate: row.nextRunDate,
+          updatedAt: row.updatedAt,
+        },
         data: { nextRunDate: expected },
       });
       repaired += count;

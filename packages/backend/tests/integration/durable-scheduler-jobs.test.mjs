@@ -498,6 +498,75 @@ test("a monthly schedule left a month late by the old arithmetic is moved back t
   await retireSchedules();
 });
 
+test("a late monthly row whose missing occurrence is today is moved back unless the row was already written today", async () => {
+  const MAR_15 = Date.parse("2027-03-15T12:00:00Z");
+  // Late since before today: Mar 15 was never generated.
+  const late = await schedule("late-today", { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15", dueOffset: 0 });
+  try {
+    setNow(MAR_15);
+    // Advanced today (as by a run that generated Mar 15 before the upgrade).
+    const ranToday = await schedule("ran-today", { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15", dueOffset: 0 });
+    // The query engine stamps updatedAt from the real clock, not the mocked
+    // one: set the write times explicitly.
+    const written = (id, at) =>
+      app.prisma.$executeRawUnsafe(`UPDATE "RecurringTaskConfig" SET "updatedAt" = $1 WHERE "id" = $2`, new Date(at), id);
+    await written(late.id, NOW);
+    await written(ranToday.id, MAR_15);
+    await tick(A);
+    assert.deepEqual(await dueDatesOf(late.name), ["2027-03-15"], "the missing occurrence is generated today");
+    assert.equal((await configOf(late.id)).nextRunDate, "2027-04-15");
+    assert.deepEqual(await dueDatesOf(ranToday.name), [], "a row written today is left alone");
+    assert.equal((await configOf(ranToday.id)).nextRunDate, "2027-04-15");
+    await tick(A);
+    assert.deepEqual(await dueDatesOf(late.name), ["2027-03-15"]);
+  } finally {
+    setNow(NOW);
+    await retireSchedules();
+  }
+});
+
+test("the late-monthly repair does not overwrite an edit made after it read the row", async () => {
+  // Late under day 31 (Mar 31 skipped). An edit to day 30 lands between the
+  // repair's read and its write and keeps the stored next run.
+  const s = await schedule("repair-race", { frequency: "MONTHLY", dayOfMonth: 31, startDate: "2027-01-31", nextRunDate: "2027-04-30" });
+  let raced = false;
+  const bind = (target) => new Proxy(target, {
+    get(object, key) {
+      const value = Reflect.get(object, key);
+      return typeof value === "function" ? value.bind(object) : value;
+    },
+  });
+  const configs = bind(app.prisma.recurringTaskConfig);
+  const racing = new Proxy(app.prisma, {
+    get(object, key) {
+      if (key === "recurringTaskConfig") {
+        return new Proxy(configs, {
+          get(target, name) {
+            if (name !== "findMany") return Reflect.get(target, name);
+            return async (args) => {
+              const rows = await target.findMany(args);
+              if (!raced && args?.where?.frequency === "MONTHLY") {
+                raced = true;
+                await app.prisma.recurringTaskConfig.update({ where: { id: s.id }, data: { dayOfMonth: 30 } });
+              }
+              return rows;
+            };
+          },
+        });
+      }
+      const value = Reflect.get(object, key);
+      return typeof value === "function" ? value.bind(object) : value;
+    },
+  });
+  await processRecurringTasks(racing, A.fastify);
+  assert.ok(raced);
+  assert.equal((await configOf(s.id)).nextRunDate, "2027-04-30", "the stale day-31 date is not written");
+  // The next run repairs it under the edited day.
+  await tick(A);
+  assert.equal((await configOf(s.id)).nextRunDate, "2027-03-30");
+  await retireSchedules();
+});
+
 test("shutdown during a running scheduler pass waits for the occurrence in progress and starts no new work", async () => {
   assert.ok(periodic, "scheduled jobs have a stoppable lifecycle");
   const s = await schedule("shutdown", { nextRunDate: day(-4), dueOffset: 0 });

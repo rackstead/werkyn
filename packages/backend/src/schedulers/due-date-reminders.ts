@@ -1,8 +1,12 @@
 import type { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
-import { notify } from "../utils/notify.js";
+import {
+  deliverNotification,
+  enqueueNotifications,
+} from "../modules/notifications/notification-delivery.js";
 
 const DEFAULT_TIMING = "1_day_before";
+const BATCH_SIZE = 100;
 
 /** Map timing preference → number of days before due date */
 const TIMING_TO_DAYS: Record<string, number> = {
@@ -21,9 +25,10 @@ function formatDateUTC(date: Date): string {
 
 export async function processDueDateReminders(
   prisma: PrismaClient,
-  fastify: FastifyInstance,
+  fastify: Pick<FastifyInstance, "broadcastToUser" | "log">,
+  options: { now?: Date; signal?: AbortSignal } = {},
 ) {
-  const now = new Date();
+  const now = options.now ?? new Date();
 
   // Build the 4 target dates (UTC): today, +1, +3, +7
   const targetDates = Object.entries(TIMING_TO_DAYS).map(([timing, days]) => {
@@ -105,7 +110,8 @@ export async function processDueDateReminders(
     return;
   }
 
-  // Filter out already-sent reminders
+  // Skip reminders already recorded. This read only saves work: the insert
+  // below decides which run sends a reminder.
   const alreadySent = await prisma.taskReminderSent.findMany({
     where: {
       OR: candidates.map((c) => ({
@@ -121,46 +127,77 @@ export async function processDueDateReminders(
     alreadySent.map((s) => `${s.taskId}:${s.userId}:${s.dueDate}`),
   );
 
-  const toSend = candidates.filter(
-    (c) => !sentSet.has(`${c.taskId}:${c.userId}:${c.dueDate}`),
-  );
+  // Sorted, so concurrent runs insert markers in the same order and wait on
+  // each other instead of deadlocking.
+  const toSend = candidates
+    .filter((c) => !sentSet.has(`${c.taskId}:${c.userId}:${c.dueDate}`))
+    .sort((a, b) => {
+      const x = `${a.taskId}:${a.userId}`;
+      const y = `${b.taskId}:${b.userId}`;
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
 
   if (toSend.length === 0) {
     fastify.log.info("Due-date reminders: all already sent");
     return;
   }
 
-  // Record sent reminders (skipDuplicates as safety net)
-  await prisma.taskReminderSent.createMany({
-    data: toSend.map((c) => ({
-      taskId: c.taskId,
-      userId: c.userId,
-      dueDate: c.dueDate,
-    })),
-    skipDuplicates: true,
-  });
+  // Each batch records its sent markers and queues their notifications in one
+  // transaction. Only markers this run inserted (ON CONFLICT DO NOTHING ...
+  // RETURNING) get a notification, so concurrent runs send each reminder
+  // once, and a failed batch records nothing and is retried on the next run.
+  const queued: string[] = [];
+  let failedBatches = 0;
+  for (let i = 0; i < toSend.length; i += BATCH_SIZE) {
+    if (options.signal?.aborted) break;
+    const batch = toSend.slice(i, i + BATCH_SIZE);
+    const byKey = new Map(batch.map((c) => [`${c.taskId}:${c.userId}:${c.dueDate}`, c]));
+    try {
+      const ids = await prisma.$transaction(async (tx) => {
+        const inserted = await tx.taskReminderSent.createManyAndReturn({
+          data: batch.map((c) => ({ taskId: c.taskId, userId: c.userId, dueDate: c.dueDate })),
+          skipDuplicates: true,
+          select: { taskId: true, userId: true, dueDate: true },
+        });
+        return enqueueNotifications(
+          tx,
+          inserted.map((marker) => {
+            const c = byKey.get(`${marker.taskId}:${marker.userId}:${marker.dueDate}`)!;
+            return {
+              recipients: [c.userId],
+              type: "TASK_DUE_SOON" as const,
+              title: `Task due soon: ${c.taskTitle}`,
+              body: `"${c.taskTitle}" in ${c.projectName} is due on ${c.dueDate}`,
+              data: {
+                taskId: c.taskId,
+                workspaceId: c.workspaceId,
+                dueDate: c.dueDate,
+              },
+            };
+          }),
+          now,
+        );
+      });
+      queued.push(...ids);
+    } catch (err) {
+      failedBatches++;
+      fastify.log.error(err, "Due-date reminders: could not record a batch; it will be retried");
+    }
+  }
 
-  // Send notifications
-  const results = await Promise.allSettled(
-    toSend.map((c) =>
-      notify(prisma, fastify, {
-        recipients: [c.userId],
-        type: "TASK_DUE_SOON",
-        title: `Task due soon: ${c.taskTitle}`,
-        body: `"${c.taskTitle}" in ${c.projectName} is due on ${c.dueDate}`,
-        data: {
-          taskId: c.taskId,
-          workspaceId: c.workspaceId,
-          dueDate: c.dueDate,
-        },
-      }),
-    ),
-  );
-
-  const succeeded = results.filter((r) => r.status === "fulfilled").length;
-  const failed = results.filter((r) => r.status === "rejected").length;
+  // First delivery attempt. A failed or interrupted one stays queued for the
+  // notification delivery worker.
+  const results = { completed: 0, pending: 0, skipped: 0 };
+  for (const id of queued) {
+    if (options.signal?.aborted) break;
+    results[await deliverNotification(prisma, fastify, id, { now, log: fastify.log })] += 1;
+  }
+  const waiting = queued.length - results.completed;
 
   fastify.log.info(
-    `Due-date reminders: sent ${succeeded} notifications${failed > 0 ? `, ${failed} failed` : ""}`,
+    { queued: queued.length, ...results, failedBatches },
+    `Due-date reminders: sent ${results.completed} notifications` +
+      (waiting > 0 ? `, ${waiting} queued for retry` : "") +
+      (failedBatches > 0 ? `, ${failedBatches} batches failed` : ""),
   );
 }

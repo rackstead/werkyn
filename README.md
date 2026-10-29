@@ -373,6 +373,13 @@ others get `410` and change nothing. An email-verification link is likewise
 consumed by exactly one request. See
 [docs/remediation/sec-026.md](docs/remediation/sec-026.md).
 
+A password change writes the new password only if the current password it
+verified is still the account's password when the change commits. A change
+whose current password was replaced meanwhile by a password reset or another
+change gets `400 Current password is incorrect` and changes nothing. A
+successful reset also invalidates the account's other unused reset links. See
+[docs/remediation/sec-027.md](docs/remediation/sec-027.md).
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

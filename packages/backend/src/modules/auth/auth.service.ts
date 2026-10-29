@@ -462,6 +462,21 @@ export async function resetPassword(
     // token's expiry; rolling back leaves the token unused.
     if (resetToken.expiresAt <= new Date())
       throw new GoneError("Reset token has expired");
+    // The reset also invalidates the account's other unused links; a later
+    // use of one is answered 404, like a link replaced by forgot-password. A
+    // link whose row is locked is being claimed (or deleted) by a concurrent
+    // request and is skipped rather than waited for: two resets with
+    // different links of one account would otherwise each wait for the
+    // other's token.
+    await tx.$executeRaw`
+      DELETE FROM "PasswordResetToken"
+      WHERE id IN (
+        SELECT id FROM "PasswordResetToken"
+        WHERE "userId" = ${resetToken.userId} AND "usedAt" IS NULL
+          AND id <> ${resetToken.id}
+        FOR UPDATE SKIP LOCKED
+      )
+    `;
     await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },

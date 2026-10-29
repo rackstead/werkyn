@@ -1,11 +1,13 @@
 import type { PrismaClient } from "@prisma/client";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
+  isBusy,
   limitLockWaits,
   refreshTransactionOptions,
   revokeUserRefreshSessions,
 } from "../auth/refresh-sessions.js";
 import {
+  AppError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
@@ -92,14 +94,40 @@ export async function changePassword(
 
   const passwordHash = await hashPassword(data.newPassword);
 
-  await prisma.$transaction(async (tx) => {
+  // The current password was verified against the hash read above, outside
+  // the transaction, so that bcrypt does not run while the row is held. The
+  // transaction locks the user row (FOR NO KEY UPDATE, as password login and
+  // reset do, before the families) and writes only if the hash is still the
+  // one that was verified. A reset or another change that committed in
+  // between replaced the password this request proved; it is refused with
+  // the same error as a wrong password and changes nothing.
+  const changing = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
+    const [current] = await tx.$queryRaw<
+      Array<{ passwordHash: string | null }>
+    >`
+      SELECT "passwordHash" FROM "User" WHERE id = ${userId} FOR NO KEY UPDATE
+    `;
+    if (current?.passwordHash !== user.passwordHash) {
+      throw new ValidationError("Current password is incorrect");
+    }
     await tx.user.update({
       where: { id: userId },
       data: { passwordHash },
     });
     await revokeUserRefreshSessions(tx, userId, "password_change");
   }, refreshTransactionOptions);
+  await changing.catch((error: unknown) => {
+    // A lock wait past the lock timeout, or a transaction past its budget,
+    // was rolled back without changing anything; the request can be retried.
+    if (isBusy(error))
+      throw new AppError(
+        503,
+        "Service Unavailable",
+        "This account is busy. Try again in a moment.",
+      );
+    throw error;
+  });
 
   return { message: "Password updated" };
 }

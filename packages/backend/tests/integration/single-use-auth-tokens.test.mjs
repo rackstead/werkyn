@@ -588,6 +588,91 @@ test("a single reset changes the password, uses the token and ends every other s
   assert(await verifyPassword(chosen, await storedPasswordHash(user)));
 });
 
+test("a successful reset invalidates the account's other unused reset tokens", async () => {
+  const user = await makeUser();
+  const other = await makeUser();
+  const token = await issueResetToken(user);
+  const unused = [await issueResetToken(user), await issueResetToken(user)];
+  const earlier = await issueResetToken(user, { usedAt: new Date() });
+  const othersToken = await issueResetToken(other);
+  const chosen = candidatePassword("first");
+
+  const response = await reset(token, chosen);
+  assert.equal(response.statusCode, 200, response.body);
+  for (const stale of unused) {
+    assert.equal(await resetTokenRow(stale), null);
+    const late = await reset(stale, candidatePassword("late"));
+    assert.equal(late.statusCode, 404, late.body);
+    assert.match(late.json().message, /invalid reset token/i);
+  }
+  assert(await verifyPassword(chosen, await storedPasswordHash(user)));
+  assert((await resetTokenRow(token)).usedAt);
+  assert((await resetTokenRow(earlier)).usedAt, "used tokens are kept");
+  assert.equal((await resetTokenRow(othersToken)).usedAt, null);
+  const otherReset = await reset(othersToken, candidatePassword("other"));
+  assert.equal(otherReset.statusCode, 200, otherReset.body);
+});
+
+test("a reset with another token of the account, queued behind a successful reset, changes nothing", async () => {
+  const user = await makeUser();
+  const first = await issueResetToken(user);
+  const second = await issueResetToken(user);
+  const winner = candidatePassword("winner");
+  const loser = candidatePassword("loser");
+  const responses = await withControlLock(userRowLock(user), async (start) => {
+    // The first reset claims its token, removes the second and waits for the
+    // user row; the second reset then waits for its token.
+    start(() => reset(first, winner));
+    await waitForLockWaiters(1);
+    start(() => reset(second, loser));
+    await waitForLockWaiters(2);
+  });
+  assert.deepEqual(
+    responses.map((r) => r.statusCode),
+    [200, 404],
+    describe(...responses),
+  );
+  assert.match(responses[1].json().message, /invalid reset token/i);
+  const stored = await storedPasswordHash(user);
+  assert(await verifyPassword(winner, stored));
+  assert.equal(await verifyPassword(loser, stored), false);
+  assert.equal(await resetTokenRow(second), null);
+});
+
+test("concurrent resets with different tokens of one account never deadlock and leave no unused token", async () => {
+  for (let round = 0; round < 3; round++) {
+    const user = await makeUser();
+    const tokens = [];
+    for (let i = 0; i < CONCURRENT; i++)
+      tokens.push(await issueResetToken(user));
+    const candidates = tokens.map((_, i) => candidatePassword(`${round}-${i}`));
+    const responses = await Promise.all(
+      tokens.map((token, i) => reset(token, candidates[i])),
+    );
+    for (const response of responses)
+      assert([200, 404].includes(response.statusCode), describe(...responses));
+    const winners = candidates.filter(
+      (_, i) => responses[i].statusCode === 200,
+    );
+    assert(winners.length >= 1, describe(...responses));
+    const stored = await storedPasswordHash(user);
+    const kept = [];
+    for (const candidate of winners)
+      if (await verifyPassword(candidate, stored)) kept.push(candidate);
+    assert.equal(
+      kept.length,
+      1,
+      "the password of one successful reset is kept",
+    );
+    assert.equal(
+      await control.passwordResetToken.count({
+        where: { userId: user.id, usedAt: null },
+      }),
+      0,
+    );
+  }
+});
+
 // ─── Email verification ────────────────────────────────────
 
 test("concurrent verifications with one token: exactly one succeeds and the rest get the invalid-token error", async () => {

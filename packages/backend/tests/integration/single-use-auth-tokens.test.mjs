@@ -44,6 +44,8 @@ const { buildApp } = await import("../../src/app.ts");
 const { hashPassword, verifyPassword } =
   await import("../../src/utils/passwords.ts");
 const authService = await import("../../src/modules/auth/auth.service.ts");
+const { refreshLockLimits } =
+  await import("../../src/modules/auth/refresh-sessions.ts");
 
 const suffix = crypto.randomBytes(5).toString("hex");
 const domain = `single-use-${suffix}.example.test`;
@@ -304,6 +306,46 @@ function verificationTokenRowLock(token) {
   };
 }
 
+function userRowLock(user) {
+  return async (tx) => {
+    const rows = await tx.$queryRaw`
+      SELECT id FROM "User" WHERE id = ${user.id} FOR UPDATE
+    `;
+    assert.equal(rows.length, 1);
+  };
+}
+
+// Runs the actor against a lock the control keeps holding, with the lock wait
+// capped at 300 ms. The answer must arrive while the lock is still held.
+async function answeredWhileHeld(lock, actor) {
+  const limit = refreshLockLimits.lockTimeoutMs;
+  refreshLockLimits.lockTimeoutMs = 300;
+  let response;
+  try {
+    await withControlLock(lock, async (start) => {
+      const pending = start(actor);
+      await waitForLockWaiters(1);
+      let timer;
+      try {
+        response = await Promise.race([
+          pending,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("the request waited for the lock holder")),
+              5_000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+  } finally {
+    refreshLockLimits.lockTimeoutMs = limit;
+  }
+  return response;
+}
+
 // Holds the next application transaction until released, to stand for a
 // request that passed its token check and was then delayed (scheduling, a
 // slow password hash) before writing anything.
@@ -466,6 +508,31 @@ test("a reset whose token expires while it waits for the token is refused and ch
   assert.equal((await refresh(session)).statusCode, 200);
 });
 
+for (const [name, lockOf] of [
+  ["the token row", (_user, token) => resetTokenRowLock(token)],
+  ["the user row", (user) => userRowLock(user)],
+]) {
+  test(`a reset blocked on ${name} past the lock timeout is a retryable 503 that uses nothing`, async () => {
+    const user = await makeUser();
+    const [session] = await twoSessions(user);
+    const token = await issueResetToken(user);
+    const response = await answeredWhileHeld(lockOf(user, token), () =>
+      reset(token, candidatePassword("busy")),
+    );
+    assert.equal(response.statusCode, 503, response.body);
+    assert.match(response.json().message, /busy/i);
+    assert(await verifyPassword(password, await storedPasswordHash(user)));
+    assert.equal((await resetTokenRow(token)).usedAt, null);
+    assert(!(await families(user)).some((f) => f.revokedAt));
+    assert.equal((await refresh(session)).statusCode, 200);
+
+    const chosen = candidatePassword("retry");
+    const retried = await reset(token, chosen);
+    assert.equal(retried.statusCode, 200, retried.body);
+    assert(await verifyPassword(chosen, await storedPasswordHash(user)));
+  });
+}
+
 test("used, expired and unknown reset tokens are refused without side effects", async () => {
   const user = await makeUser();
   let [session] = await twoSessions(user);
@@ -590,6 +657,25 @@ test("a verification whose token expires while it waits for the token is refused
     await control.emailVerificationToken.count({ where: { token } }),
     1,
   );
+});
+
+test("a verification blocked on its token past the lock timeout is a retryable 503 that uses nothing", async () => {
+  const user = await makeUser({ emailVerified: false });
+  const token = await issueVerificationToken(user);
+  const response = await answeredWhileHeld(
+    verificationTokenRowLock(token),
+    () => verify(token),
+  );
+  assert.equal(response.statusCode, 503, response.body);
+  assert.match(response.json().message, /busy/i);
+  assert.equal(await isVerified(user), false);
+  assert.equal(
+    await control.emailVerificationToken.count({ where: { token } }),
+    1,
+  );
+  const retried = await verify(token);
+  assert.equal(retried.statusCode, 200, retried.body);
+  assert.equal(await isVerified(user), true);
 });
 
 test("verification: a single use verifies and consumes the token; reuse, expiry and unknown tokens are refused", async () => {

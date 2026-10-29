@@ -135,7 +135,7 @@ export type RotationResult =
 // meta.code, model queries only in the message) or ran out of its budget
 // (P2028) and was rolled back, so nothing it did is committed. Answered 503:
 // unlike a superseded token (409), the presented cookie is unchanged.
-function isBusy(error: unknown) {
+export function isBusy(error: unknown) {
   if (error instanceof Prisma.PrismaClientKnownRequestError)
     return (
       error.code === "P2028" ||

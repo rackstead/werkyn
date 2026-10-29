@@ -7,6 +7,7 @@ import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
 import {
   createRefreshSession,
+  isBusy,
   limitLockWaits,
   refreshTransactionOptions,
   revokeRefreshFamily,
@@ -395,6 +396,18 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   await sendPasswordResetEmail(user.email, token);
 }
 
+// A token transaction that waited past the lock timeout or its budget was
+// rolled back without using the token, so the same link can be retried.
+function retryLinkWhenBusy(error: unknown): never {
+  if (isBusy(error))
+    throw new AppError(
+      503,
+      "Service Unavailable",
+      "This link is busy. Try again in a moment.",
+    );
+  throw error;
+}
+
 function assertResetTokenUsable<
   T extends { usedAt: Date | null; expiresAt: Date },
 >(resetToken: T | null, now: Date): asserts resetToken is T {
@@ -427,7 +440,7 @@ export async function resetPassword(
   // The token row is locked before the user row and the user row before the
   // families (refresh-sessions.ts); no path locks a reset token while holding
   // its user.
-  await prisma.$transaction(async (tx) => {
+  const resetting = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     const now = new Date();
     const claimed = await tx.passwordResetToken.updateMany({
@@ -455,14 +468,14 @@ export async function resetPassword(
     });
     await revokeUserRefreshSessions(tx, resetToken.userId, "password_reset");
   }, refreshTransactionOptions);
+  await resetting.catch(retryLinkWhenBusy);
 }
 
 function assertVerificationTokenUsable<T extends { expiresAt: Date }>(
   verificationToken: T | null,
   now: Date,
 ): asserts verificationToken is T {
-  if (!verificationToken)
-    throw new NotFoundError("Invalid verification token");
+  if (!verificationToken) throw new NotFoundError("Invalid verification token");
   if (verificationToken.expiresAt <= now)
     throw new GoneError("Verification token has expired");
 }
@@ -478,7 +491,7 @@ export async function verifyEmail(prisma: PrismaClient, token: string) {
   // transaction whose delete removed it. A concurrent use of the same link,
   // or one whose token a resend replaced meanwhile, changes nothing and gets
   // the same error as a later reuse.
-  const user = await prisma.$transaction(async (tx) => {
+  const verifying = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     const now = new Date();
     const claimed = await tx.emailVerificationToken.deleteMany({
@@ -522,6 +535,7 @@ export async function verifyEmail(prisma: PrismaClient, token: string) {
     }
     return user;
   }, refreshTransactionOptions);
+  const user = await verifying.catch(retryLinkWhenBusy);
 
   return { user };
 }

@@ -133,6 +133,19 @@ export class AutosaveQueue<T extends object> {
     this.baseRevision = revision;
   };
 
+  /**
+   * A write of this entity made outside the queue (for example a rename from
+   * the page tree) produced `revision`. When that is the revision right after
+   * the base, nothing else was written in between, so later saves are based
+   * on it instead of being refused for this client's own change.
+   */
+  acknowledgeRevision = (revision: number | undefined) => {
+    if (revision === undefined || this.baseRevision === undefined) return;
+    if (this.inFlight || revision !== this.baseRevision + 1) return;
+    this.baseRevision = revision;
+    this.observedRevision = revision;
+  };
+
   setPolicy(policy: AutosavePolicy) {
     this.policy = policy;
   }

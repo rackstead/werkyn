@@ -14,6 +14,7 @@ import {
   useWikiPage,
   useUpdateWikiPage,
   useWikiPageBreadcrumbs,
+  wikiAutosaveKey,
 } from "../api";
 import { WikiEditor } from "./wiki-editor";
 import { VersionHistoryPanel } from "./version-history-panel";
@@ -72,7 +73,7 @@ function WikiPageSession({
   // retained draft is not even attempted over another editor's work; the
   // server enforces the lock and the revision as well.
   const holdsLock = useRef(false);
-  const autosave = useEntityAutosave(`wiki:${userId}:${pageId}`, save, {
+  const autosave = useEntityAutosave(wikiAutosaveKey(userId, pageId), save, {
     author: userId,
     canSave: () =>
       holdsLock.current ? null : "Start editing to save these changes",

@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as wiki from "../api";
 import { WikiPageView } from "./wiki-page-view";
+import { wikiAutosaveKey } from "../api";
+import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
 import { useAuthStore } from "@/stores/auth-store";
 
 const { http, notices } = vi.hoisted(() => ({
@@ -1028,6 +1030,37 @@ describe("server revisions and edit conflicts", () => {
     });
     expect(stored.revision).toBe(3);
     expect(screen.getByText("Restore changes")).toBeTruthy();
+  });
+
+  it("a rename from the page tree is stored after pending edits and not reported as a conflict", async () => {
+    const id = `tree-rename-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    fireEvent.change(body(screen), { target: { value: "pending body" } });
+    // What the tree's rename does, without waiting for the editor's debounce.
+    await act(async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        const response = (await http
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .json()) as { data: { revision: number } };
+        return response.data.revision;
+      });
+    });
+    expect(written.map((w) => w.body)).toEqual([
+      { content: paragraph("pending body"), expectedRevision: 4 },
+      { title: "Renamed" },
+    ]);
+    // The cached page has not caught up, yet the next edit builds on the rename.
+    fireEvent.change(body(screen), { target: { value: "after rename" } });
+    await tick(801);
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("after rename"),
+      expectedRevision: 6,
+    });
+    expect(stored).toMatchObject({ revision: 7, title: "Renamed" });
+    expect(screen.queryByText("Restore changes")).toBeNull();
   });
 
   it("a save refused by another user's lock names the holder and is not resent", async () => {

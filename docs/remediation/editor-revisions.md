@@ -43,7 +43,9 @@ save, which then sees it, or waits until the save has committed.
 - Version numbers are assigned under the page row lock and no longer repeat.
 - An expired lock of another user is replaced with a conditional delete, so a
   renewal that won the race keeps its lock. Release and renewal are single
-  conditional statements on the caller's own lock row.
+  conditional statements on the caller's own lock row, and a renewal only
+  extends a lock that has not lapsed: a save by another user may already have
+  checked a lapsed lock as absent. Start Editing takes it again.
 - The description check locks the task row after the project and column rows,
   as every task writer does (see `dat-005.md`).
 
@@ -60,6 +62,10 @@ A 409 edit conflict sets the draft aside instead of retrying it: the page or
 description shows the stored document again and is refetched, and a notice
 explains the conflict (naming the lock holder for `EDIT_LOCKED`). Restoring the
 draft is an explicit replacement of the version then shown; discarding drops it.
+A rename or icon change from the page tree first stores the open editor's
+pending edits, and the editor's next save builds on its revision when nothing
+else was written in between, so the user's own change is not reported as a
+conflict.
 
 ## Validation
 

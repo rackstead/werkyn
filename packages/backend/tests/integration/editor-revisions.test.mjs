@@ -174,9 +174,9 @@ async function waitForLockWaiters(expected) {
  * and is waiting in PostgreSQL before any of them can write. `starts` run in
  * order, each after the previous one is observed waiting: PostgreSQL grants a
  * row lock to its waiters in arrival order, which models one request being
- * delivered before another.
+ * delivered before another. `during` runs while they all wait.
  */
-async function race(table, id, starts) {
+async function race(table, id, starts, during) {
   let unlock, locked;
   const unlocked = new Promise((resolve) => (unlock = resolve));
   const ready = new Promise((resolve) => (locked = resolve));
@@ -204,6 +204,7 @@ async function race(table, id, starts) {
       running.push(Promise.resolve(start()));
       await waitForLockWaiters(running.length);
     }
+    await during?.();
   } finally {
     unlock();
     await Promise.allSettled([holder, ...running]);
@@ -549,6 +550,36 @@ test("after a lock takeover the previous holder's saves are refused", async () =
   }
 });
 
+test("a late renewal cannot revive a lapsed lock under a save that already checked it", async () => {
+  const page = await newPage();
+  status(await acquire("ALICE", page.id), 200);
+  await expireLock(page.id);
+  // Bob's save takes the page row and passes the lock check (Alice's lock has
+  // lapsed), then waits on Bob's user row for its version insert. Alice's
+  // renewal arrives in that window.
+  let renewal;
+  const [saved] = await race(
+    "User",
+    users.BOB.id,
+    [() => save("BOB", page.id, { content: doc("bob"), expectedRevision: 0 })],
+    async () => {
+      renewal = await req("ALICE", "PATCH", `/api/wiki/pages/${page.id}/lock/heartbeat`);
+    },
+  );
+  status(renewal, 404);
+  status(saved, 200);
+  const lock = await app.prisma.wikiPageLock.findUnique({ where: { pageId: page.id } });
+  assert.ok(!lock || lock.expiresAt <= new Date(), "the lapsed lock was renewed");
+  // Start Editing takes the page again, and the stale draft is refused.
+  status(await acquire("ALICE", page.id), 200);
+  conflict(
+    await save("ALICE", page.id, { content: doc("alice"), expectedRevision: 0 }),
+    "REVISION_CONFLICT",
+    1,
+  );
+  assert.deepEqual((await stored(page.id)).content, doc("bob"));
+});
+
 test("two users taking a free lock at once: exactly one holds it", async () => {
   const page = await newPage();
   const responses = await race("WikiPage", page.id, [
@@ -688,15 +719,15 @@ test("concurrent and reordered description saves: exactly one is stored", async 
     () => saveTask("BOB", task.id, { description: "<p>bob</p>", expectedDescriptionRevision: 0 }),
     () => saveTask("ALICE", task.id, { description: "<p>tab</p>", expectedDescriptionRevision: 0 }),
   ]);
-  assert.deepEqual(
-    responses.map((r) => r.statusCode),
-    [200, 409, 409],
-    responses.map((r) => r.body).join("\n"),
-  );
-  for (const response of responses.slice(1))
+  // The requests first queue for the key-share lock of their activity insert,
+  // which they then hold together, so which one reaches the revision check
+  // first is up to the database; exactly one may win.
+  const won = responses.filter((r) => r.statusCode === 200);
+  assert.equal(won.length, 1, responses.map((r) => r.body).join("\n"));
+  for (const response of responses.filter((r) => r !== won[0]))
     conflict(response, "REVISION_CONFLICT", 1);
   let after = await app.prisma.task.findUniqueOrThrow({ where: { id: task.id } });
-  assert.equal(after.description, "<p>alice</p>");
+  assert.equal(after.description, won[0].json().data.description);
   assert.equal(after.descriptionRevision, 1);
 
   // A retransmitted older save arriving after a newer one does not revert it.

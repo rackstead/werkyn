@@ -72,12 +72,16 @@ export async function heartbeatLock(
   pageId: string,
   userId: string,
 ) {
-  // Renews only this user's own lock row, in one conditional statement.
+  // Renews only this user's own lock while it is still held, in one
+  // conditional statement. A lapsed lock is not revived: a save or restore by
+  // another user may already have checked it as absent. Start Editing takes
+  // it again under the page row lock.
+  const now = new Date();
   const { count } = await prisma.wikiPageLock.updateMany({
-    where: { pageId, userId },
+    where: { pageId, userId, expiresAt: { gt: now } },
     data: {
-      expiresAt: new Date(Date.now() + LOCK_DURATION_MS),
-      heartbeat: new Date(),
+      expiresAt: new Date(now.getTime() + LOCK_DURATION_MS),
+      heartbeat: now,
     },
   });
   if (count === 0) throw new NotFoundError("No active lock found");

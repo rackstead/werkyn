@@ -16,6 +16,11 @@ import type {
   UpdateWikiShareInput,
 } from "@pm/shared";
 
+/** The autosave queue of one user's edits to one page. */
+export function wikiAutosaveKey(userId: string, pageId: string) {
+  return `wiki:${userId}:${pageId}`;
+}
+
 // ─── Types ──────────────────────────────────────────────
 
 export interface WikiSpace {

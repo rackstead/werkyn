@@ -22,6 +22,23 @@ if (typeof window !== "undefined") {
   });
 }
 
+/**
+ * Runs a write of an entity made outside its editor, such as a rename from the
+ * page tree, after the editor's pending saves have been stored. The editor's
+ * later saves are then based on that write's revision when nothing else was
+ * written in between, so it is not reported as a conflict.
+ */
+export async function writeAlongsideAutosave(
+  entityKey: string,
+  write: () => Promise<number | undefined>,
+) {
+  const queue = () =>
+    queues.get(entityKey)?.queue as AutosaveQueue<object> | undefined;
+  await queue()?.flush().catch(() => {});
+  const revision = await write();
+  queue()?.acknowledgeRevision(revision);
+}
+
 function retained<T extends object>(queue: AutosaveQueue<T>) {
   const snapshot = queue.getSnapshot();
   return snapshot.hasUnsavedChanges || snapshot.parked !== undefined;

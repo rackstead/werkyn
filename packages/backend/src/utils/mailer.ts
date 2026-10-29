@@ -1,4 +1,4 @@
-import nodemailer from "nodemailer";
+import nodemailer, { type Transporter, type TransportOptions } from "nodemailer";
 import type { PrismaClient } from "@prisma/client";
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
@@ -13,7 +13,7 @@ export type MailDeliveryResult =
 
 class MailNotConfiguredError extends Error {}
 
-let transporter: { transport: nodemailer.Transporter; source: MailTransportSource } | undefined;
+let transporter: { transport: Transporter; source: MailTransportSource } | undefined;
 let prismaRef: PrismaClient | undefined;
 
 const stats = {
@@ -38,7 +38,7 @@ export function resetTransporter() {
 }
 
 async function getTransporter(): Promise<{
-  transport: nodemailer.Transporter;
+  transport: Transporter;
   source: MailTransportSource;
 }> {
   if (transporter) return transporter;
@@ -51,7 +51,7 @@ async function getTransporter(): Promise<{
       });
 
       if (dbConfig && dbConfig.host) {
-        const options: nodemailer.TransportOptions & {
+        const options: TransportOptions & {
           host: string;
           port: number;
           secure: boolean;
@@ -79,7 +79,7 @@ async function getTransporter(): Promise<{
 
   // 2. Env var fallback
   if (env.SMTP_HOST) {
-    const options: nodemailer.TransportOptions & {
+    const options: TransportOptions & {
       host: string;
       port: number;
       secure: boolean;

@@ -1,8 +1,12 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import type { BackupExportRequest } from "@pm/shared";
-import AdmZip from "adm-zip";
 import { exportBackup } from "./backup.service.js";
 import { previewRestore, executeRestore } from "./restore.service.js";
+import {
+  BackupArchiveError,
+  readBackupArchive,
+  type BackupArchiveContents,
+} from "./backup-archive.js";
 import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 
@@ -54,28 +58,19 @@ async function consumeFileBuffer(
  * Supports both legacy .json files and .zip archives.
  */
 function parseUploadedBackup(
+  request: FastifyRequest,
   buffer: Buffer,
   filename: string,
-): { jsonBuffer: Buffer; assets: Map<string, Buffer> } {
+): BackupArchiveContents {
   if (filename.endsWith(".zip") || isZipBuffer(buffer)) {
-    const zip = new AdmZip(buffer);
-    const jsonEntry = zip.getEntry("backup.json");
-    if (!jsonEntry) {
-      throw new ValidationError(
-        "Invalid backup ZIP: missing backup.json",
-      );
-    }
-
-    const jsonBuffer = jsonEntry.getData();
-    const assets = new Map<string, Buffer>();
-
-    for (const entry of zip.getEntries()) {
-      if (entry.entryName.startsWith("assets/") && !entry.isDirectory) {
-        assets.set(entry.entryName, entry.getData());
+    try {
+      return readBackupArchive(buffer);
+    } catch (error) {
+      if (error instanceof BackupArchiveError) {
+        request.log.warn({ reason: error.reason }, "Rejected backup archive");
       }
+      throw error;
     }
-
-    return { jsonBuffer, assets };
   }
 
   // Legacy plain JSON
@@ -99,7 +94,7 @@ export async function previewHandler(
 ) {
   const { wid } = request.params as { wid: string };
   const { buffer, filename } = await consumeFileBuffer(request);
-  const { jsonBuffer, assets } = parseUploadedBackup(buffer, filename);
+  const { jsonBuffer, assets } = parseUploadedBackup(request, buffer, filename);
 
   const summary = await previewRestore(
     request.server.prisma,
@@ -118,7 +113,7 @@ export async function restoreHandler(
 ) {
   const { wid } = request.params as { wid: string };
   const { buffer, filename } = await consumeFileBuffer(request);
-  const { jsonBuffer, assets } = parseUploadedBackup(buffer, filename);
+  const { jsonBuffer, assets } = parseUploadedBackup(request, buffer, filename);
 
   const summary = await executeRestore(
     request.server.prisma,

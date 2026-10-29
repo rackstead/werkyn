@@ -35,6 +35,9 @@ await writeFile(path.join(outsideDir, "sentinel.txt"), "unchanged");
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
+const { exportBackup } = await import("../../src/modules/backup/backup.service.ts");
+const { BACKUP_ARCHIVE_LIMITS, EXPORT_TOO_LARGE_MESSAGE, inspectBackupArchive, readBackupArchive } =
+  await import("../../src/modules/backup/backup-archive.ts");
 
 const suffix = crypto.randomUUID().slice(0, 8);
 const MiB = 1 << 20;
@@ -368,13 +371,16 @@ test("symlink entries are imported as inert bytes, never followed or created", a
   assert.equal((await readFile(full)).toString(), "/etc/passwd");
 });
 
-/** Rejected archives are refused by preview and restore with no side effect. */
-async function assertRejected(label, zip) {
+const ARCHIVE_INVALID = "Invalid backup ZIP: the archive is damaged or uses unsupported ZIP features";
+const ARCHIVE_TOO_LARGE = "Invalid backup ZIP: the archive exceeds the restore limits";
+
+/** Rejected archives get a 400 from preview and restore with no side effect. */
+async function assertRejected(label, zip, message = ARCHIVE_INVALID) {
   const before = await tree();
   for (const action of ["preview", "restore"]) {
     const response = await upload(crafted.id, action, zip);
-    assert.notEqual(response.statusCode, 200, `${label} ${action}: ${response.body}`);
-    assert.ok(response.statusCode >= 400, `${label} ${action}: ${response.statusCode}`);
+    assert.equal(response.statusCode, 400, `${label} ${action}: ${response.body}`);
+    assert.equal(response.json().message, message, `${label} ${action}`);
   }
   assert.deepEqual(await added(before), [], label);
   assert.equal(
@@ -419,26 +425,17 @@ test("declared sizes never allocate more than the stored bytes", async () => {
     ]),
   );
 
-  // A 4 GiB declaration over honest bytes yields exactly those bytes.
+  // A 4 GiB declaration over honest bytes exceeds the restore budget, so it
+  // is refused before anything is inflated.
   const honest = `${label} honest`;
-  const zip = craftZip([
-    {
-      name: "backup.json",
-      content: backupJson(honest, ["assets/stored.png", "assets/deflated.png"]),
-      size: 0xffffffff,
-    },
-    { name: "assets/stored.png", content, size: 0xffffffff },
-    { name: "assets/deflated.png", content, method: DEFLATED, size: 0xffffffff },
-  ]);
-  const before = await tree();
-  const response = await upload(crafted.id, "restore", zip);
-  assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json().data.images, 2);
-  const newFiles = await added(before);
-  assert.equal(newFiles.length, 2);
-  for (const rel of newFiles)
-    assert.deepEqual(await readFile(path.join(root, rel)), content);
-  assert.equal((await spaces(honest)).length, 1);
+  await assertRejected(
+    honest,
+    craftZip([
+      { name: "backup.json", content: backupJson(honest, ["assets/deflated.png"]) },
+      { name: "assets/deflated.png", content, method: DEFLATED, size: 0xfffffffe },
+    ]),
+    ARCHIVE_TOO_LARGE,
+  );
 });
 
 test("a declared size of zero does not lift the decompression cap", async () => {
@@ -469,4 +466,49 @@ test("checksum mismatches and truncated entries are rejected", async () => {
     `${label} json`,
     craftZip([{ name: "backup.json", content: corrupt, crc: crc32(corrupt) ^ 1 }]),
   );
+});
+
+test("export refuses an archive that restore would refuse", async () => {
+  const space = await app.prisma.wikiSpace.create({
+    data: { workspaceId: source.id, name: `Budget wiki ${suffix}`, slug: `budget-${suffix}` },
+  });
+  const urls = [];
+  for (const size of [1000, 2000]) {
+    const stored = await app.storage.save(
+      `${source.id}/uploads/wiki`,
+      space.id,
+      crypto.randomUUID(),
+      ".png",
+      crypto.randomBytes(size),
+    );
+    urls.push(`/storage/${stored}`);
+  }
+  await app.prisma.wikiPage.create({
+    data: {
+      spaceId: space.id,
+      title: "Budget page",
+      createdById: admin.id,
+      content: urls.map((url) => ({ type: "image", props: { url } })),
+    },
+  });
+  const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
+  const exportWith = (limits) =>
+    exportBackup(app.prisma, source.id, request, app.storage, admin.id, { ...BACKUP_ARCHIVE_LIMITS, ...limits });
+
+  const { zipBuffer } = await exportWith({});
+  const entries = inspectBackupArchive(zipBuffer);
+  const total = entries.reduce((sum, entry) => sum + entry.size, 0);
+  const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
+
+  // Exactly at the limits the export succeeds and restores under them.
+  const exact = { maxTotalBytes: total, maxEntries: 4, maxEntryBytes: Math.max(...entries.map((e) => e.size)) };
+  const fitting = await exportWith(exact);
+  assert.equal(readBackupArchive(fitting.zipBuffer, { ...BACKUP_ARCHIVE_LIMITS, ...exact }).assets.size, 2);
+
+  await assert.rejects(exportWith({ maxTotalBytes: total - 1 }), tooLarge);
+  // backup.json, the implied assets/ folder and two files are four entries.
+  await assert.rejects(exportWith({ maxEntries: 3 }), tooLarge);
+  assert.ok(entries.find((e) => e.name === "backup.json").size < 1999);
+  await assert.rejects(exportWith({ maxEntryBytes: 1999 }), tooLarge);
+  await assert.rejects(exportWith({ maxNameBytes: entries[1].name.length - 1 }), tooLarge);
 });

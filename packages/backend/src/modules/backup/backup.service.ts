@@ -8,6 +8,11 @@ import {
   assertBackupExportAccess,
   resolveBackupAssetPaths,
 } from "./backup-asset-access.js";
+import {
+  BACKUP_ARCHIVE_LIMITS,
+  BackupExportBudget,
+  type BackupArchiveLimits,
+} from "./backup-archive.js";
 
 export interface BackupExportResult {
   zipBuffer: Buffer;
@@ -20,6 +25,7 @@ export async function exportBackup(
   request: BackupExportRequest,
   storage: StorageProvider,
   actorId: string,
+  limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS,
 ): Promise<BackupExportResult> {
   await assertBackupExportAccess(prisma, workspaceId, actorId);
   const workspace = await prisma.workspace.findUniqueOrThrow({
@@ -344,6 +350,8 @@ export async function exportBackup(
 
   const assetBuffers = new Map<string, Buffer>();
   const urlRewriteMap = new Map<string, string>();
+  // Refuse an export that restore would refuse, before reading more files.
+  const budget = new BackupExportBudget(limits);
 
   if (request.includeFiles) {
     // Collect & rewrite storage URLs in wiki content
@@ -361,6 +369,7 @@ export async function exportBackup(
     for (const url of allStorageUrls) {
       const ctx = await assertBackupExportAccess(prisma, workspaceId, actorId);
       const storagePaths = await resolveBackupAssetPaths(prisma, ctx, url);
+      let found: { assetPath: string; buffer: Buffer } | undefined;
       for (const storagePath of storagePaths) {
         try {
           // Resolve literal upload filenames before URI alternatives. Stat only
@@ -371,13 +380,16 @@ export async function exportBackup(
             !(await storage.exists(storagePath))
           ) continue;
           const buffer = await storage.read(storagePath);
-          const assetPath = `assets/${path.basename(storagePath)}`;
-          assetBuffers.set(assetPath, buffer);
-          urlRewriteMap.set(url, assetPath);
+          found = { assetPath: `assets/${path.basename(storagePath)}`, buffer };
           break;
         } catch {
           // File not found on disk — skip, leave original URL in JSON
         }
+      }
+      if (found) {
+        budget.add(found.assetPath, found.buffer.length);
+        assetBuffers.set(found.assetPath, found.buffer);
+        urlRewriteMap.set(url, found.assetPath);
       }
     }
 
@@ -412,6 +424,9 @@ export async function exportBackup(
     wikiSpaces: wikiSpaceEntries,
   };
 
+  const json = JSON.stringify(backupJson, null, 2);
+  budget.add("backup.json", Buffer.byteLength(json));
+
   // ─── Package as ZIP ───────────────────────────────────
 
   const zipBuffer = await new Promise<Buffer>((resolve, reject) => {
@@ -423,9 +438,7 @@ export async function exportBackup(
     archive.on("error", reject);
 
     // Add backup.json
-    archive.append(JSON.stringify(backupJson, null, 2), {
-      name: "backup.json",
-    });
+    archive.append(json, { name: "backup.json" });
 
     // Add asset files
     for (const [assetPath, buffer] of assetBuffers) {

@@ -80,6 +80,7 @@ function request(actor, method, url, payload) {
 
 const hookTables = [
   ["Task", "INSERT"],
+  ["Task", "DELETE"],
   ["RecurringTaskConfig", "UPDATE"],
   ["TaskReminderSent", "INSERT"],
   ["Notification", "INSERT"],
@@ -113,16 +114,16 @@ async function installHooks() {
     END $$`);
   for (const [table, op] of hookTables) {
     if (!(await tableExists(table))) continue;
-    await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "b04_hook" ON "${table}"`);
+    await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "b04_hook_${op}" ON "${table}"`);
     await app.prisma.$executeRawUnsafe(
-      `CREATE TRIGGER "b04_hook" BEFORE ${op} ON "${table}" FOR EACH ROW EXECUTE FUNCTION b04_hook()`,
+      `CREATE TRIGGER "b04_hook_${op}" BEFORE ${op} ON "${table}" FOR EACH ROW EXECUTE FUNCTION b04_hook()`,
     );
   }
 }
 
 async function removeHooks() {
-  for (const [table] of hookTables) {
-    if (await tableExists(table)) await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "b04_hook" ON "${table}"`);
+  for (const [table, op] of hookTables) {
+    if (await tableExists(table)) await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "b04_hook_${op}" ON "${table}"`);
   }
   await app.prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS b04_hook()`);
   await app.prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "b04_hook"`);
@@ -163,6 +164,18 @@ async function waitForWaiters(count, failed = () => null) {
     await sleep(25);
   }
   throw new Error(`Expected ${count} transactions waiting at the barrier`);
+}
+
+// Sessions waiting on a row or transaction lock (not on the barrier).
+async function waitForLockWaiter() {
+  for (let attempt = 0; attempt < 1200; attempt++) {
+    const rows = await observer.$queryRawUnsafe(`
+      SELECT "pid" FROM pg_stat_activity
+      WHERE "datname" = current_database() AND "wait_event_type" = 'Lock' AND "wait_event" <> 'advisory'`);
+    if (rows.length > 0) return;
+    await sleep(25);
+  }
+  throw new Error("Expected a transaction waiting on a row lock");
 }
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -470,6 +483,12 @@ test("a monthly schedule left a month late by the old arithmetic is moved back t
   const late = await schedule("late-monthly", { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15" });
   // Generated today (Mar 10) and advanced: correct, and left alone.
   const current = await schedule("current-monthly", { frequency: "MONTHLY", dayOfMonth: 10, startDate: day(0), nextRunDate: day(0) });
+  // A stopped run neither repairs nor generates.
+  const stopped = new AbortController();
+  stopped.abort();
+  const idle = await tick(A, { signal: stopped.signal });
+  assert.equal(idle.repaired + idle.generated, 0);
+  assert.equal((await configOf(late.id)).nextRunDate, "2027-04-15");
   await tick(A);
   assert.equal((await configOf(late.id)).nextRunDate, "2027-03-15");
   assert.equal((await configOf(current.id)).nextRunDate, "2027-04-10");
@@ -520,6 +539,57 @@ test("shutdown during a running scheduler pass waits for the occurrence in progr
   assert.deepEqual(await dueDatesOf(s.name), [day(-4), day(-3), day(-2), day(-1), day(0)]);
   await retireSchedules();
 });
+
+// Project and workspace deletion lock the Project row, then cascade to its
+// tasks and schedules. An occurrence locks the Project before its schedule,
+// so neither order of the two can deadlock (and fail the deletion with a 500
+// or the occurrence).
+for (const target of ["project", "workspace"]) {
+  for (const order of ["occurrence first", "deletion first"]) {
+    test(`deleting a ${target} during one of its occurrences neither deadlocks nor fails (${order})`, async () => {
+      const label = `delete-${target}-${uid()}`;
+      const ws = await app.prisma.workspace.create({
+        data: { name: label, slug: label, members: { create: { userId: users.ADMIN.id, role: "ADMIN" } } },
+      });
+      try {
+        const p = await app.prisma.project.create({ data: { workspaceId: ws.id, name: label } });
+        const st = await app.prisma.statusColumn.create({ data: { projectId: p.id, name: "Open" } });
+        // The deletion's cascade is held at this task's delete.
+        await app.prisma.task.create({ data: { projectId: p.id, statusId: st.id, title: `${label} existing`, position: 0 } });
+        await schedule(label, { projectId: p.id, nextRunDate: day(0), dueOffset: 0 });
+        const url = target === "project" ? `/api/projects/${p.id}` : `/api/workspaces/${ws.id}`;
+        // Deletion through HTTP on the app's pool; the scheduler on its own.
+        const remove = () => request("ADMIN", "DELETE", url).then((response) => response);
+        await setHook("barrier", order === "occurrence first" ? "Task:INSERT" : "Task:DELETE");
+        const release = await holdBarrier();
+        let run, deletion;
+        try {
+          if (order === "occurrence first") {
+            run = tick(B); // holds its locks, waiting at the new task's insert
+            await waitForWaiters(1);
+            deletion = remove();
+          } else {
+            deletion = remove(); // holds the project row, waiting in the task cascade
+            await waitForWaiters(1);
+            run = tick(B);
+          }
+          await waitForLockWaiter();
+        } finally {
+          await release();
+        }
+        const [summary, response] = await Promise.all([run, deletion]);
+        await clearHooks();
+        assert.equal(response.statusCode, 204, response.body);
+        assert.equal(summary.failed, 0, "the occurrence does not fail");
+        assert.equal(await app.prisma.project.count({ where: { id: p.id } }), 0);
+      } finally {
+        await clearHooks();
+        await app.prisma.workspace.deleteMany({ where: { id: ws.id } });
+        await retireSchedules();
+      }
+    });
+  }
+}
 
 test("trash purge stops between candidates once its stop signal is aborted", async () => {
   const { processTrashPurge } = await import("../../src/schedulers/trash-purge.js");

@@ -9,9 +9,10 @@ import {
 
 // Generates the tasks of recurring schedules whose next run date has arrived.
 //
-// Each occurrence is one transaction: lock the schedule row, record the date
-// in RecurringTaskOccurrence, create the task, advance nextRunDate. The three
-// writes commit together or not at all, so:
+// Each occurrence is one transaction: lock the project (key share) and then
+// the schedule row, record the date in RecurringTaskOccurrence, create the
+// task, advance nextRunDate. The three writes commit together or not at all,
+// so:
 //
 // - a failure (or a crash) at any point leaves the schedule on the same date,
 //   and a later run generates it; an occurrence is never lost;
@@ -35,6 +36,7 @@ import {
 
 export const MAX_OCCURRENCES_PER_RUN = 31;
 const PAGE_SIZE = 100;
+const REPAIR_PAGE_SIZE = 500;
 
 interface DueConfig {
   id: string;
@@ -75,6 +77,17 @@ async function runNextOccurrence(
 ): Promise<Outcome> {
   return prisma.$transaction(
     async (tx): Promise<Outcome> => {
+      // Lock order: the Project row (key share), then the schedule row, then
+      // the status, member and label rows and the task rows that task
+      // creation touches. Project and workspace deletion lock the Project row
+      // before cascading to the schedule; taking the schedule first could
+      // deadlock with them. A key-share lock does not block project updates
+      // such as archiving.
+      await tx.$queryRaw`
+        SELECT p."id" FROM "Project" p
+        JOIN "RecurringTaskConfig" c ON c."projectId" = p."id"
+        WHERE c."id" = ${configId}
+        FOR KEY SHARE OF p`;
       const [config] = await tx.$queryRaw<DueConfig[]>`
         SELECT c."id", c."projectId", c."templateId", c."frequency"::text AS "frequency",
                c."dayOfWeek", c."dayOfMonth", c."endDate", c."nextRunDate", p."archived"
@@ -152,20 +165,39 @@ async function runNextOccurrence(
  * code never match, because their next run always is the first occurrence
  * after the last generated or skipped date.
  */
-async function repairLateMonthlySchedules(prisma: PrismaClient, today: string) {
-  const rows = await prisma.recurringTaskConfig.findMany({
-    where: { isActive: true, frequency: "MONTHLY", nextRunDate: { gt: today } },
-    select: { id: true, startDate: true, dayOfMonth: true, nextRunDate: true },
-  });
+async function repairLateMonthlySchedules(
+  prisma: PrismaClient,
+  today: string,
+  signal?: AbortSignal,
+) {
   let repaired = 0;
-  for (const row of rows) {
-    const expected = calculateNextRunDate("MONTHLY", row.startDate, null, row.dayOfMonth, today);
-    if (expected <= today || expected >= row.nextRunDate) continue;
-    const { count } = await prisma.recurringTaskConfig.updateMany({
-      where: { id: row.id, isActive: true, nextRunDate: row.nextRunDate },
-      data: { nextRunDate: expected },
+  let cursor: string | undefined;
+  // Paged by id, and stops between rows when the run is stopped; each repair
+  // is one compare-and-set, so a stopped scan resumes on the next run.
+  while (!signal?.aborted) {
+    const rows = await prisma.recurringTaskConfig.findMany({
+      where: {
+        isActive: true,
+        frequency: "MONTHLY",
+        nextRunDate: { gt: today },
+        ...(cursor ? { id: { gt: cursor } } : {}),
+      },
+      orderBy: { id: "asc" },
+      take: REPAIR_PAGE_SIZE,
+      select: { id: true, startDate: true, dayOfMonth: true, nextRunDate: true },
     });
-    repaired += count;
+    if (rows.length === 0) break;
+    cursor = rows[rows.length - 1].id;
+    for (const row of rows) {
+      if (signal?.aborted) break;
+      const expected = calculateNextRunDate("MONTHLY", row.startDate, null, row.dayOfMonth, today);
+      if (expected <= today || expected >= row.nextRunDate) continue;
+      const { count } = await prisma.recurringTaskConfig.updateMany({
+        where: { id: row.id, isActive: true, nextRunDate: row.nextRunDate },
+        data: { nextRunDate: expected },
+      });
+      repaired += count;
+    }
   }
   return repaired;
 }
@@ -186,7 +218,7 @@ export async function processRecurringTasks(
     repaired: 0,
   };
   try {
-    summary.repaired = await repairLateMonthlySchedules(prisma, today);
+    summary.repaired = await repairLateMonthlySchedules(prisma, today, signal);
   } catch (err) {
     fastify.log.error(err, "Recurring tasks: could not check monthly schedules for a late next run");
   }

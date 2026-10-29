@@ -28,6 +28,10 @@ import { ValidationError } from "./errors.js";
 // the known exception: its cascade deletes WorkspaceMember rows before the
 // projects, the reverse of a writer, and PostgreSQL resolves that cycle by
 // aborting one side, which the API reports as a retryable 409.
+// The recurring-task scheduler (schedulers/recurring-tasks.ts) runs template
+// instantiation inside its own transaction: it takes the Project row KEY SHARE,
+// then its schedule row FOR UPDATE SKIP LOCKED, then the locks above, so it
+// follows the same Project-first order.
 // Not locked here: a template's stored column, a duplicated task's column and
 // the default first column are plain reads, held only by the insert's own
 // foreign-key check, so a column delete racing those still gets the generic

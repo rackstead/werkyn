@@ -74,6 +74,8 @@ function ChatRoute() {
 
   return (
     <ChatLayout
+      // A workspace gets a fresh chat: no panel, dialog or draft carries over.
+      key={workspace.id}
       workspaceId={workspace.id}
       channelId={search.channelId}
       currentUserId={user.id}

@@ -103,13 +103,17 @@ async function runNextOccurrence(
       const save = (nextRunDate: string) =>
         tx.recurringTaskConfig.update({
           where: { id: config.id },
-          data: { nextRunDate, ...(pastEnd(nextRunDate) ? { isActive: false } : {}) },
+          data: {
+            nextRunDate,
+            lastRunDate: today,
+            ...(pastEnd(nextRunDate) ? { isActive: false } : {}),
+          },
         });
 
       if (pastEnd(config.nextRunDate)) {
         await tx.recurringTaskConfig.update({
           where: { id: config.id },
-          data: { isActive: false },
+          data: { isActive: false, lastRunDate: today },
         });
         return { kind: "ended" };
       }
@@ -161,12 +165,12 @@ async function runNextOccurrence(
  * late (docs/remediation/dat-007.md). When an active MONTHLY schedule's next
  * run is later than the first occurrence on or after today, the stored date
  * skips that occurrence: move it back. An occurrence in the future cannot
- * have been generated yet. One due today counts as missing only if nothing
- * wrote the row today: a run that generated today's date (also before the
- * upgrade, which recorded no occurrence) or skipped it for an archived
- * project advanced the row today. Rows written by the current code never
- * match, because their next run always is the first occurrence after the
- * last generated or skipped date.
+ * have been generated yet. One due today counts as missing only if no
+ * scheduler run advanced the row today (lastRunDate): a run that generated
+ * today's date, or skipped it for an archived project, did. Edits do not
+ * write lastRunDate. Rows written by the current code never match, because
+ * their next run always is the first occurrence after the last generated or
+ * skipped date.
  */
 async function repairLateMonthlySchedules(
   prisma: PrismaClient,
@@ -187,7 +191,14 @@ async function repairLateMonthlySchedules(
       },
       orderBy: { id: "asc" },
       take: REPAIR_PAGE_SIZE,
-      select: { id: true, startDate: true, dayOfMonth: true, nextRunDate: true, updatedAt: true },
+      select: {
+        id: true,
+        startDate: true,
+        dayOfMonth: true,
+        nextRunDate: true,
+        lastRunDate: true,
+        updatedAt: true,
+      },
     });
     if (rows.length === 0) break;
     cursor = rows[rows.length - 1].id;
@@ -195,7 +206,7 @@ async function repairLateMonthlySchedules(
       if (signal?.aborted) break;
       const expected = calculateNextRunDate("MONTHLY", row.startDate, null, row.dayOfMonth, today);
       if (expected < today || expected >= row.nextRunDate) continue;
-      if (expected === today && todayUTC(row.updatedAt) >= today) continue;
+      if (expected === today && (row.lastRunDate ?? "") >= today) continue;
       // Only if the row is unchanged since it was read: an edit in between
       // (even one that kept nextRunDate) keeps its own result.
       const { count } = await prisma.recurringTaskConfig.updateMany({
@@ -206,6 +217,7 @@ async function repairLateMonthlySchedules(
           startDate: row.startDate,
           dayOfMonth: row.dayOfMonth,
           nextRunDate: row.nextRunDate,
+          lastRunDate: row.lastRunDate,
           updatedAt: row.updatedAt,
         },
         data: { nextRunDate: expected },

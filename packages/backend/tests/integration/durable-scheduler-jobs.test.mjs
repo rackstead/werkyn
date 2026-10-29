@@ -498,29 +498,42 @@ test("a monthly schedule left a month late by the old arithmetic is moved back t
   await retireSchedules();
 });
 
-test("a late monthly row whose missing occurrence is today is moved back unless the row was already written today", async () => {
+test("a late monthly row whose missing occurrence is today is moved back unless a run already handled today", async () => {
   const MAR_15 = Date.parse("2027-03-15T12:00:00Z");
-  // Late since before today: Mar 15 was never generated.
-  const late = await schedule("late-today", { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15", dueOffset: 0 });
+  const legacy = { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15", dueOffset: 0 };
+  // Late: Mar 15 was never generated.
+  const late = await schedule("late-today", legacy);
+  // Late too, and edited today (end date only) before today's run.
+  const edited = await schedule("late-edited-today", legacy);
+  // Advanced by a run today (as an upgrade-day row generated before the upgrade).
+  const ranToday = await schedule("ran-today", legacy);
+  const lastRun = (id, date) =>
+    app.prisma.$executeRawUnsafe(`UPDATE "RecurringTaskConfig" SET "lastRunDate" = $1 WHERE "id" = $2`, date, id);
   try {
+    await lastRun(late.id, day(0));
+    await lastRun(edited.id, day(0));
+    await lastRun(ranToday.id, "2027-03-15");
     setNow(MAR_15);
-    // Advanced today (as by a run that generated Mar 15 before the upgrade).
-    const ranToday = await schedule("ran-today", { frequency: "MONTHLY", dayOfMonth: 15, startDate: "2027-01-31", nextRunDate: "2027-04-15", dueOffset: 0 });
+    tokens.ADMIN = signAccessToken({ sub: users.ADMIN.id, email: users.ADMIN.email });
+    const patched = await request("ADMIN", "PATCH", `/api/projects/${project.id}/recurring/${edited.id}`, { endDate: "2027-12-31" });
+    assert.equal(patched.statusCode, 200, patched.body);
+    assert.equal("lastRunDate" in patched.json().data, false, "scheduler bookkeeping stays out of the API");
     // The query engine stamps updatedAt from the real clock, not the mocked
-    // one: set the write times explicitly.
-    const written = (id, at) =>
-      app.prisma.$executeRawUnsafe(`UPDATE "RecurringTaskConfig" SET "updatedAt" = $1 WHERE "id" = $2`, new Date(at), id);
-    await written(late.id, NOW);
-    await written(ranToday.id, MAR_15);
+    // one: stamp the edit at the mocked time.
+    await app.prisma.$executeRawUnsafe(`UPDATE "RecurringTaskConfig" SET "updatedAt" = $1 WHERE "id" = $2`, new Date(MAR_15), edited.id);
     await tick(A);
     assert.deepEqual(await dueDatesOf(late.name), ["2027-03-15"], "the missing occurrence is generated today");
+    assert.deepEqual(await dueDatesOf(edited.name), ["2027-03-15"], "an edit today does not hide it");
     assert.equal((await configOf(late.id)).nextRunDate, "2027-04-15");
-    assert.deepEqual(await dueDatesOf(ranToday.name), [], "a row written today is left alone");
+    assert.equal((await configOf(late.id)).lastRunDate, "2027-03-15");
+    assert.deepEqual(await dueDatesOf(ranToday.name), [], "a row a run already handled today is left alone");
     assert.equal((await configOf(ranToday.id)).nextRunDate, "2027-04-15");
     await tick(A);
     assert.deepEqual(await dueDatesOf(late.name), ["2027-03-15"]);
+    assert.deepEqual(await dueDatesOf(edited.name), ["2027-03-15"]);
   } finally {
     setNow(NOW);
+    tokens.ADMIN = signAccessToken({ sub: users.ADMIN.id, email: users.ADMIN.email });
     await retireSchedules();
   }
 });

@@ -10,6 +10,12 @@
 -- before this migration are not known, and the stored "nextRunDate" already
 -- points past them.
 --
+-- "RecurringTaskConfig"."lastRunDate" is the UTC date of the last scheduler
+-- run that advanced or ended the schedule; edits never write it. Existing rows
+-- get the date of their last write of any kind, which can only be later than
+-- their last run. The scheduler compares it with today only, so the
+-- approximation matters on the upgrade day alone.
+--
 -- "NotificationDelivery" is the outbox for notifications sent through
 -- notify() (task, comment, template, file-share and due-date reminder
 -- notifications). Its notifications are created in the same transaction that
@@ -17,6 +23,11 @@
 -- retried with backoff, and a delivered row is deleted. A row that exhausts
 -- its attempts keeps "lastError" with a null "nextAttemptAt", so it leaves the
 -- due-row index range.
+
+-- AlterTable
+ALTER TABLE "RecurringTaskConfig" ADD COLUMN     "lastRunDate" TEXT;
+
+UPDATE "RecurringTaskConfig" SET "lastRunDate" = to_char("updatedAt", 'YYYY-MM-DD');
 
 -- CreateTable
 CREATE TABLE "NotificationDelivery" (

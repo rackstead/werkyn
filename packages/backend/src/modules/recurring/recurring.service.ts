@@ -7,9 +7,13 @@ import {
 } from "@pm/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 
+// Scheduler bookkeeping, not part of the API.
+const configOmit = { lastRunDate: true } as const;
+
 export async function listRecurringConfigs(prisma: PrismaClient, projectId: string) {
   return prisma.recurringTaskConfig.findMany({
     where: { projectId },
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },
@@ -47,6 +51,7 @@ export async function createRecurringConfig(
       endDate: data.endDate,
       nextRunDate,
     },
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },
@@ -115,6 +120,7 @@ export async function updateRecurringConfig(
   return prisma.recurringTaskConfig.update({
     where: { id: configId, projectId },
     data: updateData,
+    omit: configOmit,
     include: {
       template: { select: { id: true, name: true, title: true } },
     },

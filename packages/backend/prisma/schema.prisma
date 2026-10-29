@@ -708,6 +708,9 @@ model RecurringTaskConfig {
   endDate     String?
   nextRunDate String
   isActive    Boolean             @default(true)
+  /// UTC date (YYYY-MM-DD) of the last scheduler run that advanced or ended
+  /// this schedule. Written only by the scheduler, never by edits.
+  lastRunDate String?
   createdAt   DateTime            @default(now())
   updatedAt   DateTime            @updatedAt
 

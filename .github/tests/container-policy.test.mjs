@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import test from "node:test";
 
@@ -74,6 +84,37 @@ test("the entrypoint is valid sh and drops root before migrating or serving", ()
   assert.ok(dropRoot > 0);
   assert.ok(entrypoint.indexOf("prisma migrate deploy") > dropRoot);
   assert.ok(entrypoint.indexOf("exec node") > dropRoot);
+});
+
+test("the root handover leaves directories outside the data roots alone", () => {
+  // Runs the real entrypoint as "root" (a stub id) with a recording chown stub.
+  // Every configured directory here resolves outside /app/storage and /app/data,
+  // directly or through a symbolic link, so chown must never run.
+  const dir = mkdtempSync(join(tmpdir(), "werkyn-handover-"));
+  try {
+    const bin = join(dir, "bin");
+    const calls = join(dir, "chown-calls");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "id"), "#!/bin/sh\necho 0\n", { mode: 0o755 });
+    writeFileSync(join(bin, "chown"), `#!/bin/sh\necho "$@" >> '${calls}'\n`, { mode: 0o755 });
+    symlinkSync("/etc", join(dir, "etc-link"));
+    for (const [storage, dex] of [
+      ["/etc", "/usr"],
+      [join(dir, "etc-link"), "/"],
+    ]) {
+      const result = spawnSync("sh", ["docker-entrypoint.sh", "fix-permissions"], {
+        cwd: new URL("../../", import.meta.url),
+        env: { PATH: `${bin}:${process.env.PATH}`, STORAGE_DIR: storage, DEX_CONFIG_DIR: dex },
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const refused = result.stderr.match(/Not changing owners under (\S+):/g) ?? [];
+      assert.equal(refused.length, 2, result.stderr);
+    }
+    assert.equal(existsSync(calls), false, "chown ran outside the data roots");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("Compose runs the app as the image user after handing over root-owned data", () => {

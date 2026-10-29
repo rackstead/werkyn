@@ -5,8 +5,8 @@
 # Images before this one ran as root, so an existing installation's storage and
 # Dex directories hold files owned by root that werkyn cannot change. Started as
 # root, this script gives every file owned by root in those two directories to
-# werkyn and then continues as werkyn; nothing else runs as root. Files owned by
-# other users are left alone.
+# werkyn, if they lie under /app/storage or /app/data, and then continues as
+# werkyn; nothing else runs as root. Files owned by other users are left alone.
 #
 #   docker-entrypoint.sh                  migrate, then start the server
 #   docker-entrypoint.sh fix-permissions  as root: only hand over the files
@@ -27,11 +27,16 @@ DEX_PATH=$(data_dir "${DEX_CONFIG_DIR:-/app/data/dex}")
 fix_permissions() {
   for dir in "$STORAGE_PATH" "$DEX_PATH"; do
     [ -d "$dir" ] || continue
+    # Only the image's data roots, where the volumes are mounted, are handed
+    # over. The check uses the resolved path, so a symbolic link cannot point it
+    # elsewhere; a directory configured outside them is left to the operator.
     real=$(cd "$dir" && pwd -P)
     case "$real" in
-      / | /app)
-        echo "Not changing owners under $real: point STORAGE_DIR and DEX_CONFIG_DIR at data directories." >&2
-        exit 1
+      /app/storage | /app/storage/* | /app/data | /app/data/*) ;;
+      *)
+        echo "Not changing owners under $real: only /app/storage and /app/data are handed over." >&2
+        echo "Make it writable by uid 10001 yourself; see docs/remediation/ops-004.md." >&2
+        continue
         ;;
     esac
     # find does not follow symbolic links and chown -h changes a link itself,

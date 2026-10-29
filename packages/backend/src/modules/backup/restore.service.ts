@@ -412,7 +412,7 @@ export async function executeRestore(
           }
 
           // Custom field values (checked and de-duplicated by the plan)
-          for (const v of fieldPlan.values.get(t._originalId) ?? []) {
+          for (const v of fieldPlan.values.get(t) ?? []) {
             const fieldId = restoredFieldIds.get(v.fieldRef);
             if (!fieldId) continue;
             await tx.customFieldValue.create({

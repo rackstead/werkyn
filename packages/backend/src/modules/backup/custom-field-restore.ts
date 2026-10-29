@@ -11,6 +11,7 @@ import {
 import { ValidationError } from "../../utils/errors.js";
 
 type BackupProject = BackupFile["projects"][number];
+type BackupTask = BackupProject["tasks"][number];
 
 export interface RestoredCustomField {
   originalId: string;
@@ -23,8 +24,12 @@ export interface RestoredCustomField {
 
 export interface CustomFieldRestorePlan {
   fields: RestoredCustomField[];
-  /** Values to restore, by task `_originalId`, each already checked against its field. */
-  values: Map<string, { fieldRef: string; value: Prisma.InputJsonValue }[]>;
+  /**
+   * Values to restore for each task entry of the project (keyed by the entry
+   * itself, since a backup's task IDs are not checked for uniqueness), each
+   * already checked against its field.
+   */
+  values: Map<BackupTask, { fieldRef: string; value: Prisma.InputJsonValue }[]>;
   warnings: string[];
 }
 
@@ -76,7 +81,7 @@ export function planCustomFieldRestore(entry: BackupProject): CustomFieldRestore
     byRef.set(field._originalId, restored);
   }
 
-  const values = new Map<string, { fieldRef: string; value: Prisma.InputJsonValue }[]>();
+  const values = new Map<BackupTask, { fieldRef: string; value: Prisma.InputJsonValue }[]>();
   const skipped = new Map<string, number>();
   for (const task of entry.tasks) {
     const seen = new Set<string>();
@@ -93,7 +98,7 @@ export function planCustomFieldRestore(entry: BackupProject): CustomFieldRestore
       seen.add(item.fieldRef);
       if (checked.value !== null) kept.push({ fieldRef: item.fieldRef, value: checked.value });
     }
-    if (kept.length > 0) values.set(task._originalId, kept);
+    if (kept.length > 0) values.set(task, kept);
   }
   for (const field of fields) {
     const count = skipped.get(field.originalId);

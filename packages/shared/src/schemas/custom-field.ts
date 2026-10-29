@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isDateOnly, multilineText, singleLineText } from "./common.js";
+import { isDateOnly, isMultilineText, multilineText, singleLineText } from "./common.js";
 
 export const CustomFieldTypeEnum = z.enum([
   "TEXT",
@@ -228,6 +228,7 @@ export interface CustomFieldDefinition {
 export type CustomFieldValueIssue =
   | "required"
   | "wrong_type"
+  | "invalid_text"
   | "invalid_date"
   | "invalid_url"
   | "unknown_option"
@@ -255,7 +256,11 @@ export function checkCustomFieldValue(field: CustomFieldDefinition, value: unkno
 
   switch (field.type) {
     case "TEXT":
-      return typeof value === "string" ? { ok: true, value } : fail("wrong_type", "must be text");
+      if (typeof value !== "string") return fail("wrong_type", "must be text");
+      // The request schema already applies this; restore and the report need it too.
+      return isMultilineText(value)
+        ? { ok: true, value }
+        : fail("invalid_text", "must not contain control characters other than tab and line breaks");
     case "NUMBER":
       return typeof value === "number" && Number.isFinite(value)
         ? { ok: true, value }

@@ -22,14 +22,18 @@ const { findCustomFieldIssues } = await import("../../src/scripts/custom-field-v
 let app, admin, target, audited, clean;
 const suffix = crypto.randomUUID().slice(0, 20);
 
-function backup(customFields, customFieldValues) {
+const backupTask = (customFieldValues, title = "Restored task") => ({
+  _originalId: "task", title, priority: "NONE", position: 0, statusRef: "status", customFieldValues,
+});
+
+function backup(customFields, customFieldValues, tasks = [backupTask(customFieldValues)]) {
   return Buffer.from(JSON.stringify({
     metadata: { version: "1.1", exportedAt: new Date().toISOString(), sourceWorkspace: { name: "Source", slug: "source" }, userRefs: [] },
     projects: [{
       project: { name: "Restored fields" },
       statuses: [{ _originalId: "status", name: "Open", color: null, position: 0, isCompletion: false }],
       customFields,
-      tasks: [{ _originalId: "task", title: "Restored task", priority: "NONE", position: 0, statusRef: "status", customFieldValues }],
+      tasks,
     }],
     channels: [],
     wikiSpaces: [],
@@ -102,6 +106,27 @@ test("restore keeps valid custom fields and values, drops the rest, and preview 
   ]);
 });
 
+test("restore keeps each task's own values when task IDs repeat, and skips text PostgreSQL cannot store", async () => {
+  const file = backup([{ _originalId: "f", name: "Code", type: "TEXT", options: null, required: false, position: 0 }], null, [
+    backupTask([{ fieldRef: "f", value: "first" }], "First"),
+    backupTask([{ fieldRef: "f", value: "second" }], "Second"),
+    backupTask([{ fieldRef: "f", value: "nul\u0000byte" }], "Third"),
+  ]);
+  const warning = 'Custom field "Code" in project "Restored fields": skipped 1 value(s) that do not match the field\'s type or options, or repeat a task\'s value';
+  assert.ok((await previewRestore(app.prisma, target.id, admin.id, file)).warnings.includes(warning));
+  const summary = await executeRestore(app.prisma, target.id, admin.id, file);
+  assert.ok(summary.warnings.includes(warning));
+  const tasks = await app.prisma.task.findMany({
+    where: { project: { workspaceId: target.id }, title: { in: ["First", "Second", "Third"] } },
+    orderBy: { title: "asc" }, select: { title: true, customFieldValues: { select: { value: true } } },
+  });
+  assert.deepEqual(tasks, [
+    { title: "First", customFieldValues: [{ value: "first" }] },
+    { title: "Second", customFieldValues: [{ value: "second" }] },
+    { title: "Third", customFieldValues: [] },
+  ]);
+});
+
 test("a backup with an unknown custom-field type is rejected by preview and restore alike", async () => {
   const file = backup([{ _originalId: "f", name: "Odd", type: "COLOR", options: null, required: false, position: 0 }], []);
   for (const run of [previewRestore, executeRestore]) {
@@ -121,6 +146,7 @@ test("the custom-field report lists stored values the API now rejects, by id, wi
   const field = (name, type, options) => app.prisma.customField.create({ data: { projectId: project.id, name, type, options } });
   const f = {
     text: await field("Text", "TEXT"),
+    note: await field("Note", "TEXT"),
     textWithOptions: await field("Text with options", "TEXT", [{ value: "x" }]),
     date: await field("Date", "DATE"),
     url: await field("Url", "URL"),
@@ -140,6 +166,7 @@ test("the custom-field report lists stored values the API now rejects, by id, wi
     option: await value(task.id, f.select.id, "C"),
     validSelect: await value(other.id, f.select.id, "B"),
     repeated: await value(task.id, f.multi.id, ["x", "x"]),
+    control: await value(task.id, f.note.id, "bell\u0007"),
   };
 
   const before = await app.prisma.customFieldValue.findMany({ where: { task: { projectId: project.id } }, orderBy: { id: "asc" } });
@@ -153,6 +180,7 @@ test("the custom-field report lists stored values the API now rejects, by id, wi
   assert.deepEqual(byKey.custom_field_value_type.samples, [sample(rows.type, "delete")]);
   assert.deepEqual(byKey.custom_field_value_option.samples, [sample(rows.option, "delete")]);
   assert.deepEqual(byKey.custom_field_value_repeated.samples, [sample(rows.repeated, "dedupe")]);
+  assert.deepEqual(byKey.custom_field_value_text.samples, [sample(rows.control, "strip")]);
   assert.deepEqual(
     byKey.custom_field_options.samples.map((s) => [s.id, s.repair]).sort(),
     [[f.textWithOptions.id, "drop_options"], [f.repeated.id, "rewrite_options"], [f.empty.id, "add_options"]].sort(),

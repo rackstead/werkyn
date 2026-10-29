@@ -43,10 +43,12 @@ test("MULTI_SELECT lists keep order, drop removed options and repeats, and clear
   assert.deepEqual(migrateOptionValue("TEXT", "red", targets), { action: "keep" });
 });
 
-const backupProject = (customFields, customFieldValues) => ({
-  project: { name: "P" }, statuses: [], labels: [], members: [], attachments: [], customFields,
-  tasks: [{ _originalId: "t", title: "T", priority: "NONE", position: 0, statusRef: "s", assignees: [], labels: [],
-    subtasks: [], dependencies: [], comments: [], activityLogs: [], customFieldValues }],
+const backupTask = (customFieldValues, id = "t") => ({
+  _originalId: id, title: "T", priority: "NONE", position: 0, statusRef: "s", assignees: [], labels: [],
+  subtasks: [], dependencies: [], comments: [], activityLogs: [], customFieldValues,
+});
+const backupProject = (customFields, customFieldValues, tasks = [backupTask(customFieldValues)]) => ({
+  project: { name: "P" }, statuses: [], labels: [], members: [], attachments: [], customFields, tasks,
 });
 
 test("restore planning keeps valid values once and reports what it dropped", () => {
@@ -63,10 +65,24 @@ test("restore planning keeps valid values once and reports what it dropped", () 
     ["n", "NUMBER", undefined, true], ["m", "MULTI_SELECT", [{ value: "a" }], false],
   ]);
   // The empty value is no value; the second value for "n" repeats the task's field.
-  assert.deepEqual(plan.values.get("t"), [{ fieldRef: "m", value: ["a"] }]);
+  assert.deepEqual([...plan.values.values()], [[{ fieldRef: "m", value: ["a"] }]]);
   assert.deepEqual(plan.warnings, [
     'Custom field "Multi" in project "P": dropped 1 malformed or repeated option(s)',
     'Custom field "Num" in project "P": skipped 1 value(s) that do not match the field\'s type or options, or repeat a task\'s value',
+  ]);
+});
+
+test("restore planning keeps each task entry's values, even when task IDs repeat", () => {
+  const first = backupTask([{ fieldRef: "x", value: "first" }], "same");
+  const second = backupTask([{ fieldRef: "x", value: "second" }, { fieldRef: "y", value: "nul\u0000" }], "same");
+  const plan = planCustomFieldRestore(backupProject([
+    { _originalId: "x", name: "Text", type: "TEXT", options: null, required: false, position: 0 },
+    { _originalId: "y", name: "Other", type: "TEXT", options: null, required: false, position: 1 },
+  ], [], [first, second]));
+  assert.deepEqual(plan.values.get(first), [{ fieldRef: "x", value: "first" }]);
+  assert.deepEqual(plan.values.get(second), [{ fieldRef: "x", value: "second" }]);
+  assert.deepEqual(plan.warnings, [
+    'Custom field "Other" in project "P": skipped 1 value(s) that do not match the field\'s type or options, or repeat a task\'s value',
   ]);
 });
 
@@ -79,6 +95,7 @@ test("the report proposes delete or dedupe for stored values and an options repa
   assert.deepEqual(classifyStoredValue({ type: "URL", options: null }, "data:text/html,x"), { key: "custom_field_value_url", repair: "delete" });
   assert.deepEqual(classifyStoredValue({ type: "DATE", options: null }, "2026-13-01"), { key: "custom_field_value_date", repair: "delete" });
   assert.deepEqual(classifyStoredValue({ type: "CHECKBOX", options: null }, "yes"), { key: "custom_field_value_type", repair: "delete" });
+  assert.deepEqual(classifyStoredValue({ type: "TEXT", options: null }, "a\u0001b"), { key: "custom_field_value_text", repair: "strip" });
 
   assert.equal(classifyFieldOptions(multi), null);
   assert.equal(classifyFieldOptions({ type: "SELECT", options: options("x", "x") }), "rewrite_options");

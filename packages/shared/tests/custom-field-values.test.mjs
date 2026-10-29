@@ -40,7 +40,7 @@ test("empty values are null, blank text and the empty list", () => {
 
 test("checkCustomFieldValue accepts each type's valid values", () => {
   const cases = [
-    [field("TEXT"), "anything at all"], [field("TEXT"), "multi\nline"], [field("NUMBER"), 0], [field("NUMBER"), -1.5],
+    [field("TEXT"), "anything at all"], [field("TEXT"), "multi\nline\r\nwith\ttab"], [field("NUMBER"), 0], [field("NUMBER"), -1.5],
     [field("CHECKBOX"), false], [field("CHECKBOX"), true], [field("DATE"), "2028-02-29"], [field("URL"), "https://example.com"],
     [select, "High"], [multi, ["c", "a"]], [multi, ["b"]],
   ];
@@ -52,6 +52,8 @@ test("checkCustomFieldValue accepts each type's valid values", () => {
 test("checkCustomFieldValue names the field and the problem", () => {
   const cases = [
     [field("TEXT"), 5, "wrong_type", '"Field" must be text'],
+    [field("TEXT"), "nul\u0000here", "invalid_text", '"Field" must not contain control characters other than tab and line breaks'],
+    [field("TEXT"), "bell\u0007", "invalid_text", '"Field" must not contain control characters other than tab and line breaks'],
     [field("NUMBER"), "5", "wrong_type", '"Field" must be a finite number'],
     [field("NUMBER"), Infinity, "wrong_type", '"Field" must be a finite number'],
     [field("NUMBER"), Number.NaN, "wrong_type", '"Field" must be a finite number'],

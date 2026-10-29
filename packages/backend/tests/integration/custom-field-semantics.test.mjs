@@ -18,8 +18,12 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-custom-field-sem
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { PrismaClient } = await import("@prisma/client");
 
 let app, user, token, apiKey, workspace, project;
+// Its own connection, so the lock probe never waits for the app pool that the
+// blocked requests hold.
+let observer;
 const events = [];
 let requests = 0;
 
@@ -70,12 +74,13 @@ async function assertRejected(cases, { message } = {}) {
   assert.deepEqual(events, []);
 }
 
-/** Resolves once a query of this database waits for a lock, or once `pending` settles. */
+/** Resolves once a query of this database waits for a lock, or once `pending` settles (5 s at most). */
 async function waitForLockWait(pending) {
   let settled = false;
   pending.then(() => { settled = true; }, () => { settled = true; });
-  for (let attempt = 0; attempt < 200 && !settled; attempt++) {
-    const [{ waiting }] = await app.prisma.$queryRaw`
+  const deadline = Date.now() + 5000;
+  while (!settled && Date.now() < deadline) {
+    const [{ waiting }] = await observer.$queryRaw`
       SELECT count(*)::int AS waiting FROM pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock'`;
     if (waiting > 0) return;
@@ -84,6 +89,8 @@ async function waitForLockWait(pending) {
 }
 
 before(async () => {
+  observer = new PrismaClient({ datasourceUrl: process.env.TEST_DATABASE_URL });
+  await observer.$connect();
   app = await buildApp(); await app.ready();
   app.broadcast = (...args) => events.push(args);
   const suffix = crypto.randomUUID().slice(0, 20);
@@ -104,6 +111,7 @@ after(async () => {
       await app.prisma.user.deleteMany({ where: { id: user?.id } });
     }
   } finally {
+    await observer?.$disconnect();
     await app?.close();
     await rm(storageDir, { recursive: true, force: true });
   }

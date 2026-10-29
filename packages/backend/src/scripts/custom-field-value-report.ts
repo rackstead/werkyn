@@ -46,6 +46,10 @@ const ISSUES: Record<string, { description: string; repair: string }> = {
     description: "Value has the wrong JSON type for its field",
     repair: "repair=delete: delete the row after review; the API cannot show or edit it.",
   },
+  custom_field_value_text: {
+    description: "TEXT value contains control characters other than tab and line breaks",
+    repair: "repair=strip: rewrite the text without those characters (stripDisallowedControlCharacters in @pm/shared).",
+  },
   custom_field_value_date: {
     description: "DATE value is not a real YYYY-MM-DD calendar date between 1900 and 2999",
     repair: "repair=delete: delete the row, or rewrite it with the intended date if it can be recovered.",
@@ -67,6 +71,7 @@ const ISSUES: Record<string, { description: string; repair: string }> = {
 
 const VALUE_ISSUE_KEYS: Record<Exclude<CustomFieldValueIssue, "required">, string> = {
   wrong_type: "custom_field_value_type",
+  invalid_text: "custom_field_value_text",
   invalid_date: "custom_field_value_date",
   invalid_url: "custom_field_value_url",
   unknown_option: "custom_field_value_option",
@@ -85,7 +90,8 @@ export function classifyStoredValue(
   if (checked.ok) return null;
   if (checked.issue === "required") return null; // unreachable: the check above ignores required
   const key = VALUE_ISSUE_KEYS[checked.issue];
-  return { key, repair: checked.issue === "repeated_option" ? "dedupe" : "delete" };
+  const repair = checked.issue === "repeated_option" ? "dedupe" : checked.issue === "invalid_text" ? "strip" : "delete";
+  return { key, repair };
 }
 
 /** The proposed repair for a field's options, or null when they are valid. */

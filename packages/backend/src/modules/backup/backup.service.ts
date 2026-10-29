@@ -13,6 +13,7 @@ import {
   BackupExportBudget,
   type BackupArchiveLimits,
 } from "./backup-archive.js";
+import { BACKUP_JSON_LIMITS, type BackupJsonLimits } from "./backup-json.js";
 
 export interface BackupExportResult {
   zipBuffer: Buffer;
@@ -26,6 +27,7 @@ export async function exportBackup(
   storage: StorageProvider,
   actorId: string,
   limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS,
+  jsonLimits: BackupJsonLimits = BACKUP_JSON_LIMITS,
 ): Promise<BackupExportResult> {
   await assertBackupExportAccess(prisma, workspaceId, actorId);
   const workspace = await prisma.workspace.findUniqueOrThrow({
@@ -351,7 +353,7 @@ export async function exportBackup(
   const assetBuffers = new Map<string, Buffer>();
   const urlRewriteMap = new Map<string, string>();
   // Refuse an export that restore would refuse, before reading more files.
-  const budget = new BackupExportBudget(limits);
+  const budget = new BackupExportBudget(limits, jsonLimits);
 
   if (request.includeFiles) {
     // Collect & rewrite storage URLs in wiki content
@@ -424,8 +426,8 @@ export async function exportBackup(
     wikiSpaces: wikiSpaceEntries,
   };
 
-  const json = JSON.stringify(backupJson, null, 2);
-  budget.add("backup.json", Buffer.byteLength(json));
+  const json = Buffer.from(JSON.stringify(backupJson, null, 2));
+  budget.addBackupJson(json);
 
   // ─── Package as ZIP ───────────────────────────────────
 

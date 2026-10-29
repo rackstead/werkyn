@@ -7,6 +7,7 @@ import {
   readBackupArchive,
   type BackupArchiveContents,
 } from "./backup-archive.js";
+import { BackupJsonError } from "./backup-json.js";
 import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 
@@ -58,23 +59,29 @@ async function consumeFileBuffer(
  * Supports both legacy .json files and .zip archives.
  */
 function parseUploadedBackup(
-  request: FastifyRequest,
   buffer: Buffer,
   filename: string,
 ): BackupArchiveContents {
   if (filename.endsWith(".zip") || isZipBuffer(buffer)) {
-    try {
-      return readBackupArchive(buffer);
-    } catch (error) {
-      if (error instanceof BackupArchiveError) {
-        request.log.warn({ reason: error.reason }, "Rejected backup archive");
-      }
-      throw error;
-    }
+    return readBackupArchive(buffer);
   }
 
   // Legacy plain JSON
   return { jsonBuffer: buffer, assets: new Map() };
+}
+
+/** Log the fixed reason code of a refused upload, never its content. */
+async function logRejection<T>(request: FastifyRequest, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof BackupArchiveError) {
+      request.log.warn({ reason: error.reason }, "Rejected backup archive");
+    } else if (error instanceof BackupJsonError) {
+      request.log.warn({ reason: error.reason }, "Rejected backup file");
+    }
+    throw error;
+  }
 }
 
 /** Quick check: ZIP files start with PK\x03\x04 */
@@ -94,15 +101,10 @@ export async function previewHandler(
 ) {
   const { wid } = request.params as { wid: string };
   const { buffer, filename } = await consumeFileBuffer(request);
-  const { jsonBuffer, assets } = parseUploadedBackup(request, buffer, filename);
-
-  const summary = await previewRestore(
-    request.server.prisma,
-    wid,
-    request.user!.id,
-    jsonBuffer,
-    assets,
-  );
+  const summary = await logRejection(request, () => {
+    const { jsonBuffer, assets } = parseUploadedBackup(buffer, filename);
+    return previewRestore(request.server.prisma, wid, request.user!.id, jsonBuffer, assets);
+  });
 
   return reply.send({ data: summary });
 }
@@ -113,16 +115,17 @@ export async function restoreHandler(
 ) {
   const { wid } = request.params as { wid: string };
   const { buffer, filename } = await consumeFileBuffer(request);
-  const { jsonBuffer, assets } = parseUploadedBackup(request, buffer, filename);
-
-  const summary = await executeRestore(
-    request.server.prisma,
-    wid,
-    request.user!.id,
-    jsonBuffer,
-    assets,
-    request.server.storage,
-  );
+  const summary = await logRejection(request, () => {
+    const { jsonBuffer, assets } = parseUploadedBackup(buffer, filename);
+    return executeRestore(
+      request.server.prisma,
+      wid,
+      request.user!.id,
+      jsonBuffer,
+      assets,
+      request.server.storage,
+    );
+  });
 
   return reply.send({ data: summary });
 }

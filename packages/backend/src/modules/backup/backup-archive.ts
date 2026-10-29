@@ -1,5 +1,11 @@
 import AdmZip from "adm-zip";
 import { ValidationError } from "../../utils/errors.js";
+import {
+  BACKUP_JSON_LIMITS,
+  BackupJsonError,
+  inspectBackupJson,
+  type BackupJsonLimits,
+} from "./backup-json.js";
 
 const MiB = 1024 * 1024;
 
@@ -18,7 +24,10 @@ export const BACKUP_ARCHIVE_LIMITS = Object.freeze({
   maxNameBytes: 1024,
   /** Segments split on "/" or "\". Exported names have at most two. */
   maxPathSegments: 16,
-  /** Declared uncompressed size of one entry; V8 cannot parse a longer JSON text. */
+  /**
+   * Declared uncompressed size of one entry. `backup.json` must also fit the
+   * much smaller BACKUP_JSON_LIMITS.maxBytes, checked before it is inflated.
+   */
   maxEntryBytes: 512 * MiB,
   /** Declared uncompressed size of all entries; a restore holds them in memory. */
   maxTotalBytes: 1024 * MiB,
@@ -283,15 +292,30 @@ export const EXPORT_TOO_LARGE_MESSAGE =
   "This export would exceed the backup restore limits. Select fewer projects, channels or wiki spaces, or leave out files.";
 
 /**
- * Counts an export's entries as `inspectBackupArchive` will, so export stops
- * as soon as the archive could no longer be restored.
+ * Counts an export's entries as `inspectBackupArchive` will, and measures its
+ * `backup.json` as restore will, so export stops as soon as the archive could
+ * no longer be restored.
  */
 export class BackupExportBudget {
   private readonly sizes = new Map<string, number>();
   private readonly nodes = new Set<string>();
   private totalBytes = 0;
 
-  constructor(private readonly limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS) {}
+  constructor(
+    private readonly limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS,
+    private readonly jsonLimits: BackupJsonLimits = BACKUP_JSON_LIMITS,
+  ) {}
+
+  /** Add `backup.json`; throws a 400 if restore would refuse to parse it. */
+  addBackupJson(json: Buffer) {
+    this.add("backup.json", json.length);
+    try {
+      inspectBackupJson(json, this.jsonLimits);
+    } catch (error) {
+      if (error instanceof BackupJsonError) throw new ValidationError(EXPORT_TOO_LARGE_MESSAGE);
+      throw error;
+    }
+  }
 
   /** Add or replace the entry `name`; throws a 400 once over the budget. */
   add(name: string, size: number) {
@@ -331,6 +355,7 @@ export interface BackupArchiveContents {
 export function readBackupArchive(
   buffer: Buffer,
   limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS,
+  maxJsonBytes: number = BACKUP_JSON_LIMITS.maxBytes,
 ): BackupArchiveContents {
   const inspected = inspectBackupArchive(buffer, limits);
   try {
@@ -365,6 +390,7 @@ export function readBackupArchive(
     if (jsonIndex < 0) {
       throw new ValidationError("Invalid backup ZIP: missing backup.json");
     }
+    if (inspected[jsonIndex].size > maxJsonBytes) throw tooLarge("json-size");
     const jsonBuffer = read(jsonIndex);
     const assets = new Map<string, Buffer>();
     inspected.forEach((entry, index) => {

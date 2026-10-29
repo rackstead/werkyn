@@ -7,6 +7,7 @@ import {
 import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
+import { settleWithConcurrency } from "@/lib/settle-with-concurrency";
 
 export interface DriveFile {
   id: string;
@@ -331,23 +332,30 @@ export function useCopyFile(wid: string) {
   });
 }
 
+interface MoveTarget {
+  parentId: string | null;
+  teamFolderId?: string | null;
+}
+
+function moveFileRequest(wid: string, fileId: string, { parentId, teamFolderId }: MoveTarget) {
+  return api
+    .patch(`workspaces/${wid}/files/${fileId}`, {
+      json: { parentId, ...(teamFolderId !== undefined ? { teamFolderId } : {}) },
+    })
+    .json<{ data: DriveFile }>();
+}
+
+function trashFileRequest(wid: string, fileId: string, trashedAt = new Date().toISOString()) {
+  return api
+    .patch(`workspaces/${wid}/files/${fileId}`, { json: { trashedAt } })
+    .json<{ data: DriveFile }>();
+}
+
 export function useMoveFile(wid: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({
-      fileId,
-      parentId,
-      teamFolderId,
-    }: {
-      fileId: string;
-      parentId: string | null;
-      teamFolderId?: string | null;
-    }) =>
-      api
-        .patch(`workspaces/${wid}/files/${fileId}`, {
-          json: { parentId, ...(teamFolderId !== undefined ? { teamFolderId } : {}) },
-        })
-        .json<{ data: DriveFile }>(),
+    mutationFn: ({ fileId, ...target }: { fileId: string } & MoveTarget) =>
+      moveFileRequest(wid, fileId, target),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["files"] });
     },
@@ -357,13 +365,60 @@ export function useMoveFile(wid: string) {
 export function useTrashFile(wid: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (fileId: string) =>
-      api
-        .patch(`workspaces/${wid}/files/${fileId}`, {
-          json: { trashedAt: new Date().toISOString() },
-        })
-        .json<{ data: DriveFile }>(),
+    mutationFn: (fileId: string) => trashFileRequest(wid, fileId),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["files"] });
+    },
+  });
+}
+
+/** File requests a bulk action keeps in flight at once. */
+export const BULK_FILE_CONCURRENCY = 4;
+
+/** Which files of a bulk action were changed and which failed, in selection order. */
+export interface BulkFileResult {
+  succeeded: string[];
+  failed: Array<{ fileId: string; error: unknown }>;
+}
+
+async function runBulkFileAction(
+  fileIds: readonly string[],
+  request: (fileId: string) => Promise<unknown>,
+): Promise<BulkFileResult> {
+  const results = await settleWithConcurrency(fileIds, BULK_FILE_CONCURRENCY, request);
+  const outcome: BulkFileResult = { succeeded: [], failed: [] };
+  results.forEach((result, i) => {
+    if (result.status === "fulfilled") outcome.succeeded.push(fileIds[i]);
+    else outcome.failed.push({ fileId: fileIds[i], error: result.reason });
+  });
+  return outcome;
+}
+
+/**
+ * Trashes many files as one mutation. Each file is its own request, so one
+ * failure never hides the others: the result says which files were trashed
+ * and which failed, and the file lists refresh once for the whole batch.
+ */
+export function useBulkTrashFiles(wid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (fileIds: readonly string[]) => {
+      const trashedAt = new Date().toISOString();
+      return runBulkFileAction(fileIds, (fileId) => trashFileRequest(wid, fileId, trashedAt));
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["files"] });
+    },
+  });
+}
+
+/** Moves many files to one target as one mutation; see useBulkTrashFiles. */
+export function useBulkMoveFiles(wid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ fileIds, ...target }: { fileIds: readonly string[] } & MoveTarget) =>
+      runBulkFileAction(fileIds, (fileId) => moveFileRequest(wid, fileId, target)),
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: ["files"] });
     },
   });

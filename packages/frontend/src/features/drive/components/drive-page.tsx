@@ -43,7 +43,6 @@ import { TeamFoldersSection } from "./team-folders-section";
 import { StarredSection } from "./starred-section";
 import { RecentFilesSection } from "./recent-files-section";
 import { ShareFileDialog } from "./share-file-dialog";
-import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { SearchInput } from "@/components/shared/search-input";
 import { Button } from "@/components/ui/button";
 import {
@@ -147,7 +146,6 @@ export function DrivePage({
   const [previewFile, setPreviewFile] = useState<DriveFile | null>(null);
   const [activeDrag, setActiveDrag] = useState<DriveFile | null>(null);
   const [showTrashConfirm, setShowTrashConfirm] = useState(false);
-  const [isTrashingBatch, setIsTrashingBatch] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selection = useFileSelection();
 
@@ -240,6 +238,11 @@ export function DrivePage({
     [addRecent],
   );
 
+  // The trash confirmation belongs to a selection; it never outlives it.
+  useEffect(() => {
+    if (selection.count === 0) setShowTrashConfirm(false);
+  }, [selection.count]);
+
   // Clear search and selection when folder/teamFolder changes
   useEffect(() => {
     setSearchQuery("");
@@ -326,31 +329,6 @@ export function DrivePage({
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [previewFile, selection, fileIds, canEdit]);
-
-  const handleKeyboardTrash = useCallback(async () => {
-    const selected = Array.from(selection.selectedIds);
-    setIsTrashingBatch(true);
-    const results = await Promise.allSettled(
-      selected.map(
-        (fid) =>
-          new Promise<void>((resolve, reject) => {
-            trashFile.mutate(fid, {
-              onSuccess: () => resolve(),
-              onError: (err) => reject(err),
-            });
-          }),
-      ),
-    );
-    setIsTrashingBatch(false);
-    setShowTrashConfirm(false);
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed === 0) {
-      toast.success(`Moved ${selected.length} file${selected.length !== 1 ? "s" : ""} to trash`);
-    } else {
-      toast.error(`${failed} file${failed !== 1 ? "s" : ""} failed to trash`);
-    }
-    selection.clear();
-  }, [selection, trashFile]);
 
   const dragOverlayIcon = activeDrag
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)
@@ -622,8 +600,8 @@ export function DrivePage({
         onClose={() => {
           setMoveFileDialog(null);
           setMoveFileIds([]);
-          if (moveFileIds.length > 0) selection.clear();
         }}
+        onMoved={selection.deselect}
         workspaceId={workspaceId}
       />
 
@@ -649,18 +627,6 @@ export function DrivePage({
         onDismiss={clearUploads}
       />
 
-      {/* Keyboard-triggered trash confirm */}
-      <ConfirmDialog
-        open={showTrashConfirm}
-        onClose={() => setShowTrashConfirm(false)}
-        onConfirm={handleKeyboardTrash}
-        title={`Move ${selection.count} item${selection.count !== 1 ? "s" : ""} to trash?`}
-        description="Items in trash can be restored later."
-        confirmLabel="Trash"
-        variant="destructive"
-        loading={isTrashingBatch}
-      />
-
       {/* Bulk Actions */}
       {selection.count > 0 && (
         <DriveBulkActions
@@ -668,6 +634,9 @@ export function DrivePage({
           selectedFiles={selectedFiles}
           onClear={selection.clear}
           onMoveSelected={handleMoveSelected}
+          trashConfirmOpen={showTrashConfirm}
+          onTrashConfirmOpenChange={setShowTrashConfirm}
+          onTrashed={selection.deselect}
           onShareSelected={() => {
             const ids = Array.from(selection.selectedIds);
             setShareTarget({

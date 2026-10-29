@@ -7,15 +7,25 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { useFiles, useTeamFolders, useMoveFile, useCopyFile, type DriveFile } from "../api";
+import {
+  useFiles,
+  useTeamFolders,
+  useMoveFile,
+  useCopyFile,
+  useBulkMoveFiles,
+  type DriveFile,
+} from "../api";
 import { Folder, ChevronRight, Loader2, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { toastBulkFileResult } from "./bulk-result-toast";
 
 interface MoveDialogProps {
   file: DriveFile | null;
   fileIds?: string[];
   onClose: () => void;
+  /** Called once a batch move settles, with the files that were moved. */
+  onMoved?: (fileIds: string[]) => void;
   workspaceId: string;
   mode?: "move" | "copy";
 }
@@ -25,14 +35,22 @@ interface SelectedTarget {
   teamFolderId?: string | null;
 }
 
-export function MoveDialog({ file, fileIds, onClose, workspaceId, mode = "move" }: MoveDialogProps) {
+export function MoveDialog({
+  file,
+  fileIds,
+  onClose,
+  onMoved,
+  workspaceId,
+  mode = "move",
+}: MoveDialogProps) {
   const [selected, setSelected] = useState<SelectedTarget>({ folderId: null });
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(),
   );
-  const [isProcessingBatch, setIsProcessingBatch] = useState(false);
   const moveFile = useMoveFile(workspaceId);
   const copyFile = useCopyFile(workspaceId);
+  const bulkMove = useBulkMoveFiles(workspaceId);
+  const isProcessingBatch = bulkMove.isPending;
   const { data: teamFoldersData } = useTeamFolders(workspaceId);
   const teamFolders = teamFoldersData?.data ?? [];
 
@@ -67,31 +85,18 @@ export function MoveDialog({ file, fileIds, onClose, workspaceId, mode = "move" 
 
   const handleAction = async () => {
     if (isBatch && fileIds) {
-      setIsProcessingBatch(true);
-      const results = await Promise.allSettled(
-        fileIds.map(
-          (fid) =>
-            new Promise<void>((resolve, reject) => {
-              moveFile.mutate(
-                {
-                  fileId: fid,
-                  parentId: selected.folderId,
-                  teamFolderId: selected.teamFolderId,
-                },
-                {
-                  onSuccess: () => resolve(),
-                  onError: (err) => reject(err),
-                },
-              );
-            }),
-        ),
-      );
-      setIsProcessingBatch(false);
-      const failed = results.filter((r) => r.status === "rejected").length;
-      if (failed === 0) {
-        toast.success(`Moved ${fileIds.length} file${fileIds.length !== 1 ? "s" : ""}`);
-      } else {
-        toast.error(`${failed} file${failed !== 1 ? "s" : ""} failed to move`);
+      if (bulkMove.isPending) return;
+      try {
+        const result = await bulkMove.mutateAsync({
+          fileIds,
+          parentId: selected.folderId,
+          teamFolderId: selected.teamFolderId,
+        });
+        toastBulkFileResult(result, "move");
+        // Moved files leave the selection; failed ones stay selected to retry.
+        onMoved?.(result.succeeded);
+      } catch {
+        // Not a per-file failure; the client-wide mutation handler reported it.
       }
       onClose();
       return;
@@ -126,7 +131,13 @@ export function MoveDialog({ file, fileIds, onClose, workspaceId, mode = "move" 
     : `${actionVerb} "${file?.name}"`;
 
   return (
-    <Dialog open={isOpen} onOpenChange={(v) => !v && onClose()}>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(v) => {
+        // A batch move under way stays on screen until it settles.
+        if (!v && !isProcessingBatch) onClose();
+      }}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
@@ -185,7 +196,7 @@ export function MoveDialog({ file, fileIds, onClose, workspaceId, mode = "move" 
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
+          <Button variant="outline" onClick={onClose} disabled={isProcessingBatch}>
             Cancel
           </Button>
           <Button onClick={handleAction} disabled={mutation.isPending || isProcessingBatch}>

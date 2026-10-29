@@ -2,6 +2,8 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 import { WebSocketClient } from "@/lib/websocket-client";
 import { useAuthStore } from "@/stores/auth-store";
 import { queryClient } from "@/lib/query-client";
+import { apiWebSocketUrl } from "@/lib/api-url";
+import { onIdentityChange } from "@/lib/identity";
 
 const RealtimeContext = createContext<WebSocketClient | null>(null);
 
@@ -11,20 +13,6 @@ export function useRealtimeClient(): WebSocketClient | null {
 
 interface RealtimeProviderProps {
   children: ReactNode;
-}
-
-function getWsUrl(): string {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const host = window.location.host;
-  const basePath = import.meta.env.VITE_API_BASE_URL || "/api";
-
-  // If basePath is a full URL, extract host
-  if (basePath.startsWith("http")) {
-    const url = new URL(basePath);
-    return `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}${url.pathname}/ws`;
-  }
-
-  return `${protocol}//${host}${basePath}/ws`;
 }
 
 export function RealtimeProvider({ children }: RealtimeProviderProps) {
@@ -41,7 +29,7 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
     }
 
     const wsClient = new WebSocketClient({
-      url: getWsUrl(),
+      url: apiWebSocketUrl(),
       getToken: () => useAuthStore.getState().accessToken,
       onReconnect: () => {
         // Invalidate all queries to catch missed events
@@ -51,8 +39,13 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
 
     setClient(wsClient);
     wsClient.connect();
+    // The socket is authenticated as the identity that opened it. Close it as
+    // soon as the identity changes, before React unmounts this provider, so
+    // no further event for the previous account reaches the caches.
+    const stopOnIdentityChange = onIdentityChange(() => wsClient.disconnect());
 
     return () => {
+      stopOnIdentityChange();
       wsClient.disconnect();
       setClient(null);
     };

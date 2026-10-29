@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
+import { apiBase } from "@/lib/api-url";
 
 export interface Attachment {
   id: string;
@@ -87,7 +88,7 @@ export function useDownloadAttachment(wid: string) {
   return useMutation({
     mutationFn: async ({ attachmentId, fileName }: { attachmentId: string; fileName: string }) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/attachments/${attachmentId}/download`,

@@ -41,13 +41,13 @@ export function useUpdateProfile() {
       return res.data;
     },
     onSuccess: (updatedUser) => {
-      queryClient.setQueryData(queryKeys.me, updatedUser);
+      // The profile of the account that is signed in now, and no other.
       const current = useAuthStore.getState().user;
-      if (current) {
-        useAuthStore.setState({
-          user: { ...current, ...updatedUser },
-        });
-      }
+      if (current?.id !== updatedUser.id) return;
+      queryClient.setQueryData(queryKeys.me, updatedUser);
+      useAuthStore.setState({
+        user: { ...current, ...updatedUser },
+      });
     },
   });
 }

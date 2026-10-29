@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { api } from "@/lib/api-client";
-import { useAuthStore } from "@/stores/auth-store";
+import { useAuthStore, whenLoggedOut } from "@/stores/auth-store";
 import { router } from "@/lib/router";
 import { toast } from "sonner";
 import { queryKeys } from "@/lib/query-keys";
@@ -43,8 +43,11 @@ interface AuthResponse {
 export function useLogin(inviteToken?: string) {
   const navigate = useNavigate();
   return useMutation({
-    mutationFn: (data: { email: string; password: string }) =>
-      api.post("auth/login", { json: data }).json<AuthResponse>(),
+    mutationFn: async (data: { email: string; password: string }) => {
+      // A sign-out still revoking its session must not clear this one's cookie.
+      await whenLoggedOut();
+      return api.post("auth/login", { json: data }).json<AuthResponse>();
+    },
     onSuccess: async (res) => {
       const { user, accessToken, workspaces } = res.data;
       useAuthStore.getState().setAuth(user, accessToken, workspaces);
@@ -61,16 +64,18 @@ export function useLogin(inviteToken?: string) {
 export function useRegister(inviteToken?: string) {
   const navigate = useNavigate();
   return useMutation({
-    mutationFn: (data: {
+    mutationFn: async (data: {
       displayName: string;
       email: string;
       password: string;
-    }) =>
-      api
+    }) => {
+      await whenLoggedOut();
+      return api
         .post("auth/register", {
           json: { ...data, inviteToken },
         })
-        .json<AuthResponse>(),
+        .json<AuthResponse>();
+    },
     onSuccess: async (res) => {
       const { user, accessToken, workspaces, admission } = res.data;
       useAuthStore.getState().setAuth(user, accessToken, workspaces);

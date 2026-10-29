@@ -13,6 +13,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Download, Lock, Share2 } from "lucide-react";
+import { apiBase } from "@/lib/api-url";
 
 export const Route = createFileRoute("/share/files/$token")({
   component: ShareFilesPage,
@@ -109,7 +110,7 @@ function ShareFilesPage() {
 
   // Render shared files
   const { files, createdBy } = publicShare;
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+  const baseUrl = apiBase();
 
   return (
     <div className="min-h-screen bg-background">

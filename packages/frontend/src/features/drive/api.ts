@@ -11,6 +11,7 @@ import { useObjectUrl } from "@/lib/use-object-url";
 import { queryKeys } from "@/lib/query-keys";
 import { settleWithConcurrency } from "@/lib/settle-with-concurrency";
 import { useAuthStore } from "@/stores/auth-store";
+import { apiBase } from "@/lib/api-url";
 
 export interface DriveFile {
   id: string;
@@ -216,7 +217,7 @@ export function uploadSingleFile(
 
   const promise = new Promise<DriveFile>((resolve, reject) => {
     const token = useAuthStore.getState().accessToken;
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+    const baseUrl = apiBase();
 
     const formData = new FormData();
     if (parentId) formData.append("parentId", parentId);
@@ -479,7 +480,7 @@ export function useThumbnailUrl(wid: string, fileId: string | null, hasThumbnail
     queryKey: ["file-thumbnail", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/thumbnail`,
@@ -511,7 +512,7 @@ export function useFilePreviewUrl(wid: string, fileId: string | null, mimeType?:
     queryKey: ["file-preview", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download?inline=true`,
@@ -555,7 +556,7 @@ export function useFileTextContent(wid: string, fileId: string | null) {
     queryKey: ["file-text", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download?inline=true`,
@@ -580,7 +581,7 @@ export function useDownloadFile(wid: string) {
   return useMutation({
     mutationFn: async ({ fileId, fileName }: { fileId: string; fileName: string }) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download`,
@@ -614,7 +615,7 @@ export function useArchiveFiles(wid: string) {
   return useMutation({
     mutationFn: async ({ fileIds, archiveName }: { fileIds: string[]; archiveName: string }) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/archive`,

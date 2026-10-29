@@ -1,4 +1,6 @@
 import { create } from "zustand";
+import { apiUrl } from "@/lib/api-url";
+import { changeIdentity, identityGeneration } from "@/lib/identity";
 
 interface User {
   id: string;
@@ -23,6 +25,12 @@ export interface WorkspaceMembership {
   };
 }
 
+interface Session {
+  user: User;
+  accessToken: string;
+  workspaces: WorkspaceMembership[];
+}
+
 interface AuthState {
   user: User | null;
   accessToken: string | null;
@@ -40,16 +48,92 @@ interface AuthState {
     userId: string,
     workspaces: WorkspaceMembership[],
   ) => boolean;
+  /**
+   * Signs out at once, here and in this browser's other tabs, then revokes the
+   * session on the server. The returned promise settles when revocation has
+   * finished or given up (bounded); it never rejects.
+   */
   logout: () => Promise<void>;
+  /**
+   * Signs out after a refresh started in `generation` failed, unless the
+   * identity has changed since. Nothing is sent to the server: the session
+   * cookie no longer works.
+   */
+  expireSession: (generation: number) => void;
   refresh: () => Promise<boolean>;
   hydrate: () => Promise<void>;
 }
+
+// ─── Cross-tab ordering ──────────────────────────────────
+//
+// Tabs share one refresh cookie and announce identity changes over a
+// BroadcastChannel. Each announcement carries the epoch of the identity change
+// it reflects; a tab ignores announcements older than the newest change it
+// knows of. Without this, a refresh that another tab completed just before
+// this tab signed out could sign this tab back in.
+//
+// An epoch is a time plus the id of the tab that made the change (to order
+// changes made in the same millisecond). A change is dated by the evidence it
+// rests on: sign-in and sign-out by the user's action, a refresh that reports
+// a different account by when its request was sent, so that it cannot
+// outrank a sign-out that happened while it was in flight.
+
+interface Epoch {
+  at: number;
+  tab: string;
+}
+
+const tabId = Math.random().toString(36).slice(2);
+let knownEpoch: Epoch = { at: 0, tab: "" };
+
+function compareEpochs(a: Epoch, b: Epoch) {
+  if (a.at !== b.at) return a.at - b.at;
+  return a.tab < b.tab ? -1 : a.tab > b.tab ? 1 : 0;
+}
+
+/** Starts a newer epoch, dated `at` unless that would not be newer. */
+function advanceEpoch(at: number): Epoch {
+  knownEpoch = { at: Math.max(at, knownEpoch.at + 1), tab: tabId };
+  return knownEpoch;
+}
+
+function isEpoch(value: unknown): value is Epoch {
+  const epoch = value as Epoch | null | undefined;
+  return typeof epoch?.at === "number" && typeof epoch.tab === "string";
+}
+
+/**
+ * Accepts an announcement's epoch unless it is older than one already known.
+ * Messages from tabs still running an earlier build carry no epoch; they are
+ * taken as current, which is how every message was treated before.
+ */
+function acceptEpoch(value: unknown): boolean {
+  if (!isEpoch(value)) return true;
+  if (compareEpochs(value, knownEpoch) < 0) return false;
+  knownEpoch = value;
+  return true;
+}
+
+type AuthMessage =
+  | { type: "logout"; epoch: Epoch }
+  | { type: "refresh"; epoch: Epoch; data: Session }
+  | {
+      type: "workspaces";
+      epoch: Epoch;
+      data: { userId: string; workspaces: WorkspaceMembership[] };
+    };
 
 // BroadcastChannel for cross-tab sync
 const channel =
   typeof BroadcastChannel !== "undefined"
     ? new BroadcastChannel("pm-auth")
     : null;
+
+function announce(message: AuthMessage) {
+  channel?.postMessage(message);
+}
+
+// ─── Refresh ──────────────────────────────────────────────
 
 let lastRefreshTime = 0;
 
@@ -68,6 +152,8 @@ const SUPERSEDED_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 6000];
 const SUPERSEDED_BUDGET_MS = 15_000;
 let supersededSince: number | null = null;
 const broadcastWaiters = new Set<() => void>();
+// The identity generation the pending `_refreshPromise` was started in.
+let refreshGeneration = -1;
 
 function supersededTooLong() {
   return (
@@ -76,12 +162,28 @@ function supersededTooLong() {
   );
 }
 
-async function requestRefresh() {
+/** What a refresh started at `start` may still change. */
+interface RefreshStart {
+  generation: number;
+  epoch: Epoch;
+}
+
+/** The identity or the cross-tab epoch changed after `start`. */
+function isStale(start: RefreshStart) {
+  return (
+    identityGeneration() !== start.generation ||
+    compareEpochs(knownEpoch, start.epoch) !== 0
+  );
+}
+
+async function requestRefresh(start: RefreshStart) {
   const sentAt = Date.now();
-  const res = await fetch("/api/auth/refresh", {
+  const res = await fetch(apiUrl("auth/refresh"), {
     method: "POST",
     credentials: "include",
   });
+  // A stale answer says nothing about the cookie of the current session.
+  if (isStale(start)) return res;
   // A 409 for a cookie sent before a newer refresh landed says nothing about
   // the cookie the browser holds now; a busy 503 leaves the cookie unchanged.
   if (res.status === 409) {
@@ -106,25 +208,114 @@ function waitForBroadcast(ms: number) {
   });
 }
 
+function wakeRefreshWaiters() {
+  for (const wake of [...broadcastWaiters]) wake();
+}
+
+// ─── Logout ───────────────────────────────────────────────
+
+// Server-side revocation runs after local state is already cleared. It is
+// bounded so that a hung network cannot keep it, or a sign-in waiting for it,
+// pending indefinitely.
+const LOGOUT_TIMEOUT_MS = 10_000;
+let pendingLogout: Promise<void> | null = null;
+
+/**
+ * Settles once a sign-out's server revocation has finished or given up. A new
+ * sign-in waits for it, so the sign-out's cookie removal cannot arrive after,
+ * and remove, the new session's cookie.
+ */
+export function whenLoggedOut(): Promise<void> {
+  return pendingLogout ?? Promise.resolve();
+}
+
+async function revokeSession(accessToken: string | null, userId: string) {
+  const controller = new AbortController();
+  const signOut = (token: string | null) =>
+    fetch(apiUrl("auth/logout"), {
+      method: "POST",
+      credentials: "include",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
+    });
+  const revoke = async () => {
+    const res = await signOut(accessToken);
+    if (res.status !== 401) return;
+    // The server only accepts a sign-out with a current access token. When
+    // ours has expired, exchange the cookie for one, without signing this
+    // tab back in, and sign out with that, unless the cookie now belongs to
+    // another account (signed in from another tab meanwhile).
+    const refreshed = await fetch(apiUrl("auth/refresh"), {
+      method: "POST",
+      credentials: "include",
+      signal: controller.signal,
+    });
+    if (!refreshed.ok) return;
+    const body = (await refreshed.json()) as {
+      data?: { user?: { id?: string }; accessToken?: string };
+    };
+    if (body.data?.user?.id !== userId || !body.data.accessToken) return;
+    await signOut(body.data.accessToken);
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Settles at the deadline even if a request ignores its abort signal.
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve();
+    }, LOGOUT_TIMEOUT_MS);
+  });
+  try {
+    await Promise.race([revoke(), deadline]);
+  } catch {
+    // Local state is already cleared; the network may be unavailable.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ─── Store ────────────────────────────────────────────────
+
 export const useAuthStore = create<AuthState>((set, get) => {
+  /** Applies a session; an account change resets everything held for the previous one. */
+  function applySession(session: Session, epoch: Epoch) {
+    supersededSince = null;
+    set({
+      user: session.user,
+      accessToken: session.accessToken,
+      workspaces: session.workspaces,
+    });
+    announce({ type: "refresh", epoch, data: session });
+  }
+
+  /** Clears the session here and tells other tabs at `epoch` or older. */
+  function endSession(epoch: Epoch) {
+    lastRefreshTime = 0;
+    supersededSince = null;
+    set({ user: null, accessToken: null, workspaces: [] });
+    announce({ type: "logout", epoch });
+  }
+
   // Listen for cross-tab messages
-  channel?.addEventListener("message", (event) => {
-    const { type, data } = event.data;
-    if (type === "logout") {
+  channel?.addEventListener("message", (event: MessageEvent) => {
+    const message = event.data as Partial<AuthMessage> | null;
+    if (!message || !acceptEpoch(message.epoch)) return;
+    if (message.type === "logout") {
+      lastRefreshTime = 0;
+      supersededSince = null;
       set({ user: null, accessToken: null, workspaces: [], isHydrated: true });
-    } else if (type === "refresh") {
+      wakeRefreshWaiters();
+    } else if (message.type === "refresh" && message.data) {
+      const { user, accessToken, workspaces } = message.data;
       lastRefreshTime = Date.now();
       supersededSince = null;
-      set({
-        user: data.user,
-        accessToken: data.accessToken,
-        workspaces: data.workspaces,
-      });
-      for (const wake of [...broadcastWaiters]) wake();
-    } else if (type === "workspaces") {
+      set({ user, accessToken, workspaces });
+      wakeRefreshWaiters();
+    } else if (message.type === "workspaces" && message.data) {
+      const { userId, workspaces } = message.data;
       // Memberships of one account; ignored by tabs signed in as another.
       set((state) =>
-        state.user?.id === data.userId ? { workspaces: data.workspaces } : state,
+        state.user?.id === userId ? { workspaces } : state,
       );
     }
   });
@@ -137,12 +328,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
     _refreshPromise: null,
 
     setAuth: (user, accessToken, workspaces) => {
-      supersededSince = null;
-      set({ user, accessToken, workspaces });
-      channel?.postMessage({
-        type: "refresh",
-        data: { user, accessToken, workspaces },
-      });
+      // A sign-in is newer than anything announced before it.
+      applySession({ user, accessToken, workspaces }, advanceEpoch(Date.now()));
     },
 
     setWorkspaces: (workspaces) => {
@@ -159,24 +346,33 @@ export const useAuthStore = create<AuthState>((set, get) => {
         return { workspaces };
       });
       if (applied)
-        channel?.postMessage({ type: "workspaces", data: { userId, workspaces } });
+        announce({
+          type: "workspaces",
+          epoch: knownEpoch,
+          data: { userId, workspaces },
+        });
       return applied;
     },
 
-    logout: async () => {
-      try {
-        await fetch("/api/auth/logout", {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            Authorization: `Bearer ${get().accessToken}`,
-          },
-        });
-      } catch {
-        // Ignore errors during logout
-      }
-      set({ user: null, accessToken: null, workspaces: [] });
-      channel?.postMessage({ type: "logout" });
+    logout: () => {
+      const { user, accessToken } = get();
+      endSession(advanceEpoch(Date.now()));
+      if (!user) return whenLoggedOut();
+      const revoking = revokeSession(accessToken, user.id);
+      pendingLogout = revoking;
+      void revoking.then(() => {
+        if (pendingLogout === revoking) pendingLogout = null;
+      });
+      return revoking;
+    },
+
+    expireSession: (generation) => {
+      if (identityGeneration() !== generation) return;
+      const { user, accessToken } = get();
+      if (!user && !accessToken) return;
+      // Only just newer than the session that failed: tabs that have already
+      // moved on to a later sign-in ignore it.
+      endSession(advanceEpoch(0));
     },
 
     refresh: async () => {
@@ -185,46 +381,62 @@ export const useAuthStore = create<AuthState>((set, get) => {
         return !!get().accessToken;
       }
 
-      // Mutex: reuse existing refresh promise
+      const start: RefreshStart = {
+        generation: identityGeneration(),
+        epoch: knownEpoch,
+      };
+      // Mutex: reuse the refresh already running for this identity.
       const existing = get()._refreshPromise;
-      if (existing) return existing;
+      if (existing && refreshGeneration === start.generation) return existing;
       // Checked before the mutex promise exists: a synchronous result inside
       // it would leave a settled promise behind as the "pending" refresh.
       if (supersededTooLong()) return false;
 
-      const promise = (async () => {
+      // A refresh overtaken by an identity change reports success only if this
+      // tab is still the same identity and has a token (adopted from another
+      // tab's newer announcement); its own result is never applied.
+      const overtaken = () =>
+        identityGeneration() === start.generation && !!get().accessToken;
+
+      const run = async () => {
         try {
           const startedAt = Date.now();
-          let res = await requestRefresh();
+          let res = await requestRefresh(start);
           for (const delay of SUPERSEDED_RETRY_DELAYS_MS) {
+            if (isStale(start)) return overtaken();
             if (!retryable(res)) break;
             await waitForBroadcast(delay);
+            if (isStale(start)) return overtaken();
             if (lastRefreshTime > startedAt && get().accessToken) {
               supersededSince = null;
               return true;
             }
             if (supersededTooLong()) return false;
-            res = await requestRefresh();
+            res = await requestRefresh(start);
           }
 
+          if (isStale(start)) return overtaken();
           if (!res.ok) return false;
 
           const body = await res.json();
-          const { user, accessToken, workspaces } = body.data;
+          if (isStale(start)) return overtaken();
+          const session = body.data as Session;
           lastRefreshTime = Date.now();
-          set({ user, accessToken, workspaces });
-          channel?.postMessage({
-            type: "refresh",
-            data: { user, accessToken, workspaces },
-          });
+          const epoch =
+            get().user?.id === session.user.id
+              ? knownEpoch
+              : advanceEpoch(startedAt);
+          applySession(session, epoch);
           return true;
         } catch {
           return false;
-        } finally {
-          set({ _refreshPromise: null });
         }
-      })();
+      };
+      const promise: Promise<boolean> = run().finally(() => {
+        if (get()._refreshPromise === promise) set({ _refreshPromise: null });
+      });
 
+      refreshGeneration = start.generation;
       set({ _refreshPromise: promise });
       return promise;
     },
@@ -245,4 +457,15 @@ export const useAuthStore = create<AuthState>((set, get) => {
       set({ isHydrated: true });
     },
   };
+});
+
+// Every change of the signed-in account, from any source, goes through the
+// identity transition. The refresh state above belongs to the previous one.
+useAuthStore.subscribe((state, previous) => {
+  const userId = state.user?.id ?? null;
+  const previousUserId = previous.user?.id ?? null;
+  if (userId === previousUserId) return;
+  supersededSince = null;
+  changeIdentity(previousUserId, userId);
+  wakeRefreshWaiters();
 });

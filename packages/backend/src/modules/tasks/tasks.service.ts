@@ -25,6 +25,7 @@ import {
   assertProjectLabels,
   assertProjectStatus,
   assertUniqueIds,
+  lockProjectStatuses,
   projectAssigneeIds,
   projectLabelIds,
 } from "../../utils/task-references.js";
@@ -317,13 +318,9 @@ export async function updateTask(
 
     // Handle status change
     if (data.statusId && data.statusId !== existing.statusId) {
-      // Validate the status belongs to the same project
-      const newStatus = await tx.statusColumn.findFirst({
-        where: { id: data.statusId, projectId: existing.projectId },
-      });
-      if (!newStatus) {
-        throw new ValidationError("Status column not found in this project");
-      }
+      // Validate and lock the new column (after the project row) before any
+      // write, as the other task writers do (task-references.ts).
+      await assertProjectStatus(tx, existing.projectId, data.statusId);
 
       // Get max position in new column
       const maxPos = await tx.task.aggregate({
@@ -447,6 +444,26 @@ export async function moveTask(
   // We normalize all affected columns inside a transaction so positions
   // stay contiguous (0, 1, 2, …) and match the frontend's expectations.
   return prisma.$transaction(async (tx) => {
+    // Lock the project row and both columns before renumbering any task. A
+    // column delete locks its column first and then that column's tasks, so it
+    // now waits for the move (and then moves the task with the others) or
+    // commits first and the move is refused, instead of deadlocking with it.
+    const columns = await lockProjectStatuses(tx, task.projectId, [task.statusId, data.statusId]);
+    if (!columns.has(data.statusId)) {
+      throw new ValidationError("Status column not found in this project");
+    }
+    // The source column was read before the transaction. If the task has left
+    // it since (a delete of that column moved it), renumbering it would be
+    // wrong; the client should retry with the current board. A column cannot
+    // be deleted while a task still uses it, so an unchanged statusId means
+    // the source column (now locked, unless it is a legacy column of another
+    // project) still holds the task.
+    const current = await tx.task.findUnique({ where: { id: taskId }, select: { statusId: true } });
+    if (!current) throw new NotFoundError("Task not found");
+    if (current.statusId !== task.statusId) {
+      throw new ConflictError("The task was moved at the same time; try again");
+    }
+
     const isSameColumn = task.statusId === data.statusId;
 
     if (isSameColumn) {
@@ -595,33 +612,38 @@ export async function addAssignee(
     throw new ForbiddenError("Members can only assign themselves");
   }
 
-  await assertProjectAssignees(prisma, task.projectId, [data.userId]);
+  // The access check holds the assignee's membership rows until the insert
+  // commits, so a concurrent removal either waits and then clears this
+  // assignment or commits first and the check fails.
+  return prisma.$transaction(async (tx) => {
+    await assertProjectAssignees(tx, task.projectId, [data.userId]);
 
-  // Check if already assigned
-  const existing = await prisma.taskAssignee.findUnique({
-    where: { taskId_userId: { taskId, userId: data.userId } },
-  });
-  if (existing) {
-    throw new ConflictError("User is already assigned to this task");
-  }
+    // Check if already assigned
+    const existing = await tx.taskAssignee.findUnique({
+      where: { taskId_userId: { taskId, userId: data.userId } },
+    });
+    if (existing) {
+      throw new ConflictError("User is already assigned to this task");
+    }
 
-  const assignee = await prisma.taskAssignee.create({
-    data: { taskId, userId: data.userId },
-    include: {
-      user: {
-        select: { id: true, displayName: true, avatarUrl: true },
+    const assignee = await tx.taskAssignee.create({
+      data: { taskId, userId: data.userId },
+      include: {
+        user: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
       },
-    },
-  });
+    });
 
-  await logActivity(prisma, {
-    taskId,
-    actorId,
-    action: "assigned",
-    details: { userId: data.userId },
-  });
+    await logActivity(tx, {
+      taskId,
+      actorId,
+      action: "assigned",
+      details: { userId: data.userId },
+    });
 
-  return assignee;
+    return assignee;
+  });
 }
 
 export async function removeAssignee(
@@ -775,6 +797,11 @@ export async function bulkUpdateTasks(
     if (data.assigneeIds) await assertProjectAssignees(tx, projectId, data.assigneeIds);
     if (data.labelIds) await assertProjectLabels(tx, projectId, data.labelIds);
 
+    // Per-task writes go in task id order, the order in which member removals
+    // lock assignment rows (clearAssignments), so the two never wait on each
+    // other in a cycle whatever order the client listed the tasks in.
+    const taskIds = [...data.taskIds].sort();
+
     // Bulk update status
     if (data.statusId) {
       await tx.task.updateMany({
@@ -793,7 +820,7 @@ export async function bulkUpdateTasks(
 
     // Bulk update assignees (replace)
     if (data.assigneeIds) {
-      for (const taskId of data.taskIds) {
+      for (const taskId of taskIds) {
         await tx.taskAssignee.deleteMany({ where: { taskId } });
         if (data.assigneeIds.length > 0) {
           await tx.taskAssignee.createMany({
@@ -813,7 +840,7 @@ export async function bulkUpdateTasks(
 
     // Bulk update labels (replace)
     if (data.labelIds !== undefined) {
-      for (const taskId of data.taskIds) {
+      for (const taskId of taskIds) {
         await tx.taskLabel.deleteMany({ where: { taskId } });
         if (data.labelIds.length > 0) {
           await tx.taskLabel.createMany({
@@ -840,7 +867,7 @@ export async function bulkUpdateTasks(
     }
 
     // Log activity for each task
-    for (const taskId of data.taskIds) {
+    for (const taskId of taskIds) {
       await logActivity(tx, {
         taskId,
         actorId,

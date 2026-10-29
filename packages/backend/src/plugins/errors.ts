@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { AppError, ValidationError, LockedError } from "../utils/errors.js";
 import { ZodError } from "zod";
 import { env } from "../config/env.js";
+import { isRetryableDatabaseError } from "../utils/retryable-database-errors.js";
 
 interface ErrorBody {
   statusCode: number;
@@ -72,6 +73,10 @@ function isDataException(sqlState: unknown) {
  * database error text, so they are logged and never sent to clients.
  */
 function prismaErrorResponse(error: unknown): ErrorBody | null {
+  // A deadlock, serialization failure or expired transaction rolled the
+  // transaction back; the client may retry. Checked first: Prisma reports
+  // these under several error classes, most of which would otherwise be a 500.
+  if (isRetryableDatabaseError(error)) return PRISMA_REQUEST_ERRORS.P2034;
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     // P2010 wraps a raw query failure and carries its SQLSTATE in meta.code.
     if (error.code === "P2010" && isDataException(error.meta?.code)) {

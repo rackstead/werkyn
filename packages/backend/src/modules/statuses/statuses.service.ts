@@ -88,9 +88,16 @@ export async function deleteStatus(
   statusId: string,
 ) {
   return prisma.$transaction(async (tx) => {
-    const status = await tx.statusColumn.findFirst({
-      where: { id: statusId, projectId },
-    });
+    // Lock the column before moving its tasks. A task write that already
+    // validated this column holds it FOR KEY SHARE (task-references.ts), so the
+    // delete waits for it and then moves its task too; a write that starts
+    // later waits here and is refused once the column is gone.
+    const locked = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "StatusColumn" WHERE id = ${statusId} AND "projectId" = ${projectId} FOR UPDATE
+    `;
+    const status = locked.length
+      ? await tx.statusColumn.findUnique({ where: { id: statusId } })
+      : null;
     if (!status) {
       throw new NotFoundError("Status column not found");
     }

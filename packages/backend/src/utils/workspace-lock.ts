@@ -1,5 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { ConflictError, NotFoundError } from "./errors.js";
+import { isRetryableDatabaseError } from "./retryable-database-errors.js";
 
 /**
  * Workspace-row mutex shared by every writer whose correctness depends on a
@@ -61,7 +62,9 @@ function isRetryableTransactionError(error: unknown) {
       ? error.code
       : undefined;
   // P2034: write conflict/deadlock; P2028: transaction start/timeout failure.
-  return code === "P2034" || code === "P2028";
+  // Deadlocks and serialization failures also arrive under other Prisma error
+  // classes (see the helper).
+  return code === "P2034" || code === "P2028" || isRetryableDatabaseError(error);
 }
 
 /**

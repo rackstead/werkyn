@@ -29,36 +29,42 @@ export async function createSubtask(
     select: { id: true, projectId: true },
   });
   if (!task) throw new NotFoundError("Task not found");
-  if (data.assigneeId !== undefined) {
-    await assertProjectAssignees(prisma, task.projectId, [data.assigneeId]);
-  }
 
-  const maxPos = await prisma.subtask.aggregate({
-    where: { taskId },
-    _max: { position: true },
-  });
-  const position = (maxPos._max.position ?? -1) + 1;
+  // The assignee's membership rows stay locked until the subtask commits, so a
+  // concurrent project or workspace removal cannot slip in between.
+  const subtask = await prisma.$transaction(async (tx) => {
+    if (data.assigneeId !== undefined) {
+      await assertProjectAssignees(tx, task.projectId, [data.assigneeId]);
+    }
 
-  const subtask = await prisma.subtask.create({
-    data: {
-      taskId,
-      title: data.title,
-      assigneeId: data.assigneeId,
-      dueDate: data.dueDate,
-      position,
-    },
-    include: {
-      assignee: {
-        select: { id: true, displayName: true, avatarUrl: true },
+    const maxPos = await tx.subtask.aggregate({
+      where: { taskId },
+      _max: { position: true },
+    });
+    const position = (maxPos._max.position ?? -1) + 1;
+
+    const created = await tx.subtask.create({
+      data: {
+        taskId,
+        title: data.title,
+        assigneeId: data.assigneeId,
+        dueDate: data.dueDate,
+        position,
       },
-    },
-  });
+      include: {
+        assignee: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
+      },
+    });
 
-  await logActivity(prisma, {
-    taskId,
-    actorId,
-    action: "subtask_added",
-    details: { subtaskId: subtask.id, title: subtask.title },
+    await logActivity(tx, {
+      taskId,
+      actorId,
+      action: "subtask_added",
+      details: { subtaskId: created.id, title: created.title },
+    });
+    return created;
   });
 
   return { subtask, projectId: task.projectId };
@@ -77,25 +83,29 @@ export async function updateSubtask(
   if (!existing) throw new NotFoundError("Subtask not found");
 
   await assertTaskEdit(prisma, existing.taskId, actorId);
-  if (data.assigneeId !== undefined && data.assigneeId !== null) {
-    await assertProjectAssignees(prisma, existing.task.projectId, [data.assigneeId]);
-  }
 
-  const subtask = await prisma.subtask.update({
-    where: { id: subtaskId },
-    data,
-    include: {
-      assignee: {
-        select: { id: true, displayName: true, avatarUrl: true },
+  const subtask = await prisma.$transaction(async (tx) => {
+    if (data.assigneeId !== undefined && data.assigneeId !== null) {
+      await assertProjectAssignees(tx, existing.task.projectId, [data.assigneeId]);
+    }
+
+    const updated = await tx.subtask.update({
+      where: { id: subtaskId },
+      data,
+      include: {
+        assignee: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
       },
-    },
-  });
+    });
 
-  await logActivity(prisma, {
-    taskId: existing.taskId,
-    actorId,
-    action: "subtask_edited",
-    details: { subtaskId, title: subtask.title },
+    await logActivity(tx, {
+      taskId: existing.taskId,
+      actorId,
+      action: "subtask_edited",
+      details: { subtaskId, title: updated.title },
+    });
+    return updated;
   });
 
   return { subtask, projectId: existing.task.projectId };
@@ -159,8 +169,12 @@ export async function reorderSubtasks(
     }
   }
 
+  // Update in subtask id order, the order in which member removals lock
+  // subtask rows (clearAssignments), so the two cannot deadlock.
+  const positions = orderedIds.map((id, index) => ({ id, index }));
+  positions.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   await prisma.$transaction(
-    orderedIds.map((id, index) =>
+    positions.map(({ id, index }) =>
       prisma.subtask.update({
         where: { id },
         data: { position: index },

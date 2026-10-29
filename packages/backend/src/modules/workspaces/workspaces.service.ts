@@ -10,6 +10,7 @@ import type {
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { clearAssignments } from "../../utils/task-references.js";
 import { scopeTaskRelations } from "../../utils/task-scope.js";
 import {
   revokeWorkspaceAccess,
@@ -255,6 +256,10 @@ export async function removeMember(
     await tx.groupMember.deleteMany({
       where: { userId: targetUserId, group: { workspaceId } },
     });
+    // Assignments end with access, as on project removal. An assignment that
+    // held the membership rows committed before the delete above, so these
+    // later statements see and clear it (task-references.ts).
+    await clearAssignments(tx, targetUserId, { workspaceId });
   });
 
   revokeWorkspaceAccess(targetUserId, workspaceId);

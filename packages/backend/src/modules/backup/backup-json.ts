@@ -145,6 +145,9 @@ export const BACKUP_VALIDATION_BATCH_VALUES = 512;
 const error: z.core.$ZodErrorMap = (issue) => {
   if (issue.code === "invalid_value") {
     if (issue.input === undefined) return "Required";
+    // A non-string gets the shared type message ("Expected 'a' | 'b', received
+    // number"), as on Zod 3; it names only the input's type.
+    if (typeof issue.input !== "string") return undefined;
     return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(" | ")}`;
   }
   if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";

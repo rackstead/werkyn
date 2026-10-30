@@ -129,6 +129,7 @@ function reference(text) {
     error: (issue) => {
       if (issue.code === "invalid_value") {
         if (issue.input === undefined) return "Required";
+        if (typeof issue.input !== "string") return undefined;
         return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(" | ")}`;
       }
       if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";
@@ -164,6 +165,23 @@ test("bounded validation reports what a full parse reports, in the same order", 
     if (expected.message) invalid++;
   }
   assert.ok(invalid > 200, `${invalid} of 300 mutations were invalid`);
+});
+
+test("enum problems read as on Zod 3 and never quote the upload", () => {
+  const meta = (version) => JSON.stringify({ metadata: { ...META, version }, channels: [{ channel: { type: "secret-type" } }] });
+  assert.equal(
+    bounded(meta(5)).message,
+    `${FORMAT}Expected '1.0' | '1.1', received number; Invalid enum value. Expected 'PUBLIC' | 'PRIVATE'`,
+  );
+  assert.equal(
+    bounded(meta(null)).message,
+    `${FORMAT}Expected '1.0' | '1.1', received null; Invalid enum value. Expected 'PUBLIC' | 'PRIVATE'`,
+  );
+  assert.equal(
+    bounded(meta("secret-version")).message,
+    `${FORMAT}Invalid enum value. Expected '1.0' | '1.1'; Invalid enum value. Expected 'PUBLIC' | 'PRIVATE'`,
+  );
+  assert.equal(bounded(JSON.stringify({ metadata: { ...META, version: undefined } })).message, `${FORMAT}Required`);
 });
 
 test("defaults are applied and unknown keys stripped as before", () => {

@@ -489,3 +489,107 @@ test("an export whose client has gone stops and leaves no file", async () => {
   );
   assert.deepEqual(await stagedFiles(), []);
 });
+
+test("rows deleted between export batches never cut the rest of a list short", async () => {
+  const project = await app.prisma.project.create({ data: { workspaceId: source.id, name: `Paged ${suffix}` } });
+  const status = await app.prisma.statusColumn.create({ data: { projectId: project.id, name: "Open" } });
+  const start = Date.now() - 60_000;
+  for (let i = 1; i <= 5; i++) {
+    await app.prisma.task.create({
+      data: { projectId: project.id, statusId: status.id, title: `Paged ${i}`, position: i, createdAt: new Date(start + i * 1000) },
+    });
+  }
+  // The last row of the first batch is deleted before the next batch is read.
+  let deleted;
+  const tasks = new Proxy(app.prisma.task, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop !== "findMany") return typeof value === "function" ? value.bind(target) : value;
+      return async (args) => {
+        const rows = await value.call(target, args);
+        if (!deleted && args?.where?.projectId === project.id && rows.length === 2) {
+          deleted = rows[1].title;
+          await app.prisma.task.delete({ where: { id: rows[1].id } });
+        }
+        return rows;
+      };
+    },
+  });
+  const prisma = new Proxy(app.prisma, {
+    get: (target, prop) => (prop === "task" ? tasks : Reflect.get(target, prop)),
+  });
+  const { file } = await exportBackup(
+    prisma,
+    source.id,
+    { projects: [{ projectId: project.id, includeTasks: true }], channels: [], wikiSpaces: [], includeFiles: false },
+    app.storage,
+    admin.id,
+    undefined,
+    undefined,
+    { batchSize: 2 },
+  );
+  try {
+    const backup = JSON.parse((await readBackupArchive(file.path)).jsonBuffer.toString());
+    assert.equal(deleted, "Paged 2");
+    // Read before it was deleted, so still exported; every later row follows.
+    assert.deepEqual(
+      backup.projects[0].tasks.map((t) => t.title),
+      ["Paged 1", "Paged 2", "Paged 3", "Paged 4", "Paged 5"],
+    );
+  } finally {
+    await file.dispose();
+  }
+});
+
+test("a wiki page that gains an image while images are copied refuses the export", async () => {
+  const { WIKI_CHANGED_MESSAGE } = await import("../../src/modules/backup/backup.service.ts");
+  const space = await app.prisma.wikiSpace.create({
+    data: { workspaceId: source.id, name: `Changing ${suffix}`, slug: `changing-${suffix}` },
+  });
+  const stored = [];
+  for (const name of ["first", "added"]) {
+    stored.push(
+      `/storage/${await app.storage.save(`${source.id}/uploads/wiki`, space.id, crypto.randomUUID(), ".png", Buffer.from(name))}`,
+    );
+  }
+  const page = await app.prisma.wikiPage.create({
+    data: {
+      spaceId: space.id,
+      title: "Changing page",
+      createdById: admin.id,
+      content: [{ type: "image", props: { url: stored[0] } }],
+    },
+  });
+  // While the first image is copied, someone embeds a second one.
+  let edited = false;
+  const storage = Object.create(app.storage);
+  storage.openReadStream = async (storagePath) => {
+    if (!edited) {
+      edited = true;
+      await app.prisma.wikiPage.update({
+        where: { id: page.id },
+        data: { content: stored.map((url) => ({ type: "image", props: { url } })) },
+      });
+    }
+    return app.storage.openReadStream(storagePath);
+  };
+  const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
+  await assert.rejects(exportBackup(app.prisma, source.id, request, storage, admin.id), {
+    statusCode: 409,
+    message: WIKI_CHANGED_MESSAGE,
+  });
+  assert.ok(edited);
+  assert.deepEqual(await stagedFiles(), []);
+
+  // Tried again, the export holds both images and rewrites both references.
+  const { file } = await exportBackup(app.prisma, source.id, request, app.storage, admin.id);
+  try {
+    const contents = await readBackupArchive(file.path);
+    const backup = JSON.parse(contents.jsonBuffer.toString());
+    const urls = backup.wikiSpaces[0].pages[0].content.map((block) => block.props.url);
+    assert.equal(urls.length, 2);
+    for (const url of urls) assert.ok(contents.assets.has(url), url);
+  } finally {
+    await file.dispose();
+  }
+});

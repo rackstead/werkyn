@@ -15,6 +15,7 @@ import path from "node:path";
 import { PassThrough, pipeline as pipeStreams, Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { env } from "../../config/env.js";
+import { ConflictError } from "../../utils/errors.js";
 import { extractStorageUrls, rewriteStorageUrls } from "./backup-assets.js";
 import {
   assertBackupExportAccess,
@@ -50,7 +51,12 @@ export interface BackupExportOptions {
   stagingDir?: string;
   /** Stops the export at its next step once aborted. */
   signal?: AbortSignal;
+  /** Rows per query; tests use small batches. */
+  batchSize?: number;
 }
+
+export const WIKI_CHANGED_MESSAGE =
+  "The wiki changed while it was being exported. Try the export again.";
 
 type ProjectEntry = BackupFile["projects"][number];
 type TaskEntry = ProjectEntry["tasks"][number];
@@ -218,22 +224,39 @@ class PrettyJsonWriter {
   }
 }
 
-/** Read rows in pages of EXPORT_BATCH ordered by `orderBy`, then `id`. */
-async function* batches<T extends { id: string }>(
-  read: (page: { take: number; skip?: number; cursor?: { id: string } }) => Promise<T[]>,
+/** A row's place in `createdAt`, then `id`, order. */
+interface Position {
+  createdAt: Date;
+  id: string;
+}
+
+/**
+ * Read rows ordered by `createdAt`, then `id`, `size` at a time. Each query
+ * asks for rows after the last one read by value, so a row deleted between
+ * queries cannot end the walk early.
+ */
+async function* batches<T extends Position>(
+  read: (page: { where: object; take: number }) => Promise<T[]>,
+  size: number,
   signal?: AbortSignal,
 ): AsyncGenerator<T[]> {
-  let cursor: string | undefined;
+  let last: Position | undefined;
   for (;;) {
     if (signal?.aborted) throw new BackupRequestAbortedError();
-    const rows = await read(
-      cursor === undefined
-        ? { take: EXPORT_BATCH }
-        : { take: EXPORT_BATCH, skip: 1, cursor: { id: cursor } },
-    );
+    const rows = await read({
+      take: size,
+      where: last
+        ? {
+            OR: [
+              { createdAt: { gt: last.createdAt } },
+              { createdAt: last.createdAt, id: { gt: last.id } },
+            ],
+          }
+        : {},
+    });
     if (rows.length > 0) yield rows;
-    if (rows.length < EXPORT_BATCH) return;
-    cursor = rows[rows.length - 1].id;
+    if (rows.length < size) return;
+    last = rows[rows.length - 1];
   }
 }
 
@@ -261,6 +284,7 @@ export async function exportBackup(
     select: { name: true, slug: true },
   });
   const { signal } = options;
+  const batchSize = options.batchSize ?? EXPORT_BATCH;
   const checkAborted = () => {
     if (signal?.aborted) throw new BackupRequestAbortedError();
   };
@@ -269,11 +293,11 @@ export async function exportBackup(
   const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits));
   let size: number;
   try {
-    const urlRewriteMap = request.includeFiles
-      ? await archiveWikiAssets(prisma, workspaceId, request, storage, actorId, archive, checkAborted)
-      : new Map<string, string>();
+    const assets = request.includeFiles
+      ? await archiveWikiAssets(prisma, workspaceId, request, storage, actorId, archive, batchSize, checkAborted)
+      : undefined;
     await archive.appendJson((write) =>
-      writeBackupJson(prisma, workspaceId, workspace, request, urlRewriteMap, write, signal),
+      writeBackupJson(prisma, workspaceId, workspace, request, assets, write, batchSize, signal),
     );
     size = await archive.finish();
   } catch (error) {
@@ -285,10 +309,18 @@ export async function exportBackup(
   return { file: stagedFile(file, size), filename };
 }
 
+interface ArchivedAssets {
+  /** Every URL looked at, whether or not its file was copied. */
+  examined: Set<string>;
+  /** Each copied URL's archive path. */
+  rewrites: Map<string, string>;
+}
+
 /**
  * Copy every authorized image the selected wiki pages embed into the archive
  * and return the rewrite from each copied URL to its archive path. Pages are
- * read here for their content only; `backup.json` reads them again.
+ * read here for their content only; `backup.json` reads them again and
+ * refuses a page that gained a URL in between.
  */
 async function archiveWikiAssets(
   prisma: PrismaClient,
@@ -297,8 +329,9 @@ async function archiveWikiAssets(
   storage: StorageProvider,
   actorId: string,
   archive: ExportArchive,
+  batchSize: number,
   checkAborted: () => void,
-): Promise<Map<string, string>> {
+): Promise<ArchivedAssets> {
   const allStorageUrls = new Set<string>();
   for (const opt of request.wikiSpaces) {
     const space = await prisma.wikiSpace.findUnique({
@@ -306,13 +339,15 @@ async function archiveWikiAssets(
       select: { id: true },
     });
     if (!space) continue;
-    for await (const pages of batches((page) =>
-      prisma.wikiPage.findMany({
-        where: { spaceId: opt.spaceId },
-        select: { id: true, content: true },
-        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-        ...page,
-      }),
+    for await (const pages of batches(
+      ({ where, take }) =>
+        prisma.wikiPage.findMany({
+          where: { spaceId: opt.spaceId, ...where },
+          select: { id: true, createdAt: true, content: true },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          take,
+        }),
+      batchSize,
     )) {
       checkAborted();
       for (const page of pages) {
@@ -361,7 +396,7 @@ async function archiveWikiAssets(
       break;
     }
   }
-  return urlRewriteMap;
+  return { examined: allStorageUrls, rewrites: urlRewriteMap };
 }
 
 /** Write `backup.json`: the selected content, then the metadata it refers to. */
@@ -370,8 +405,9 @@ async function writeBackupJson(
   workspaceId: string,
   workspace: { name: string; slug: string },
   request: BackupExportRequest,
-  urlRewriteMap: Map<string, string>,
+  assets: ArchivedAssets | undefined,
   write: (text: string) => Promise<void>,
+  batchSize: number,
   signal?: AbortSignal,
 ) {
   const json = new PrettyJsonWriter(write);
@@ -471,9 +507,9 @@ async function writeBackupJson(
     await json.open("[", "tasks");
     if (opt.includeTasks) {
       for await (const dbTasks of batches(
-        (page) =>
+        ({ where, take }) =>
           prisma.task.findMany({
-            where: { projectId: opt.projectId },
+            where: { projectId: opt.projectId, ...where },
             include: {
               assignees: { select: { userId: true } },
               labels: { select: { labelId: true } },
@@ -488,8 +524,9 @@ async function writeBackupJson(
                 : false,
             },
             orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-            ...page,
+            take,
           }),
+        batchSize,
         signal,
       )) {
         for (const t of dbTasks) {
@@ -601,15 +638,16 @@ async function writeBackupJson(
     await json.open("[", "messages");
     if (opt.includeMessages) {
       for await (const dbMessages of batches(
-        (page) =>
+        ({ where, take }) =>
           prisma.chatMessage.findMany({
-            where: { channelId: opt.channelId, deletedAt: null },
+            where: { channelId: opt.channelId, deletedAt: null, ...where },
             include: opt.includeReactions
               ? { reactions: { select: { userId: true, emoji: true } } }
               : undefined,
             orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-            ...page,
+            take,
           }),
+        batchSize,
         signal,
       )) {
         for (const m of dbMessages) {
@@ -659,15 +697,16 @@ async function writeBackupJson(
     );
     await json.open("[", "pages");
     for await (const dbPages of batches(
-      (page) =>
+      ({ where, take }) =>
         prisma.wikiPage.findMany({
-          where: { spaceId: opt.spaceId },
+          where: { spaceId: opt.spaceId, ...where },
           include: opt.includeComments
             ? { comments: { orderBy: { createdAt: "asc" } } }
             : undefined,
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-          ...page,
+          take,
         }),
+      batchSize,
       signal,
     )) {
       for (const p of dbPages) {
@@ -700,11 +739,16 @@ async function writeBackupJson(
             })
           : [];
 
-        // Rewrite URLs of images copied into the archive.
-        const content =
-          p.content && urlRewriteMap.size > 0
-            ? rewriteStorageUrls(p.content, urlRewriteMap)
-            : p.content;
+        let content: unknown = p.content;
+        if (assets && content) {
+          // A URL added since the images were copied would point at a file
+          // the archive lacks; the export is refused rather than incomplete.
+          for (const url of extractStorageUrls(content)) {
+            if (!assets.examined.has(url)) throw new ConflictError(WIKI_CHANGED_MESSAGE);
+          }
+          // Rewrite URLs of images copied into the archive.
+          if (assets.rewrites.size > 0) content = rewriteStorageUrls(content, assets.rewrites);
+        }
 
         await json.value({
           _originalId: p.id,

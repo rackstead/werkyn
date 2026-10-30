@@ -92,7 +92,9 @@ buffer before sending it. Now the archive is written to a staged file,
   (SEC-009), and gets one archive entry however many URLs spell it. Two
   different files with the same name get distinct entry names.
 - `backup.json` follows, written in pieces of about 64 KiB as rows are read
-  500 at a time (tasks, messages, pages). It keeps the previous two-space
+  500 at a time (tasks, messages, pages). Each query asks for the rows after
+  the last one read, by creation time and ID, so a row deleted meanwhile
+  cannot end a list early. It keeps the previous two-space
   formatting. `metadata` now comes last, because it lists every user the
   content refers to; key order does not matter to restore.
 - Every byte is counted as it is written: each image against the per-entry and
@@ -107,9 +109,10 @@ buffer before sending it. Now the archive is written to a staged file,
   download completes or is abandoned, and a client that reads nothing for 60
   seconds is dropped.
 
-Images are read from the archive's pages twice: once for the URLs to copy,
-once to write the pages. A page edited in between keeps any URL that was not
-copied, as a missing file always has.
+Wiki pages are read twice: once for the image URLs to copy, once to write
+the pages. If a page gains a URL in between, its file would be missing from
+the archive, so the export is refused with a 409 asking to try again, and
+leaves no file.
 
 ## What a backup contains
 
@@ -227,8 +230,11 @@ both workspaces entity by entity by name: counts, every relationship, and the
 image bytes. Preview and restore report the same counts with no warnings. One
 assertion depends on current restore behaviour: the restoring admin is
 added to each restored channel's members. `tests/integration/backup-zip-restore.test.mjs`
-also checks that refused exports leave no staged file, and the round-trip file
-that an export whose client has gone stops without one.
+also checks that refused exports leave no staged file. The round-trip file
+also checks that an export whose client has gone stops without one, that a
+task deleted between two batches does not cut the rest of the list short,
+and that a page gaining an image during the export gets the 409 and a retry
+exports both images.
 
 On the previous code all five integration tests and both unit test files fail.
 The existing backup suites (SEC-009, SEC-025, SEC-028 and restore tests) pass

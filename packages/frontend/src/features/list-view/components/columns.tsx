@@ -28,7 +28,7 @@ import { Check, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CustomField } from "@/features/projects/api";
 import { useSetCustomFieldValue } from "@/features/projects/api";
-import { shouldSaveCustomFieldValue, type CustomFieldInput } from "@/features/tasks/custom-field-save";
+import { useCustomFieldSaver, type CustomFieldInput } from "@/features/tasks/custom-field-save";
 
 const columnHelper = createColumnHelper<Task>();
 
@@ -443,10 +443,11 @@ function InlineCustomFieldCell({
 
   // Nothing is sent for an unchanged value or an emptied required field; the
   // cell then shows the stored value again.
+  const { save: saveValue } = useCustomFieldSaver(field, value, (newValue, onError) =>
+    setFieldValue.mutate({ fieldId: field.id, value: newValue }, { onError }),
+  );
   const save = (newValue: CustomFieldInput) => {
-    if (shouldSaveCustomFieldValue(field, value, newValue)) {
-      setFieldValue.mutate({ fieldId: field.id, value: newValue });
-    }
+    saveValue(newValue);
     setEditing(false);
   };
 

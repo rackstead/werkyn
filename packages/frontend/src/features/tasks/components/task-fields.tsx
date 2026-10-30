@@ -21,7 +21,7 @@ import { UserAvatar } from "@/components/shared/user-avatar";
 import { UserPicker } from "@/components/shared/user-picker";
 import { LabelPicker } from "@/components/shared/label-picker";
 import { DatePicker } from "@/components/shared/date-picker";
-import { shouldSaveCustomFieldValue, type CustomFieldInput } from "../custom-field-save";
+import { useCustomFieldSaver, type CustomFieldInput } from "../custom-field-save";
 import { cn } from "@/lib/utils";
 
 const PRIORITIES = ["NONE", "LOW", "MEDIUM", "HIGH", "URGENT"] as const;
@@ -296,16 +296,15 @@ function InlineCustomFieldEditor({
   const cfv = task.customFieldValues?.find((v) => v.fieldId === field.id);
   const value = cfv?.value;
 
-  // Returns false when nothing was sent (no change, or a required field left
-  // empty); text inputs then show the stored value again.
-  const save = (newValue: CustomFieldInput) => {
-    if (!shouldSaveCustomFieldValue(field, value, newValue)) return false;
-    setFieldValue.mutate({ fieldId: field.id, value: newValue });
-    return true;
-  };
+  // save() returns false when nothing was sent (no change, or a required
+  // field left empty); text inputs then show the current value again.
+  const { save, current } = useCustomFieldSaver(field, value, (newValue, onError) =>
+    setFieldValue.mutate({ fieldId: field.id, value: newValue }, { onError }),
+  );
   const saveInput = (input: HTMLInputElement, newValue: CustomFieldInput) => {
     if (!save(newValue)) {
-      input.value = typeof value === "string" || typeof value === "number" ? String(value) : "";
+      const shown = current();
+      input.value = typeof shown === "string" || typeof shown === "number" ? String(shown) : "";
     }
   };
 

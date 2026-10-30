@@ -139,3 +139,22 @@ it("leaving an emptied required field sends nothing and shows the stored value a
     expect(http.put).toHaveBeenCalledWith("projects/p/tasks/t/custom-fields/ticket", { json: { value: "OPS-2" } }),
   );
 });
+
+it("a quick change back to the rendered value is still sent while the first save is in flight", async () => {
+  // Neither request settles, so the rendered task value stays "A" throughout.
+  http.put.mockReturnValue({ json: () => new Promise(() => {}) });
+  fields.push({ id: "code", projectId: "p", name: "Code", type: "TEXT", options: null, required: false, position: 0 });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <TaskFields task={taskWith([["code", "A"]])} canEdit />
+    </QueryClientProvider>,
+  );
+  const input = screen.getByLabelText("Code") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "B" } });
+  fireEvent.blur(input);
+  fireEvent.change(input, { target: { value: "A" } });
+  fireEvent.blur(input);
+  fireEvent.blur(input); // unchanged since the last save
+  await waitFor(() => expect(http.put).toHaveBeenCalledTimes(2));
+  expect(http.put.mock.calls.map(([, options]) => options.json.value)).toEqual(["B", "A"]);
+});

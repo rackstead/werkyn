@@ -157,9 +157,17 @@ async function fixture() {
   const [thread] = await prisma.$queryRaw<{ id: string }[]>`
     SELECT "parentId" AS id FROM "ChatMessage" WHERE "channelId" = ${general.id} AND "parentId" IS NOT NULL
     GROUP BY "parentId" ORDER BY count(*) DESC, "parentId" LIMIT 1`;
-  const [olderPage] = await prisma.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "ChatMessage" WHERE "channelId" = ${general.id} AND "parentId" IS NULL
-    ORDER BY "createdAt" DESC OFFSET 2000 LIMIT 1`;
+  // An older history page 2,000 messages back, or halfway at small scales;
+  // none when the channel has no more than one page.
+  const [{ topLevel }] = await prisma.$queryRaw<{ topLevel: number }[]>`
+    SELECT count(*)::int AS "topLevel" FROM "ChatMessage" WHERE "channelId" = ${general.id} AND "parentId" IS NULL`;
+  const olderOffset = Math.min(2000, Math.floor(topLevel / 2));
+  const [olderPage] =
+    olderOffset > 50
+      ? await prisma.$queryRaw<{ id: string }[]>`
+          SELECT id FROM "ChatMessage" WHERE "channelId" = ${general.id} AND "parentId" IS NULL
+          ORDER BY "createdAt" DESC OFFSET ${olderOffset} LIMIT 1`
+      : [];
   const [folder] = await prisma.$queryRaw<{ id: string }[]>`
     SELECT f.id FROM "File" f JOIN "File" c ON c."parentId" = f.id AND c."trashedAt" IS NULL
     WHERE f."workspaceId" = ${wid} AND f."ownerId" = ${member.id} AND f."isFolder" AND f."trashedAt" IS NULL
@@ -171,10 +179,18 @@ async function fixture() {
   const [space] = await prisma.$queryRaw<{ id: string }[]>`
     SELECT s.id FROM "WikiSpace" s JOIN "WikiPage" p ON p."spaceId" = s.id
     WHERE s."workspaceId" = ${wid} GROUP BY s.id ORDER BY count(*) DESC, s.id LIMIT 1`;
-  const [wikiParent] = await prisma.$queryRaw<{ id: string }[]>`
-    SELECT "parentId" AS id FROM "WikiPage" WHERE "spaceId" = ${space.id} AND "parentId" IS NOT NULL
-    GROUP BY "parentId" ORDER BY count(*) DESC, "parentId" LIMIT 1`;
-  return { wid, admin, member, big, median, statuses, task, general, thread, olderPage, folder, team, space, wikiParent };
+  const [wikiParent] = space
+    ? await prisma.$queryRaw<{ id: string }[]>`
+        SELECT "parentId" AS id FROM "WikiPage" WHERE "spaceId" = ${space.id} AND "parentId" IS NOT NULL
+        GROUP BY "parentId" ORDER BY count(*) DESC, "parentId" LIMIT 1`
+    : [];
+  // Rows a small fixture may lack; their endpoints are skipped.
+  const optional = <T>(row: T) => row as T | undefined;
+  return {
+    wid, admin, member, big, median, statuses, task, general,
+    thread: optional(thread), olderPage: optional(olderPage), folder: optional(folder),
+    team: optional(team), space: optional(space), wikiParent: optional(wikiParent),
+  };
 }
 
 function token(user: { id: string; email: string }) {
@@ -185,9 +201,12 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
   const m = token(f.member);
   const a = token(f.admin);
   const get = (t: string, path: string) => () => request("GET", path, t);
+  /** An endpoint that needs a fixture row, or none when the fixture lacks it. */
+  const needs = <T>(row: T | undefined, t: string, path: (row: T) => string) =>
+    row ? get(t, path(row)) : undefined;
   const week = `startDate=${day(-6)}&endDate=${day(0)}`;
   const quarter = `startDate=${day(-90)}&endDate=${day(0)}`;
-  const endpoints: [string, () => Promise<Response>][] = [
+  const endpoints: [string, (() => Promise<Response>) | undefined][] = [
     ["tasks: board, largest project", get(m, `/projects/${f.big.id}/tasks?view=board`)],
     ["tasks: board, median project", get(m, `/projects/${f.median.id}/tasks?view=board`)],
     ["tasks: list page 1 (position)", get(m, `/projects/${f.big.id}/tasks`)],
@@ -205,30 +224,35 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
     ["search: no match", get(m, `/workspaces/${f.wid}/search?q=qzxv`)],
     ["chat: channel list", get(m, `/chat/${f.wid}/channels`)],
     ["chat: history, newest page", get(m, `/chat/${f.wid}/channels/${f.general.id}/messages`)],
-    ["chat: history, older page", get(m, `/chat/${f.wid}/channels/${f.general.id}/messages?cursor=${f.olderPage.id}`)],
-    ["chat: thread replies", get(m, `/chat/${f.wid}/messages/${f.thread.id}/thread`)],
+    ["chat: history, older page", needs(f.olderPage, m, (p) => `/chat/${f.wid}/channels/${f.general.id}/messages?cursor=${p.id}`)],
+    ["chat: thread replies", needs(f.thread, m, (t) => `/chat/${f.wid}/messages/${t.id}/thread`)],
     ["chat: unread counts", get(m, `/chat/${f.wid}/unread`)],
     ["notifications: list", get(m, `/notifications`)],
     ["notifications: mentions widget", get(m, `/notifications?type=CHAT_MENTION,COMMENT_MENTION&limit=10`)],
     ["notifications: unread count", get(m, `/notifications/unread-count`)],
     ["drive: root (member)", get(m, `/workspaces/${f.wid}/files`)],
     ["drive: root (admin)", get(a, `/workspaces/${f.wid}/files`)],
-    ["drive: largest personal folder", get(m, `/workspaces/${f.wid}/files?parentId=${f.folder.id}`)],
-    ["drive: team folder", get(m, `/workspaces/${f.wid}/files?teamFolderId=${f.team.id}`)],
+    ["drive: largest personal folder", needs(f.folder, m, (d) => `/workspaces/${f.wid}/files?parentId=${d.id}`)],
+    ["drive: team folder", needs(f.team, m, (t) => `/workspaces/${f.wid}/files?teamFolderId=${t.id}`)],
     ["drive: recent files widget", get(m, `/workspaces/${f.wid}/files?sortBy=updatedAt&sortOrder=desc`)],
     ["drive: trash", get(m, `/workspaces/${f.wid}/files?trashed=true`)],
     ["drive: starred", get(m, `/workspaces/${f.wid}/files/starred`)],
     ["drive: shared with me", get(m, `/workspaces/${f.wid}/files/shared-with-me`)],
     ["drive: shared by me", get(m, `/workspaces/${f.wid}/files/shared-by-me`)],
     ["wiki: spaces", get(m, `/workspaces/${f.wid}/wiki/spaces`)],
-    ["wiki: tree root, largest space", get(m, `/wiki/spaces/${f.space.id}/pages/tree`)],
-    ["wiki: tree children, largest parent", get(m, `/wiki/spaces/${f.space.id}/pages/tree?parentId=${f.wikiParent.id}`)],
+    ["wiki: tree root, largest space", needs(f.space, m, (s) => `/wiki/spaces/${s.id}/pages/tree`)],
+    ["wiki: tree children, largest parent", needs(f.space && f.wikiParent && { space: f.space, parent: f.wikiParent }, m,
+      (r) => `/wiki/spaces/${r.space.id}/pages/tree?parentId=${r.parent.id}`)],
     ["time: my entries, week", get(m, `/workspaces/${f.wid}/time/entries?${week}&userId=${f.member.id}`)],
     ["time: report 90 days (admin)", get(a, `/workspaces/${f.wid}/time/reports?${quarter}`)],
   ];
   const results: Result[] = [];
   for (const [name, run] of endpoints) {
     if (ONLY && !name.includes(ONLY)) continue;
+    if (!run) {
+      console.log(`${name.padEnd(44)} skipped: the fixture has no row for it`);
+      continue;
+    }
     results.push(await measure(name, run));
   }
   return results;

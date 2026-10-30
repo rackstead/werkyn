@@ -9,6 +9,10 @@
 // The log is expected in the default "%m [%p] " prefix format, as printed by
 // `docker logs` for the postgres image. Durations of the parse, bind and
 // execute steps of a statement are summed; calls counts executions.
+// Statements that differ only in whitespace or comments outside quotes are
+// grouped; quoted literals and identifiers are kept exactly. Each EXPLAIN runs
+// in a read-only transaction that is rolled back, so a logged statement that
+// writes or locks rows is skipped instead of executed.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { PrismaClient } from "@prisma/client";
@@ -22,6 +26,62 @@ const EXPLAIN = Number(option("explain") ?? "0");
 
 const ENTRY = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \S+ \[(\d+)\] (\w+):\s+(.*)$/;
 const DURATION = /^duration: ([\d.]+) ms\s+(parse|bind|execute) [^:]*: ([\s\S]*)$/;
+
+/**
+ * Splits SQL into quoted text ('…' and "…", doubled quotes as escapes),
+ * comments and the code between them, so edits can leave quoted text alone.
+ */
+function segments(sql: string) {
+  const parts: { kind: "code" | "quoted" | "comment"; text: string }[] = [];
+  let i = 0;
+  let start = 0;
+  const push = (kind: "code" | "quoted" | "comment", end: number) => {
+    if (end > start) parts.push({ kind, text: sql.slice(start, end) });
+    start = end;
+  };
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'" || c === '"') {
+      push("code", i);
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === c && sql[i + 1] === c) i += 2;
+        else if (sql[i] === c) {
+          i += 1;
+          break;
+        } else i += 1;
+      }
+      push("quoted", i);
+    } else if (c === "-" && sql[i + 1] === "-") {
+      push("code", i);
+      while (i < sql.length && sql[i] !== "\n") i += 1;
+      push("comment", i);
+    } else if (c === "/" && sql[i + 1] === "*") {
+      push("code", i);
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      push("comment", i);
+    } else i += 1;
+  }
+  push("code", i);
+  return parts;
+}
+
+/** Collapses whitespace and drops comments outside quoted text. */
+function normalize(sql: string) {
+  const out: string[] = [];
+  let code = "";
+  for (const part of segments(sql)) {
+    if (part.kind === "quoted") {
+      out.push(code.replace(/\s+/g, " "), part.text);
+      code = "";
+    } else {
+      code += part.kind === "comment" ? " " : part.text;
+    }
+  }
+  out.push(code.replace(/\s+/g, " "));
+  return out.join("").trim();
+}
 
 interface Statement {
   sql: string;
@@ -47,7 +107,8 @@ function parse(text: string) {
     if (!d) continue;
     const ms = Number(d[1]);
     const phase = d[2];
-    const sql = d[3].replace(/\s+/g, " ").trim();
+    // Continuation lines of a log message start with a tab after the newline.
+    const sql = normalize(d[3].replace(/\n\t/g, "\n"));
     const s = stats.get(sql) ?? { sql, calls: 0, totalMs: 0, executeMs: 0, maxMs: 0 };
     s.totalMs += ms;
     if (phase === "execute") {
@@ -57,7 +118,7 @@ function parse(text: string) {
         s.maxMs = ms;
         const next = entries[i + 1];
         const params = next && next.pid === e.pid && next.level === "DETAIL" ? /^parameters: ([\s\S]*)$/i.exec(next.message)?.[1] : undefined;
-        s.maxParams = params?.replace(/\n\s*/g, " ");
+        s.maxParams = params?.replace(/\n\t/g, "\n");
       }
     }
     stats.set(sql, s);
@@ -74,10 +135,18 @@ function parameters(list: string | undefined) {
   return values;
 }
 
+/** Substitutes the logged parameter literals for $n placeholders outside quoted text. */
 function bind(sql: string, params: string | undefined) {
   const values = parameters(params);
-  return sql.replace(/\$(\d+)/g, (whole, n: string) => values.get(Number(n)) ?? whole);
+  return segments(sql)
+    .map((p) =>
+      p.kind === "quoted" ? p.text : p.text.replace(/\$(\d+)/g, (whole, n: string) => values.get(Number(n)) ?? whole),
+    )
+    .join("");
 }
+
+/** Thrown to roll back the read-only transaction an EXPLAIN runs in. */
+class Rollback extends Error {}
 
 async function explain(ranked: Statement[]) {
   const prisma = new PrismaClient();
@@ -89,7 +158,25 @@ async function explain(ranked: Statement[]) {
       if (!/^(select|with)\b/i.test(s.sql)) continue;
       done += 1;
       const sql = bind(s.sql, s.maxParams);
-      const rows = await prisma.$queryRawUnsafe<{ "QUERY PLAN": string }[]>(`EXPLAIN (ANALYZE, BUFFERS) ${sql}`);
+      let rows: { "QUERY PLAN": string }[] = [];
+      try {
+        // EXPLAIN ANALYZE executes the statement: read-only refuses writes and
+        // row locks, and the transaction is always rolled back.
+        await prisma.$transaction(
+          async (tx) => {
+            await tx.$executeRawUnsafe("SET TRANSACTION READ ONLY");
+            rows = await tx.$queryRawUnsafe<{ "QUERY PLAN": string }[]>(`EXPLAIN (ANALYZE, BUFFERS) ${sql}`);
+            throw new Rollback();
+          },
+          { maxWait: 10_000, timeout: 300_000 },
+        );
+      } catch (error) {
+        if (!(error instanceof Rollback)) {
+          const reason = error instanceof Error ? error.message.split("\n").filter(Boolean).pop() : String(error);
+          out.push(`### #${rank + 1}  skipped: ${reason}`, sql, "");
+          continue;
+        }
+      }
       out.push(
         `### #${rank + 1}  total ${s.totalMs.toFixed(1)} ms, ${s.calls} calls, max ${s.maxMs.toFixed(2)} ms`,
         sql,

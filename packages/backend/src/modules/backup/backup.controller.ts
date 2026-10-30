@@ -10,7 +10,11 @@ import {
   type BackupArchiveContents,
 } from "./backup-archive.js";
 import { BACKUP_JSON_LIMITS, BackupJsonError } from "./backup-json.js";
-import { backupConcurrency, clientAbortSignal } from "./backup-concurrency.js";
+import {
+  backupConcurrency,
+  clientAbortSignal,
+  releaseBackupAdmission,
+} from "./backup-concurrency.js";
 import {
   BACKUP_TRANSFER_LIMITS,
   backupStagingDir,
@@ -67,16 +71,14 @@ export async function exportHandler(
   );
   // The stream closes once its last byte has been handed to the response, in
   // the same tick, before the client can have it all, or when the response is
-  // abandoned. Releasing the admission then lets a client that has the whole
-  // file start its next backup request at once.
-  const sent = new Promise((resolve) => download.once("close", resolve));
+  // abandoned. The admission is released then, so a client that has the whole
+  // file can start its next backup request at once.
+  download.once("close", () => releaseBackupAdmission(request));
   reply
     .header("Content-Type", "application/zip")
     .header("Content-Length", String(file.size))
     .header("Content-Disposition", formatContentDisposition(filename))
     .send(download);
-  // Hold the admission until the download has finished or been abandoned.
-  await sent;
   return reply;
 }
 

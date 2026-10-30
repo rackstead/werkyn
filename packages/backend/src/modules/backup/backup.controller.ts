@@ -1,19 +1,25 @@
-import { open, readFile } from "node:fs/promises";
+import { open, readFile, type FileHandle } from "node:fs/promises";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
 import { exportBackup } from "./backup.service.js";
 import { previewRestore, executeRestore } from "./restore.service.js";
 import {
+  BACKUP_ARCHIVE_LIMITS,
   BackupArchiveError,
   readBackupArchive,
   type BackupArchiveContents,
 } from "./backup-archive.js";
 import { BACKUP_JSON_LIMITS, BackupJsonError } from "./backup-json.js";
-import { backupConcurrency, clientAbortSignal } from "./backup-concurrency.js";
+import {
+  backupConcurrency,
+  clientAbortSignal,
+  releaseBackupAdmission,
+} from "./backup-concurrency.js";
 import {
   BACKUP_TRANSFER_LIMITS,
   backupStagingDir,
   receiveBackupUpload,
+  watchIdle,
   type StagedUpload,
 } from "./backup-staging.js";
 import { env } from "../../config/env.js";
@@ -32,37 +38,50 @@ export async function exportHandler(
   }
 
   const signal = clientAbortSignal(reply);
-  // The archive is built in memory, so the export keeps the exclusive section
-  // until its response has been sent or abandoned.
-  await backupConcurrency.exclusive(async () => {
-    const { zipBuffer, filename } = await exportBackup(
-      request.server.prisma,
-      wid,
-      body,
-      request.server.storage,
-      request.user!.id,
-    );
-    const sent = responseEnded(reply);
-    // A client that stops reading is dropped after the idle timeout.
-    reply.raw.setTimeout(BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () => reply.raw.destroy());
-    reply
-      .header("Content-Type", "application/zip")
-      .header("Content-Disposition", formatContentDisposition(filename))
-      .send(zipBuffer);
-    await sent;
-  }, signal);
+  // Build the archive in the exclusive section; it is staged on disk, so the
+  // download that follows runs outside it.
+  const { file, filename } = await backupConcurrency.exclusive(
+    () =>
+      exportBackup(
+        request.server.prisma,
+        wid,
+        body,
+        request.server.storage,
+        request.user!.id,
+        BACKUP_ARCHIVE_LIMITS,
+        BACKUP_JSON_LIMITS,
+        { stagingDir: backupStagingDir(env.STORAGE_DIR), signal },
+      ),
+    signal,
+  );
+
+  // Open the finished archive, then remove its name: the open file stays
+  // readable until the response ends or is abandoned, and nothing is left on
+  // disk either way.
+  let handle: FileHandle;
+  try {
+    handle = await open(file.path, "r");
+  } finally {
+    await file.dispose();
+  }
+  // A client that reads nothing for the idle timeout is dropped, which
+  // destroys the stream and ends this request.
+  const download = watchIdle(handle.createReadStream(), BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () =>
+    reply.raw.destroy(),
+  );
+  // The stream closes once its last byte has been handed to the response, in
+  // the same tick, before the client can have it all, or when the response is
+  // abandoned. The admission is released then, so a client that has the whole
+  // file can start its next backup request at once.
+  download.once("close", () => releaseBackupAdmission(request));
+  reply
+    .header("Content-Type", "application/zip")
+    .header("Content-Length", String(file.size))
+    .header("Content-Disposition", formatContentDisposition(filename))
+    .send(download);
   return reply;
 }
 
-/** Resolves once the response has been sent in full or its connection closed. */
-function responseEnded(reply: FastifyReply): Promise<void> {
-  const response = reply.raw;
-  if (response.writableFinished || response.destroyed) return Promise.resolve();
-  return new Promise((resolve) => {
-    response.once("finish", resolve);
-    response.once("close", resolve);
-  });
-}
 
 /** Quick check: ZIP files start with PK\x03\x04 */
 function isZipSignature(bytes: Buffer): boolean {

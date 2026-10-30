@@ -6,7 +6,7 @@ import { ValidationError } from "../../utils/errors.js";
 import {
   BACKUP_JSON_LIMITS,
   BackupJsonError,
-  inspectBackupJson,
+  BackupJsonMeter,
   type BackupJsonLimits,
 } from "./backup-json.js";
 
@@ -459,28 +459,38 @@ export const EXPORT_TOO_LARGE_MESSAGE =
 
 /**
  * Counts an export's entries as `inspectBackupArchive` will, and measures its
- * `backup.json` as restore will, so export stops as soon as the archive could
- * no longer be restored.
+ * `backup.json` as restore will, as each is written, so export stops as soon
+ * as the archive could no longer be restored.
  */
 export class BackupExportBudget {
   private readonly sizes = new Map<string, number>();
   private readonly nodes = new Set<string>();
   private totalBytes = 0;
+  private json: BackupJsonMeter | undefined;
 
   constructor(
     private readonly limits: BackupArchiveLimits = BACKUP_ARCHIVE_LIMITS,
     private readonly jsonLimits: BackupJsonLimits = BACKUP_JSON_LIMITS,
   ) {}
 
-  /** Add `backup.json`; throws a 400 if restore would refuse to parse it. */
-  addBackupJson(json: Buffer) {
-    this.add("backup.json", json.length);
+  /**
+   * Count the next piece of `backup.json`; throws a 400 as soon as restore
+   * would refuse to parse the file, or the archive grows past its budget.
+   */
+  writeJson(chunk: Buffer) {
+    this.json ??= new BackupJsonMeter(this.jsonLimits);
     try {
-      inspectBackupJson(json, this.jsonLimits);
+      this.json.write(chunk);
     } catch (error) {
       if (error instanceof BackupJsonError) throw new ValidationError(EXPORT_TOO_LARGE_MESSAGE);
       throw error;
     }
+    this.add("backup.json", this.json.bytes);
+  }
+
+  /** Count a whole `backup.json` at once. */
+  addBackupJson(json: Buffer) {
+    this.writeJson(json);
   }
 
   /** Add or replace the entry `name`; throws a 400 once over the budget. */

@@ -1,10 +1,13 @@
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma } from "@prisma/client";
+
+/** The client or an export's snapshot transaction. */
+type Db = Prisma.TransactionClient;
 import { assertFileAccess, type AccessContext } from "../files/file-access.js";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
 
 /** A service caller's supplied role is never export authority. */
 export async function assertBackupExportAccess(
-  prisma: PrismaClient,
+  prisma: Db,
   workspaceId: string,
   userId: string,
 ): Promise<AccessContext> {
@@ -62,7 +65,7 @@ function storagePathsFromUrl(url: string): string[] {
 
 /** Resolve current resource authority before opening any embedded storage path. */
 export async function resolveBackupAssetPaths(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: AccessContext,
   url: string,
 ): Promise<string[]> {
@@ -113,7 +116,7 @@ export async function resolveBackupAssetPaths(
 }
 
 async function isOwnedUploadPath(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: AccessContext,
   storagePath: string,
 ): Promise<boolean> {

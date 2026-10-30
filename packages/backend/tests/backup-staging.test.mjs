@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { after, test } from "node:test";
 
 const {
@@ -18,6 +18,7 @@ const {
   stageStream,
   stagingPath,
   sweepBackupStaging,
+  watchIdle,
 } = await import("../src/modules/backup/backup-staging.ts");
 const { BACKUP_ARCHIVE_LIMITS } = await import("../src/modules/backup/backup-archive.ts");
 
@@ -259,4 +260,49 @@ test("a request that stalls before or during its file is dropped", async (t) => 
   await new Promise((resolve) => socket.once("close", resolve));
   assert.match(response, /^HTTP\/1\.1 200/);
   assert.deepEqual(outcomes, ["staged"]);
+});
+
+test("a download that stops moving is dropped after exactly the idle timeout", async () => {
+  const chunk = Buffer.alloc(64 * 1024);
+  const source = () =>
+    new Readable({
+      read() {
+        this.push(chunk);
+      },
+    });
+
+  // A client that never reads: the response stops taking bytes at once.
+  let idleAt;
+  const started = Date.now();
+  const stalled = watchIdle(source(), 200, () => (idleAt = Date.now() - started));
+  stalled.pipe(new Writable({ highWaterMark: 1024, write() {} }));
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.ok(idleAt >= 190 && idleAt < 400, `dropped after ${idleAt} ms`);
+  stalled.destroy();
+
+  // A slow client that keeps reading is never dropped, however long it takes.
+  let dropped = false;
+  const slow = watchIdle(source(), 200, () => (dropped = true));
+  let received = 0;
+  slow.pipe(
+    new Writable({
+      highWaterMark: 1024,
+      write(data, _encoding, callback) {
+        received += data.length;
+        setTimeout(callback, 100);
+      },
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  slow.destroy();
+  assert.equal(dropped, false);
+  assert.ok(received >= 5 * chunk.length, `${received}`);
+
+  // Closing the stream clears the timer.
+  let late = false;
+  const done = watchIdle(Readable.from([chunk], { objectMode: false }), 100, () => (late = true));
+  done.resume();
+  await new Promise((resolve) => done.once("close", resolve));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(late, false);
 });

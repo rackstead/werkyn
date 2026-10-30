@@ -41,6 +41,22 @@ const { BACKUP_ARCHIVE_LIMITS, EXPORT_TOO_LARGE_MESSAGE, inspectBackupArchive, r
 
 const suffix = crypto.randomUUID().slice(0, 8);
 const MiB = 1 << 20;
+
+/** Export through the service and read the staged archive, then remove it. */
+async function exportZip(...args) {
+  const { file } = await exportBackup(...args);
+  try {
+    return { zipBuffer: await readFile(file.path) };
+  } finally {
+    await file.dispose();
+  }
+}
+
+/** Staged files an export left behind; there should never be any. */
+const stagedExports = async () =>
+  (await readdir(path.join(storageDir, ".tmp", "backup")).catch(() => [])).filter((name) =>
+    name.startsWith("export-"),
+  );
 let app, admin, token, source, target, crafted;
 let requests = 0;
 
@@ -473,7 +489,7 @@ test("export refuses an archive that restore would refuse", async () => {
     data: { workspaceId: source.id, name: `Budget wiki ${suffix}`, slug: `budget-${suffix}` },
   });
   const urls = [];
-  for (const size of [1000, 2000]) {
+  for (const size of [1000, 4000]) {
     const stored = await app.storage.save(
       `${source.id}/uploads/wiki`,
       space.id,
@@ -493,7 +509,7 @@ test("export refuses an archive that restore would refuse", async () => {
   });
   const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
   const exportWith = (limits) =>
-    exportBackup(app.prisma, source.id, request, app.storage, admin.id, { ...BACKUP_ARCHIVE_LIMITS, ...limits });
+    exportZip(app.prisma, source.id, request, app.storage, admin.id, { ...BACKUP_ARCHIVE_LIMITS, ...limits });
 
   const { zipBuffer } = await exportWith({});
   const entries = await inspectBackupArchive(zipBuffer);
@@ -508,9 +524,11 @@ test("export refuses an archive that restore would refuse", async () => {
   await assert.rejects(exportWith({ maxTotalBytes: total - 1 }), tooLarge);
   // backup.json, the implied assets/ folder and two files are four entries.
   await assert.rejects(exportWith({ maxEntries: 3 }), tooLarge);
-  assert.ok(entries.find((e) => e.name === "backup.json").size < 1999);
-  await assert.rejects(exportWith({ maxEntryBytes: 1999 }), tooLarge);
-  await assert.rejects(exportWith({ maxNameBytes: entries[1].name.length - 1 }), tooLarge);
+  assert.ok(entries.find((e) => e.name === "backup.json").size < 3999);
+  await assert.rejects(exportWith({ maxEntryBytes: 3999 }), tooLarge);
+  await assert.rejects(exportWith({ maxNameBytes: entries.find((e) => e.name.startsWith("assets/")).name.length - 1 }), tooLarge);
+  // A refused export stops writing and removes its partial archive.
+  assert.deepEqual(await stagedExports(), []);
 });
 
 test("export refuses a backup.json that restore would refuse to parse", async () => {
@@ -529,7 +547,7 @@ test("export refuses a backup.json that restore would refuse to parse", async ()
   });
   const request = { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true };
   const exportWith = (jsonLimits) =>
-    exportBackup(app.prisma, source.id, request, app.storage, admin.id, BACKUP_ARCHIVE_LIMITS, {
+    exportZip(app.prisma, source.id, request, app.storage, admin.id, BACKUP_ARCHIVE_LIMITS, {
       ...BACKUP_JSON_LIMITS,
       ...jsonLimits,
     });
@@ -549,4 +567,5 @@ test("export refuses a backup.json that restore would refuse to parse", async ()
   const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
   for (const key of Object.keys(exact))
     await assert.rejects(exportWith({ [key]: exact[key] - 1 }), tooLarge, key);
+  assert.deepEqual(await stagedExports(), []);
 });

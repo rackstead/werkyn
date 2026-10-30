@@ -9,6 +9,7 @@ const {
   SERVER_BUSY_MESSAGE,
   WORKSPACE_BUSY_MESSAGE,
   limitBackupRequests,
+  releaseBackupAdmission,
 } = await import("../src/modules/backup/backup-concurrency.ts");
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -139,4 +140,28 @@ test("the route wrapper holds an admission until the handler settles", async () 
   finish.resolve("done");
   assert.equal(await ok, "done");
   assert.equal(limits.usage.admitted, 0, "released after success");
+});
+
+test("a streaming handler can release its admission before it settles", async () => {
+  const limits = new BackupConcurrency();
+  let settle;
+  const streaming = limitBackupRequests(async (request) => {
+    // As a download's stream closes, while the response is still finishing.
+    releaseBackupAdmission(request);
+    releaseBackupAdmission(request);
+    await new Promise((resolve) => (settle = resolve));
+  }, limits);
+  const route = fakeRoute("w");
+  const pending = streaming(route.request, route.reply);
+  await tick();
+  assert.deepEqual(limits.usage, { admitted: 0, workspaces: 0, exclusiveRunning: 0 });
+  // The workspace takes a new request at once, and the late settle frees nothing twice.
+  const next = limits.admit("w");
+  settle();
+  await pending;
+  assert.equal(limits.usage.admitted, 1);
+  next();
+  assert.equal(limits.usage.admitted, 0);
+  // Outside a limited handler there is nothing to release.
+  releaseBackupAdmission({});
 });

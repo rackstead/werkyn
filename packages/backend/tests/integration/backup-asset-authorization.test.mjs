@@ -160,6 +160,12 @@ before(async () => {
     reads.push(storagePath);
     return read(storagePath);
   };
+  // Export streams each embedded file; opening one counts as reading it.
+  const openReadStream = app.storage.openReadStream.bind(app.storage);
+  app.storage.openReadStream = async (storagePath) => {
+    reads.push(storagePath);
+    return openReadStream(storagePath);
+  };
   const exists = app.storage.exists.bind(app.storage);
   app.storage.exists = async (storagePath) => {
     stats.push(storagePath);

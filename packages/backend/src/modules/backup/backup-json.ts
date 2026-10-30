@@ -74,55 +74,103 @@ const COMMA = 0x2c;
 const COLON = 0x3a;
 
 /**
+ * Measures `backup.json` as it is written, chunk by chunk, and throws as soon
+ * as it exceeds `limits`. Export uses it to stop before building a file that
+ * restore would refuse; `inspectBackupJson` uses it for a whole file, so both
+ * count the same way.
+ */
+export class BackupJsonMeter {
+  private bytesSeen = 0;
+  private tokens = 1;
+  private objects = 0;
+  private depth = 0;
+  private maxDepth = 0;
+  private inString = false;
+  private escaped = false;
+
+  constructor(private readonly limits: BackupJsonLimits = BACKUP_JSON_LIMITS) {}
+
+  get bytes() {
+    return this.bytesSeen;
+  }
+
+  /**
+   * Count `chunk`. Multi-byte UTF-8 never contains an ASCII byte, so
+   * structural characters are found on the raw bytes, and a chunk may end
+   * anywhere, even inside a character or an escape.
+   */
+  write(chunk: Buffer): this {
+    const { limits } = this;
+    this.bytesSeen += chunk.length;
+    if (this.bytesSeen > limits.maxBytes) throw new BackupJsonError("json-size");
+    let { tokens, objects, depth, maxDepth, inString, escaped } = this;
+    try {
+      for (let i = 0; i < chunk.length; i++) {
+        const byte = chunk[i];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (byte === BACKSLASH) escaped = true;
+          else if (byte === QUOTE) inString = false;
+          continue;
+        }
+        switch (byte) {
+          case QUOTE:
+            inString = true;
+            break;
+          case OPEN_OBJECT:
+          case OPEN_ARRAY:
+            if (byte === OPEN_OBJECT && ++objects > limits.maxObjects) {
+              throw new BackupJsonError("json-objects");
+            }
+            if (++depth > maxDepth) {
+              maxDepth = depth;
+              if (maxDepth > limits.maxDepth) throw new BackupJsonError("json-depth");
+            }
+            if (++tokens > limits.maxTokens) throw new BackupJsonError("json-tokens");
+            break;
+          case CLOSE_OBJECT:
+          case CLOSE_ARRAY:
+            depth--;
+            break;
+          case COMMA:
+          case COLON:
+            if (++tokens > limits.maxTokens) throw new BackupJsonError("json-tokens");
+            break;
+        }
+      }
+    } finally {
+      this.tokens = tokens;
+      this.objects = objects;
+      this.depth = depth;
+      this.maxDepth = maxDepth;
+      this.inString = inString;
+      this.escaped = escaped;
+    }
+    return this;
+  }
+
+  get stats(): BackupJsonStats {
+    return {
+      bytes: this.bytesSeen,
+      tokens: this.tokens,
+      objects: this.objects,
+      depth: this.maxDepth,
+    };
+  }
+}
+
+/**
  * Measure `json` in one pass without allocating, and refuse it before
- * JSON.parse if it exceeds `limits`. Multi-byte UTF-8 never contains an ASCII
- * byte, so structural characters are found on the raw bytes. Text that is not
- * valid JSON is left for JSON.parse to reject; the counts still bound what it
- * could allocate before it fails.
+ * JSON.parse if it exceeds `limits`. Text that is not valid JSON is left for
+ * JSON.parse to reject; the counts still bound what it could allocate before
+ * it fails.
  */
 export function inspectBackupJson(
   json: Buffer,
   limits: BackupJsonLimits = BACKUP_JSON_LIMITS,
 ): BackupJsonStats {
   if (json.length > limits.maxBytes) throw new BackupJsonError("json-size");
-  let tokens = 1;
-  let objects = 0;
-  let depth = 0;
-  let maxDepth = 0;
-  let inString = false;
-  for (let i = 0; i < json.length; i++) {
-    const byte = json[i];
-    if (inString) {
-      if (byte === BACKSLASH) i++;
-      else if (byte === QUOTE) inString = false;
-      continue;
-    }
-    switch (byte) {
-      case QUOTE:
-        inString = true;
-        break;
-      case OPEN_OBJECT:
-      case OPEN_ARRAY:
-        if (byte === OPEN_OBJECT && ++objects > limits.maxObjects) {
-          throw new BackupJsonError("json-objects");
-        }
-        if (++depth > maxDepth) {
-          maxDepth = depth;
-          if (maxDepth > limits.maxDepth) throw new BackupJsonError("json-depth");
-        }
-        if (++tokens > limits.maxTokens) throw new BackupJsonError("json-tokens");
-        break;
-      case CLOSE_OBJECT:
-      case CLOSE_ARRAY:
-        depth--;
-        break;
-      case COMMA:
-      case COLON:
-        if (++tokens > limits.maxTokens) throw new BackupJsonError("json-tokens");
-        break;
-    }
-  }
-  return { bytes: json.length, tokens, objects, depth: maxDepth };
+  return new BackupJsonMeter(limits).write(json).stats;
 }
 
 /** Problems quoted in the response; validation stops once it has this many. */

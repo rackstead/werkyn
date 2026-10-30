@@ -145,6 +145,19 @@ export function clientAbortSignal(reply: FastifyReply): AbortSignal {
 
 type Handler = (request: FastifyRequest, reply: FastifyReply) => Promise<unknown>;
 
+const admissions = new WeakMap<FastifyRequest, () => void>();
+
+/**
+ * Release the request's admission now, before its handler settles. A
+ * streaming handler calls this when its stream closes: Fastify's reply is a
+ * thenable, so the handler itself settles only once the response has
+ * finished, which a client can observe later than it has the whole body.
+ * Releasing twice is harmless.
+ */
+export function releaseBackupAdmission(request: FastifyRequest) {
+  admissions.get(request)?.();
+}
+
 /**
  * Admit the request for its `:wid` before `handler` reads anything, and hold
  * the admission until the handler settles. A handler that streams a response
@@ -167,10 +180,12 @@ export function limitBackupRequests(
       }
       throw error;
     }
+    admissions.set(request, release);
     try {
       return await handler(request, reply);
     } finally {
       release();
+      admissions.delete(request);
     }
   };
 }

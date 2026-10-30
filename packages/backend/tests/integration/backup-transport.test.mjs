@@ -325,7 +325,7 @@ test("processing takes turns, and a request whose client left never starts", { t
   assert.deepEqual(await staged(), []);
 });
 
-test("an export keeps the exclusive section until its response has been sent", { timeout: 60_000 }, async () => {
+test("an export downloads outside the exclusive section but keeps its admission", { timeout: 60_000 }, async () => {
   const { a, d } = workspaces;
   // An incompressible image larger than the loopback socket buffers, so the
   // response cannot finish while the client is not reading.
@@ -364,27 +364,54 @@ test("an export keeps the exclusive section until its response has been sent", {
   request.end(JSON.stringify({ projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }] }));
   await waitFor(() => downloadResponse !== undefined, "the export to start its response", 20_000);
 
-  // A preview in another workspace is staged but cannot start processing.
-  const label = `After export ${suffix}`;
-  const preview = startUpload(a.id, "preview", archiveFor(label));
-  preview.finish();
-  await waitFor(async () => (await staged()).length === 1, "the preview to stage");
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(backupConcurrency.usage.exclusiveRunning, 1, "the export still holds the section");
-  assert.equal((await staged()).length, 1, "the preview is still waiting");
+  // The archive was opened and its name removed before the download began.
+  assert.deepEqual(await staged(), []);
+  assert.equal(backupConcurrency.usage.exclusiveRunning, 0);
 
-  // Once the client reads the export, the preview proceeds.
+  // While the export's client reads nothing, a preview in another workspace
+  // is processed, and the export still holds its own workspace's admission.
+  const label = `After export ${suffix}`;
+  const previewed = await startUpload(a.id, "preview", archiveFor(label)).finish();
+  assert.equal(previewed.status, 200, JSON.stringify(previewed.body));
+  assert.deepEqual(backupConcurrency.usage, { admitted: 1, workspaces: 1, exclusiveRunning: 0 });
+  const busy = await post(d.id, "export", { wikiSpaces: [{ spaceId: space.id }] });
+  assert.equal(busy.status, 429);
+
+  // Once the client reads, the download completes byte for byte.
   downloadResponse.resume();
   const finished = await download;
   assert.equal(finished.statusCode, 200);
   const zip = Buffer.concat(received);
+  assert.equal(zip.length, Number(finished.headers["content-length"]));
   const { readBackupArchive } = await import("../../src/modules/backup/backup-archive.ts");
   const contents = await readBackupArchive(zip);
   const [exported] = [...contents.assets.values()];
   assert.equal(sha256(await exported.read()), sha256(image));
-  const previewed = await preview.response;
-  assert.equal(previewed.status, 200, JSON.stringify(previewed.body));
-  await waitFor(() => backupConcurrency.usage.admitted === 0, "both admissions to be released");
+  await waitFor(() => backupConcurrency.usage.admitted === 0, "the export's admission to be released");
+  assert.deepEqual(await staged(), []);
+});
+
+test("an export whose client leaves mid-download frees its admission and leaves nothing", { timeout: 60_000 }, async () => {
+  const { d } = workspaces;
+  const [space] = await app.prisma.wikiSpace.findMany({
+    where: { workspaceId: d.id, name: `Export ${suffix}` },
+  });
+  const request = track(
+    http.request(`${base}/api/workspaces/${d.id}/backup/export`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    }),
+  );
+  const response = new Promise((resolve, reject) => {
+    request.on("error", reject);
+    request.on("response", resolve);
+  });
+  request.end(JSON.stringify({ wikiSpaces: [{ spaceId: space.id }] }));
+  const download = await response;
+  download.pause();
+  assert.equal(backupConcurrency.usage.admitted, 1);
+  request.destroy();
+  await waitFor(() => backupConcurrency.usage.admitted === 0, "the admission to be released");
   assert.deepEqual(await staged(), []);
 });
 
@@ -523,6 +550,40 @@ test("a large upload is staged and restored without holding it in memory", { tim
       (await readdir(path.join(childStaging, ".tmp", "backup"))).filter((n) => n.endsWith(".part")),
       [],
     );
+
+    // Export the restored space, images included, from the same process: the
+    // archive is built on disk and streamed, never held in memory.
+    const exported = await new Promise((resolve, reject) => {
+      const request = http.request(`http://127.0.0.1:${port}/api/workspaces/${workspace.id}/backup/export`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      });
+      request.on("error", reject);
+      request.on("response", (response) => {
+        const out = path.join(root, "exported.zip");
+        pipeline(response, createWriteStream(out)).then(
+          () => resolve({ status: response.statusCode, headers: response.headers, file: out }),
+          reject,
+        );
+      });
+      request.end(JSON.stringify({ wikiSpaces: [{ spaceId: space.id }] }));
+    });
+    assert.equal(exported.status, 200);
+    const exportedBytes = (await stat(exported.file)).size;
+    assert.equal(Number(exported.headers["content-length"]), exportedBytes);
+    assert.ok(exportedBytes > 3 * assetSize, `${exportedBytes}`);
+    const afterExport = await ask();
+    t.diagnostic(`export ${(exportedBytes / MiB).toFixed(1)} MiB; server peak RSS ${afterExport} MiB after export`);
+    assert.ok(afterExport - afterRestore < 64, `export grew peak RSS by ${afterExport - afterRestore} MiB`);
+    const { readBackupArchive } = await import("../../src/modules/backup/backup-archive.ts");
+    const contents = await readBackupArchive(exported.file);
+    const exportedDigests = [];
+    for (const asset of contents.assets.values()) {
+      const hash = crypto.createHash("sha256");
+      for await (const chunk of asset.open()) hash.update(chunk);
+      exportedDigests.push(hash.digest("hex"));
+    }
+    assert.deepEqual(exportedDigests.sort(), Object.values(digests).sort());
   } finally {
     child.stdin.end("quit\n");
     await new Promise((resolve) => child.once("close", resolve));

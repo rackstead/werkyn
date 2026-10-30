@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import { Transform, type Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+import { pipeline, Transform, type Readable } from "node:stream";
+import { pipeline as pipeStreams } from "node:stream/promises";
 import type { FastifyBaseLogger, FastifyRequest } from "fastify";
 import { AppError, ValidationError } from "../../utils/errors.js";
 import { BACKUP_ARCHIVE_LIMITS } from "./backup-archive.js";
@@ -110,7 +110,7 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
     options.idleTimeoutMs,
   );
   try {
-    await pipeline(source, meter, createWriteStream(file, { flags: "wx", mode: 0o600 }));
+    await pipeStreams(source, meter, createWriteStream(file, { flags: "wx", mode: 0o600 }));
   } catch (error) {
     await rm(file, { force: true });
     if (error instanceof AppError) throw error;
@@ -121,6 +121,25 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
     clearTimeout(idle);
   }
   return stagedFile(file, size);
+}
+
+/**
+ * Pass `source` through, calling `onIdle` once if no bytes move for
+ * `idleTimeoutMs`. Piped to a response, the stream stops moving as soon as
+ * the client stops reading, so this drops a stalled download after exactly
+ * that long. A socket timeout is not exact: Node skips its first expiry while
+ * a write is still pending, which roughly doubles the wait.
+ */
+export function watchIdle(source: Readable, idleTimeoutMs: number, onIdle: () => void): Readable {
+  const idle = setTimeout(onIdle, idleTimeoutMs);
+  const watched = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      idle.refresh();
+      callback(null, chunk);
+    },
+  });
+  watched.once("close", () => clearTimeout(idle));
+  return pipeline(source, watched, () => {});
 }
 
 export interface StagedUpload extends StagedFile {

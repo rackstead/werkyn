@@ -273,11 +273,18 @@ describe("session close codes", () => {
     }
   });
 
-  it("does not report a close after the client was disconnected", () => {
-    const onSessionEnded = vi.fn();
-    const { reporting, opened } = clientReporting(onSessionEnded);
-    reporting.disconnect();
-    opened.closeWith(4005);
-    expect(onSessionEnded).not.toHaveBeenCalled();
-  });
+  it.each([4004, 4005])(
+    "neither reports nor reconnects after close %i of a client that was already disconnected",
+    async (code) => {
+      vi.useFakeTimers();
+      const onSessionEnded = vi.fn();
+      const { reporting, opened } = clientReporting(onSessionEnded);
+      const before = FakeWebSocket.instances.length;
+      reporting.disconnect();
+      opened.closeWith(code);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(onSessionEnded).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(before);
+    },
+  );
 });

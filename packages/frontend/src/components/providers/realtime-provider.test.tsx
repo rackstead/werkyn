@@ -150,6 +150,57 @@ describe("session close codes", () => {
     expect(useAuthStore.getState().accessToken).toBe("bob-token");
   });
 
+  it.each([4004, 4005])(
+    "neither renews nor reconnects after close %i of a socket the identity change shut down",
+    async (code) => {
+      const { renew, signOut, expire } = stubStore(async () => false);
+      const aliceSocket = await mount("alice-token");
+      vi.useFakeTimers();
+      try {
+        // Only the identity-change disconnect runs here: the token is the
+        // same, so the provider's own effect does not rebuild the client.
+        act(() => useAuthStore.setState({ user: { ...alice, id: "bob" } }));
+        act(() => aliceSocket.closeWith(code));
+        await act(() => vi.advanceTimersByTimeAsync(60_000));
+
+        expect(FakeWebSocket.instances).toHaveLength(1);
+        expect(renew).not.toHaveBeenCalled();
+        expect(expire).not.toHaveBeenCalled();
+        expect(signOut).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("does not expire or reconnect for a renewal overtaken by an identity change", async () => {
+    let fail!: () => void;
+    const { renew, signOut } = stubStore(
+      () => new Promise<boolean>((resolve) => (fail = () => resolve(false))),
+    );
+    // The store's own expireSession, which ignores a stale generation.
+    const expire = vi.fn((generation: number) => expireSession(generation));
+    useAuthStore.setState({ expireSession: expire });
+    const aliceSocket = await mount("alice-token");
+    vi.useFakeTimers();
+    try {
+      act(() => aliceSocket.closeWith(4005, "Session revoked"));
+      expect(renew).toHaveBeenCalledTimes(1);
+      // Bob signs in while Alice's refresh is still running.
+      act(() => useAuthStore.setState({ user: { ...alice, id: "bob" }, accessToken: "bob-token" }));
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      await act(async () => fail());
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      expect(signOut).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().user?.id).toBe("bob");
+      expect(useAuthStore.getState().accessToken).toBe("bob-token");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("neither refreshes nor signs out after an ordinary disconnect", async () => {
     const { renew, signOut, expire } = stubStore(async () => true);
     const socket = await mount("token");

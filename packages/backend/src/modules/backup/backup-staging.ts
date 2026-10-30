@@ -59,8 +59,12 @@ export class BackupTransferStalledError extends AppError {
 
 export const UPLOAD_INTERRUPTED_MESSAGE = "The backup upload did not complete";
 
-/** A new, unused staging path of `kind` in `dir`, which is created if needed. */
+/**
+ * A new, unused staging path of `kind` in `dir`, which is created if needed.
+ * Nothing is staged until leftovers of an earlier process have been swept.
+ */
 export async function stagingPath(kind: "upload" | "export", dir: string) {
+  await prepareBackupStaging(dir);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   return path.join(dir, `${kind}-${randomUUID()}.part`);
 }
@@ -125,24 +129,54 @@ export interface StagedUpload extends StagedFile {
 
 /**
  * Stream the request's uploaded backup file into `dir`, refusing it beyond
- * `maxBytes`. The caller must dispose of the result once it has finished.
+ * `maxBytes`. A request that sends nothing for `idleTimeoutMs`, before or
+ * during the file, is dropped. The caller must dispose of the result once it
+ * has finished with it.
  */
 export async function receiveBackupUpload(
   request: FastifyRequest,
-  { dir, maxBytes }: { dir: string; maxBytes: number },
+  {
+    dir,
+    maxBytes,
+    idleTimeoutMs = BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
+  }: { dir: string; maxBytes: number; idleTimeoutMs?: number },
 ): Promise<StagedUpload> {
-  const file = await request.file({ limits: { fileSize: maxBytes } });
+  // The multipart parser reads the request from here on. Until the file part
+  // starts, a request that stops sending is dropped, so it cannot hold its
+  // admission; stageStream watches the file itself.
+  const pending = request.file({ limits: { fileSize: maxBytes } });
+  pending.catch(() => {});
+  const raw = request.raw;
+  let idle: NodeJS.Timeout | undefined;
+  const stalled = new Promise<never>((_, reject) => {
+    idle = setTimeout(() => {
+      reject(new BackupTransferStalledError());
+      raw.destroy();
+    }, idleTimeoutMs);
+  });
+  const onData = () => idle?.refresh();
+  raw.on("data", onData);
+  let file: Awaited<typeof pending>;
+  try {
+    file = await Promise.race([pending, stalled]);
+  } finally {
+    clearTimeout(idle);
+    raw.off("data", onData);
+  }
   if (!file) {
     throw new ValidationError("No file uploaded");
   }
   if (!file.filename.endsWith(".json") && !file.filename.endsWith(".zip")) {
     throw new ValidationError("Only .json and .zip files are accepted");
   }
-  const staged = await stageStream(file.file, {
-    dir,
-    maxBytes,
-    idleTimeoutMs: BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
-  });
+  let staged: StagedFile;
+  try {
+    staged = await stageStream(file.file, { dir, maxBytes, idleTimeoutMs });
+  } catch (error) {
+    // Drop a client that stalled mid-file; it is not reading a response.
+    if (error instanceof BackupTransferStalledError) raw.destroy();
+    throw error;
+  }
   // The multipart parser ends a file at its size limit instead of failing.
   if (file.file.truncated) {
     await staged.dispose();
@@ -151,12 +185,37 @@ export async function receiveBackupUpload(
   return { ...staged, filename: file.filename };
 }
 
+const sweeps = new Map<string, Promise<void>>();
+
 /**
- * Remove staged files left behind by a process that stopped mid-request. Run
- * once at startup, before any backup request is admitted; staged files are
- * only ever used by the request that created them. Returns how many it removed.
+ * Sweep `dir` once per process. The server does this at startup; until a
+ * sweep has succeeded, every attempt to stage a file retries it first, so
+ * leftovers are never kept alongside new files.
  */
-export async function sweepBackupStaging(log: FastifyBaseLogger, dir: string): Promise<number> {
+export function prepareBackupStaging(dir: string, log?: FastifyBaseLogger): Promise<void> {
+  let sweep = sweeps.get(dir);
+  if (!sweep) {
+    sweep = sweepBackupStaging(log, dir).then(
+      () => {},
+      (error: unknown) => {
+        sweeps.delete(dir);
+        throw error;
+      },
+    );
+    sweeps.set(dir, sweep);
+  }
+  return sweep;
+}
+
+/**
+ * Remove staged files left behind by a process that stopped mid-request.
+ * Staged files are only ever used by the request that created them, so this
+ * runs before any are created. Returns how many it removed.
+ */
+export async function sweepBackupStaging(
+  log: Pick<FastifyBaseLogger, "warn"> | undefined,
+  dir: string,
+): Promise<number> {
   let names: string[];
   try {
     names = await readdir(dir);
@@ -170,6 +229,6 @@ export async function sweepBackupStaging(log: FastifyBaseLogger, dir: string): P
     await rm(path.join(dir, name), { force: true });
     removed++;
   }
-  if (removed > 0) log.warn({ removed }, "Removed staged backup files left by an earlier process");
+  if (removed > 0) log?.warn({ removed }, "Removed staged backup files left by an earlier process");
   return removed;
 }

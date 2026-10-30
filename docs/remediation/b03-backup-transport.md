@@ -33,7 +33,9 @@ one transaction, and only then releases its admission.
 
 Admitted requests take turns in one exclusive section, in arrival order. That
 section covers reading `backup.json`, parsing and validating it, and the
-preview or restore itself, and for export, building the archive. These are the
+preview or restore itself, and for export, building the archive and sending
+it: export still builds the archive in memory, so it keeps the section until
+its response has been sent or abandoned. These are the
 steps whose memory the SEC-028 budget bounds for a single request, so the
 budget, and its recommendation of at least a 384 MiB heap, now holds for the
 whole process rather than per request. Uploads to the staging area run outside
@@ -51,13 +53,17 @@ and never held in memory as a whole:
 - The upload is limited to the smaller of `MAX_FILE_SIZE` and 1,088 MiB: the
   1 GiB archive budget, plus room for headers and a directory of 10,000
   entries. Beyond that the response is a 413 and the partial file is removed.
-- An upload that sends no bytes for 60 seconds is abandoned with a 408.
+- A request that sends no bytes for 60 seconds, whether before its file part
+  starts or during the file, is dropped (408). An export whose client reads
+  nothing for 60 seconds is dropped too.
 - The staged file is removed on every path before the response is sent, so a
   client can start its next backup request as soon as it has the answer.
 - At startup, before the server accepts requests, staged files left by a
   process that stopped mid-request are removed. Only names of the form above
-  are touched. Like the rest of the app, this assumes one server process per
-  storage directory.
+  are touched. If that sweep fails, the server still starts, but nothing is
+  staged until a sweep has succeeded: each backup request retries it first,
+  and fails while it cannot. Like the rest of the app, this assumes one server
+  process per storage directory.
 
 The archive is then read from the file by position instead of from a buffer:
 the end record from the last 64 KiB, the central directory through a 1 MiB
@@ -65,7 +71,9 @@ window, and one small read per local header. The SEC-025 inspection rules and
 limits are unchanged, so exactly the same archives are accepted and refused.
 adm-zip is no longer used to restore: entry data is read straight from the
 file, inflated with zlib, and must come to exactly its declared size and
-CRC-32. Inflation stops as soon as an entry exceeds its declared size.
+CRC-32. Inflation stops as soon as an entry exceeds its declared size. A
+failure to read the staged file is a server error (500), not a damaged
+archive.
 
 Only `backup.json` (at most 24 MiB) is read into memory. Every embedded file is
 streamed once to verify it before anything is written, as before, and again
@@ -105,7 +113,11 @@ stream of the unit test buffers less than 64 MiB at any moment.
 admission, release after success and error, the order and exclusivity of the
 exclusive section, skipping a request aborted while it waits, staging without
 buffering, the size limit at and one past its boundary, the idle timeout,
-interrupted uploads, and the startup sweep. `tests/backup-archive.test.mjs` now
+interrupted uploads, the startup sweep and its retry after a failure, and, on
+a real socket, dropping a request that stalls before its file part, inside the
+multipart preamble or mid-file. `tests/backup-archive.test.mjs` also checks
+that a failed read of the staged file keeps its errno instead of becoming a
+400. `tests/backup-archive.test.mjs` now
 reads every case from a buffer and an export-shaped archive from a file too,
 and checks that inflation stops just past the declared size.
 
@@ -120,6 +132,8 @@ port and drives it over TCP:
   no admissions;
 - while the exclusive section is held, a staged restore waits; a restore whose
   client leaves while waiting never runs;
+- an export whose client is not reading a 32 MiB response keeps the exclusive
+  section, so a preview in another workspace waits until the download ends;
 - an upload one byte over `MAX_FILE_SIZE` gets a 413 and leaves nothing;
 - the 192 MiB measurement above, in a separate server process.
 
@@ -129,7 +143,8 @@ unchanged apart from awaiting the reader.
 
 ## Remaining limits
 
-Export still builds the whole archive in memory before sending it. A client
+Export still builds the whole archive in memory before sending it, and keeps
+the exclusive section while a slow but steady client downloads it. A client
 that keeps sending a few bytes a minute holds its admission; three such
 clients, in three workspaces, fill the process. The limits are per process,
 and up to three staged uploads of up to 1,088 MiB each can be on disk at once.

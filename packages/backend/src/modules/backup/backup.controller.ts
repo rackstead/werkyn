@@ -32,22 +32,36 @@ export async function exportHandler(
   }
 
   const signal = clientAbortSignal(reply);
-  const { zipBuffer, filename } = await backupConcurrency.exclusive(
-    () =>
-      exportBackup(
-        request.server.prisma,
-        wid,
-        body,
-        request.server.storage,
-        request.user!.id,
-      ),
-    signal,
-  );
+  // The archive is built in memory, so the export keeps the exclusive section
+  // until its response has been sent or abandoned.
+  await backupConcurrency.exclusive(async () => {
+    const { zipBuffer, filename } = await exportBackup(
+      request.server.prisma,
+      wid,
+      body,
+      request.server.storage,
+      request.user!.id,
+    );
+    const sent = responseEnded(reply);
+    // A client that stops reading is dropped after the idle timeout.
+    reply.raw.setTimeout(BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () => reply.raw.destroy());
+    reply
+      .header("Content-Type", "application/zip")
+      .header("Content-Disposition", formatContentDisposition(filename))
+      .send(zipBuffer);
+    await sent;
+  }, signal);
+  return reply;
+}
 
-  return reply
-    .header("Content-Type", "application/zip")
-    .header("Content-Disposition", formatContentDisposition(filename))
-    .send(zipBuffer);
+/** Resolves once the response has been sent in full or its connection closed. */
+function responseEnded(reply: FastifyReply): Promise<void> {
+  const response = reply.raw;
+  if (response.writableFinished || response.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    response.once("finish", resolve);
+    response.once("close", resolve);
+  });
 }
 
 /** Quick check: ZIP files start with PK\x03\x04 */

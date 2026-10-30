@@ -129,20 +129,28 @@ function collect(request) {
   });
 }
 
+/** Requests a failed test may leave open; `after` drops them before closing. */
+const openRequests = new Set();
+function track(request) {
+  openRequests.add(request);
+  request.once("close", () => openRequests.delete(request));
+  return request;
+}
+
 /**
  * Start an upload over TCP that sends the envelope and the first `sent` bytes
  * of `file`, then waits. `finish()` sends the rest; `abort()` drops the socket.
  */
 function startUpload(workspaceId, action, file, { sent = file.length >> 1, filename = "backup.zip" } = {}) {
   const { contentType, head, tail } = envelope(filename);
-  const request = http.request(`${base}/api/workspaces/${workspaceId}/backup/${action}`, {
+  const request = track(http.request(`${base}/api/workspaces/${workspaceId}/backup/${action}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
       "content-type": contentType,
       "content-length": head.length + file.length + tail.length,
     },
-  });
+  }));
   const response = collect(request);
   response.catch(() => {});
   request.write(Buffer.concat([head, file.subarray(0, sent)]));
@@ -198,6 +206,7 @@ before(async () => {
 });
 
 after(async () => {
+  for (const request of openRequests) request.destroy();
   try {
     if (app) {
       await app.prisma.workspace.deleteMany({
@@ -218,7 +227,7 @@ test("startup removes staged files a stopped process left behind", async () => {
   assert.deepEqual(await staged(), []);
 });
 
-test("requests over the limits get 429 or 503 with Retry-After, and every path frees its admission", async () => {
+test("requests over the limits get 429 or 503 with Retry-After, and every path frees its admission", { timeout: 60_000 }, async () => {
   const { a, b, c, d, dProject } = workspaces;
   const exportD = () => post(d.id, "export", { projects: [{ projectId: dProject.id }] });
 
@@ -286,7 +295,7 @@ test("requests over the limits get 429 or 503 with Retry-After, and every path f
   assert.equal(sha256(bytes), sha256(asset));
 });
 
-test("processing takes turns, and a request whose client left never starts", async () => {
+test("processing takes turns, and a request whose client left never starts", { timeout: 60_000 }, async () => {
   const { a, b } = workspaces;
   let open;
   const held = backupConcurrency.exclusive(() => new Promise((resolve) => (open = resolve)));
@@ -316,7 +325,70 @@ test("processing takes turns, and a request whose client left never starts", asy
   assert.deepEqual(await staged(), []);
 });
 
-test("an upload over the size limit gets a 413 and leaves nothing staged", async () => {
+test("an export keeps the exclusive section until its response has been sent", { timeout: 60_000 }, async () => {
+  const { a, d } = workspaces;
+  // An incompressible image larger than the loopback socket buffers, so the
+  // response cannot finish while the client is not reading.
+  const image = crypto.randomBytes(32 * MiB);
+  const space = await app.prisma.wikiSpace.create({
+    data: { workspaceId: d.id, name: `Export ${suffix}`, slug: `export-${suffix}` },
+  });
+  const stored = await app.storage.save(`${d.id}/uploads/wiki`, space.id, crypto.randomUUID(), ".bin", image);
+  await app.prisma.wikiPage.create({
+    data: {
+      spaceId: space.id,
+      title: "Export page",
+      createdById: admin.id,
+      content: [{ type: "image", props: { url: `/storage/${stored}` } }],
+    },
+  });
+
+  const request = track(
+    http.request(`${base}/api/workspaces/${d.id}/backup/export`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    }),
+  );
+  const received = [];
+  let downloadResponse;
+  const download = new Promise((resolve, reject) => {
+    request.on("error", reject);
+    request.on("response", (response) => {
+      downloadResponse = response;
+      // Read nothing until told to.
+      response.pause();
+      response.on("data", (chunk) => received.push(chunk));
+      response.on("end", () => resolve(response));
+    });
+  });
+  request.end(JSON.stringify({ projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }] }));
+  await waitFor(() => downloadResponse !== undefined, "the export to start its response", 20_000);
+
+  // A preview in another workspace is staged but cannot start processing.
+  const label = `After export ${suffix}`;
+  const preview = startUpload(a.id, "preview", archiveFor(label));
+  preview.finish();
+  await waitFor(async () => (await staged()).length === 1, "the preview to stage");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(backupConcurrency.usage.exclusiveRunning, 1, "the export still holds the section");
+  assert.equal((await staged()).length, 1, "the preview is still waiting");
+
+  // Once the client reads the export, the preview proceeds.
+  downloadResponse.resume();
+  const finished = await download;
+  assert.equal(finished.statusCode, 200);
+  const zip = Buffer.concat(received);
+  const { readBackupArchive } = await import("../../src/modules/backup/backup-archive.ts");
+  const contents = await readBackupArchive(zip);
+  const [exported] = [...contents.assets.values()];
+  assert.equal(sha256(await exported.read()), sha256(image));
+  const previewed = await preview.response;
+  assert.equal(previewed.status, 200, JSON.stringify(previewed.body));
+  await waitFor(() => backupConcurrency.usage.admitted === 0, "both admissions to be released");
+  assert.deepEqual(await staged(), []);
+});
+
+test("an upload over the size limit gets a 413 and leaves nothing staged", { timeout: 60_000 }, async () => {
   const { a } = workspaces;
   const big = Buffer.alloc(MAX_FILE_SIZE + 1, 1);
   const response = await startUpload(a.id, "preview", big, { sent: 0 }).finish();

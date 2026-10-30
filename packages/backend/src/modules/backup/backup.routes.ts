@@ -9,15 +9,17 @@ import {
   restoreHandler,
 } from "./backup.controller.js";
 import { limitBackupRequests } from "./backup-concurrency.js";
-import { backupStagingDir, sweepBackupStaging } from "./backup-staging.js";
+import { backupStagingDir, prepareBackupStaging } from "./backup-staging.js";
 import { env } from "../../config/env.js";
 
 export default async function backupRoutes(fastify: FastifyInstance) {
   // A staged file belongs to the request that created it, so any found before
   // the server accepts requests were left by a process that stopped mid-request.
+  // If this sweep fails, the server still starts, and every backup request
+  // retries it before staging anything (and fails while it cannot).
   fastify.addHook("onReady", async () => {
     try {
-      await sweepBackupStaging(fastify.log, backupStagingDir(env.STORAGE_DIR));
+      await prepareBackupStaging(backupStagingDir(env.STORAGE_DIR), fastify.log);
     } catch (error) {
       fastify.log.error({ err: error }, "Could not clear the backup staging area");
     }

@@ -559,6 +559,8 @@ export async function readBackupArchive(
       return { jsonBuffer, assets };
     } catch (error) {
       if (error instanceof ValidationError) throw error;
+      // Reading the staged file failed: a server fault, not a damaged upload.
+      if (typeof (error as NodeJS.ErrnoException).syscall === "string") throw error;
       // zlib messages can describe the data; never pass them on.
       throw invalid("read-failed");
     }

@@ -4,6 +4,9 @@ import crypto from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { Readable } from "node:stream";
 import zlib from "node:zlib";
 import { after, test } from "node:test";
 import archiver from "archiver";
@@ -376,6 +379,30 @@ test("rejections never quote entry names or zlib messages", async () => {
     statusCode: 400,
     message: "Invalid backup ZIP: missing backup.json",
   });
+});
+
+test("a failure to read the staged file is a server error, not a damaged archive", async () => {
+  const file = path.join(scratch, "unreadable.zip");
+  await writeFile(file, craftZip([json(), asset("a.png")]));
+  const original = fs.createReadStream;
+  fs.createReadStream = () =>
+    new Readable({
+      read() {
+        this.destroy(Object.assign(new Error("EIO: i/o error, read"), { code: "EIO", syscall: "read" }));
+      },
+    });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(readBackupArchive(file), (error) => {
+      assert.ok(!(error instanceof BackupArchiveError), String(error));
+      assert.equal(error.code, "EIO");
+      return true;
+    });
+  } finally {
+    fs.createReadStream = original;
+    syncBuiltinESMExports();
+  }
+  assert.equal((await readBackupArchive(file)).assets.size, 1);
 });
 
 test("the export budget counts entries the way the restore inspection does", () => {

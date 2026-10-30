@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { PassThrough, Readable } from "node:stream";
 import { after, test } from "node:test";
 
@@ -12,7 +13,10 @@ const {
   BackupUploadTooLargeError,
   UPLOAD_INTERRUPTED_MESSAGE,
   backupStagingDir,
+  prepareBackupStaging,
+  receiveBackupUpload,
   stageStream,
+  stagingPath,
   sweepBackupStaging,
 } = await import("../src/modules/backup/backup-staging.ts");
 const { BACKUP_ARCHIVE_LIMITS } = await import("../src/modules/backup/backup-archive.ts");
@@ -166,4 +170,93 @@ test("startup sweeps staged files only", async () => {
   assert.equal(warned.length, 1);
   assert.deepEqual(warned[0][0], { removed: 2 });
   assert.equal(await readFile(path.join(dir, "notes.txt"), "utf8"), "x");
+});
+
+test("nothing is staged until leftovers have been swept, and a failed sweep is retried", async () => {
+  const dir = freshDir();
+  // A file where the folder should be: the startup sweep cannot list it.
+  await writeFile(dir, "not a folder");
+  await assert.rejects(prepareBackupStaging(dir, log), { code: "ENOTDIR" });
+  await assert.rejects(stagingPath("upload", dir), { code: "ENOTDIR" });
+
+  // Once the folder is readable, the next attempt sweeps it and then stages.
+  await rm(dir);
+  await mkdir(dir);
+  const leftover = `upload-${crypto.randomUUID()}.part`;
+  await writeFile(path.join(dir, leftover), "left behind");
+  const fresh = await stagingPath("upload", dir);
+  assert.equal(path.dirname(fresh), dir);
+  assert.deepEqual(await readdir(dir), [], "the leftover was swept first");
+
+  // After a successful sweep, files staged since are never swept again.
+  await writeFile(fresh, "in use");
+  await prepareBackupStaging(dir, log);
+  await stagingPath("export", dir);
+  assert.deepEqual(await readdir(dir), [path.basename(fresh)]);
+});
+
+test("a request that stalls before or during its file is dropped", async (t) => {
+  const Fastify = (await import("fastify")).default;
+  const multipart = (await import("@fastify/multipart")).default;
+  const dir = freshDir();
+  const outcomes = [];
+  const app = Fastify();
+  await app.register(multipart);
+  app.post("/upload", async (request) => {
+    try {
+      const staged = await receiveBackupUpload(request, { dir, maxBytes: MiB, idleTimeoutMs: 200 });
+      await staged.dispose();
+      outcomes.push("staged");
+      return { ok: true };
+    } catch (error) {
+      outcomes.push(error.constructor.name);
+      throw error;
+    }
+  });
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  t.after(() => app.close());
+  const { port } = app.server.address();
+  const boundary = "stall-boundary";
+  const part = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="b.zip"\r\nContent-Type: application/zip\r\n\r\n`;
+
+  /** Send the request head and `body`, keep the socket open, report when it closes. */
+  async function stall(body) {
+    const socket = net.connect(port, "127.0.0.1");
+    await new Promise((resolve) => socket.once("connect", resolve));
+    socket.write(
+      `POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: 100000\r\n\r\n${body}`,
+    );
+    const started = Date.now();
+    await new Promise((resolve) => socket.once("close", resolve));
+    return Date.now() - started;
+  }
+
+  for (const body of ["", `--${boundary}\r\nContent-Disp`, `${part}some bytes`]) {
+    outcomes.length = 0;
+    const elapsed = await stall(body);
+    assert.ok(elapsed >= 150 && elapsed < 5_000, `${JSON.stringify(body)}: ${elapsed} ms`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(outcomes, ["BackupTransferStalledError"], JSON.stringify(body));
+  }
+  assert.deepEqual(await readdir(dir).catch(() => []), []);
+
+  // A slow request that keeps sending is not dropped.
+  outcomes.length = 0;
+  const socket = net.connect(port, "127.0.0.1");
+  await new Promise((resolve) => socket.once("connect", resolve));
+  const tail = `\r\n--${boundary}--\r\n`;
+  const pieces = [`--${boundary}\r\n`, part.slice(boundary.length + 4), "abc", "def", tail];
+  const length = pieces.join("").length;
+  socket.write(
+    `POST /upload HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: ${length}\r\n\r\n`,
+  );
+  let response = "";
+  socket.on("data", (chunk) => (response += chunk));
+  for (const piece of pieces) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    socket.write(piece);
+  }
+  await new Promise((resolve) => socket.once("close", resolve));
+  assert.match(response, /^HTTP\/1\.1 200/);
+  assert.deepEqual(outcomes, ["staged"]);
 });

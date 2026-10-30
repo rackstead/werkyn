@@ -267,7 +267,6 @@ export async function listMessages(
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
       },
-      _count: { select: { replies: true } },
       reactions: {
         select: { id: true, emoji: true, userId: true },
         orderBy: { createdAt: "asc" as const },
@@ -282,9 +281,30 @@ export async function listMessages(
   if (hasMore) messages.pop();
 
   return {
-    data: messages,
+    data: await withReplyCounts(prisma, messages),
     nextCursor: hasMore ? messages[messages.length - 1]?.id : undefined,
   };
+}
+
+/**
+ * Adds `_count.replies` (every reply, as the `_count` include counts) to a
+ * list of messages. Counted here for the listed messages only: for a list,
+ * Prisma's `_count` include joins a count of every thread in the table.
+ */
+async function withReplyCounts<T extends { id: string }>(
+  prisma: PrismaClient,
+  messages: T[],
+) {
+  if (messages.length === 0) return [];
+  const counts = await prisma.$queryRaw<{ parentId: string; replies: number }[]>`
+    SELECT "parentId", count(*)::int AS "replies" FROM "ChatMessage"
+    WHERE "parentId" = ANY(${messages.map((m) => m.id)})
+    GROUP BY "parentId"`;
+  const byParent = new Map(counts.map((c) => [c.parentId, c.replies]));
+  return messages.map((m) => ({
+    ...m,
+    _count: { replies: byParent.get(m.id) ?? 0 },
+  }));
 }
 
 // Idempotency bookkeeping stays server-side: the sender's key and the
@@ -733,14 +753,13 @@ export async function listPinnedMessages(
   prisma: PrismaClient,
   channelId: string,
 ) {
-  return prisma.chatMessage.findMany({
+  const pinned = await prisma.chatMessage.findMany({
     where: { channelId, pinnedAt: { not: null }, deletedAt: null },
     omit: chatMessageOmit,
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true },
       },
-      _count: { select: { replies: true } },
       reactions: {
         select: { id: true, emoji: true, userId: true },
         orderBy: { createdAt: "asc" as const },
@@ -748,6 +767,7 @@ export async function listPinnedMessages(
     },
     orderBy: { pinnedAt: "desc" },
   });
+  return withReplyCounts(prisma, pinned);
 }
 
 // ─── Bookmarks ────────────────────────────────────────

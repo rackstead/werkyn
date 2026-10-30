@@ -1,4 +1,4 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import type {
   CreateWorkspaceInput,
   UpdateWorkspaceInput,
@@ -287,40 +287,46 @@ export async function getDashboard(
       name: true,
       color: true,
       archived: true,
-      tasks: {
-        where: { archived: false },
-        select: {
-          id: true,
-          dueDate: true,
-          status: { select: { isCompletion: true } },
-        },
-      },
     },
     orderBy: { name: "asc" },
   });
+  if (projects.length === 0) return { data: [] };
 
   const today = new Date().toISOString().split("T")[0];
 
-  const data = projects.map((project) => {
-    const totalTasks = project.tasks.length;
-    const completedTasks = project.tasks.filter(
-      (t) => t.status.isCompletion,
-    ).length;
-    const overdueTasks = project.tasks.filter(
-      (t) =>
-        t.dueDate &&
-        t.dueDate < today &&
-        !t.status.isCompletion,
-    ).length;
+  // Counted in the database instead of loading every active task of every
+  // project. A task is overdue when its non-empty due date sorts before today
+  // by code unit, as a JavaScript string comparison would (hence COLLATE "C").
+  const counts = await prisma.$queryRaw<
+    {
+      projectId: string;
+      totalTasks: number;
+      completedTasks: number;
+      overdueTasks: number;
+    }[]
+  >`
+    SELECT t."projectId",
+      count(*)::int AS "totalTasks",
+      count(*) FILTER (WHERE s."isCompletion")::int AS "completedTasks",
+      count(*) FILTER (
+        WHERE NOT s."isCompletion" AND t."dueDate" <> '' AND t."dueDate" < ${today} COLLATE "C"
+      )::int AS "overdueTasks"
+    FROM "Task" t
+    JOIN "StatusColumn" s ON s."id" = t."statusId"
+    WHERE t."projectId" IN (${Prisma.join(projects.map((p) => p.id))}) AND NOT t."archived"
+    GROUP BY t."projectId"`;
+  const byProject = new Map(counts.map((c) => [c.projectId, c]));
 
+  const data = projects.map((project) => {
+    const count = byProject.get(project.id);
     return {
       id: project.id,
       name: project.name,
       color: project.color,
       archived: project.archived,
-      totalTasks,
-      completedTasks,
-      overdueTasks,
+      totalTasks: count?.totalTasks ?? 0,
+      completedTasks: count?.completedTasks ?? 0,
+      overdueTasks: count?.overdueTasks ?? 0,
     };
   });
 

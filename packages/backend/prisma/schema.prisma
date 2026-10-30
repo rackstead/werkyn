@@ -488,6 +488,11 @@ model Task {
   @@index([projectId, archived])
   @@index([projectId, dueDate])
   @@index([projectId, startDate])
+  // Board order of a project's tasks (utils/task-order.ts): serves the task
+  // list's default sort without sorting every task of the project. "id" is
+  // left out on purpose: as an index-only source of a project's task IDs it
+  // made the planner hash every readable task for the notification list.
+  @@index([projectId, archived, position, createdAt])
 }
 
 model TaskAssignee {

@@ -38,7 +38,12 @@ before(async () => {
 
 after(async () => {
   try {
-    if (workspace) await app.prisma.workspace.deleteMany({ where: { id: workspace.id } });
+    if (workspace) {
+      await app.prisma.workspace.deleteMany({ where: { id: workspace.id } });
+      // Deleting the files queued their blobs for cleanup; this suite starts no
+      // cleanup worker and removes the storage itself, so drop only its rows.
+      await app.prisma.blobCleanup.deleteMany({ where: { storagePath: { startsWith: `${workspace.id}/` } } });
+    }
     if (user) await app.prisma.user.deleteMany({ where: { id: user.id } });
   } finally {
     await app?.close();

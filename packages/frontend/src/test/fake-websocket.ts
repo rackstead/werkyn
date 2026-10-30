@@ -51,6 +51,12 @@ export class FakeWebSocket {
     this.onclose?.({});
   }
 
+  /** Server closes the connection with a status code. */
+  closeWith(code: number, reason = "") {
+    this.readyState = 3;
+    this.onclose?.({ code, reason });
+  }
+
   /** Server sends one frame: objects are serialized, strings sent verbatim. */
   deliver(frame: unknown) {
     this.onmessage?.({

@@ -15,6 +15,7 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-chat-auth-"));
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 const realtime = await import("../../src/modules/realtime/realtime.service.js");
 let app, ownWorkspace, foreignWorkspace;
 const users = [], channels = {}, sockets = [], observedEvents = [];
@@ -82,7 +83,9 @@ before(async () => {
   const suffix = crypto.randomUUID();
   for (const name of ["ADMIN", "MEMBER", "VIEWER", "PEER", "FOREIGN"]) {
     const u = await app.prisma.user.create({ data: { email: `chat-${name}-${suffix}@example.test`, displayName: name, emailVerified: true } });
-    users.push(u); sessions[name] = signAccessToken({ sub: u.id, email: u.email });
+    // Sockets require an access token bound to a live sign-in session.
+    const { familyId } = await startRefreshSession(app.prisma, u.id);
+    users.push(u); sessions[name] = signAccessToken({ sub: u.id, email: u.email, sid: familyId });
   }
   ownWorkspace = await app.prisma.workspace.create({ data: { name: "Chat own", slug: `chat-own-${suffix}`, members: { create: users.slice(0, 4).map((u, i) => ({ userId: u.id, role: ["ADMIN", "MEMBER", "VIEWER", "MEMBER"][i] })) } } });
   foreignWorkspace = await app.prisma.workspace.create({ data: { name: "Chat foreign", slug: `chat-foreign-${suffix}`, members: { create: { userId: users[4].id, role: "ADMIN" } } } });

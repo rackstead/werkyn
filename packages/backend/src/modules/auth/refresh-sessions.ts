@@ -55,27 +55,34 @@ export async function limitLockWaits(tx: Tx) {
   `;
 }
 
+export interface RefreshSession {
+  refreshToken: string;
+  // The family id; access tokens of this session carry it as `sid`.
+  familyId: string;
+}
+
 /**
- * Starts a new family for the user and returns its first raw refresh token.
- * The user row is held FOR SHARE while the family is created. Password change
- * and reset update that row before revoking every family, so they either
- * commit first or wait for this session and then revoke it too.
+ * Starts a new family for the user and returns its first raw refresh token
+ * and its id. The user row is held FOR SHARE while the family is created.
+ * Password change and reset update that row before revoking every family, so
+ * they either commit first or wait for this session and then revoke it too.
  */
-export async function createRefreshSession(
+export async function startRefreshSession(
   client: Client,
   userId: string,
-): Promise<string> {
+): Promise<RefreshSession> {
   if ("$transaction" in client)
     return client.$transaction(async (tx) => {
       await limitLockWaits(tx);
-      return createRefreshSession(tx, userId);
+      return startRefreshSession(tx, userId);
     }, refreshTransactionOptions);
   await client.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR SHARE`;
   const refreshToken = generateRefreshToken();
+  const familyId = crypto.randomUUID();
   // The family is never visible without its first token.
   await client.refreshTokenFamily.create({
     data: {
-      id: crypto.randomUUID(),
+      id: familyId,
       userId,
       tokens: {
         create: {
@@ -85,7 +92,15 @@ export async function createRefreshSession(
       },
     },
   });
-  return refreshToken;
+  return { refreshToken, familyId };
+}
+
+/** Starts a new family and returns its first raw refresh token. */
+export async function createRefreshSession(
+  client: Client,
+  userId: string,
+): Promise<string> {
+  return (await startRefreshSession(client, userId)).refreshToken;
 }
 
 async function findFamilyId(tx: Tx, tokenHash: string) {
@@ -125,7 +140,9 @@ async function revokeLockedFamily(
 }
 
 export type RotationResult =
-  | { status: "rotated"; userId: string; refreshToken: string }
+  | { status: "rotated"; userId: string; familyId: string; refreshToken: string }
+  // Reuse of a rotated token revoked its family.
+  | { status: "reused"; familyId: string }
   | { status: "superseded" }
   | { status: "busy" }
   | { status: "expired" }
@@ -187,7 +204,7 @@ export function rotateRefreshToken(
           expiresAt: new Date(now.getTime() + REFRESH_TOKEN_TTL_MS),
         },
       });
-      return { status: "rotated", userId: family.userId, refreshToken };
+      return { status: "rotated", userId: family.userId, familyId, refreshToken };
     }
 
     const rotated = await tx.rotatedRefreshToken.findUnique({
@@ -198,7 +215,7 @@ export function rotateRefreshToken(
     if (now.getTime() - rotated.rotatedAt.getTime() < REFRESH_REUSE_GRACE_MS)
       return { status: "superseded" };
     await revokeLockedFamily(tx, familyId, "reuse");
-    return { status: "invalid" };
+    return { status: "reused", familyId };
   }, refreshTransactionOptions);
   return rotation.catch((error: unknown): RotationResult => {
     if (isBusy(error)) return { status: "busy" };
@@ -206,32 +223,38 @@ export function rotateRefreshToken(
   });
 }
 
-/** Revokes the family of a presented active or rotated token, if any. */
+/**
+ * Revokes the family of a presented active or rotated token, if any, and
+ * returns its id once the revocation has committed.
+ */
 export async function revokeRefreshFamily(
   prisma: PrismaClient,
   rawToken: string,
   reason: RefreshRevocationReason,
-) {
+): Promise<string | null> {
   const tokenHash = hashToken(rawToken);
-  await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     const familyId = await findFamilyId(tx, tokenHash);
-    if (!familyId || !(await lockFamily(tx, familyId))) return;
+    if (!familyId || !(await lockFamily(tx, familyId))) return null;
     await revokeLockedFamily(tx, familyId, reason);
+    return familyId;
   }, refreshTransactionOptions);
 }
 
 /**
  * Revokes every family of a user inside the caller's READ COMMITTED
- * transaction, which should start with limitLockWaits. Families are locked in id order, waiting for in-flight
- * rotations to commit, so their successors are deleted as well.
+ * transaction, which should start with limitLockWaits. Families are locked in
+ * id order, waiting for in-flight rotations to commit, so their successors are
+ * deleted as well. Returns the ids of the families it locked; the caller ends
+ * their realtime sockets after its transaction commits.
  */
 export async function revokeUserRefreshSessions(
   tx: Tx,
   userId: string,
   reason: RefreshRevocationReason,
-) {
-  await tx.$queryRaw`
+): Promise<string[]> {
+  const families = await tx.$queryRaw<Array<{ id: string }>>`
     SELECT id FROM "RefreshTokenFamily"
     WHERE "userId" = ${userId}
     ORDER BY id
@@ -242,4 +265,5 @@ export async function revokeUserRefreshSessions(
     data: { revokedAt: new Date(), revokedReason: reason },
   });
   await tx.refreshToken.deleteMany({ where: { userId } });
+  return families.map((family) => family.id);
 }

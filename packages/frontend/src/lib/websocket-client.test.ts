@@ -165,3 +165,119 @@ describe("shared subscriptions", () => {
     ]);
   });
 });
+
+describe("session close codes", () => {
+  function clientReporting(onSessionEnded?: (code: number) => Promise<unknown> | void) {
+    const reporting = new WebSocketClient({
+      url: "ws://test/api/ws",
+      getToken: () => "token",
+      onSessionEnded,
+    });
+    reporting.connect();
+    const opened = FakeWebSocket.latest();
+    opened.accept();
+    return { reporting, opened };
+  }
+
+  function deferred() {
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  it.each([4004, 4005])(
+    "reports close %i once and reconnects only after the renewal, with the normal backoff",
+    async (code) => {
+      vi.useFakeTimers();
+      const renewal = deferred();
+      const onSessionEnded = vi.fn(() => renewal.promise);
+      const { reporting, opened } = clientReporting(onSessionEnded);
+      try {
+        const before = FakeWebSocket.instances.length;
+        opened.closeWith(code);
+        expect(onSessionEnded).toHaveBeenCalledTimes(1);
+        expect(onSessionEnded).toHaveBeenCalledWith(code);
+
+        // A slow renewal: no reconnect with the old token, not even when the
+        // tab becomes visible.
+        await vi.advanceTimersByTimeAsync(10_000);
+        const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+        document.dispatchEvent(new Event("visibilitychange"));
+        visibility.mockRestore();
+        expect(FakeWebSocket.instances).toHaveLength(before);
+
+        renewal.resolve();
+        await vi.advanceTimersByTimeAsync(999);
+        expect(FakeWebSocket.instances).toHaveLength(before);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(FakeWebSocket.instances).toHaveLength(before + 1);
+        expect(onSessionEnded).toHaveBeenCalledTimes(1);
+      } finally {
+        reporting.disconnect();
+      }
+    },
+  );
+
+  it("resumes the backoff when the renewal fails", async () => {
+    vi.useFakeTimers();
+    const renewal = deferred();
+    const { reporting, opened } = clientReporting(() => renewal.promise);
+    try {
+      const before = FakeWebSocket.instances.length;
+      opened.closeWith(4005);
+      renewal.reject(new Error("refresh failed"));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(FakeWebSocket.instances).toHaveLength(before + 1);
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it("does not reconnect after the owner disconnects it during the renewal", async () => {
+    vi.useFakeTimers();
+    const renewal = deferred();
+    const { reporting, opened } = clientReporting(() => renewal.promise);
+    const before = FakeWebSocket.instances.length;
+    opened.closeWith(4004);
+    reporting.disconnect();
+    renewal.resolve();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(FakeWebSocket.instances).toHaveLength(before);
+  });
+
+  it("reconnects with the normal backoff when nobody handles session closes", async () => {
+    vi.useFakeTimers();
+    const { reporting, opened } = clientReporting();
+    try {
+      const before = FakeWebSocket.instances.length;
+      opened.closeWith(4005);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(FakeWebSocket.instances).toHaveLength(before + 1);
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it.each([1006, 1000, 4002, 4009])("does not report close %i", (code) => {
+    const onSessionEnded = vi.fn();
+    const { reporting, opened } = clientReporting(onSessionEnded);
+    try {
+      opened.closeWith(code);
+      expect(onSessionEnded).not.toHaveBeenCalled();
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it("does not report a close after the client was disconnected", () => {
+    const onSessionEnded = vi.fn();
+    const { reporting, opened } = clientReporting(onSessionEnded);
+    reporting.disconnect();
+    opened.closeWith(4005);
+    expect(onSessionEnded).not.toHaveBeenCalled();
+  });
+});

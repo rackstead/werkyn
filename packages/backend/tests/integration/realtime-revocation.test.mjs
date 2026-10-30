@@ -21,6 +21,7 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-realtime-revocat
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 const realtime = await import("../../src/modules/realtime/realtime.service.js");
 
 let app, port;
@@ -54,7 +55,13 @@ async function createFixture() {
       data: { email: `rt-${name}-${suffix}@example.test`, displayName: name, emailVerified: true },
     });
     userIds.push(created.id);
-    return { ...created, token: signAccessToken({ sub: created.id, email: created.email }) };
+    // Sockets require an access token bound to a live sign-in session.
+    const { familyId } = await startRefreshSession(app.prisma, created.id);
+    return {
+      ...created,
+      sessionId: familyId,
+      token: signAccessToken({ sub: created.id, email: created.email, sid: familyId }),
+    };
   };
   const admin = await user("admin");
   const deputy = await user("deputy");
@@ -349,7 +356,9 @@ test("demoting an administrator drops project subscriptions that relied on the a
 
 test("a socket is closed when its access token expires and receives nothing afterwards", async () => {
   const f = await createFixture();
-  const shortToken = jwt.sign({ sub: f.member.id, email: f.member.email }, JWT_SECRET, { expiresIn: 2 });
+  const shortToken = jwt.sign({ sub: f.member.id, email: f.member.email, sid: f.member.sessionId }, JWT_SECRET, {
+    expiresIn: 2,
+  });
   const client = await connect(shortToken);
   try {
     await subscribeAll(client, f);

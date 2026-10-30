@@ -16,6 +16,7 @@ process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const realtime = await import("../../src/modules/realtime/realtime.service.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 const { notify } = await import("../../src/utils/notify.js");
 let app, workspace, foreignWorkspace, project, hidden, assigned, unassigned, blocking, subtask, comment, field, label, status;
 const users = {}, tokens = {}, sockets = [], events = [];
@@ -56,7 +57,9 @@ before(async () => {
   const roles = { ADMIN: "ADMIN", MEMBER: "MEMBER", VIEWER: "VIEWER", OUTSIDER: "MEMBER", OUTSIDE_VIEWER: "VIEWER", PEER: "MEMBER", FOREIGN: "ADMIN" };
   for (const actor of Object.keys(roles)) {
     const user = await app.prisma.user.create({ data: { email: `project-${actor}-${suffix}@example.test`, displayName: actor, emailVerified: true } });
-    users[actor] = user; tokens[actor] = signAccessToken({ sub: user.id, email: user.email });
+    // Sockets require an access token bound to a live sign-in session.
+    const { familyId } = await startRefreshSession(app.prisma, user.id);
+    users[actor] = user; tokens[actor] = signAccessToken({ sub: user.id, email: user.email, sid: familyId });
   }
   workspace = await app.prisma.workspace.create({ data: { name: "Project authorization", slug: `project-scope-${suffix}`, members: { create: Object.keys(roles).filter((r) => r !== "FOREIGN").map((r) => ({ userId: users[r].id, role: roles[r] })) } } });
   foreignWorkspace = await app.prisma.workspace.create({ data: { name: "Foreign workspace", slug: `project-foreign-${suffix}`, members: { create: { userId: users.FOREIGN.id, role: "ADMIN" } } } });

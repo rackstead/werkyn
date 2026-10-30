@@ -15,6 +15,7 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-chat-send-"));
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 const realtime = await import("../../src/modules/realtime/realtime.service.js");
 // The retry worker entry point. Missing before the fix, when nothing retries.
 const delivery = await import("../../src/modules/chat/chat-delivery.js").catch(() => null);
@@ -145,7 +146,9 @@ before(async () => {
       data: { email: `chat-send-${name}-${suffix}@example.test`, displayName: name, emailVerified: true },
     });
     users[name] = user;
-    sessions[name] = signAccessToken({ sub: user.id, email: user.email });
+    // Sockets require an access token bound to a live sign-in session.
+    const { familyId } = await startRefreshSession(app.prisma, user.id);
+    sessions[name] = signAccessToken({ sub: user.id, email: user.email, sid: familyId });
   }
   workspace = await app.prisma.workspace.create({
     data: {

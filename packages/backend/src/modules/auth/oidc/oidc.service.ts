@@ -5,7 +5,7 @@ import type { PrismaClient } from "@prisma/client";
 import { env } from "../../../config/env.js";
 import { UnauthorizedError } from "../../../utils/errors.js";
 import { signAccessToken } from "../../../utils/tokens.js";
-import { createRefreshSession } from "../refresh-sessions.js";
+import { startRefreshSession } from "../refresh-sessions.js";
 import {
   assertSsoEnabled,
   readOidcIdentity,
@@ -188,9 +188,13 @@ export async function handleOidcCallback(
   const identity = readOidcIdentity(claims, as.issuer);
   const user = await resolveOidcUser(prisma, identity, oidcState.connectorId);
 
-  // Generate werkyn tokens
-  const accessToken = signAccessToken({ sub: user.id, email: user.email });
-  const refreshToken = await createRefreshSession(prisma, user.id);
+  // Generate werkyn tokens. The access token names the new session.
+  const { refreshToken, familyId } = await startRefreshSession(prisma, user.id);
+  const accessToken = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    sid: familyId,
+  });
 
   const workspaces = await prisma.workspaceMember.findMany({
     where: { userId: user.id },

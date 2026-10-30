@@ -21,6 +21,7 @@ overrides:
   '@tiptap/extension-strike': 3.30.6
   '@tiptap/extension-text': 3.30.6
   '@tiptap/extension-underline': 3.30.6
+  prosemirror-transform: 1.12.4
 
 importers:
 
@@ -3881,7 +3882,7 @@ packages:
       lowlight: ^3.1.0
       prosemirror-model: ^1.19.3
       prosemirror-state: ^1.4.3
-      prosemirror-transform: ^1.8.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: ^1.32.4
       refractor: ^5.0.0
       sugar-high: ^0.6.1 || ^0.7.0 || ^0.8.0 || ^0.9.0
@@ -3927,9 +3928,6 @@ packages:
 
   prosemirror-tables@1.8.5:
     resolution: {integrity: sha512-V/0cDCsHKHe/tfWkeCmthNUcEp1IVO3p6vwN8XtwE9PZQLAZJigbw3QoraAdfJPir4NKJtNvOB8oYGKRl+t0Dw==}
-
-  prosemirror-transform@1.11.0:
-    resolution: {integrity: sha512-4I7Ce4KpygXb9bkiPS3hTEk4dSHorfRw8uI0pE8IhxlK2GXsqv5tIA7JUSxtSu7u8APVOTtbUBxTmnHIxVkIJw==}
 
   prosemirror-transform@1.12.4:
     resolution: {integrity: sha512-2/WuPum3pn+O/Vi2vzpi8210ICUe2kIPXdLYjQ09Pv5DtT5bcKWMJhAKPBwvpPjpp5iOYUVwVEr0gOM1BY1Mgw==}
@@ -4888,11 +4886,11 @@ snapshots:
       fast-deep-equal: 3.1.3
       hast-util-from-dom: 5.0.1
       prosemirror-dropcursor: 1.8.2
-      prosemirror-highlight: 0.13.1(@shikijs/types@3.22.0)(@types/hast@3.0.4)(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-transform@1.11.0)(prosemirror-view@1.42.5)
+      prosemirror-highlight: 0.13.1(@shikijs/types@3.22.0)(@types/hast@3.0.4)(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-transform@1.12.4)(prosemirror-view@1.42.5)
       prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
       prosemirror-tables: 1.8.5
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
       rehype-format: 5.0.1
       rehype-parse: 9.0.1
@@ -5321,7 +5319,7 @@ snapshots:
       prosemirror-history: 1.5.0
       prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
 
   '@hookform/resolvers@3.10.0(react-hook-form@7.71.1(react@19.2.4))':
@@ -8535,7 +8533,7 @@ snapshots:
   prosemirror-dropcursor@1.8.2:
     dependencies:
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
 
   prosemirror-gapcursor@1.4.1:
@@ -8545,19 +8543,19 @@ snapshots:
       prosemirror-state: 1.4.4
       prosemirror-view: 1.42.5
 
-  prosemirror-highlight@0.13.1(@shikijs/types@3.22.0)(@types/hast@3.0.4)(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-transform@1.11.0)(prosemirror-view@1.42.5):
+  prosemirror-highlight@0.13.1(@shikijs/types@3.22.0)(@types/hast@3.0.4)(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-transform@1.12.4)(prosemirror-view@1.42.5):
     optionalDependencies:
       '@shikijs/types': 3.22.0
       '@types/hast': 3.0.4
       prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
 
   prosemirror-history@1.5.0:
     dependencies:
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
       rope-sequence: 1.3.4
 
@@ -8584,7 +8582,7 @@ snapshots:
   prosemirror-state@1.4.4:
     dependencies:
       prosemirror-model: 1.25.12
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
 
   prosemirror-tables@1.8.5:
@@ -8592,12 +8590,8 @@ snapshots:
       prosemirror-keymap: 1.2.3
       prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
-
-  prosemirror-transform@1.11.0:
-    dependencies:
-      prosemirror-model: 1.25.12
 
   prosemirror-transform@1.12.4:
     dependencies:
@@ -8607,7 +8601,7 @@ snapshots:
     dependencies:
       prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.11.0
+      prosemirror-transform: 1.12.4
 
   pump@3.0.3:
     dependencies:

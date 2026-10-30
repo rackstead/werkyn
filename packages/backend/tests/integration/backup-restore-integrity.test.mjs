@@ -28,6 +28,7 @@ const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { graphLimits } = await import("../../src/utils/graph-limits.ts");
 const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+const { backupStagingDir, sweepBackupStaging } = await import("../../src/modules/backup/backup-staging.ts");
 
 const backendDir = new URL("../..", import.meta.url);
 const suffix = crypto.randomUUID().slice(0, 8);
@@ -404,7 +405,12 @@ test("a crash after the files were written leaves them queued for removal", asyn
   const [code] = await new Promise((resolve) => child.on("close", (...result) => resolve(result)));
   assert.equal(code, 7, output.slice(-500));
 
-  const written = (await files()).filter((f) => !beforeFiles.includes(f));
+  // The crashed upload stays staged until the next start sweeps it.
+  const staging = path.relative(storageDir, backupStagingDir(storageDir));
+  const left = (await files()).filter((f) => !beforeFiles.includes(f));
+  const written = left.filter((f) => !f.startsWith(`${staging}${path.sep}`));
+  assert.equal(left.length - written.length, 1);
+  assert.equal(await sweepBackupStaging(undefined, backupStagingDir(storageDir)), 1);
   assert.equal(written.length, 2);
   for (const f of written) assert.equal(path.dirname(f), path.join(ws.id, "uploads", "wiki", "imports"));
   assert.deepEqual(await queued(ws.id), written.map((storagePath) => ({ storagePath, attempts: 0, later: true })));

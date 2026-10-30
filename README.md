@@ -270,6 +270,35 @@ Creation accepts `{"name":"CI pipeline","expiresInDays":30}`. `expiresInDays`
 accepts whole numbers from 1 to 365, defaults to 30, and accepts `null` to opt out
 of expiration.
 
+### Concurrent edits to wiki pages and task descriptions
+
+Wiki pages carry a `revision` and tasks a `descriptionRevision`. Each advances
+with every stored change: a page's title, content or icon (a version restore
+included), or a task's description. To avoid overwriting a change you have not
+seen, send the revision you last read with your edit:
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $WERKYN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Runbook","expectedRevision":7}' \
+  https://your-werkyn.example/api/wiki/pages/$PAGE_ID
+```
+
+`PATCH /api/tasks/:id` accepts `{"description":"<p>...</p>","expectedDescriptionRevision":3}`
+in the same way; the field is ignored when `description` is absent, and other
+task fields never change `descriptionRevision`. When the stored revision is
+different, nothing is written and the response is `409` with
+`"code":"REVISION_CONFLICT"` and `"current":{"revision":8,"updatedAt":"..."}`.
+Read the item again and decide what to send. Requests without the field behave
+as before: the edit replaces whatever is stored (last writer wins) and still
+advances the revision.
+
+While a user holds a wiki page's edit lock (taken by **Start Editing**; it
+lapses two minutes after its last renewal), a save or version restore by anyone
+else is refused with `409`, `"code":"EDIT_LOCKED"` and `current.lockedBy`,
+whether or not it carries a revision. A page nobody is editing accepts writes
+without a lock.
+
 ### Testing API keys
 
 Run the settings tests with `pnpm --filter @pm/frontend test`. The backend

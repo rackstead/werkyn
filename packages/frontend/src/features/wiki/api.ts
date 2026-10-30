@@ -16,6 +16,11 @@ import type {
   UpdateWikiShareInput,
 } from "@pm/shared";
 
+/** The autosave queue of one user's edits to one page. */
+export function wikiAutosaveKey(userId: string, pageId: string) {
+  return `wiki:${userId}:${pageId}`;
+}
+
 // ─── Types ──────────────────────────────────────────────
 
 export interface WikiSpace {
@@ -55,6 +60,8 @@ export interface WikiPage {
   content: unknown;
   icon: string | null;
   position: number;
+  /** Advances with every stored title, content or icon change. */
+  revision?: number;
   createdById: string;
   lastEditedById: string | null;
   createdAt: string;
@@ -387,8 +394,9 @@ export function useRestoreVersion(pgid: string) {
       qc.invalidateQueries({ queryKey: ["wiki-versions", pgid] });
       toast.success("Version restored");
     },
-    onError: () => {
-      toast.error("Failed to restore version");
+    onError: (error) => {
+      // For example, another user holds the page's edit lock.
+      toast.error(error.message || "Failed to restore version");
     },
   });
 }

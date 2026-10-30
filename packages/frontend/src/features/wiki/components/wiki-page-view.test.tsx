@@ -4,6 +4,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as wiki from "../api";
 import { WikiPageView } from "./wiki-page-view";
+import { wikiAutosaveKey } from "../api";
+import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
+import { PendingEditsError } from "@/lib/autosave-queue";
 import { useAuthStore } from "@/stores/auth-store";
 
 const { http, notices } = vi.hoisted(() => ({
@@ -873,5 +876,303 @@ describe("entity-bound Wiki autosave", () => {
       expect(screen.queryByText("Restore changes")).toBeNull();
       expect(writesTo(a)).toHaveLength(1);
     });
+  });
+});
+
+describe("server revisions and edit conflicts", () => {
+  type Stored = { revision: number; title: string; content: unknown };
+  function paragraph(text: string) {
+    return [{ type: "paragraph", content: text }];
+  }
+  function refusal(
+    code: "REVISION_CONFLICT" | "EDIT_LOCKED",
+    revision: number,
+    extra: Record<string, unknown> = {},
+  ) {
+    return Object.assign(new Error("Refused"), {
+      statusCode: 409,
+      code,
+      current: { revision, updatedAt: "2026-10-30T00:00:00.000Z", ...extra },
+    });
+  }
+  // Stands in for the server's compare-and-set: a save based on another
+  // revision, or made while `lockedBy` holds the lock, writes nothing.
+  function serve(id: string, stored: Stored, lockedBy?: { current: string | null }) {
+    pages.set(id, { ...page(id), ...structuredClone(stored) });
+    http.patch.mockImplementation(
+      (path: string, options: { json: Record<string, unknown> }) =>
+        path.endsWith("/heartbeat")
+          ? Promise.resolve(undefined)
+          : {
+              json: async () => {
+                written.push({ path, body: options.json });
+                const { expectedRevision, ...fields } = options.json;
+                if (lockedBy?.current)
+                  throw refusal("EDIT_LOCKED", stored.revision, {
+                    lockedBy: { id: "other", displayName: lockedBy.current },
+                  });
+                if (
+                  expectedRevision !== undefined &&
+                  expectedRevision !== stored.revision
+                )
+                  throw refusal("REVISION_CONFLICT", stored.revision);
+                Object.assign(stored, fields);
+                stored.revision += 1;
+                return { data: { ...page(id), ...structuredClone(stored) } };
+              },
+            },
+    );
+  }
+  // What a refetch of the page delivers to the open view.
+  function refetched(id: string, stored: Stored, screen: { rerender: (ui: ReactNode) => void }) {
+    pages.set(id, { ...page(id), ...structuredClone(stored) });
+    screen.rerender(view(id));
+  }
+  function body(screen: { getByLabelText: (label: string) => HTMLElement }) {
+    return screen.getByLabelText("Page body") as HTMLTextAreaElement;
+  }
+
+  it("sends the revision its document is based on, then each save's own revision", async () => {
+    const id = `revision-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    fireEvent.change(body(screen), { target: { value: "one" } });
+    await tick(801);
+    // The cached page still says revision 4; the next save is based on the
+    // revision this session's own save produced.
+    fireEvent.change(body(screen), { target: { value: "two" } });
+    await tick(801);
+    expect(written.map((w) => (w.body as any).expectedRevision)).toEqual([4, 5]);
+    expect(stored).toMatchObject({ revision: 6, content: paragraph("two") });
+    // A newer document fetched while idle is what later edits are based on.
+    stored.revision = 9;
+    refetched(id, stored, screen);
+    await tick();
+    fireEvent.change(body(screen), { target: { value: "three" } });
+    await tick(801);
+    expect((written.at(-1)!.body as any).expectedRevision).toBe(9);
+    expect(stored).toMatchObject({ revision: 10, content: paragraph("three") });
+  });
+
+  it("a save refused for an older revision is set aside with an explicit conflict, never resent", async () => {
+    const id = `conflict-${++suffix}`;
+    const stored = { revision: 1, title: id, content: paragraph("base") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    // Another client stores revision 2 before this edit is sent.
+    Object.assign(stored, { revision: 2, content: paragraph("theirs") });
+    fireEvent.change(body(screen), { target: { value: "mine" } });
+    await tick(801);
+    expect(written).toEqual([
+      {
+        path: `wiki/pages/${id}`,
+        body: { content: paragraph("mine"), expectedRevision: 1 },
+      },
+    ]);
+    expect(stored.content).toEqual(paragraph("theirs"));
+    expect(screen.getByRole("status").textContent).toContain(
+      "This page was changed elsewhere while you were editing",
+    );
+    // The editor shows the stored page again, not the refused draft, and no
+    // generic retry notice is offered.
+    expect(body(screen).value).not.toContain("mine");
+    expect(screen.queryByText("Retry save")).toBeNull();
+    expect(notices.error).not.toHaveBeenCalled();
+    // Blur, navigation flushes and timers send nothing more.
+    fireEvent.click(screen.getByText("History"));
+    await tick(5000);
+    expect(written).toHaveLength(1);
+    fireEvent.click(screen.getByText("History"));
+    await tick();
+
+    // Once the newer page arrives, restoring is an explicit replacement of it.
+    refetched(id, stored, screen);
+    await tick();
+    fireEvent.click(screen.getByText("Restore changes"));
+    await tick();
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("mine"),
+      expectedRevision: 2,
+    });
+    expect(stored).toMatchObject({ revision: 3, content: paragraph("mine") });
+    expect(screen.queryByText("Restore changes")).toBeNull();
+    // The restored draft is now stored as revision 3, which the next edit is
+    // based on although the cached page still says 2.
+    fireEvent.change(body(screen), { target: { value: "mine, edited" } });
+    await tick(801);
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("mine, edited"),
+      expectedRevision: 3,
+    });
+    expect(stored.revision).toBe(4);
+  });
+
+  it("after a conflict the page stays locked until the draft is restored or discarded, then edits build on the page shown", async () => {
+    const id = `after-conflict-${++suffix}`;
+    const stored = { revision: 1, title: id, content: paragraph("base") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    Object.assign(stored, { revision: 2, content: paragraph("theirs") });
+    fireEvent.change(body(screen), { target: { value: "mine: a long paragraph" } });
+    await tick(801);
+    expect(written).toHaveLength(1);
+    // Until the newer page arrives the editor shows the older one; it is
+    // locked, so nothing typed there can be refused again and replace the
+    // set-aside draft (independent review M1).
+    expect(body(screen).disabled).toBe(true);
+    fireEvent.change(body(screen), { target: { value: "base x" } });
+    await tick(801);
+    refetched(id, stored, screen);
+    await tick(801);
+    expect(written).toHaveLength(1);
+    // The original draft is what Restore brings back.
+    fireEvent.click(screen.getByText("Restore changes"));
+    await tick();
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("mine: a long paragraph"),
+      expectedRevision: 2,
+    });
+    expect(stored).toMatchObject({ revision: 3, content: paragraph("mine: a long paragraph") });
+  });
+
+  it("discarding a conflicting draft unlocks the page and later edits build on the page shown", async () => {
+    const id = `discard-conflict-${++suffix}`;
+    const stored = { revision: 1, title: id, content: paragraph("base") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    Object.assign(stored, { revision: 2, content: paragraph("theirs") });
+    fireEvent.change(body(screen), { target: { value: "mine" } });
+    refetched(id, stored, screen);
+    await tick(801);
+    expect(written.map((w) => (w.body as any).expectedRevision)).toEqual([1]);
+    fireEvent.click(screen.getByText("Discard"));
+    await tick();
+    expect(body(screen).disabled).toBe(false);
+    fireEvent.change(body(screen), { target: { value: "theirs, edited" } });
+    await tick(801);
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("theirs, edited"),
+      expectedRevision: 2,
+    });
+    expect(stored.revision).toBe(3);
+    expect(screen.queryByText("Restore changes")).toBeNull();
+  });
+
+  it("a rename from the page tree is stored after pending edits and not reported as a conflict", async () => {
+    const id = `tree-rename-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    fireEvent.change(body(screen), { target: { value: "pending body" } });
+    // What the tree's rename does, without waiting for the editor's debounce.
+    await act(async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        const response = (await http
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .json()) as { data: { revision: number } };
+        return response.data.revision;
+      });
+    });
+    expect(written.map((w) => w.body)).toEqual([
+      { content: paragraph("pending body"), expectedRevision: 4 },
+      { title: "Renamed" },
+    ]);
+    // The cached page has not caught up, yet the next edit builds on the rename.
+    fireEvent.change(body(screen), { target: { value: "after rename" } });
+    await tick(801);
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("after rename"),
+      expectedRevision: 6,
+    });
+    expect(stored).toMatchObject({ revision: 7, title: "Renamed" });
+    expect(screen.queryByText("Restore changes")).toBeNull();
+  });
+
+  it("an edit made while a page-tree write is in flight is sent after it, on its revision", async () => {
+    const id = `tree-held-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let outside!: Promise<void>;
+    await act(async () => {
+      outside = writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        await gate;
+        const response = (await http
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .json()) as { data: { revision: number } };
+        return response.data.revision;
+      });
+    });
+    fireEvent.change(body(screen), { target: { value: "typed during rename" } });
+    await tick(801);
+    expect(written).toEqual([]);
+    await act(async () => {
+      release();
+      await outside;
+    });
+    await tick();
+    expect(written.map((w) => w.body)).toEqual([
+      { title: "Renamed" },
+      { content: paragraph("typed during rename"), expectedRevision: 5 },
+    ]);
+    expect(stored).toMatchObject({ revision: 6, title: "Renamed" });
+    expect(screen.queryByText("Restore changes")).toBeNull();
+  });
+
+  it("a page-tree write is not made when the editor's pending edits cannot be stored", async () => {
+    const id = `tree-blocked-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const served = http.patch.getMockImplementation()!;
+    http.patch.mockImplementation((path: string, options: any) =>
+      options.json.content
+        ? { json: async () => { written.push({ path, body: options.json }); throw new Error("Offline"); } }
+        : served(path, options),
+    );
+    const screen = render(view(id), { wrapper });
+    await tick();
+    fireEvent.change(body(screen), { target: { value: "unsaved" } });
+    let refused: unknown;
+    await act(async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        throw new Error("the outside write must not run");
+      }).catch((error) => {
+        refused = error;
+      });
+    });
+    expect(refused).toBeInstanceOf(PendingEditsError);
+    expect(written.map((w) => w.body)).toEqual([
+      { content: paragraph("unsaved"), expectedRevision: 4 },
+    ]);
+    expect(stored).toMatchObject({ revision: 4, title: id });
+  });
+
+  it("a save refused by another user's lock names the holder and is not resent", async () => {
+    const id = `locked-${++suffix}`;
+    const stored = { revision: 3, title: id, content: paragraph("base") };
+    const lockedBy = { current: null as string | null };
+    serve(id, stored, lockedBy);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    // The lock lapsed and Bob took the page before this tab noticed.
+    lockedBy.current = "Bob";
+    fireEvent.change(body(screen), { target: { value: "late" } });
+    await tick(801);
+    expect(written).toHaveLength(1);
+    expect(screen.getByRole("status").textContent).toContain(
+      "Bob is editing this page",
+    );
+    expect(stored).toMatchObject({ revision: 3, content: paragraph("base") });
+    fireEvent.click(screen.getByText("Done Editing"));
+    await tick(5000);
+    expect(written).toHaveLength(1);
   });
 });

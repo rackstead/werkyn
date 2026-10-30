@@ -1,7 +1,12 @@
 import fp from "fastify-plugin";
 import type { FastifyInstance, FastifyError } from "fastify";
 import { Prisma } from "@prisma/client";
-import { AppError, ValidationError, LockedError } from "../utils/errors.js";
+import {
+  AppError,
+  EditConflictError,
+  ValidationError,
+  LockedError,
+} from "../utils/errors.js";
 import { ZodError } from "zod";
 import { env } from "../config/env.js";
 import { isRetryableDatabaseError } from "../utils/retryable-database-errors.js";
@@ -124,6 +129,10 @@ export default fp(async (fastify: FastifyInstance) => {
         };
         if (error instanceof ValidationError && error.details) {
           response.details = error.details;
+        }
+        if (error instanceof EditConflictError) {
+          response.code = error.code;
+          response.current = error.current;
         }
         if (error instanceof LockedError) {
           reply.header("Retry-After", String(error.retryAfter));

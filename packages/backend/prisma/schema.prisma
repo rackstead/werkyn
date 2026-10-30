@@ -461,6 +461,9 @@ model Task {
   startDate   String?
   reminder    String?
   archived    Boolean   @default(false)
+  // Incremented by every description write; editors send the revision they
+  // last saw and a stale one is refused instead of overwriting newer text.
+  descriptionRevision Int @default(0)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -1013,6 +1016,9 @@ model WikiPage {
   content        Json?
   icon           String?
   position       Int      @default(0)
+  // Incremented by every title, content or icon write (saves and restores);
+  // editors send the revision they last saw and a stale one is refused.
+  revision       Int      @default(0)
   createdById    String
   lastEditedById String?
   createdAt      DateTime @default(now())

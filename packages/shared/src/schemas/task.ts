@@ -33,6 +33,11 @@ export const UpdateTaskSchema = z.object({
   dueDate: dateOnly("Due date").nullable().optional(),
   startDate: dateOnly("Start date").nullable().optional(),
   reminder: ReminderEnum.nullable().optional(),
+  // The `descriptionRevision` a new description is based on. When it is not
+  // the stored revision the update is refused with 409 REVISION_CONFLICT.
+  // Ignored without `description`; omitted, the description is replaced
+  // whatever is stored (last writer wins).
+  expectedDescriptionRevision: z.number().int().min(0).max(INT32_MAX).optional(),
 });
 export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
 

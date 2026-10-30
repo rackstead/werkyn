@@ -36,6 +36,10 @@ export const UpdateWikiPageSchema = z.object({
   title: singleLineText().min(1).max(500).optional(),
   content: z.any().optional(),
   icon: z.string().nullable().optional(),
+  // The page `revision` this edit is based on. When it is not the stored
+  // revision the save is refused with 409 REVISION_CONFLICT. Omitted, the
+  // save applies to whatever is stored (last writer wins).
+  expectedRevision: z.number().int().min(0).max(INT32_MAX).optional(),
 });
 export type UpdateWikiPageInput = z.infer<typeof UpdateWikiPageSchema>;
 

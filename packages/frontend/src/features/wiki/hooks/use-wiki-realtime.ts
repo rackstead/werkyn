@@ -114,9 +114,8 @@ export function useWikiRealtime(workspaceId: string | undefined) {
           // takes the new document; unsaved or set-aside changes are never
           // replaced or sent.
           invalidate(queryKeys.wikiPage(pageId), true);
-          // Best effort: the server records its occasional auto-save version
-          // without waiting, so this list can lag by that version until the
-          // next update.
+          // A save or restore records its version in the same transaction,
+          // so the refetched list already includes it.
           invalidate(["wiki-versions", pageId]);
           break;
         }

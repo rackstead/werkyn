@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { toast } from "sonner";
-import { AutosaveQueue } from "@/lib/autosave-queue";
+import { AutosaveQueue, type SaveFn } from "@/lib/autosave-queue";
 import { useAuthStore } from "@/stores/auth-store";
 
 const queues = new Map<
@@ -22,6 +22,21 @@ if (typeof window !== "undefined") {
   });
 }
 
+/**
+ * Runs a write of an entity made outside its editor, such as a rename from the
+ * page tree, between the editor's saves (see AutosaveQueue.writeAlongside).
+ * Rejects with PendingEditsError, without writing, when the editor's pending
+ * edits cannot be stored first.
+ */
+export async function writeAlongsideAutosave(
+  entityKey: string,
+  write: () => Promise<number | undefined>,
+) {
+  const queue = queues.get(entityKey)?.queue as AutosaveQueue<object> | undefined;
+  if (queue) await queue.writeAlongside(write);
+  else await write();
+}
+
 function retained<T extends object>(queue: AutosaveQueue<T>) {
   const snapshot = queue.getSnapshot();
   return snapshot.hasUnsavedChanges || snapshot.parked !== undefined;
@@ -34,16 +49,25 @@ export interface EntityAutosaveOptions {
   canSave?: () => string | null;
   /** Whether automatic flushes may resend a draft whose last attempt failed. */
   retryFailedAutomatically: boolean;
+  /**
+   * The stored revision of the entity as currently loaded, when the server
+   * reports one. Saves are sent with the revision their edits are based on.
+   */
+  revision?: number;
+  /** Whether a failed save is a conflict; its draft is then set aside. */
+  isConflict?: (error: Error) => boolean;
   delay?: number;
 }
 
 export function useEntityAutosave<T extends object>(
   entityKey: string,
-  save: (patch: T) => Promise<unknown>,
+  save: SaveFn<T>,
   {
     author,
     canSave = () => null,
     retryFailedAutomatically,
+    revision,
+    isConflict,
     delay = 800,
   }: EntityAutosaveOptions,
 ) {
@@ -97,7 +121,7 @@ export function useEntityAutosave<T extends object>(
     return existing;
   }, [entityKey]);
   queue.setSave(save);
-  queue.setPolicy({ canSave, retryFailedAutomatically });
+  queue.setPolicy({ canSave, retryFailedAutomatically, isConflict });
   const subscribe = useCallback(
     (listener: () => void) => {
       // React can unsubscribe/re-subscribe the same mounted queue (StrictMode).
@@ -124,6 +148,12 @@ export function useEntityAutosave<T extends object>(
     [queue],
   );
 
+  // An effect, like the editors' own content sync: a newer stored document
+  // and the revision it is based on are taken in the same commit.
+  useEffect(() => {
+    queue.observeRevision(revision);
+  }, [queue, revision, snapshot.hasUnsavedChanges]);
+
   return {
     ...snapshot,
     schedule: queue.schedule,
@@ -133,5 +163,6 @@ export function useEntityAutosave<T extends object>(
     park: queue.park,
     restoreParked: queue.restoreParked,
     discardParked: queue.discardParked,
+    adoptRevision: queue.adoptRevision,
   };
 }

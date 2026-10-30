@@ -12,6 +12,13 @@ import {
 } from "../../utils/errors.js";
 import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import {
+  PAGE_WRITE_TRANSACTION,
+  assertNotLockedByOther,
+  assertRevision,
+  lockPageRow,
+  snapshotPage,
+} from "./wiki-page-writes.js";
 
 const pageSelect = {
   id: true,
@@ -28,9 +35,10 @@ const pageSelect = {
   lastEditedBy: { select: { id: true, displayName: true, avatarUrl: true } },
 } satisfies Prisma.WikiPageSelect;
 
-const pageWithContentSelect = {
+export const pageWithContentSelect = {
   ...pageSelect,
   content: true,
+  revision: true,
 } satisfies Prisma.WikiPageSelect;
 
 type Tx = Prisma.TransactionClient;
@@ -219,30 +227,39 @@ export async function getPage(prisma: PrismaClient, pageId: string) {
   return page;
 }
 
+/**
+ * Saves a page as a compare-and-set under the page row lock: another user's
+ * unexpired edit lock refuses the write, and so does an `expectedRevision`
+ * other than the stored one. Without `expectedRevision` (older API clients)
+ * the write applies to whatever is stored, as before. The occasional auto-save
+ * version records the content this save replaces in the same transaction.
+ */
 export async function updatePage(
   prisma: PrismaClient,
   pageId: string,
   actorId: string,
   data: UpdateWikiPageInput,
 ) {
-  const existing = await prisma.wikiPage.findUnique({
-    where: { id: pageId },
-    select: { id: true },
-  });
-  if (!existing) throw new NotFoundError("Wiki page not found");
+  return prisma.$transaction(async (tx) => {
+    const current = await lockPageRow(tx, pageId);
+    await assertNotLockedByOther(tx, pageId, actorId, current);
+    assertRevision(data.expectedRevision, current);
+    await snapshotPage(tx, pageId, actorId, { throttle: true });
 
-  const updateData: Prisma.WikiPageUpdateInput = {
-    lastEditedBy: { connect: { id: actorId } },
-  };
-  if (data.title !== undefined) updateData.title = data.title;
-  if (data.content !== undefined) updateData.content = data.content;
-  if (data.icon !== undefined) updateData.icon = data.icon;
+    const updateData: Prisma.WikiPageUpdateInput = {
+      lastEditedBy: { connect: { id: actorId } },
+      revision: { increment: 1 },
+    };
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.content !== undefined) updateData.content = data.content;
+    if (data.icon !== undefined) updateData.icon = data.icon;
 
-  return prisma.wikiPage.update({
-    where: { id: pageId },
-    data: updateData,
-    select: pageWithContentSelect,
-  });
+    return tx.wikiPage.update({
+      where: { id: pageId },
+      data: updateData,
+      select: pageWithContentSelect,
+    });
+  }, PAGE_WRITE_TRANSACTION);
 }
 
 export async function deletePage(

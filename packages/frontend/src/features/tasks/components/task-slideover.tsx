@@ -111,6 +111,7 @@ export function TaskSlideover({
                     <TaskDescription
                       taskId={task.id}
                       description={task.description}
+                      descriptionRevision={task.descriptionRevision}
                       canEdit={canEdit}
                     />
                   </Suspense>
@@ -200,6 +201,7 @@ export function TaskSlideover({
                   <TaskDescription
                     taskId={task.id}
                     description={task.description}
+                    descriptionRevision={task.descriptionRevision}
                     canEdit={canEdit}
                   />
                 </Suspense>

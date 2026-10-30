@@ -13,6 +13,7 @@ import type {
 } from "@pm/shared";
 import {
   ConflictError,
+  EditConflictError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
@@ -316,6 +317,7 @@ export async function updateTask(
     if (data.title !== undefined) updateData.title = data.title;
     if (data.description !== undefined) {
       updateData.description = sanitizeDescription(data.description);
+      updateData.descriptionRevision = { increment: 1 };
     }
     if (data.dueDate !== undefined) updateData.dueDate = data.dueDate;
     if (data.startDate !== undefined) updateData.startDate = data.startDate;
@@ -370,6 +372,17 @@ export async function updateTask(
       });
     }
 
+    if (
+      data.description !== undefined &&
+      data.expectedDescriptionRevision !== undefined
+    ) {
+      await assertDescriptionRevision(
+        tx,
+        taskId,
+        data.expectedDescriptionRevision,
+      );
+    }
+
     const task = await tx.task.update({
       where: { id: taskId },
       data: updateData,
@@ -387,6 +400,34 @@ export async function updateTask(
     });
     return scopeTaskRelations(task);
   });
+}
+
+/**
+ * Refuses a description based on a revision other than the stored one. The
+ * task row stays locked until the update commits, so the check and the
+ * revision increment are one compare-and-set. It is taken after the project
+ * and column rows, as in every task writer; `FOR NO KEY UPDATE` does not wait
+ * for the key-share locks of activity or comment inserts.
+ */
+async function assertDescriptionRevision(
+  tx: Prisma.TransactionClient,
+  taskId: string,
+  expectedRevision: number,
+) {
+  const [current] = await tx.$queryRaw<
+    Array<{ descriptionRevision: number; updatedAt: Date }>
+  >`
+    SELECT "descriptionRevision", "updatedAt" FROM "Task"
+    WHERE "id" = ${taskId}
+    FOR NO KEY UPDATE
+  `;
+  if (!current) throw new NotFoundError("Task not found");
+  if (current.descriptionRevision === expectedRevision) return;
+  throw new EditConflictError(
+    "This description was changed after the version you edited. Reload it before saving.",
+    "REVISION_CONFLICT",
+    { revision: current.descriptionRevision, updatedAt: current.updatedAt },
+  );
 }
 
 export async function deleteTask(

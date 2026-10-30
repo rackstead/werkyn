@@ -12,6 +12,12 @@ export interface SaveSnapshot<T> {
    * restores or discards them.
    */
   parked: T | undefined;
+  /**
+   * The server refused the parked changes because the stored document had
+   * changed since they were based on it, or another user holds its lock.
+   * Cleared when they are restored or discarded.
+   */
+  conflict: Error | null;
 }
 
 export interface AutosavePolicy {
@@ -19,7 +25,22 @@ export interface AutosavePolicy {
   canSave: () => string | null;
   /** Whether automatic flushes may resend a draft whose last attempt failed. */
   retryFailedAutomatically: boolean;
+  /**
+   * Whether a failed save conflicts with newer stored content (or another
+   * user's lock). Its draft is then set aside instead of being retried.
+   */
+  isConflict?: (error: Error) => boolean;
 }
+
+/**
+ * Sends one patch. `baseRevision` is the stored revision the patch is based
+ * on (undefined when the server reports none); the save resolves to the
+ * stored revision it produced, when known.
+ */
+export type SaveFn<T> = (
+  patch: T,
+  baseRevision: number | undefined,
+) => Promise<number | void>;
 
 export interface AutosaveCallbacks {
   /** A save attempt failed while an editor was open. */
@@ -30,6 +51,14 @@ export interface AutosaveCallbacks {
   onSaved: () => void;
   /** Unsaved changes were set aside; `closed` when no editor is open. */
   onParked: (closed: boolean) => void;
+}
+
+/** An outside write was not made because unsaved edits could not be stored first. */
+export class PendingEditsError extends Error {
+  constructor(message = "Save or discard this item's unsaved changes first") {
+    super(message);
+    this.name = "PendingEditsError";
+  }
 }
 
 /** Rejects a flush that was not allowed to send anything. */
@@ -47,6 +76,12 @@ export class AutosaveQueue<T extends object> {
   private parked: T | undefined;
   // The pending fields include a draft whose last attempt failed or was blocked.
   private failed = false;
+  private conflict: Error | null = null;
+  // The stored revision the queued changes are based on: the revision the
+  // editor showed when it had nothing unsaved, then each save's own result.
+  private baseRevision: number | undefined;
+  private observedRevision: number | undefined;
+  private observedWhileDirty = false;
   private running: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Set<() => void>();
@@ -60,17 +95,90 @@ export class AutosaveQueue<T extends object> {
     draft: undefined,
     hasUnsavedChanges: false,
     parked: undefined,
+    conflict: null,
   };
 
   constructor(
-    private save: (patch: T) => Promise<unknown>,
+    private save: SaveFn<T>,
     private delay: number,
     private callbacks: AutosaveCallbacks,
   ) {}
 
-  setSave(save: (patch: T) => Promise<unknown>) {
+  setSave(save: SaveFn<T>) {
     this.save = save;
   }
+
+  /**
+   * Reports the stored revision the entity's query now holds. While nothing is
+   * unsaved the editor shows that document, so edits are based on it. Like the
+   * editors, the first value seen after unsaved changes were stored is not
+   * taken: it can be older than this queue's own last save.
+   */
+  observeRevision = (revision: number | undefined) => {
+    if (revision === undefined) return;
+    if (this.snapshot.hasUnsavedChanges) {
+      this.observedWhileDirty = true;
+      return;
+    }
+    if (this.observedWhileDirty) {
+      this.observedWhileDirty = false;
+      this.observedRevision = revision;
+      return;
+    }
+    if (revision === this.observedRevision) return;
+    this.observedRevision = revision;
+    this.baseRevision = revision;
+  };
+
+  /**
+   * The editor was just reset to the stored document of `revision` (for
+   * example remounted after a conflict); later edits are based on it.
+   */
+  adoptRevision = (revision: number | undefined) => {
+    if (revision === undefined || this.snapshot.hasUnsavedChanges) return;
+    this.observedWhileDirty = false;
+    this.observedRevision = revision;
+    this.baseRevision = revision;
+  };
+
+  /**
+   * A write of this entity made outside the queue (for example a rename from
+   * the page tree) produced `revision`. When that is the revision right after
+   * the base, nothing else was written in between, so later saves are based
+   * on it instead of being refused for this client's own change.
+   */
+  acknowledgeRevision = (revision: number | undefined) => {
+    if (revision === undefined || this.baseRevision === undefined) return;
+    if (this.inFlight || revision !== this.baseRevision + 1) return;
+    this.baseRevision = revision;
+    this.observedRevision = revision;
+  };
+
+  /**
+   * Makes a write of this entity outside the queue (for example a rename from
+   * the page tree) between its saves: pending edits are stored first, and if
+   * they cannot be, the outside write is not made. Saves of edits made
+   * meanwhile wait for it and are then based on its revision.
+   */
+  writeAlongside = async (write: () => Promise<number | undefined>) => {
+    try {
+      await this.flush();
+    } catch {
+      throw new PendingEditsError();
+    }
+    const outside = write().then((revision) => this.acknowledgeRevision(revision));
+    // Flushes requested meanwhile wait for this, then for the edits made
+    // meanwhile, which are saved on the acknowledged revision.
+    const held: Promise<void> = outside
+      .catch(() => {})
+      .then(() => {
+        this.running = null;
+        return this.pending ? this.flush() : undefined;
+      });
+    held.catch(() => {});
+    this.running = held;
+    await outside;
+  };
 
   setPolicy(policy: AutosavePolicy) {
     this.policy = policy;
@@ -102,6 +210,7 @@ export class AutosaveQueue<T extends object> {
       error,
       hasUnsavedChanges: status !== "saved",
       parked: this.parked,
+      conflict: this.parked ? this.conflict : null,
     };
     for (const listener of this.listeners) listener();
     if (status === "saved" && !this.parked && !this.listeners.size)
@@ -171,9 +280,11 @@ export class AutosaveQueue<T extends object> {
   /** Puts set-aside changes back into the editor's queue and saves them. */
   restoreParked = (): Promise<void> => {
     if (!this.parked) return Promise.resolve();
-    // The restored draft replaces whatever the reopened editor holds.
+    // The restored draft replaces whatever the reopened editor holds, which
+    // after a conflict is the newer stored document.
     this.pending = { ...this.pending, ...this.parked } as T;
     this.parked = undefined;
+    this.conflict = null;
     this.failed = false;
     this.publish(this.running ? "saving" : "pending", {
       ...this.snapshot.draft,
@@ -185,6 +296,7 @@ export class AutosaveQueue<T extends object> {
   discardParked = () => {
     if (!this.parked) return;
     this.parked = undefined;
+    this.conflict = null;
     this.publish(
       this.snapshot.status,
       this.snapshot.draft,
@@ -227,15 +339,23 @@ export class AutosaveQueue<T extends object> {
           this.publish("saving", this.snapshot.draft);
           this.inFlight = patch;
           try {
-            await this.save(patch);
+            const revision = await this.save(patch, this.baseRevision);
+            if (typeof revision === "number") this.baseRevision = revision;
           } catch (cause) {
             this.inFlight = undefined;
             this.pending = Object.assign({}, patch, this.pending) as T;
-            this.failed = true;
             const error =
               cause instanceof Error
                 ? cause
                 : new Error("Changes could not be saved");
+            if (this.policy.isConflict?.(error)) {
+              // Sending these changes again would be refused again, or replace
+              // newer content: only an explicit restore sends them.
+              this.conflict = error;
+              this.park();
+              throw error;
+            }
+            this.failed = true;
             this.publish("error", this.snapshot.draft ?? this.pending, error);
             if (this.listeners.size) this.callbacks.onError(error, this.retry);
             else this.park();

@@ -294,9 +294,12 @@ test("two scheduler instances racing over missed days create exactly one task pe
   const release = await holdBarrier();
   let runs;
   try {
-    // Both instances start before either can create a task.
+    // Both instances start before either can create a task. Task creation in
+    // one project is serialized by the project's order lock (DAT-012), so one
+    // instance waits at the barrier and the other behind it on that lock.
     runs = Promise.allSettled([tick(A), tick(B)]);
-    await waitForWaiters(2);
+    await waitForWaiters(1);
+    await waitForLockWaiter();
   } finally {
     await release();
   }

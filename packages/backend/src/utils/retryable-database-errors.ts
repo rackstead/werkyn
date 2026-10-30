@@ -20,6 +20,24 @@ function sqlState(error: unknown): string | undefined {
 }
 
 /**
+ * True when a statement gave up waiting for a lock after `lock_timeout`
+ * (55P03). The transaction is rolled back; unlike a deadlock it is not worth
+ * repeating at once, since the lock is still held.
+ */
+export function isLockTimeoutError(error: unknown): boolean {
+  return sqlState(error) === "55P03";
+}
+
+/**
+ * True when a statement was canceled (57014): by `statement_timeout`, or by a
+ * manual cancel. Only the caller knows which statement and why, so callers
+ * check it around the one statement they bounded.
+ */
+export function isStatementCanceledError(error: unknown): boolean {
+  return sqlState(error) === "57014";
+}
+
+/**
  * True when the database abandoned the transaction so that another could
  * proceed (P2034, 40P01, 40001), or the transaction expired or could not start
  * in time (P2028), for example while it waited for a row lock.

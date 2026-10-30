@@ -5,6 +5,17 @@ import type {
   ReorderInput,
 } from "@pm/shared";
 import { ConflictError, NotFoundError } from "../../utils/errors.js";
+import {
+  assertCompleteOrder,
+  columnTasks,
+  withProjectOrder,
+  writeColumnOrder,
+} from "../../utils/task-order.js";
+
+// Column writers hold the project's order lock (utils/task-order.ts): two
+// creates cannot pick the same position, at most one column is the completion
+// column, and two deletes cannot both see "more than one column left" or move
+// their tasks into each other.
 
 export async function listStatuses(
   prisma: PrismaClient,
@@ -12,7 +23,7 @@ export async function listStatuses(
 ) {
   return prisma.statusColumn.findMany({
     where: { projectId },
-    orderBy: { position: "asc" },
+    orderBy: [{ position: "asc" }, { id: "asc" }],
   });
 }
 
@@ -21,7 +32,7 @@ export async function createStatus(
   projectId: string,
   data: CreateStatusColumnInput,
 ) {
-  return prisma.$transaction(async (tx) => {
+  return withProjectOrder(prisma, projectId, async (tx) => {
     // Get max position
     const maxPos = await tx.statusColumn.aggregate({
       where: { projectId },
@@ -62,7 +73,7 @@ export async function updateStatus(
     throw new NotFoundError("Status column not found");
   }
 
-  return prisma.$transaction(async (tx) => {
+  return withProjectOrder(prisma, projectId, async (tx) => {
     // If setting isCompletion to true, unset existing
     if (data.isCompletion === true) {
       await tx.statusColumn.updateMany({
@@ -87,11 +98,11 @@ export async function deleteStatus(
   projectId: string,
   statusId: string,
 ) {
-  return prisma.$transaction(async (tx) => {
-    // Lock the column before moving its tasks. A task write that already
-    // validated this column holds it FOR KEY SHARE (task-references.ts), so the
-    // delete waits for it and then moves its task too; a write that starts
-    // later waits here and is refused once the column is gone.
+  return withProjectOrder(prisma, projectId, async (tx) => {
+    // Lock the column (after the project's order lock) before moving its
+    // tasks. Task writers that place a task in a column hold the order lock
+    // too, so they either finish first (and their task moves with the others)
+    // or wait and are refused once the column is gone.
     const locked = await tx.$queryRaw<{ id: string }[]>`
       SELECT id FROM "StatusColumn" WHERE id = ${statusId} AND "projectId" = ${projectId} FOR UPDATE
     `;
@@ -111,11 +122,15 @@ export async function deleteStatus(
     // Find the lowest-position remaining column to move tasks to
     const targetColumn = await tx.statusColumn.findFirst({
       where: { projectId, id: { not: statusId } },
-      orderBy: { position: "asc" },
+      orderBy: [{ position: "asc" }, { id: "asc" }],
     });
 
-    // Move this project's tasks to the target column. A legacy task from
-    // another project that still points here must be repaired, not relinked.
+    // Move this project's tasks to the target column, the active ones after
+    // the target's own in board order. A legacy task from another project that
+    // still points here must be repaired, not relinked.
+    const incoming = await columnTasks(tx, projectId, statusId);
+    const staying = await columnTasks(tx, projectId, targetColumn!.id);
+    await writeColumnOrder(tx, [...staying, ...incoming]);
     await tx.task.updateMany({
       where: { statusId, projectId },
       data: { statusId: targetColumn!.id },
@@ -130,7 +145,7 @@ export async function deleteStatus(
     if (status.isCompletion) {
       const highestRemaining = await tx.statusColumn.findFirst({
         where: { projectId, id: { not: statusId } },
-        orderBy: { position: "desc" },
+        orderBy: [{ position: "desc" }, { id: "desc" }],
       });
       if (highestRemaining) {
         await tx.statusColumn.update({
@@ -149,11 +164,11 @@ export async function reorderStatuses(
   projectId: string,
   data: ReorderInput,
 ) {
-  return prisma.$transaction(async (tx) => {
+  return withProjectOrder(prisma, projectId, async (tx) => {
     // Validate all IDs belong to this project
     const statuses = await tx.statusColumn.findMany({
       where: { projectId },
-      select: { id: true },
+      select: { id: true, position: true },
     });
     const validIds = new Set(statuses.map((s) => s.id));
 
@@ -162,19 +177,22 @@ export async function reorderStatuses(
         throw new NotFoundError(`Status column ${id} not found in project`);
       }
     }
+    assertCompleteOrder(data.orderedIds, validIds, "status column of the project");
 
-    // Update positions
-    const updates = data.orderedIds.map((id, index) =>
-      tx.statusColumn.update({
-        where: { id },
-        data: { position: index },
-      }),
-    );
-    await Promise.all(updates);
+    // Update positions that change
+    const current = new Map(statuses.map((s) => [s.id, s.position]));
+    for (const [index, id] of data.orderedIds.entries()) {
+      if (current.get(id) !== index) {
+        await tx.statusColumn.update({
+          where: { id },
+          data: { position: index },
+        });
+      }
+    }
 
     return tx.statusColumn.findMany({
       where: { projectId },
-      orderBy: { position: "asc" },
+      orderBy: [{ position: "asc" }, { id: "asc" }],
     });
   });
 }

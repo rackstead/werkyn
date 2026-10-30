@@ -25,11 +25,16 @@ import {
   assertProjectLabels,
   assertProjectStatus,
   assertUniqueIds,
-  lockProjectStatuses,
   projectAssigneeIds,
   projectLabelIds,
 } from "../../utils/task-references.js";
 import { scopeTaskDependencyTasks, scopeTaskRelations } from "../../utils/task-scope.js";
+import {
+  columnTasks,
+  nextTaskPosition,
+  withProjectOrder,
+  writeColumnOrder,
+} from "../../utils/task-order.js";
 
 export async function listTasks(
   prisma: PrismaClient,
@@ -92,10 +97,12 @@ export async function listTasks(
           ? { createdAt: query.order }
           : { position: query.order };
 
-  // Secondary sort ensures stable ordering when primary values tie
+  // Secondary sorts make the order total when primary values tie (for the
+  // default position sort this is the board order of utils/task-order.ts)
   const orderBy: Prisma.TaskOrderByWithRelationInput[] = [
     primarySort,
     { createdAt: "asc" },
+    { id: "asc" },
   ];
 
   if (query.view === "board") {
@@ -140,16 +147,14 @@ export async function createTask(
 ) {
   actorRole = (await assertProjectAccess(prisma, projectId, actorId)).role;
   if (actorRole === "VIEWER") throw new ForbiddenError("Insufficient permissions");
-  // Check project is not archived
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { archived: true },
-  });
-  if (project?.archived) {
-    throw new ValidationError("Cannot create tasks in an archived project");
-  }
 
-  return prisma.$transaction(async (tx) => {
+  // The project's order lock keeps the chosen position last in its column
+  // until the task commits (utils/task-order.ts).
+  return withProjectOrder(prisma, projectId, async (tx, project) => {
+    if (project.archived) {
+      throw new ValidationError("Cannot create tasks in an archived project");
+    }
+
     // Determine statusId: use provided (same project only) or first column by position
     let statusId = data.statusId;
     if (statusId) {
@@ -157,7 +162,7 @@ export async function createTask(
     } else {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
       });
       if (!firstColumn) {
         throw new ValidationError("Project has no status columns");
@@ -165,12 +170,7 @@ export async function createTask(
       statusId = firstColumn.id;
     }
 
-    // Determine position: max in column + 1
-    const maxPos = await tx.task.aggregate({
-      where: { statusId, projectId },
-      _max: { position: true },
-    });
-    const position = (maxPos._max.position ?? -1) + 1;
+    const position = await nextTaskPosition(tx, projectId, statusId);
 
     const description = sanitizeDescription(data.description);
 
@@ -255,7 +255,7 @@ export async function getTask(
       customFieldValues: {
         include: { field: true },
       },
-      subtasks: { orderBy: { position: "asc" } },
+      subtasks: { orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }] },
       blockedBy: {
         include: {
           blockingTask: {
@@ -305,7 +305,12 @@ export async function updateTask(
     }
   }
 
-  return prisma.$transaction(async (tx) => {
+  // A status change places the task last in another column, so it holds the
+  // project's order lock like a move (utils/task-order.ts).
+  const transaction = <T>(work: (tx: Prisma.TransactionClient) => Promise<T>) =>
+    data.statusId ? withProjectOrder(prisma, existing.projectId, (tx) => work(tx)) : prisma.$transaction(work);
+
+  return transaction(async (tx) => {
     const updateData: Prisma.TaskUpdateInput = {};
 
     if (data.title !== undefined) updateData.title = data.title;
@@ -316,25 +321,24 @@ export async function updateTask(
     if (data.startDate !== undefined) updateData.startDate = data.startDate;
     if (data.reminder !== undefined) updateData.reminder = data.reminder;
 
-    // Handle status change
-    if (data.statusId && data.statusId !== existing.statusId) {
+    // Handle status change. The column is read again under the order lock: a
+    // move may have changed it since `existing` was read.
+    const fromStatusId = data.statusId
+      ? (await tx.task.findUniqueOrThrow({ where: { id: taskId }, select: { statusId: true } })).statusId
+      : existing.statusId;
+    if (data.statusId && data.statusId !== fromStatusId) {
       // Validate and lock the new column (after the project row) before any
       // write, as the other task writers do (task-references.ts).
       await assertProjectStatus(tx, existing.projectId, data.statusId);
 
-      // Get max position in new column
-      const maxPos = await tx.task.aggregate({
-        where: { statusId: data.statusId, projectId: existing.projectId },
-        _max: { position: true },
-      });
       updateData.status = { connect: { id: data.statusId } };
-      updateData.position = (maxPos._max.position ?? -1) + 1;
+      updateData.position = await nextTaskPosition(tx, existing.projectId, data.statusId);
 
       await logActivity(tx, {
         taskId,
         actorId,
         action: "status_changed",
-        details: { from: existing.statusId, to: data.statusId },
+        details: { from: fromStatusId, to: data.statusId },
       });
     }
 
@@ -392,7 +396,9 @@ export async function deleteTask(
 ) {
   const access = await assertTaskEdit(prisma, taskId, actorId);
   if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can delete tasks");
-  await prisma.task.delete({ where: { id: taskId } });
+  // Under the order lock, so a renumbering move never meets a row deleted
+  // after it read the column, and the cascade to dependencies is a graph change.
+  await withProjectOrder(prisma, access.projectId, (tx) => tx.task.delete({ where: { id: taskId } }));
 }
 
 export async function moveTask(
@@ -404,7 +410,7 @@ export async function moveTask(
   await assertTaskEdit(prisma, taskId, actorId);
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    select: { projectId: true, statusId: true, position: true },
+    select: { projectId: true },
   });
   if (!task) {
     throw new NotFoundError("Task not found");
@@ -441,117 +447,41 @@ export async function moveTask(
   }
 
   // Position from the frontend is a 0-based index into the sorted column.
-  // We normalize all affected columns inside a transaction so positions
-  // stay contiguous (0, 1, 2, …) and match the frontend's expectations.
-  return prisma.$transaction(async (tx) => {
-    // Lock the project row and both columns before renumbering any task. A
-    // column delete locks its column first and then that column's tasks, so it
-    // now waits for the move (and then moves the task with the others) or
-    // commits first and the move is refused, instead of deadlocking with it.
-    const columns = await lockProjectStatuses(tx, task.projectId, [task.statusId, data.statusId]);
-    if (!columns.has(data.statusId)) {
-      throw new ValidationError("Status column not found in this project");
-    }
-    // The source column was read before the transaction. If the task has left
-    // it since (a delete of that column moved it), renumbering it would be
-    // wrong; the client should retry with the current board. A column cannot
-    // be deleted while a task still uses it, so an unchanged statusId means
-    // the source column (now locked, unless it is a legacy column of another
-    // project) still holds the task.
+  // The columns the move touches are renumbered 0, 1, 2, … so positions match
+  // the frontend's expectations.
+  return withProjectOrder(prisma, task.projectId, async (tx) => {
+    // Every move, status change and column delete of the project waits for
+    // the order lock, so the task's column and both column orders read below
+    // stay current until commit (utils/task-order.ts). The destination column
+    // is then held FOR KEY SHARE like any referenced column.
+    await assertProjectStatus(tx, task.projectId, data.statusId);
     const current = await tx.task.findUnique({ where: { id: taskId }, select: { statusId: true } });
     if (!current) throw new NotFoundError("Task not found");
-    if (current.statusId !== task.statusId) {
-      throw new ConflictError("The task was moved at the same time; try again");
+
+    // Build the destination order: the others in board order, the task re-inserted at the index.
+    const ordered = await columnTasks(tx, task.projectId, data.statusId, [taskId]);
+    const movedPos = Math.min(data.position, ordered.length);
+    // Written below together with its column.
+    ordered.splice(movedPos, 0, { id: taskId, position: movedPos });
+
+    if (current.statusId !== data.statusId) {
+      // Close the gap in the source column.
+      await writeColumnOrder(tx, await columnTasks(tx, task.projectId, current.statusId, [taskId]));
     }
+    await writeColumnOrder(tx, ordered);
 
-    const isSameColumn = task.statusId === data.statusId;
-
-    if (isSameColumn) {
-      // Same-column reorder
-      const colTasks = await tx.task.findMany({
-        where: { statusId: data.statusId, projectId: task.projectId, archived: false },
-        orderBy: { position: "asc" },
-        select: { id: true, position: true },
-      });
-
-      // Build new order: remove task, re-insert at desired index
-      const ordered = colTasks.filter((t) => t.id !== taskId);
-      const insertIdx = Math.min(data.position, ordered.length);
-      ordered.splice(insertIdx, 0, { id: taskId, position: -1 });
-
-      // Update positions that changed
-      const updates: Promise<unknown>[] = [];
-      for (let i = 0; i < ordered.length; i++) {
-        if (ordered[i].id !== taskId && ordered[i].position !== i) {
-          updates.push(
-            tx.task.update({ where: { id: ordered[i].id }, data: { position: i } }),
-          );
-        }
-      }
-      await Promise.all(updates);
-
-      const movedPos = ordered.findIndex((t) => t.id === taskId);
-      const updatedTask = await tx.task.update({
-        where: { id: taskId },
-        data: { position: movedPos },
-        include: { status: true },
-      });
-
-      return { ...updatedTask, warning };
-    }
-
-    // Cross-column move
-    // 1. Normalize source column (close the gap)
-    const srcTasks = await tx.task.findMany({
-      where: { statusId: task.statusId, projectId: task.projectId, id: { not: taskId }, archived: false },
-      orderBy: { position: "asc" },
-      select: { id: true, position: true },
-    });
-
-    const srcUpdates: Promise<unknown>[] = [];
-    for (let i = 0; i < srcTasks.length; i++) {
-      if (srcTasks[i].position !== i) {
-        srcUpdates.push(
-          tx.task.update({ where: { id: srcTasks[i].id }, data: { position: i } }),
-        );
-      }
-    }
-
-    // 2. Insert into destination column at the desired index
-    const dstTasks = await tx.task.findMany({
-      where: { statusId: data.statusId, projectId: task.projectId, archived: false },
-      orderBy: { position: "asc" },
-      select: { id: true, position: true },
-    });
-
-    const dstOrdered = [...dstTasks];
-    const insertIdx = Math.min(data.position, dstOrdered.length);
-    dstOrdered.splice(insertIdx, 0, { id: taskId, position: -1 });
-
-    const dstUpdates: Promise<unknown>[] = [];
-    for (let i = 0; i < dstOrdered.length; i++) {
-      if (dstOrdered[i].id !== taskId && dstOrdered[i].position !== i) {
-        dstUpdates.push(
-          tx.task.update({ where: { id: dstOrdered[i].id }, data: { position: i } }),
-        );
-      }
-    }
-
-    await Promise.all([...srcUpdates, ...dstUpdates]);
-
-    const movedPos = dstOrdered.findIndex((t) => t.id === taskId);
     const updatedTask = await tx.task.update({
       where: { id: taskId },
       data: { statusId: data.statusId, position: movedPos },
       include: { status: true },
     });
 
-    if (data.statusId !== task.statusId) {
+    if (data.statusId !== current.statusId) {
       await logActivity(tx, {
         taskId,
         actorId,
         action: "status_changed",
-        details: { from: task.statusId, to: data.statusId },
+        details: { from: current.statusId, to: data.statusId },
       });
     }
 
@@ -567,28 +497,28 @@ export async function archiveTask(
 ) {
   const access = await assertTaskEdit(prisma, taskId, actorId);
   if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can archive tasks");
-  const task = await prisma.task.findUnique({
-    where: { id: taskId },
-    select: { statusId: true, projectId: true },
-  });
-  if (!task) {
-    throw new NotFoundError("Task not found");
-  }
 
-  const updateData: Prisma.TaskUpdateInput = { archived: data.archived };
-
-  // On unarchive: position = max + 1 in current column
-  if (!data.archived) {
-    const maxPos = await prisma.task.aggregate({
-      where: { statusId: task.statusId, projectId: task.projectId, archived: false },
-      _max: { position: true },
+  return withProjectOrder(prisma, access.projectId, async (tx) => {
+    const task = await tx.task.findUnique({
+      where: { id: taskId },
+      select: { statusId: true, archived: true },
     });
-    updateData.position = (maxPos._max.position ?? -1) + 1;
-  }
+    if (!task) {
+      throw new NotFoundError("Task not found");
+    }
 
-  return prisma.task.update({
-    where: { id: taskId },
-    data: updateData,
+    const updateData: Prisma.TaskUpdateInput = { archived: data.archived };
+
+    // On unarchive: back at the end of its column (an archived task's old
+    // position no longer counts and may be taken)
+    if (!data.archived && task.archived) {
+      updateData.position = await nextTaskPosition(tx, access.projectId, task.statusId);
+    }
+
+    return tx.task.update({
+      where: { id: taskId },
+      data: updateData,
+    });
   });
 }
 
@@ -762,7 +692,9 @@ export async function bulkUpdateTasks(
   actorId: string,
   data: BulkUpdateFieldsInput,
 ) {
-  return prisma.$transaction(async (tx) => {
+  // Under the project's order lock: the bulk update rewrites positions and
+  // task rows that moves renumber (utils/task-order.ts).
+  return withProjectOrder(prisma, projectId, async (tx) => {
     const access = await assertProjectAccess(tx, projectId, actorId);
     if (access.role === "VIEWER") throw new ForbiddenError("Insufficient permissions");
     if (access.role !== "ADMIN" && data.archived !== undefined) {
@@ -772,7 +704,15 @@ export async function bulkUpdateTasks(
     assertUniqueIds(data.taskIds, "task");
     const tasks = await tx.task.findMany({
       where: { id: { in: data.taskIds }, projectId },
-      select: { id: true, assignees: { select: { userId: true } } },
+      select: {
+        id: true,
+        statusId: true,
+        position: true,
+        archived: true,
+        createdAt: true,
+        status: { select: { position: true } },
+        assignees: { select: { userId: true } },
+      },
     });
     if (tasks.length !== data.taskIds.length) {
       throw new ValidationError("Some tasks do not belong to this project");
@@ -801,6 +741,26 @@ export async function bulkUpdateTasks(
     // lock assignment rows (clearAssignments), so the two never wait on each
     // other in a cycle whatever order the client listed the tasks in.
     const taskIds = [...data.taskIds].sort();
+
+    // Tasks that join a column's board (moved to another column, or
+    // unarchived) go after its active tasks, in their previous board order,
+    // so no two active tasks of a column share a position.
+    const joining = tasks
+      .filter((t) => !(data.archived ?? t.archived) && (t.archived || (data.statusId ?? t.statusId) !== t.statusId))
+      .sort(
+        (a, b) =>
+          a.status.position - b.status.position ||
+          a.position - b.position ||
+          a.createdAt.getTime() - b.createdAt.getTime() ||
+          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      );
+    const joiningIds = joining.map((t) => t.id);
+    const destinations = [...new Set(joining.map((t) => data.statusId ?? t.statusId))].sort();
+    for (const statusId of destinations) {
+      const staying = await columnTasks(tx, projectId, statusId, joiningIds);
+      const incoming = joining.filter((t) => (data.statusId ?? t.statusId) === statusId);
+      await writeColumnOrder(tx, [...staying, ...incoming]);
+    }
 
     // Bulk update status
     if (data.statusId) {
@@ -895,20 +855,24 @@ export async function bulkDeleteTasks(
 ) {
   const access = await assertProjectAccess(prisma, projectId, actorId);
   if (access.role !== "ADMIN") throw new ForbiddenError("Only administrators can delete tasks");
-  // Validate all tasks belong to this project
-  const tasks = await prisma.task.findMany({
-    where: { id: { in: taskIds }, projectId },
-    select: { id: true },
-  });
-  if (tasks.length !== taskIds.length) {
-    throw new ValidationError("Some tasks do not belong to this project");
-  }
+  // Under the order lock like a single delete: it deletes rows that moves and
+  // bulk updates renumber, in its own scan order.
+  return withProjectOrder(prisma, projectId, async (tx) => {
+    // Validate all tasks belong to this project
+    const tasks = await tx.task.findMany({
+      where: { id: { in: taskIds }, projectId },
+      select: { id: true },
+    });
+    if (tasks.length !== taskIds.length) {
+      throw new ValidationError("Some tasks do not belong to this project");
+    }
 
-  const result = await prisma.task.deleteMany({
-    where: { id: { in: taskIds }, projectId },
-  });
+    const result = await tx.task.deleteMany({
+      where: { id: { in: taskIds }, projectId },
+    });
 
-  return { count: result.count };
+    return { count: result.count };
+  });
 }
 
 export async function removeLabel(
@@ -954,7 +918,7 @@ export async function duplicateTask(
     include: {
       assignees: true,
       labels: true,
-      subtasks: { orderBy: { position: "asc" } },
+      subtasks: { orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }] },
     },
   });
   if (!source) {
@@ -963,16 +927,13 @@ export async function duplicateTask(
   const access = await assertProjectAccess(prisma, source.projectId, actorId);
   if (access.role === "VIEWER") throw new ForbiddenError("Insufficient permissions");
 
-  // Check project not archived
-  const project = await prisma.project.findUnique({
-    where: { id: source.projectId },
-    select: { archived: true },
-  });
-  if (project?.archived) {
-    throw new ValidationError("Cannot duplicate tasks in an archived project");
-  }
+  // The copy goes last in its column; the order lock keeps that position free
+  // until it commits (utils/task-order.ts).
+  return withProjectOrder(prisma, source.projectId, async (tx, project) => {
+    if (project.archived) {
+      throw new ValidationError("Cannot duplicate tasks in an archived project");
+    }
 
-  return prisma.$transaction(async (tx) => {
     // Copy only references that are valid in the source project today: legacy
     // rows may point at another project, and members may have lost access.
     let statusId = source.statusId;
@@ -983,7 +944,7 @@ export async function duplicateTask(
     if (!sourceStatus) {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId: source.projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
         select: { id: true },
       });
       if (!firstColumn) throw new ValidationError("Project has no status columns");
@@ -997,12 +958,7 @@ export async function duplicateTask(
       source.subtasks.flatMap((s) => (s.assigneeId ? [s.assigneeId] : [])),
     ));
 
-    // Calculate position
-    const maxPos = await tx.task.aggregate({
-      where: { statusId, projectId: source.projectId },
-      _max: { position: true },
-    });
-    const position = (maxPos._max.position ?? -1) + 1;
+    const position = await nextTaskPosition(tx, source.projectId, statusId);
 
     const task = await tx.task.create({
       data: {
@@ -1065,101 +1021,107 @@ export async function addDependency(
   actorId: string,
   data: TaskDependencyInput,
 ) {
-  await assertTaskEdit(prisma, taskId, actorId);
+  const access = await assertTaskEdit(prisma, taskId, actorId);
   // No self-dependency
   if (taskId === data.blockingTaskId) {
     throw new ValidationError("A task cannot depend on itself");
   }
 
-  // Both tasks must exist and belong to the same project
-  const [blockedTask, blockingTask] = await Promise.all([
-    prisma.task.findUnique({ where: { id: taskId }, select: { id: true, projectId: true } }),
-    prisma.task.findUnique({ where: { id: data.blockingTaskId }, select: { id: true, title: true, projectId: true } }),
-  ]);
+  // The cycle check and the insert run under the project's order lock, which
+  // every dependency add and remove of the project takes first, so two adds
+  // that would close a cycle together cannot both pass the check
+  // (utils/task-order.ts). Dependencies never cross projects.
+  return withProjectOrder(prisma, access.projectId, async (tx) => {
+    // Both tasks must exist and belong to the same project
+    const [blockedTask, blockingTask] = await Promise.all([
+      tx.task.findUnique({ where: { id: taskId }, select: { id: true, projectId: true } }),
+      tx.task.findUnique({ where: { id: data.blockingTaskId }, select: { id: true, title: true, projectId: true } }),
+    ]);
 
-  if (!blockedTask) {
-    throw new NotFoundError("Task not found");
-  }
-  if (!blockingTask) {
-    throw new NotFoundError("Blocking task not found");
-  }
-  if (blockedTask.projectId !== blockingTask.projectId) {
-    throw new ValidationError("Both tasks must belong to the same project");
-  }
+    if (!blockedTask) {
+      throw new NotFoundError("Task not found");
+    }
+    if (!blockingTask) {
+      throw new NotFoundError("Blocking task not found");
+    }
+    if (blockedTask.projectId !== blockingTask.projectId) {
+      throw new ValidationError("Both tasks must belong to the same project");
+    }
 
-  // Check for duplicate
-  const existing = await prisma.taskDependency.findUnique({
-    where: {
-      blockedTaskId_blockingTaskId: {
+    // Check for duplicate
+    const existing = await tx.taskDependency.findUnique({
+      where: {
+        blockedTaskId_blockingTaskId: {
+          blockedTaskId: taskId,
+          blockingTaskId: data.blockingTaskId,
+        },
+      },
+    });
+    if (existing) {
+      throw new ConflictError("This dependency already exists");
+    }
+
+    // BFS circular detection: load all deps for the project and check if
+    // blockingTaskId can reach blockedTaskId (taskId) through the graph
+    const allDeps = await tx.taskDependency.findMany({
+      where: {
+        blockedTask: { projectId: blockedTask.projectId },
+      },
+      select: { blockedTaskId: true, blockingTaskId: true },
+    });
+
+    // Build adjacency: blockingTaskId → [blockedTaskIds]
+    // i.e. if A blocks B, then completing A allows B. We need to check:
+    // would adding "blockingTaskId blocks taskId" create a cycle?
+    // That means: can we reach blockingTaskId starting from taskId via existing edges?
+    // Edge direction: blockedTaskId is blocked by blockingTaskId
+    // For cycle detection: if taskId (the blocked one) already transitively blocks blockingTaskId
+    const adj = new Map<string, string[]>();
+    for (const dep of allDeps) {
+      const list = adj.get(dep.blockedTaskId) ?? [];
+      list.push(dep.blockingTaskId);
+      adj.set(dep.blockedTaskId, list);
+    }
+
+    // BFS from blockingTaskId: if we can reach taskId, adding this edge creates a cycle
+    const visited = new Set<string>();
+    const queue = [data.blockingTaskId];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (current === taskId) {
+        throw new ValidationError("Cannot add dependency: would create a circular dependency");
+      }
+      if (visited.has(current)) continue;
+      visited.add(current);
+      const neighbors = adj.get(current) ?? [];
+      for (const neighbor of neighbors) {
+        if (!visited.has(neighbor)) {
+          queue.push(neighbor);
+        }
+      }
+    }
+
+    // Create the dependency
+    const dependency = await tx.taskDependency.create({
+      data: {
         blockedTaskId: taskId,
         blockingTaskId: data.blockingTaskId,
       },
-    },
+      include: {
+        blockingTask: { select: { id: true, title: true, projectId: true, status: true } },
+        blockedTask: { select: { id: true, title: true, projectId: true, status: true } },
+      },
+    });
+
+    await logActivity(tx, {
+      taskId,
+      actorId,
+      action: "dependency_added",
+      details: { blockingTaskId: data.blockingTaskId, blockingTaskTitle: blockingTask.title },
+    });
+
+    return scopeTaskDependencyTasks(dependency);
   });
-  if (existing) {
-    throw new ConflictError("This dependency already exists");
-  }
-
-  // BFS circular detection: load all deps for the project and check if
-  // blockingTaskId can reach blockedTaskId (taskId) through the graph
-  const allDeps = await prisma.taskDependency.findMany({
-    where: {
-      blockedTask: { projectId: blockedTask.projectId },
-    },
-    select: { blockedTaskId: true, blockingTaskId: true },
-  });
-
-  // Build adjacency: blockingTaskId → [blockedTaskIds]
-  // i.e. if A blocks B, then completing A allows B. We need to check:
-  // would adding "blockingTaskId blocks taskId" create a cycle?
-  // That means: can we reach blockingTaskId starting from taskId via existing edges?
-  // Edge direction: blockedTaskId is blocked by blockingTaskId
-  // For cycle detection: if taskId (the blocked one) already transitively blocks blockingTaskId
-  const adj = new Map<string, string[]>();
-  for (const dep of allDeps) {
-    const list = adj.get(dep.blockedTaskId) ?? [];
-    list.push(dep.blockingTaskId);
-    adj.set(dep.blockedTaskId, list);
-  }
-
-  // BFS from blockingTaskId: if we can reach taskId, adding this edge creates a cycle
-  const visited = new Set<string>();
-  const queue = [data.blockingTaskId];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (current === taskId) {
-      throw new ValidationError("Cannot add dependency: would create a circular dependency");
-    }
-    if (visited.has(current)) continue;
-    visited.add(current);
-    const neighbors = adj.get(current) ?? [];
-    for (const neighbor of neighbors) {
-      if (!visited.has(neighbor)) {
-        queue.push(neighbor);
-      }
-    }
-  }
-
-  // Create the dependency
-  const dependency = await prisma.taskDependency.create({
-    data: {
-      blockedTaskId: taskId,
-      blockingTaskId: data.blockingTaskId,
-    },
-    include: {
-      blockingTask: { select: { id: true, title: true, projectId: true, status: true } },
-      blockedTask: { select: { id: true, title: true, projectId: true, status: true } },
-    },
-  });
-
-  await logActivity(prisma, {
-    taskId,
-    actorId,
-    action: "dependency_added",
-    details: { blockingTaskId: data.blockingTaskId, blockingTaskTitle: blockingTask.title },
-  });
-
-  return scopeTaskDependencyTasks(dependency);
 }
 
 export async function removeDependency(
@@ -1168,37 +1130,39 @@ export async function removeDependency(
   dependencyId: string,
   actorId: string,
 ) {
-  await assertTaskEdit(prisma, taskId, actorId);
-  const dependency = await prisma.taskDependency.findUnique({
-    where: { id: dependencyId },
-    include: {
-      blockingTask: { select: { id: true, title: true, projectId: true } },
-      blockedTask: { select: { projectId: true } },
-    },
+  const access = await assertTaskEdit(prisma, taskId, actorId);
+  return withProjectOrder(prisma, access.projectId, async (tx) => {
+    const dependency = await tx.taskDependency.findUnique({
+      where: { id: dependencyId },
+      include: {
+        blockingTask: { select: { id: true, title: true, projectId: true } },
+        blockedTask: { select: { projectId: true } },
+      },
+    });
+
+    if (!dependency) {
+      throw new NotFoundError("Dependency not found");
+    }
+
+    if (dependency.blockedTaskId !== taskId) {
+      throw new ValidationError("Dependency does not belong to this task");
+    }
+
+    await tx.taskDependency.delete({ where: { id: dependencyId } });
+
+    await logActivity(tx, {
+      taskId,
+      actorId,
+      action: "dependency_removed",
+      details: {
+        blockingTaskId: dependency.blockingTaskId,
+        // A legacy cross-project link may be removed without copying its title.
+        ...(dependency.blockingTask.projectId === dependency.blockedTask.projectId
+          ? { blockingTaskTitle: dependency.blockingTask.title }
+          : {}),
+      },
+    });
+
+    return { blockingTaskId: dependency.blockingTaskId };
   });
-
-  if (!dependency) {
-    throw new NotFoundError("Dependency not found");
-  }
-
-  if (dependency.blockedTaskId !== taskId) {
-    throw new ValidationError("Dependency does not belong to this task");
-  }
-
-  await prisma.taskDependency.delete({ where: { id: dependencyId } });
-
-  await logActivity(prisma, {
-    taskId,
-    actorId,
-    action: "dependency_removed",
-    details: {
-      blockingTaskId: dependency.blockingTaskId,
-      // A legacy cross-project link may be removed without copying its title.
-      ...(dependency.blockingTask.projectId === dependency.blockedTask.projectId
-        ? { blockingTaskTitle: dependency.blockingTask.title }
-        : {}),
-    },
-  });
-
-  return { blockingTaskId: dependency.blockingTaskId };
 }

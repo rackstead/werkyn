@@ -10,7 +10,10 @@ import { ValidationError } from "./errors.js";
 // that remain are in docs/remediation/dat-005.md):
 //   - the Project row FOR KEY SHARE, always first. Project deletion locks it
 //     before cascading to columns, labels, members and tasks, so it waits for
-//     the write rather than meeting it halfway;
+//     the write rather than meeting it halfway. Writers that change task order
+//     or dependencies already hold the row FOR NO KEY UPDATE (the project's
+//     order lock, utils/task-order.ts) from their first statement, so for them
+//     this is a no-op;
 //   - explicitly supplied columns and labels FOR KEY SHARE. A column or label
 //     delete locks its own row first, so it either waits for the write (and
 //     then moves or detaches the new task) or commits first and the write is
@@ -63,9 +66,9 @@ export function assertUniqueIds(ids: readonly string[], kind: string) {
 
 /**
  * The given columns that exist in the project, locked FOR KEY SHARE (after the
- * Project row) when called in a transaction. A task move takes its source and
- * destination columns this way before renumbering any task, so a column delete
- * waits for the move instead of meeting its task rows in the opposite order.
+ * Project row) when called in a transaction. A column delete locks its column
+ * FOR UPDATE, so a write that validated the column either commits first (and
+ * its task moves with the others) or finds the column gone.
  */
 export async function lockProjectStatuses(db: Db, projectId: string, statusIds: readonly string[]) {
   const unique = [...new Set(statusIds)];

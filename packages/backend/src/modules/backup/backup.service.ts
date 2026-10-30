@@ -57,7 +57,7 @@ export async function exportBackup(
     const statuses = opt.includeStatuses
       ? await prisma.statusColumn.findMany({
           where: { projectId: opt.projectId },
-          orderBy: { position: "asc" },
+          orderBy: [{ position: "asc" }, { id: "asc" }],
         })
       : [];
 

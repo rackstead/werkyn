@@ -10,6 +10,7 @@ import {
   projectAssigneeIds,
   projectLabelIds,
 } from "../../utils/task-references.js";
+import { nextTaskPosition, withProjectOrder } from "../../utils/task-order.js";
 
 type TemplateReferences = Pick<UpdateTemplateInput, "statusId" | "assigneeIds" | "labelIds">;
 
@@ -133,14 +134,6 @@ export async function deleteTemplate(prisma: PrismaClient, projectId: string, te
   await prisma.taskTemplate.delete({ where: { id: templateId, projectId } });
 }
 
-/** Runs fn in a new transaction, or in the caller's when given a transaction client. */
-function inTransaction<T>(
-  db: PrismaClient | Prisma.TransactionClient,
-  fn: (tx: Prisma.TransactionClient) => Promise<T>,
-): Promise<T> {
-  return "$transaction" in db ? db.$transaction(fn) : fn(db);
-}
-
 /**
  * The date `days` after a calendar date (YYYY-MM-DD), or after today (UTC)
  * when no date is given.
@@ -180,16 +173,14 @@ export async function createTaskFromTemplate(
   });
   if (!template) throw new NotFoundError("Template not found");
 
-  // Check project is not archived
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { archived: true },
-  });
-  if (project?.archived) {
-    throw new ValidationError("Cannot create tasks in an archived project");
-  }
+  // Under the project's order lock, taken in a new transaction or in the
+  // caller's, so the position chosen below stays last in its column until the
+  // task commits (utils/task-order.ts).
+  return withProjectOrder(prisma, projectId, async (tx, project) => {
+    if (project.archived) {
+      throw new ValidationError("Cannot create tasks in an archived project");
+    }
 
-  return inTransaction(prisma, async (tx) => {
     // Explicit overrides are validated like any other write; stored values are
     // copied only while still valid in this project.
     const stored = await scopeTemplate(tx, projectId, template);
@@ -211,7 +202,7 @@ export async function createTaskFromTemplate(
     if (!statusId) {
       const firstColumn = await tx.statusColumn.findFirst({
         where: { projectId },
-        orderBy: { position: "asc" },
+        orderBy: [{ position: "asc" }, { id: "asc" }],
       });
       if (!firstColumn) throw new ValidationError("Project has no status columns");
       statusId = firstColumn.id;
@@ -223,12 +214,7 @@ export async function createTaskFromTemplate(
       dueDate = addDaysUTC(dueOffsetFrom, template.dueOffset);
     }
 
-    // Calculate position
-    const maxPos = await tx.task.aggregate({
-      where: { statusId, projectId },
-      _max: { position: true },
-    });
-    const position = (maxPos._max.position ?? -1) + 1;
+    const position = await nextTaskPosition(tx, projectId, statusId);
 
     const title = overrides?.title ?? template.title;
 

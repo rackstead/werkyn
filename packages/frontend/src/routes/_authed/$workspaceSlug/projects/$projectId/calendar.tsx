@@ -1,7 +1,7 @@
 import { lazy, Suspense } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { z } from "zod";
-import { TaskSlideover } from "@/features/tasks";
+import { TaskSlideover, usePreloadTaskSlideover } from "@/features/tasks";
 import { FilterBar, type Filters } from "@/components/shared/filter-bar";
 import { useAuthStore } from "@/stores/auth-store";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -42,6 +42,7 @@ function CalendarRoute() {
   const permissions = usePermissions(membership, user?.id);
 
   useRealtime(projectId);
+  usePreloadTaskSlideover();
 
   const filters: Record<string, unknown> = {};
   if (search.search) filters.search = search.search;

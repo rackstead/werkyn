@@ -1,10 +1,15 @@
 import { createRouter } from "@tanstack/react-router";
 import { routeTree } from "@/routeTree.gen";
 import { onIdentityChange } from "@/lib/identity";
+import { LoadingSpinner } from "@/components/shared/lazy-load";
 
+// Route components are split into their own chunks (autoCodeSplitting in
+// vite.config.ts). Hovering or focusing a link fetches the target's chunk, and
+// a navigation still waiting for one after a second shows the spinner.
 export const router = createRouter({
   routeTree,
   defaultPreload: "intent",
+  defaultPendingComponent: LoadingSpinner,
 });
 
 // Route guards and contexts (such as the workspace membership) were computed

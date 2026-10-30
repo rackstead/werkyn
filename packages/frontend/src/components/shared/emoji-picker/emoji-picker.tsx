@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, Suspense } from "react";
 import { Smile } from "lucide-react";
 import {
   Popover,
@@ -6,7 +6,32 @@ import {
   PopoverContent,
   PopoverAnchor,
 } from "@/components/ui/popover";
-import { EmojiPickerContent } from "./emoji-picker-content";
+import { lazyNamed } from "@/lib/lazy-import";
+import { LoadingSpinner } from "@/components/shared/lazy-load";
+
+// The emoji list is large, and the picker appears in the sidebar and dialogs of
+// every workspace page, so its contents load when it is first opened (or when
+// its trigger is hovered or focused).
+const EmojiPickerContent = lazyNamed(
+  () => import("./emoji-picker-content"),
+  "EmojiPickerContent",
+);
+
+function LazyEmojiPickerContent(
+  props: React.ComponentProps<typeof EmojiPickerContent>,
+) {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex h-[360px] w-[352px]">
+          <LoadingSpinner label="Loading emoji…" />
+        </div>
+      }
+    >
+      <EmojiPickerContent {...props} />
+    </Suspense>
+  );
+}
 
 interface EmojiPickerProps {
   value: string | null;
@@ -55,7 +80,7 @@ export function EmojiPicker({
           className="w-auto p-0"
           onOpenAutoFocus={(e) => e.preventDefault()}
         >
-          <EmojiPickerContent
+          <LazyEmojiPickerContent
             value={value}
             onSelect={handleSelect}
             onRemove={handleRemove}
@@ -68,7 +93,11 @@ export function EmojiPicker({
   // Uncontrolled mode (has its own trigger)
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
+      <PopoverTrigger
+        asChild
+        onPointerEnter={EmojiPickerContent.preload}
+        onFocus={EmojiPickerContent.preload}
+      >
         {children ?? (
           <button
             type="button"
@@ -90,7 +119,7 @@ export function EmojiPicker({
         className="w-auto p-0"
         onOpenAutoFocus={(e) => e.preventDefault()}
       >
-        <EmojiPickerContent
+        <LazyEmojiPickerContent
           value={value}
           onSelect={handleSelect}
           onRemove={handleRemove}

@@ -20,7 +20,7 @@ function useIsDark() {
   );
 }
 
-interface WikiEditorProps {
+export interface WikiEditorProps {
   initialContent?: unknown;
   recoveredContent?: unknown;
   hasUnsavedChanges?: boolean;

@@ -9,7 +9,7 @@ import { Slideover } from "@/components/ui/slideover";
 import { timeAgo } from "@/lib/time-ago";
 import { apiBase } from "@/lib/api-url";
 
-interface FilePreviewSlideoverProps {
+export interface FilePreviewSlideoverProps {
   file: DriveFile;
   workspaceId: string;
   onClose: () => void;

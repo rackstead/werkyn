@@ -19,7 +19,7 @@ const TaskDescription = lazy(() =>
   })),
 );
 
-interface TaskSlideoverProps {
+export interface TaskSlideoverProps {
   taskId: string;
   workspaceSlug: string;
   onClose: () => void;

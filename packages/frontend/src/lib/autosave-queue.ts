@@ -53,6 +53,14 @@ export interface AutosaveCallbacks {
   onParked: (closed: boolean) => void;
 }
 
+/** An outside write was not made because unsaved edits could not be stored first. */
+export class PendingEditsError extends Error {
+  constructor(message = "Save or discard this item's unsaved changes first") {
+    super(message);
+    this.name = "PendingEditsError";
+  }
+}
+
 /** Rejects a flush that was not allowed to send anything. */
 export class AutosaveBlockedError extends Error {
   constructor(message: string) {
@@ -144,6 +152,32 @@ export class AutosaveQueue<T extends object> {
     if (this.inFlight || revision !== this.baseRevision + 1) return;
     this.baseRevision = revision;
     this.observedRevision = revision;
+  };
+
+  /**
+   * Makes a write of this entity outside the queue (for example a rename from
+   * the page tree) between its saves: pending edits are stored first, and if
+   * they cannot be, the outside write is not made. Saves of edits made
+   * meanwhile wait for it and are then based on its revision.
+   */
+  writeAlongside = async (write: () => Promise<number | undefined>) => {
+    try {
+      await this.flush();
+    } catch {
+      throw new PendingEditsError();
+    }
+    const outside = write().then((revision) => this.acknowledgeRevision(revision));
+    // Flushes requested meanwhile wait for this, then for the edits made
+    // meanwhile, which are saved on the acknowledged revision.
+    const held: Promise<void> = outside
+      .catch(() => {})
+      .then(() => {
+        this.running = null;
+        return this.pending ? this.flush() : undefined;
+      });
+    held.catch(() => {});
+    this.running = held;
+    await outside;
   };
 
   setPolicy(policy: AutosavePolicy) {

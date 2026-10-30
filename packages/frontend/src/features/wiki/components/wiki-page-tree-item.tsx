@@ -10,6 +10,8 @@ import {
   type WikiPageTreeItem as TreeItem,
 } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
+import { PendingEditsError } from "@/lib/autosave-queue";
+import { toast } from "sonner";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   DropdownMenu,
@@ -63,7 +65,10 @@ export function WikiPageTreeItem({
     const userId = useAuthStore.getState().user?.id ?? "anonymous";
     void writeAlongsideAutosave(wikiAutosaveKey(userId, page.id), async () =>
       (await updatePage.mutateAsync({ pageId: page.id, ...patch })).data.revision,
-    ).catch(() => {});
+    ).catch((error) => {
+      // A failed write already shows the update's own error notice.
+      if (error instanceof PendingEditsError) toast.error(error.message);
+    });
   };
 
   const handleRenameSubmit = () => {

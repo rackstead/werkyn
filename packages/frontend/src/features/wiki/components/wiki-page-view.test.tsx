@@ -6,6 +6,7 @@ import * as wiki from "../api";
 import { WikiPageView } from "./wiki-page-view";
 import { wikiAutosaveKey } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
+import { PendingEditsError } from "@/lib/autosave-queue";
 import { useAuthStore } from "@/stores/auth-store";
 
 const { http, notices } = vi.hoisted(() => ({
@@ -1090,6 +1091,68 @@ describe("server revisions and edit conflicts", () => {
     });
     expect(stored).toMatchObject({ revision: 7, title: "Renamed" });
     expect(screen.queryByText("Restore changes")).toBeNull();
+  });
+
+  it("an edit made while a page-tree write is in flight is sent after it, on its revision", async () => {
+    const id = `tree-held-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let outside!: Promise<void>;
+    await act(async () => {
+      outside = writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        await gate;
+        const response = (await http
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .json()) as { data: { revision: number } };
+        return response.data.revision;
+      });
+    });
+    fireEvent.change(body(screen), { target: { value: "typed during rename" } });
+    await tick(801);
+    expect(written).toEqual([]);
+    await act(async () => {
+      release();
+      await outside;
+    });
+    await tick();
+    expect(written.map((w) => w.body)).toEqual([
+      { title: "Renamed" },
+      { content: paragraph("typed during rename"), expectedRevision: 5 },
+    ]);
+    expect(stored).toMatchObject({ revision: 6, title: "Renamed" });
+    expect(screen.queryByText("Restore changes")).toBeNull();
+  });
+
+  it("a page-tree write is not made when the editor's pending edits cannot be stored", async () => {
+    const id = `tree-blocked-${++suffix}`;
+    const stored = { revision: 4, title: id, content: paragraph("start") };
+    serve(id, stored);
+    const served = http.patch.getMockImplementation()!;
+    http.patch.mockImplementation((path: string, options: any) =>
+      options.json.content
+        ? { json: async () => { written.push({ path, body: options.json }); throw new Error("Offline"); } }
+        : served(path, options),
+    );
+    const screen = render(view(id), { wrapper });
+    await tick();
+    fireEvent.change(body(screen), { target: { value: "unsaved" } });
+    let refused: unknown;
+    await act(async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+        throw new Error("the outside write must not run");
+      }).catch((error) => {
+        refused = error;
+      });
+    });
+    expect(refused).toBeInstanceOf(PendingEditsError);
+    expect(written.map((w) => w.body)).toEqual([
+      { content: paragraph("unsaved"), expectedRevision: 4 },
+    ]);
+    expect(stored).toMatchObject({ revision: 4, title: id });
   });
 
   it("a save refused by another user's lock names the holder and is not resent", async () => {

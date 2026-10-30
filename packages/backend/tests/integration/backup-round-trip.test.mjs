@@ -608,12 +608,13 @@ test("an export reads one read-only repeatable-read snapshot and always closes i
       if (seen.length > 0) return;
       const [isolation] = await client.$queryRaw`SHOW transaction_isolation`;
       const [readOnly] = await client.$queryRaw`SHOW transaction_read_only`;
-      seen.push(isolation.transaction_isolation, readOnly.transaction_read_only);
+      const [timeout] = await client.$queryRaw`SHOW statement_timeout`;
+      seen.push(isolation.transaction_isolation, readOnly.transaction_read_only, timeout.statement_timeout);
     },
   });
   const request = { projects: [{ projectId: project.id }] };
   const { backup } = await exportThenRestore(prisma, source.id, request);
-  assert.deepEqual(seen, ["repeatable read", "on"]);
+  assert.deepEqual(seen, ["repeatable read", "on", "1min"]);
   assert.equal(backup.projects[0].tasks.length, 3);
 
   // Over the limits, cancelled, or failing: the snapshot is rolled back and
@@ -905,6 +906,52 @@ test("a stalled image read is cut off by a client abort or the deadline", { time
 
   assert.equal(streams.length, 2);
   for (const stream of streams) assert.ok(stream.destroyed, "the stalled read was destroyed");
+  assert.equal(await openTransactions(), 0);
+  assert.deepEqual(await stagedFiles(), []);
+});
+
+test("a database query running when the export is stopped is cancelled", { timeout: 60_000 }, async () => {
+  const { EXPORT_TOO_SLOW_MESSAGE } = await import("../../src/modules/backup/backup.service.ts");
+  const { project } = await orderedProject(source.id, ["Q1", "Q2", "Q3"]);
+  const request = BackupExportRequestSchema.parse({ projects: [{ projectId: project.id }] });
+  // The first task batch hangs in the database for 30 s.
+  const stalling = () =>
+    hooked("task", {
+      async after(rows, args, client) {
+        if (args?.where?.projectId === project.id) await client.$queryRaw`SELECT pg_sleep(30)::text AS slept`;
+      },
+    });
+  const sleeping = async () =>
+    Number(
+      (
+        await app.prisma.$queryRaw`SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND query LIKE '%pg_sleep(%' AND pid <> pg_backend_pid()`
+      )[0].n,
+    );
+
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 500);
+  let started = Date.now();
+  await assert.rejects(
+    exportBackup(stalling(), source.id, request, app.storage, admin.id, undefined, undefined, {
+      batchSize: 2,
+      signal: controller.signal,
+    }),
+    { message: "The backup request was cancelled" },
+  );
+  assert.ok(Date.now() - started < 5_000, `client abort took ${Date.now() - started} ms`);
+
+  started = Date.now();
+  await assert.rejects(
+    exportBackup(stalling(), source.id, request, app.storage, admin.id, undefined, undefined, {
+      batchSize: 2,
+      timeoutMs: 800,
+    }),
+    { statusCode: 409, message: EXPORT_TOO_SLOW_MESSAGE },
+  );
+  assert.ok(Date.now() - started < 5_000, `deadline took ${Date.now() - started} ms`);
+
+  assert.equal(await sleeping(), 0, "no cancelled query is still running");
   assert.equal(await openTransactions(), 0);
   assert.deepEqual(await stagedFiles(), []);
 });

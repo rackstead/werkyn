@@ -142,6 +142,13 @@ missing.
   storage read that has stalled, removes its file and closes the snapshot.
   A deadline, or no free connection within 10 seconds, answers with the
   retryable 409.
+- No query in the snapshot may run longer than 60 seconds
+  (`statement_timeout`). A batch query still running when the export stops
+  is cancelled on the snapshot's own database backend. The cancel is sent
+  only while that query runs, and the export waits for it before the
+  transaction ends, so it cannot reach another request's query once the
+  connection is reused. With a pool of one connection the cancel cannot run,
+  and the 60-second bound applies.
 - If a page ever referred to an image URL that the image copy had not
   examined, the export would be refused with a 409 rather than written with a
   missing file. With one snapshot this cannot happen; it remains as a guard.
@@ -198,12 +205,12 @@ are 16 MiB, 196 MiB in all) over HTTP from a fresh server process with a
 | Export | Peak RSS growth | Peak heap | Time | Archive |
 |---|---|---|---|---|
 | Before | 704 MiB (187 → 891) | 87 MiB (+39) | 7.4 s | 196.1 MiB, `backup.json` 17,001,365 bytes |
-| After | 75 MiB (185 → 260) | 69 MiB (+20) | 7.8 s | 196.1 MiB, `backup.json` 17,002,123 bytes |
+| After | 65 MiB (183 → 248) | 70 MiB (+19) | 8.1 s | 196.1 MiB, `backup.json` 17,002,123 bytes |
 
 Both archives hold 1,513 entries, 6,000 tasks, 20,000 messages and 500 pages.
 `backup.json` grew by the scope fields. The "after" row is the final code,
 with the database snapshot; peak RSS varies between runs of the same code
-(237 to 260 MiB), peak heap less (66 to 69 MiB).
+(237 to 260 MiB), peak heap less (66 to 70 MiB).
 
 ## Behavior changes
 
@@ -280,7 +287,10 @@ batches:
 - an export with images completes through a pool of one connection;
 - a storage read that never delivers a byte is cut off by a client abort
   (cancelled) and by the deadline (409), within seconds, with the stalled
-  stream destroyed and no open transaction or file left.
+  stream destroyed and no open transaction or file left;
+- a batch query held for 30 seconds in the database is cancelled within
+  seconds by a client abort and by the deadline, with no query, transaction
+  or file left behind (on the previous code the abort took 30 seconds).
 
 On the code before the snapshot, the four edit scenarios exported a cycle,
 a page twice or a missing status, and the isolation check read `read

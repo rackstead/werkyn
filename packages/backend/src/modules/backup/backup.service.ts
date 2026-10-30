@@ -61,6 +61,65 @@ function stopError(signal: AbortSignal): Error {
     : new BackupRequestAbortedError();
 }
 
+/** No single query of an export's snapshot may run longer than this. */
+export const EXPORT_STATEMENT_TIMEOUT_MS = 60_000;
+
+/**
+ * Stops an export when its client leaves or its deadline passes. Waits on
+ * storage and the archive end at once (ExportArchive). A batch query still
+ * running is cancelled on the snapshot's own database backend; the cancel is
+ * sent only while that query runs, and the export waits for it before the
+ * transaction ends, so it cannot reach another request's query on a reused
+ * connection. Every query is also bounded by EXPORT_STATEMENT_TIMEOUT_MS,
+ * which covers the rest, and a pool of one connection, where the cancel
+ * itself cannot get a connection.
+ */
+class ExportStop {
+  private active = 0;
+  private cancel: (() => Promise<unknown>) | undefined;
+  private cancelling: Promise<unknown> | undefined;
+
+  constructor(readonly signal: AbortSignal) {
+    signal.addEventListener("abort", () => this.cancelActive(), { once: true });
+  }
+
+  /** Throw the stop error once the export has been stopped. */
+  check() {
+    if (this.signal.aborted) throw stopError(this.signal);
+  }
+
+  /** While the snapshot is open, `cancel` interrupts its running query. */
+  attach(cancel: () => Promise<unknown>) {
+    this.cancel = cancel;
+    this.cancelActive();
+  }
+
+  detach() {
+    this.cancel = undefined;
+  }
+
+  private cancelActive() {
+    if (this.signal.aborted && this.active > 0 && this.cancel && !this.cancelling) {
+      this.cancelling = this.cancel().catch(() => {});
+    }
+  }
+
+  /** Run a snapshot query that a stop can cancel. */
+  async query<T>(run: () => Promise<T>): Promise<T> {
+    this.check();
+    this.active++;
+    try {
+      return await run();
+    } catch (error) {
+      this.check();
+      throw error;
+    } finally {
+      this.active--;
+      if (this.cancelling) await this.cancelling;
+    }
+  }
+}
+
 /** The snapshot every content read of an export goes through. */
 type Snapshot = Prisma.TransactionClient;
 /** `backup.json` text is handed to the archive in pieces of about this size. */
@@ -346,23 +405,24 @@ class BatchSizer {
 async function* batches<T extends Position>(
   read: (page: { where: object; take: number }) => Promise<T[]>,
   sizer: BatchSizer,
-  checkStopped: () => void,
+  stopper: ExportStop,
 ): AsyncGenerator<T[]> {
   let last: Position | undefined;
   for (;;) {
-    checkStopped();
     const take = sizer.size;
-    const rows = await read({
-      take,
-      where: last
-        ? {
-            OR: [
-              { createdAt: { gt: last.createdAt } },
-              { createdAt: last.createdAt, id: { gt: last.id } },
-            ],
-          }
-        : {},
-    });
+    const rows = await stopper.query(() =>
+      read({
+        take,
+        where: last
+          ? {
+              OR: [
+                { createdAt: { gt: last.createdAt } },
+                { createdAt: last.createdAt, id: { gt: last.id } },
+              ],
+            }
+          : {},
+      }),
+    );
     if (rows.length > 0) yield rows;
     if (rows.length < take) return;
     last = rows[rows.length - 1];
@@ -400,9 +460,7 @@ export async function exportBackup(
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(new ExportDeadlineError()), timeoutMs);
   const stop = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
-  const checkStopped = () => {
-    if (stop.aborted) throw stopError(stop);
-  };
+  const stopper = new ExportStop(stop);
 
   const file = await stagingPath("export", options.stagingDir ?? backupStagingDir(env.STORAGE_DIR));
   const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits), stop);
@@ -413,17 +471,24 @@ export async function exportBackup(
     workspace = await prisma.$transaction(
       async (db) => {
         await db.$executeRaw`SET TRANSACTION READ ONLY`;
-        const current = await db.workspace.findUniqueOrThrow({
-          where: { id: workspaceId },
-          select: { name: true, slug: true },
-        });
-        const assets = request.includeFiles
-          ? await archiveWikiAssets(db, workspaceId, request, storage, actorId, archive, maxBatch, checkStopped)
-          : undefined;
-        await archive.appendJson((write) =>
-          writeBackupJson(db, workspaceId, current, request, assets, write, maxBatch, checkStopped),
-        );
-        return current;
+        await db.$queryRaw`SELECT set_config('statement_timeout', ${String(EXPORT_STATEMENT_TIMEOUT_MS)}, true)`;
+        const [{ pid }] = await db.$queryRaw<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+        stopper.attach(() => prisma.$queryRaw`SELECT pg_cancel_backend(${pid}::int)`);
+        try {
+          const current = await db.workspace.findUniqueOrThrow({
+            where: { id: workspaceId },
+            select: { name: true, slug: true },
+          });
+          const assets = request.includeFiles
+            ? await archiveWikiAssets(db, workspaceId, request, storage, actorId, archive, maxBatch, stopper)
+            : undefined;
+          await archive.appendJson((write) =>
+            writeBackupJson(db, workspaceId, current, request, assets, write, maxBatch, stopper),
+          );
+          return current;
+        } finally {
+          stopper.detach();
+        }
       },
       {
         isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
@@ -435,7 +500,8 @@ export async function exportBackup(
     size = await archive.finish();
   } catch (error) {
     await archive.discard();
-    throw error;
+    // Once stopped, whatever failed reports the stop (a cancelled query, say).
+    throw stop.aborted ? stopError(stop) : error;
   } finally {
     clearTimeout(timer);
   }
@@ -465,7 +531,7 @@ async function archiveWikiAssets(
   actorId: string,
   archive: ExportArchive,
   maxBatch: number,
-  checkStopped: () => void,
+  stopper: ExportStop,
 ): Promise<ArchivedAssets> {
   const allStorageUrls = new Set<string>();
   for (const opt of request.wikiSpaces) {
@@ -484,7 +550,7 @@ async function archiveWikiAssets(
           take,
         }),
       sizer,
-      checkStopped,
+      stopper,
     )) {
       let chars = 0;
       for (const page of pages) {
@@ -502,7 +568,7 @@ async function archiveWikiAssets(
   const archived = new Map<string, string>();
   const usedNames = new Set<string>();
   for (const url of allStorageUrls) {
-    checkStopped();
+    stopper.check();
     const ctx = await assertBackupExportAccess(db, workspaceId, actorId);
     const storagePaths = await resolveBackupAssetPaths(db, ctx, url);
     for (const storagePath of storagePaths) {
@@ -522,7 +588,7 @@ async function archiveWikiAssets(
         ) continue;
         source = await archive.opened(storage.openReadStream(storagePath));
       } catch {
-        checkStopped();
+        stopper.check();
         // File not found on disk — skip, leave original URL in JSON
         continue;
       }
@@ -548,7 +614,7 @@ async function writeBackupJson(
   assets: ArchivedAssets | undefined,
   write: (text: string) => Promise<void>,
   maxBatch: number,
-  checkStopped: () => void,
+  stopper: ExportStop,
 ) {
   const json = new PrettyJsonWriter(write);
   // Collect all user IDs referenced across the backup
@@ -668,7 +734,7 @@ async function writeBackupJson(
             take,
           }),
         sizer,
-        checkStopped,
+        stopper,
       )) {
         const start = json.written;
         for (const t of dbTasks) {
@@ -792,7 +858,7 @@ async function writeBackupJson(
             take,
           }),
         sizer,
-        checkStopped,
+        stopper,
       )) {
         const start = json.written;
         for (const m of dbMessages) {
@@ -854,7 +920,7 @@ async function writeBackupJson(
           take,
         }),
       sizer,
-      checkStopped,
+      stopper,
     )) {
       const start = json.written;
       for (const p of dbPages) {
@@ -920,7 +986,7 @@ async function writeBackupJson(
   // ─── Metadata and user references ─────────────────────
   // Written last: it lists every user the content above refers to.
 
-  checkStopped();
+  stopper.check();
   const userRefs = await db.user.findMany({
     where: { id: { in: Array.from(userIdSet) } },
     select: { id: true, email: true, displayName: true },

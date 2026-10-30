@@ -3,7 +3,7 @@ import { WebSocketClient } from "@/lib/websocket-client";
 import { useAuthStore } from "@/stores/auth-store";
 import { queryClient } from "@/lib/query-client";
 import { apiWebSocketUrl } from "@/lib/api-url";
-import { onIdentityChange } from "@/lib/identity";
+import { identityGeneration, onIdentityChange } from "@/lib/identity";
 
 const RealtimeContext = createContext<WebSocketClient | null>(null);
 
@@ -28,6 +28,9 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
       return;
     }
 
+    // The identity this socket was opened for; a session close that arrives
+    // after it changed concerns nobody here.
+    const generation = identityGeneration();
     const wsClient = new WebSocketClient({
       url: apiWebSocketUrl(),
       getToken: () => useAuthStore.getState().accessToken,
@@ -37,14 +40,16 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
       },
       // The session behind the token expired (4004) or ended (4005). One
       // refresh yields a token that rebuilds this client. An ended session
-      // that cannot be refreshed signs out, unless another tab supplied a new
-      // token meanwhile. After an expiry a failed refresh may be transient,
-      // so sign-out is left to the HTTP 401 path.
+      // that cannot be refreshed is expired locally (nothing is revoked, and
+      // tabs already on a later sign-in ignore it), unless the identity
+      // changed or another tab supplied a new token meanwhile. After an
+      // expiry a failed refresh may be transient, so sign-out is left to the
+      // HTTP 401 path.
       onSessionEnded: async (code) => {
-        const auth = useAuthStore.getState();
-        if (await auth.refresh()) return;
+        if (identityGeneration() !== generation) return;
+        if (await useAuthStore.getState().refresh()) return;
         if (code === 4005 && useAuthStore.getState().accessToken === accessToken) {
-          await auth.logout();
+          useAuthStore.getState().expireSession(generation);
         }
       },
     });

@@ -53,33 +53,3 @@ export function rewriteStorageUrls(
   }
   return content;
 }
-
-/**
- * Recursively walk an unknown JSON value and replace URLs using a mapping.
- * Returns a deep-cloned structure with replacements applied.
- */
-export function rewriteUrls(
-  content: unknown,
-  urlMap: Map<string, string>,
-): unknown {
-  if (typeof content === "string") {
-    let result = content;
-    for (const [from, to] of urlMap) {
-      result = result.replaceAll(from, to);
-    }
-    return result;
-  }
-  if (Array.isArray(content)) {
-    return content.map((item) => rewriteUrls(item, urlMap));
-  }
-  if (content !== null && typeof content === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(
-      content as Record<string, unknown>,
-    )) {
-      out[key] = rewriteUrls(value, urlMap);
-    }
-    return out;
-  }
-  return content;
-}

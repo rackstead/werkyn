@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import {
   BACKUP_INCLUDED_CONTENT,
   BACKUP_OMITTED_CONTENT,
@@ -35,8 +35,20 @@ import {
   type StagedFile,
 } from "./backup-staging.js";
 
-/** Rows read per query, so no part of a large workspace is loaded at once. */
+/** Rows read per query at most, so no part of a large workspace is loaded at once. */
 const EXPORT_BATCH = 500;
+/** Rows in the first query of each list, before their size is known. */
+const FIRST_BATCH = 50;
+/** Later queries of a list read about this much `backup.json` text each. */
+const BATCH_TARGET_CHARS = 4 * 1024 * 1024;
+/**
+ * How long an export may keep its database snapshot open, image copy
+ * included. An export that takes longer fails with a retryable 409.
+ */
+export const EXPORT_SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
+
+/** The snapshot every content read of an export goes through. */
+type Snapshot = Prisma.TransactionClient;
 /** `backup.json` text is handed to the archive in pieces of about this size. */
 const JSON_FLUSH_BYTES = 64 * 1024;
 
@@ -51,7 +63,7 @@ export interface BackupExportOptions {
   stagingDir?: string;
   /** Stops the export at its next step once aborted. */
   signal?: AbortSignal;
-  /** Rows per query; tests use small batches. */
+  /** Most rows per query; tests use small batches. */
   batchSize?: number;
 }
 
@@ -191,8 +203,15 @@ class ExportArchive {
 class PrettyJsonWriter {
   private depth = 0;
   private readonly empty: boolean[] = [];
+  /** Characters written so far. */
+  written = 0;
 
-  constructor(private readonly write: (text: string) => Promise<void>) {}
+  constructor(private readonly sink: (text: string) => Promise<void>) {}
+
+  private write(text: string) {
+    this.written += text.length;
+    return this.sink(text);
+  }
 
   private prefix(key?: string) {
     const first = this.empty.length === 0 || this.empty[this.empty.length - 1];
@@ -231,20 +250,42 @@ interface Position {
 }
 
 /**
- * Read rows ordered by `createdAt`, then `id`, `size` at a time. Each query
- * asks for rows after the last one read by value, so a row deleted between
- * queries cannot end the walk early.
+ * Sizes the queries of one list. The first reads FIRST_BATCH rows; each later
+ * one reads about BATCH_TARGET_CHARS of output at the average size of the rows
+ * so far, between 1 and `max` rows, so a list of large rows (a page or a
+ * description can be about 1 MiB) is read a few rows at a time.
+ */
+class BatchSizer {
+  size: number;
+
+  constructor(private readonly max: number) {
+    this.size = Math.min(FIRST_BATCH, max);
+  }
+
+  /** Report the output of the batch just read. */
+  record(rows: number, chars: number) {
+    const perRow = Math.max(1, chars / Math.max(1, rows));
+    this.size = Math.max(1, Math.min(this.max, Math.floor(BATCH_TARGET_CHARS / perRow)));
+  }
+}
+
+/**
+ * Read rows ordered by `createdAt`, then `id`, in batches sized by `sizer`.
+ * Each query asks for rows after the last one read by value, so a row
+ * deleted between queries cannot end the walk early. The caller reports each
+ * batch's output to `sizer` before asking for the next.
  */
 async function* batches<T extends Position>(
   read: (page: { where: object; take: number }) => Promise<T[]>,
-  size: number,
+  sizer: BatchSizer,
   signal?: AbortSignal,
 ): AsyncGenerator<T[]> {
   let last: Position | undefined;
   for (;;) {
     if (signal?.aborted) throw new BackupRequestAbortedError();
+    const take = sizer.size;
     const rows = await read({
-      take: size,
+      take,
       where: last
         ? {
             OR: [
@@ -255,7 +296,7 @@ async function* batches<T extends Position>(
         : {},
     });
     if (rows.length > 0) yield rows;
-    if (rows.length < size) return;
+    if (rows.length < take) return;
     last = rows[rows.length - 1];
   }
 }
@@ -267,6 +308,12 @@ async function* batches<T extends Position>(
  * read; neither is held in memory as a whole. The archive and its
  * `backup.json` are measured against the restore limits as they are written,
  * and an export that would exceed them stops with a 400 and leaves no file.
+ *
+ * Every content read runs in one read-only REPEATABLE READ transaction, so the
+ * archive is one consistent snapshot of the workspace, as pg_dump takes it:
+ * edits made during the export are not in it at all. Authorization is checked
+ * against current data, outside the snapshot, so a permission removed during
+ * the export still applies.
  */
 export async function exportBackup(
   prisma: PrismaClient,
@@ -279,25 +326,38 @@ export async function exportBackup(
   options: BackupExportOptions = {},
 ): Promise<BackupExportResult> {
   await assertBackupExportAccess(prisma, workspaceId, actorId);
-  const workspace = await prisma.workspace.findUniqueOrThrow({
-    where: { id: workspaceId },
-    select: { name: true, slug: true },
-  });
   const { signal } = options;
-  const batchSize = options.batchSize ?? EXPORT_BATCH;
+  const maxBatch = options.batchSize ?? EXPORT_BATCH;
   const checkAborted = () => {
     if (signal?.aborted) throw new BackupRequestAbortedError();
   };
 
   const file = await stagingPath("export", options.stagingDir ?? backupStagingDir(env.STORAGE_DIR));
   const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits));
+  let workspace: { name: string; slug: string };
   let size: number;
   try {
-    const assets = request.includeFiles
-      ? await archiveWikiAssets(prisma, workspaceId, request, storage, actorId, archive, batchSize, checkAborted)
-      : undefined;
-    await archive.appendJson((write) =>
-      writeBackupJson(prisma, workspaceId, workspace, request, assets, write, batchSize, signal),
+    // Any failure inside rolls the snapshot back, and the archive is removed.
+    workspace = await prisma.$transaction(
+      async (db) => {
+        await db.$executeRaw`SET TRANSACTION READ ONLY`;
+        const current = await db.workspace.findUniqueOrThrow({
+          where: { id: workspaceId },
+          select: { name: true, slug: true },
+        });
+        const assets = request.includeFiles
+          ? await archiveWikiAssets(db, prisma, workspaceId, request, storage, actorId, archive, maxBatch, checkAborted)
+          : undefined;
+        await archive.appendJson((write) =>
+          writeBackupJson(db, workspaceId, current, request, assets, write, maxBatch, signal),
+        );
+        return current;
+      },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+        maxWait: 10_000,
+        timeout: EXPORT_SNAPSHOT_TIMEOUT_MS,
+      },
     );
     size = await archive.finish();
   } catch (error) {
@@ -319,42 +379,47 @@ interface ArchivedAssets {
 /**
  * Copy every authorized image the selected wiki pages embed into the archive
  * and return the rewrite from each copied URL to its archive path. Pages are
- * read here for their content only; `backup.json` reads them again and
- * refuses a page that gained a URL in between.
+ * read here from the snapshot for their content only; `backup.json` reads the
+ * same snapshot again. `authority` checks access against current data.
  */
 async function archiveWikiAssets(
-  prisma: PrismaClient,
+  db: Snapshot,
+  authority: PrismaClient,
   workspaceId: string,
   request: BackupExportRequest,
   storage: StorageProvider,
   actorId: string,
   archive: ExportArchive,
-  batchSize: number,
+  maxBatch: number,
   checkAborted: () => void,
 ): Promise<ArchivedAssets> {
   const allStorageUrls = new Set<string>();
   for (const opt of request.wikiSpaces) {
-    const space = await prisma.wikiSpace.findUnique({
+    const space = await db.wikiSpace.findUnique({
       where: { id: opt.spaceId, workspaceId },
       select: { id: true },
     });
     if (!space) continue;
+    const sizer = new BatchSizer(maxBatch);
     for await (const pages of batches(
       ({ where, take }) =>
-        prisma.wikiPage.findMany({
+        db.wikiPage.findMany({
           where: { spaceId: opt.spaceId, ...where },
           select: { id: true, createdAt: true, content: true },
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
           take,
         }),
-      batchSize,
+      sizer,
     )) {
       checkAborted();
+      let chars = 0;
       for (const page of pages) {
         if (page.content) {
+          chars += JSON.stringify(page.content).length;
           for (const url of extractStorageUrls(page.content)) allStorageUrls.add(url);
         }
       }
+      sizer.record(pages.length, chars);
     }
   }
 
@@ -364,8 +429,8 @@ async function archiveWikiAssets(
   const usedNames = new Set<string>();
   for (const url of allStorageUrls) {
     checkAborted();
-    const ctx = await assertBackupExportAccess(prisma, workspaceId, actorId);
-    const storagePaths = await resolveBackupAssetPaths(prisma, ctx, url);
+    const ctx = await assertBackupExportAccess(authority, workspaceId, actorId);
+    const storagePaths = await resolveBackupAssetPaths(authority, ctx, url);
     for (const storagePath of storagePaths) {
       const known = archived.get(storagePath);
       if (known) {
@@ -401,13 +466,13 @@ async function archiveWikiAssets(
 
 /** Write `backup.json`: the selected content, then the metadata it refers to. */
 async function writeBackupJson(
-  prisma: PrismaClient,
+  db: Snapshot,
   workspaceId: string,
   workspace: { name: string; slug: string },
   request: BackupExportRequest,
   assets: ArchivedAssets | undefined,
   write: (text: string) => Promise<void>,
-  batchSize: number,
+  maxBatch: number,
   signal?: AbortSignal,
 ) {
   const json = new PrettyJsonWriter(write);
@@ -419,7 +484,7 @@ async function writeBackupJson(
 
   await json.open("[", "projects");
   for (const opt of request.projects) {
-    const project = await prisma.project.findUnique({
+    const project = await db.project.findUnique({
       where: { id: opt.projectId, workspaceId },
       select: {
         name: true,
@@ -431,27 +496,27 @@ async function writeBackupJson(
     if (!project) continue;
 
     const statuses = opt.includeStatuses
-      ? await prisma.statusColumn.findMany({
+      ? await db.statusColumn.findMany({
           where: { projectId: opt.projectId },
           orderBy: [{ position: "asc" }, { id: "asc" }],
         })
       : [];
 
     const labels = opt.includeLabels
-      ? await prisma.label.findMany({
+      ? await db.label.findMany({
           where: { projectId: opt.projectId },
         })
       : [];
 
     const customFields = opt.includeCustomFields
-      ? await prisma.customField.findMany({
+      ? await db.customField.findMany({
           where: { projectId: opt.projectId },
           orderBy: { position: "asc" },
         })
       : [];
 
     const members = opt.includeMembers
-      ? await prisma.projectMember.findMany({
+      ? await db.projectMember.findMany({
           where: { projectId: opt.projectId },
           select: { userId: true },
         })
@@ -506,9 +571,10 @@ async function writeBackupJson(
     // Tasks
     await json.open("[", "tasks");
     if (opt.includeTasks) {
+      const sizer = new BatchSizer(maxBatch);
       for await (const dbTasks of batches(
         ({ where, take }) =>
-          prisma.task.findMany({
+          db.task.findMany({
             where: { projectId: opt.projectId, ...where },
             include: {
               assignees: { select: { userId: true } },
@@ -526,9 +592,10 @@ async function writeBackupJson(
             orderBy: [{ createdAt: "asc" }, { id: "asc" }],
             take,
           }),
-        batchSize,
+        sizer,
         signal,
       )) {
+        const start = json.written;
         for (const t of dbTasks) {
           for (const a of t.assignees) userIdSet.add(a.userId);
           for (const s of t.subtasks) {
@@ -592,6 +659,7 @@ async function writeBackupJson(
             activityLogs,
           } satisfies TaskEntry);
         }
+        sizer.record(dbTasks.length, json.written - start);
       }
     }
     await json.close("]");
@@ -604,7 +672,7 @@ async function writeBackupJson(
 
   await json.open("[", "channels");
   for (const opt of request.channels) {
-    const channel = await prisma.chatChannel.findUnique({
+    const channel = await db.chatChannel.findUnique({
       where: { id: opt.channelId, workspaceId },
       select: {
         name: true,
@@ -616,7 +684,7 @@ async function writeBackupJson(
     if (!channel || channel.type === "DM") continue;
 
     const members = opt.includeMembers
-      ? await prisma.chatChannelMember.findMany({
+      ? await db.chatChannelMember.findMany({
           where: { channelId: opt.channelId },
           select: { userId: true },
         })
@@ -637,9 +705,10 @@ async function writeBackupJson(
     await json.value(members.map((m) => ({ userRef: m.userId })), "members");
     await json.open("[", "messages");
     if (opt.includeMessages) {
+      const sizer = new BatchSizer(maxBatch);
       for await (const dbMessages of batches(
         ({ where, take }) =>
-          prisma.chatMessage.findMany({
+          db.chatMessage.findMany({
             where: { channelId: opt.channelId, deletedAt: null, ...where },
             include: opt.includeReactions
               ? { reactions: { select: { userId: true, emoji: true } } }
@@ -647,9 +716,10 @@ async function writeBackupJson(
             orderBy: [{ createdAt: "asc" }, { id: "asc" }],
             take,
           }),
-        batchSize,
+        sizer,
         signal,
       )) {
+        const start = json.written;
         for (const m of dbMessages) {
           userIdSet.add(m.userId);
           const mWithReactions = m as typeof m & { reactions?: Array<{ userId: string; emoji: string }> };
@@ -669,6 +739,7 @@ async function writeBackupJson(
             reactions,
           } satisfies MessageEntry);
         }
+        sizer.record(dbMessages.length, json.written - start);
       }
     }
     await json.close("]");
@@ -680,7 +751,7 @@ async function writeBackupJson(
 
   await json.open("[", "wikiSpaces");
   for (const opt of request.wikiSpaces) {
-    const space = await prisma.wikiSpace.findUnique({
+    const space = await db.wikiSpace.findUnique({
       where: { id: opt.spaceId, workspaceId },
       select: { name: true, description: true, icon: true },
     });
@@ -696,9 +767,10 @@ async function writeBackupJson(
       "space",
     );
     await json.open("[", "pages");
+    const sizer = new BatchSizer(maxBatch);
     for await (const dbPages of batches(
       ({ where, take }) =>
-        prisma.wikiPage.findMany({
+        db.wikiPage.findMany({
           where: { spaceId: opt.spaceId, ...where },
           include: opt.includeComments
             ? { comments: { orderBy: { createdAt: "asc" } } }
@@ -706,9 +778,10 @@ async function writeBackupJson(
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
           take,
         }),
-      batchSize,
+      sizer,
       signal,
     )) {
+      const start = json.written;
       for (const p of dbPages) {
         if (p.createdById) userIdSet.add(p.createdById);
 
@@ -741,8 +814,9 @@ async function writeBackupJson(
 
         let content: unknown = p.content;
         if (assets && content) {
-          // A URL added since the images were copied would point at a file
-          // the archive lacks; the export is refused rather than incomplete.
+          // Both reads of a page come from the same snapshot, so every URL
+          // was examined; this only guards against that ever changing, since
+          // the page would refer to a file the archive lacks.
           for (const url of extractStorageUrls(content)) {
             if (!assets.examined.has(url)) throw new ConflictError(WIKI_CHANGED_MESSAGE);
           }
@@ -761,6 +835,7 @@ async function writeBackupJson(
           comments,
         } satisfies PageEntry);
       }
+      sizer.record(dbPages.length, json.written - start);
     }
     await json.close("]");
     await json.close("}");
@@ -771,7 +846,7 @@ async function writeBackupJson(
   // Written last: it lists every user the content above refers to.
 
   if (signal?.aborted) throw new BackupRequestAbortedError();
-  const userRefs = await prisma.user.findMany({
+  const userRefs = await db.user.findMany({
     where: { id: { in: Array.from(userIdSet) } },
     select: { id: true, email: true, displayName: true },
   });

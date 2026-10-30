@@ -92,9 +92,11 @@ buffer before sending it. Now the archive is written to a staged file,
   (SEC-009), and gets one archive entry however many URLs spell it. Two
   different files with the same name get distinct entry names.
 - `backup.json` follows, written in pieces of about 64 KiB as rows are read
-  500 at a time (tasks, messages, pages). Each query asks for the rows after
-  the last one read, by creation time and ID, so a row deleted meanwhile
-  cannot end a list early. It keeps the previous two-space
+  in batches (tasks, messages, pages). Each query asks for the rows after the
+  last one read, by creation time and ID. The first query of a list reads 50
+  rows; later ones read about 4 MiB of output at the average row size so far,
+  between 1 and 500 rows, so a list of large rows (a page or a description
+  can be about 1 MiB) is read a few rows at a time. It keeps the previous two-space
   formatting. `metadata` now comes last, because it lists every user the
   content refers to; key order does not matter to restore.
 - Every byte is counted as it is written: each image against the per-entry and
@@ -109,10 +111,35 @@ buffer before sending it. Now the archive is written to a staged file,
   download completes or is abandoned, and a client that reads nothing for 60
   seconds is dropped.
 
-Wiki pages are read twice: once for the image URLs to copy, once to write
-the pages. If a page gains a URL in between, its file would be missing from
-the archive, so the export is refused with a 409 asking to try again, and
-leaves no file.
+## Consistency
+
+An export is one consistent snapshot of the workspace, as pg_dump takes it.
+Every content read (projects, statuses, labels, fields, members, tasks,
+channels, messages, wiki spaces and pages, both reads of the pages, and the
+user references) runs in one read-only REPEATABLE READ transaction. Edits
+made while an export runs are not in it at all: a dependency reversed, a
+page re-parented or moved to another space, or a status added with a task
+moved into it all export as they were when the export started, so the
+archive never holds a cycle, a page twice, or a task whose status is
+missing.
+
+- Authorization is the exception: the ADMIN check and each embedded image's
+  access are read from current data, outside the snapshot, so a permission
+  removed during the export still applies.
+- Image files are copied from storage, which has no snapshot. A file deleted
+  after its page was read is left out and its URL kept, as a missing file
+  always has been.
+- Exports run one at a time per process (the exclusive section), so the
+  snapshot holds one database connection for the build, plus short
+  authorization queries on another. It is closed on success, error,
+  cancellation and refusal, and its rows are never locked, so writers are not
+  blocked.
+- The snapshot may stay open for at most 10 minutes, image copy included.
+  Past that, or if no connection is free within 10 seconds, the export fails
+  with the retryable 409 and leaves no file.
+- If a page ever referred to an image URL that the image copy had not
+  examined, the export would be refused with a 409 rather than written with a
+  missing file. With one snapshot this cannot happen; it remains as a guard.
 
 ## What a backup contains
 
@@ -231,10 +258,22 @@ image bytes. Preview and restore report the same counts with no warnings. One
 assertion depends on current restore behaviour: the restoring admin is
 added to each restored channel's members. `tests/integration/backup-zip-restore.test.mjs`
 also checks that refused exports leave no staged file. The round-trip file
-also checks that an export whose client has gone stops without one, that a
-task deleted between two batches does not cut the rest of the list short,
-and that a page gaining an image during the export gets the 409 and a retry
-exports both images.
+also checks, with batches of two and edits made through the HTTP API between
+batches:
+
+- the reads run in a REPEATABLE READ, read-only transaction, and an export
+  refused over a limit, cancelled, or failing on a database error leaves no
+  open transaction and no file;
+- a task deleted between two batches does not cut the rest of the list short;
+- a reversed dependency, a re-parented pair of pages, a page moved to another
+  space, and a new status with a task moved into it each export as they were
+  before the edit, and the archive previews and restores with matching counts
+  and no warnings;
+- a page that gains an image while images are copied exports as it was.
+
+On the code before the snapshot, the four edit scenarios exported a cycle,
+a page twice or a missing status, and the isolation check read `read
+committed`.
 
 On the previous code all five integration tests and both unit test files fail.
 The existing backup suites (SEC-009, SEC-025, SEC-028 and restore tests) pass
@@ -242,7 +281,9 @@ unchanged apart from awaiting the reader.
 
 ## Remaining limits
 
-A client that keeps sending, or reading, a few bytes a minute holds its
+An export longer than 10 minutes fails and must be made in parts. A long
+snapshot holds back the database's cleanup of old row versions while it
+lasts. A client that keeps sending, or reading, a few bytes a minute holds its
 admission; three such clients, in three workspaces, fill the process. The
 limits are per process, and up to three staged files of up to 1,088 MiB each
 can be on disk at once. Parsing `backup.json` is still synchronous (at most

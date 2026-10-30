@@ -129,9 +129,12 @@ export function inspectBackupJson(
 const MAX_REPORTED_ISSUES = 5;
 
 /**
- * Values (objects, arrays and scalars) handed to one Zod call. Zod builds an
- * issue for every invalid value it visits before it returns, so a call never
- * sees more than this many values, and at most this many issues exist at once.
+ * Values (objects, arrays and scalars) one Zod call may traverse. Zod builds
+ * every issue of a call before it returns, so this bounds the issues that can
+ * exist at once: at most one per missing required field of each element, for
+ * example 512 empty attachments x 7 required fields = 3,584. A value Zod does
+ * not traverse is still handed over whole: `z.unknown()` content, and a value
+ * of the wrong kind, which gets a single type issue.
  */
 export const BACKUP_VALIDATION_BATCH_VALUES = 512;
 
@@ -146,43 +149,60 @@ function issueMessage(issue: ZodIssueOptionalMessage, defaultError: string) {
 
 const errorMap: ZodErrorMap = (issue, ctx) => ({ message: issueMessage(issue, ctx.defaultError) });
 
-/** True when `value` holds at most `budget.left` values; spends what it counts. */
-function fits(value: unknown, budget: { left: number }): boolean {
-  if (--budget.left < 0) return false;
-  if (value === null || typeof value !== "object") return true;
-  if (Array.isArray(value)) {
-    for (const item of value) if (!fits(item, budget)) return false;
-    return true;
-  }
-  for (const key in value) {
-    if (!fits((value as Record<string, unknown>)[key], budget)) return false;
-  }
-  return true;
+/** One validation: problems found so far, and the values counted per container. */
+interface Walk {
+  messages: string[];
+  max: number;
+  /**
+   * Each object's or array's value count (itself included), capped at
+   * BACKUP_VALIDATION_BATCH_VALUES + 1. `for…in` lists every key of an object
+   * before the first iteration, so counting an object with hundreds of
+   * thousands of keys again for each ancestor would repeat that work; each is
+   * counted once per parse.
+   */
+  counts: WeakMap<object, number>;
 }
 
-/** How many values `value` holds, or `limit + 1` once it has more than `limit`. */
-function size(value: unknown, limit: number): number {
-  const budget = { left: limit };
-  return fits(value, budget) ? limit - budget.left : limit + 1;
+/** How many values `value` holds, or BACKUP_VALIDATION_BATCH_VALUES + 1 once it has more. */
+function size(value: unknown, walk: Walk): number {
+  if (value === null || typeof value !== "object") return 1;
+  const known = walk.counts.get(value);
+  if (known !== undefined) return known;
+  const limit = BACKUP_VALIDATION_BATCH_VALUES;
+  let total = 1;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      total += size(item, walk);
+      if (total > limit) break;
+    }
+  } else {
+    for (const key in value) {
+      total += size((value as Record<string, unknown>)[key], walk);
+      if (total > limit) break;
+    }
+  }
+  const capped = Math.min(total, limit + 1);
+  walk.counts.set(value, capped);
+  return capped;
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 /**
- * Validates `value` against `schema` in pieces of at most
- * BACKUP_VALIDATION_BATCH_VALUES values, and stops once `messages` holds
- * `max` problems. Zod builds every issue of a call before returning and runs
- * error maps only once it has them all (Zod 4), so a cap inside one call
- * cannot bound memory; bounding what each call sees does. Objects and arrays
+ * Validates `value` against `schema` so that no Zod call traverses more than
+ * BACKUP_VALIDATION_BATCH_VALUES values, and stops once `walk.messages` holds
+ * `walk.max` problems. Zod builds every issue of a call before returning and
+ * runs error maps only once it has them all (Zod 4), so a cap inside one call
+ * cannot bound memory; bounding what each call traverses does. Objects and arrays
  * too large for one call are walked here through the public schema API
  * (`shape`, `element`, `unwrap`, `removeDefault`): the parts of `z.object`
  * (unknown keys stripped), `z.array`, `.optional()`, `.nullable()` and
  * `.default()` that BackupFileSchema uses. Anything else is validated whole.
  * Problems are found in the order a full parse reports them.
  */
-function collectIssues(schema: ZodTypeAny, value: unknown, messages: string[], max: number): void {
-  if (messages.length >= max) return;
+function collectIssues(schema: ZodTypeAny, value: unknown, walk: Walk): void {
+  if (walk.messages.length >= walk.max) return;
   for (;;) {
     if (schema instanceof z.ZodDefault) {
       if (value === undefined) return;
@@ -198,70 +218,66 @@ function collectIssues(schema: ZodTypeAny, value: unknown, messages: string[], m
     }
   }
   if (schema instanceof z.ZodArray && Array.isArray(value)) {
-    collectItemIssues(schema, value, messages, max);
+    collectItemIssues(schema, value, walk);
     return;
   }
   if (
     schema instanceof z.ZodObject &&
     isPlainObject(value) &&
-    size(value, BACKUP_VALIDATION_BATCH_VALUES) > BACKUP_VALIDATION_BATCH_VALUES
+    size(value, walk) > BACKUP_VALIDATION_BATCH_VALUES
   ) {
     for (const [key, field] of Object.entries(schema.shape as Record<string, ZodTypeAny>)) {
-      collectIssues(field, value[key], messages, max);
-      if (messages.length >= max) return;
+      collectIssues(field, value[key], walk);
+      if (walk.messages.length >= walk.max) return;
     }
     return;
   }
-  // A scalar, a small object or array, or a value of the wrong kind (one issue).
-  report(schema.safeParse(value, { errorMap }), messages, max);
+  // A scalar, a small object or array, or a value Zod does not traverse
+  // (`z.unknown()`, or the wrong kind of value, which gets one issue).
+  report(schema.safeParse(value, { errorMap }), walk);
 }
 
 /** Array elements in batches; an element too large for a batch is walked alone. */
-function collectItemIssues(
-  schema: z.ZodArray<ZodTypeAny>,
-  items: unknown[],
-  messages: string[],
-  max: number,
-): void {
+function collectItemIssues(schema: z.ZodArray<ZodTypeAny>, items: unknown[], walk: Walk): void {
   const batchSchema = z.array(schema.element);
   let batch: unknown[] = [];
   let batchValues = 0;
   const flush = () => {
-    if (batch.length > 0) report(batchSchema.safeParse(batch, { errorMap }), messages, max);
+    if (batch.length > 0) report(batchSchema.safeParse(batch, { errorMap }), walk);
     batch = [];
     batchValues = 0;
   };
   for (const item of items) {
-    if (messages.length >= max) return;
-    const values = size(item, BACKUP_VALIDATION_BATCH_VALUES);
+    if (walk.messages.length >= walk.max) return;
+    const values = size(item, walk);
     if (values > BACKUP_VALIDATION_BATCH_VALUES) {
       flush();
-      collectIssues(schema.element, item, messages, max);
+      collectIssues(schema.element, item, walk);
       continue;
     }
     if (batchValues + values > BACKUP_VALIDATION_BATCH_VALUES) flush();
     batch.push(item);
     batchValues += values;
   }
-  if (messages.length < max) flush();
+  if (walk.messages.length < walk.max) flush();
 }
 
-function report(result: { success: boolean; error?: z.ZodError }, messages: string[], max: number) {
+function report(result: { success: boolean; error?: z.ZodError }, walk: Walk) {
   if (result.success || !result.error) return;
   for (const issue of result.error.issues) {
-    if (messages.length >= max) return;
-    messages.push(issue.message);
+    if (walk.messages.length >= walk.max) return;
+    walk.messages.push(issue.message);
   }
 }
 
 /**
  * Parse and validate an uploaded `backup.json` within `limits`. Validation
- * stops at the fifth problem and never hands Zod more than
- * BACKUP_VALIDATION_BATCH_VALUES values at once, so a file of many invalid
- * elements (Zod builds an issue for each, about 100 bytes of heap per byte of
- * a file like `[{},{},…]`) costs a handful of issues, whatever Zod version
- * runs. Only a file without problems gets the full parse that applies
- * defaults. BackupFileSchema sets no custom messages, so every issue gets the
+ * stops at the fifth problem and never lets one Zod call traverse more than
+ * BACKUP_VALIDATION_BATCH_VALUES values, so a file of many invalid elements
+ * (Zod builds an issue for each, about 100 bytes of heap per byte of a file
+ * like `[{},{},…]`) costs at most a few thousand issues at a time, whatever
+ * Zod version runs. Only a file without problems gets the full parse that
+ * applies defaults. BackupFileSchema sets no custom messages, so every issue gets the
  * error map's message, which never quotes the upload.
  */
 export function parseBackupJson(
@@ -276,14 +292,15 @@ export function parseBackupJson(
     throw new ValidationError("Invalid JSON file");
   }
 
-  const messages: string[] = [];
-  collectIssues(BackupFileSchema, raw, messages, MAX_REPORTED_ISSUES);
+  const walk: Walk = { messages: [], max: MAX_REPORTED_ISSUES, counts: new WeakMap() };
+  collectIssues(BackupFileSchema, raw, walk);
+  const { messages } = walk;
   if (messages.length === 0) {
     // Every value already passed in bounded pieces, so this finds no element
     // problems; it builds the result with defaults applied.
     const result = BackupFileSchema.safeParse(raw, { errorMap });
     if (result.success) return result.data;
-    report(result, messages, MAX_REPORTED_ISSUES);
+    report(result, walk);
   }
   throw new ValidationError(`Invalid backup file format: ${messages.join("; ")}`);
 }

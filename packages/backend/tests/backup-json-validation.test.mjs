@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { BackupFileSchema } from "@pm/shared";
+import { z } from "zod";
 
 const { BACKUP_JSON_LIMITS, BACKUP_VALIDATION_BATCH_VALUES, inspectBackupJson, parseBackupJson } =
   await import("../src/modules/backup/backup-json.ts");
@@ -244,4 +245,77 @@ test("invalid files at the limits are refused with five problems in a 64 MiB hea
   assert.notEqual(whole.status, 0);
   assert.deepEqual(whole.lines, []);
   assert.match(whole.stderr, /heap out of memory/);
+});
+
+test("BackupFileSchema uses only constructs the bounded walk understands", () => {
+  // The walk splits z.object (unknown keys stripped) and z.array without length
+  // checks, and unwraps .optional(), .nullable() and .default(). Anything else
+  // (refinements, transforms, unions, records, strict or catchall objects,
+  // array bounds) would be validated whole, so a large value of that kind could
+  // again build an issue per element. Extend the walk before the schema.
+  const leaves = [z.ZodString, z.ZodNumber, z.ZodBoolean, z.ZodEnum, z.ZodUnknown];
+  const problems = [];
+  const visit = (schema, at) => {
+    if (schema instanceof z.ZodDefault) return visit(schema.removeDefault(), at);
+    if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) return visit(schema.unwrap(), at);
+    if (schema instanceof z.ZodArray) {
+      const { minLength, maxLength, exactLength } = schema._def;
+      if (minLength || maxLength || exactLength) problems.push(`${at}: array length check`);
+      return visit(schema.element, `${at}[]`);
+    }
+    if (schema instanceof z.ZodObject) {
+      if (schema._def.unknownKeys !== "strip" || !(schema._def.catchall instanceof z.ZodNever)) {
+        problems.push(`${at}: object is not in strip mode`);
+      }
+      for (const [key, field] of Object.entries(schema.shape)) visit(field, at ? `${at}.${key}` : key);
+      return;
+    }
+    if (!leaves.some((type) => schema instanceof type)) problems.push(`${at}: ${schema.constructor.name}`);
+  };
+  visit(BackupFileSchema, "");
+  assert.deepEqual(problems, []);
+  // The guard itself notices what it should.
+  const probe = (schema) => {
+    problems.length = 0;
+    visit(schema, "x");
+    return problems.length;
+  };
+  assert.equal(probe(z.object({ a: z.string() }).superRefine(() => {})), 1);
+  assert.equal(probe(z.object({ a: z.string() }).strict()), 1);
+  assert.equal(probe(z.array(z.string()).max(5)), 1);
+  assert.equal(probe(z.object({ a: z.union([z.string(), z.number()]) })), 1);
+  assert.equal(probe(z.object({ a: z.record(z.string()) })), 1);
+});
+
+/** In-process best-of-three timings, so CI load affects both sides alike. */
+function fastest(fn) {
+  let best = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const started = performance.now();
+    try {
+      fn();
+    } catch {
+      // Refusals are timed too.
+    }
+    best = Math.min(best, performance.now() - started);
+  }
+  return best;
+}
+
+test("an object with half a million keys is counted once, however deep the walk goes", () => {
+  // The largest object the token limit allows, as an unknown key of a subtask:
+  // the walk passes it on the way to the task fields. Counting its keys again
+  // for each walked ancestor made validation take 5x the time of JSON.parse.
+  const L = BACKUP_JSON_LIMITS;
+  const giant = `{${Array.from({ length: Math.floor(L.maxTokens / 2) - 80 }, (_, i) => `"${i.toString(36)}":0`).join(",")}}`;
+  const sub = `{"zzz":${giant},"_originalId":"s","title":"t","completed":false,"position":0}`;
+  const task = `{"subtasks":[${sub}],"_originalId":"t","title":"t","priority":"LOW","position":0,"statusRef":"s"}`;
+  const valid = Buffer.from(`{"projects":[{"tasks":[${task}],"project":{"name":"p"}}],"metadata":${JSON.stringify(META)}}`);
+  inspectBackupJson(valid);
+  assert.equal(parseBackupJson(valid).projects[0].tasks[0].subtasks[0].title, "t");
+  const parse = fastest(() => JSON.parse(valid.toString("utf-8")));
+  const validate = fastest(() => parseBackupJson(valid));
+  // About 1.7x here; 5.5x before the counts were kept per parse.
+  assert.ok(validate < 3 * parse + 50, `validation took ${validate.toFixed(0)} ms, JSON.parse ${parse.toFixed(0)} ms`);
+  assert.ok(validate < 5_000, `validation took ${validate.toFixed(0)} ms`);
 });

@@ -630,6 +630,42 @@ describe("description revisions and edit conflicts", () => {
     expect(stored.descriptionRevision).toBe(9);
   });
 
+  it("an edit attempted before the newer description arrives cannot replace the set-aside draft (review M1)", async () => {
+    const id = `task-conflict-gap-${++suffix}`;
+    const stored = { description: "<p>Base</p>", descriptionRevision: 1 };
+    serve(id, stored);
+    const screen = render(view(id, "<p>Base</p>", 1), { wrapper });
+    await tick();
+    Object.assign(stored, { description: "<p>Theirs</p>", descriptionRevision: 2 });
+    act(() => {
+      currentEditor().commands.setContent("<p>Mine: a long paragraph</p>");
+    });
+    await tick(801);
+    expect(sent).toHaveLength(1);
+    // The older description is shown until the refetch lands, and the editor
+    // is locked meanwhile.
+    expect(currentEditor().getHTML()).toBe("<p>Base</p>");
+    expect(currentEditor().isEditable).toBe(false);
+    act(() => {
+      currentEditor().commands.setContent("<p>Base x</p>");
+    });
+    await tick(50);
+    screen.rerender(view(id, "<p>Theirs</p>", 2));
+    await tick(801);
+    expect(sent).toHaveLength(1);
+    expect(currentEditor().getHTML()).toBe("<p>Theirs</p>");
+    act(() => {
+      screen.getByText("Restore changes").click();
+    });
+    await tick(801);
+    expect(sent.at(-1)).toEqual({
+      description: "<p>Mine: a long paragraph</p>",
+      expectedDescriptionRevision: 2,
+    });
+    expect(stored.description).toBe("<p>Mine: a long paragraph</p>");
+    expect(currentEditor().isEditable).toBe(true);
+  });
+
   it("a description refused for an older revision is set aside, the stored one shown, and never resent", async () => {
     const id = `task-conflict-${++suffix}`;
     const stored = { description: "<p>Base</p>", descriptionRevision: 1 };

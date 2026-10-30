@@ -45,7 +45,9 @@ save, which then sees it, or waits until the save has committed.
   renewal that won the race keeps its lock. Release and renewal are single
   conditional statements on the caller's own lock row, and a renewal only
   extends a lock that has not lapsed: a save by another user may already have
-  checked a lapsed lock as absent. Start Editing takes it again.
+  checked a lapsed lock as absent. Start Editing takes it again. A renewal
+  waits for the page row like the other writers, and lock expiry is set and
+  compared on the database clock, so a renewal delayed past expiry fails too.
 - The description check locks the task row after the project and column rows,
   as every task writer does (see `dat-005.md`).
 
@@ -60,7 +62,10 @@ the editors' content sync, a revision first seen after unsaved changes were
 stored is not taken, since the detail query can still be older than the save.
 A 409 edit conflict sets the draft aside instead of retrying it: the page or
 description shows the stored document again and is refetched, and a notice
-explains the conflict (naming the lock holder for `EDIT_LOCKED`). Restoring the
+explains the conflict (naming the lock holder for `EDIT_LOCKED`). The editor
+stays read-only until the draft is restored or discarded: until the newer
+document arrives it shows an older one, and an edit made there would be
+refused again and replace the set-aside draft. Restoring the
 draft is an explicit replacement of the version then shown; discarding drops it.
 A rename or icon change from the page tree first stores the open editor's
 pending edits, and the editor's next save builds on its revision when nothing

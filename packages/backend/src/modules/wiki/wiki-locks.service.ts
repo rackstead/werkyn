@@ -1,6 +1,10 @@
 import type { PrismaClient } from "@prisma/client";
 import { ConflictError, NotFoundError } from "../../utils/errors.js";
-import { PAGE_WRITE_TRANSACTION, lockPageRow } from "./wiki-page-writes.js";
+import {
+  PAGE_WRITE_TRANSACTION,
+  databaseNow,
+  lockPageRow,
+} from "./wiki-page-writes.js";
 
 const LOCK_DURATION_MS = 2 * 60 * 1000; // 2 minutes
 
@@ -27,7 +31,7 @@ export async function acquireLock(
       where: { pageId },
       include: lockUser,
     });
-    const now = new Date();
+    const now = await databaseNow(tx);
     const expiresAt = new Date(now.getTime() + LOCK_DURATION_MS);
 
     if (existing?.userId === userId) {
@@ -72,19 +76,25 @@ export async function heartbeatLock(
   pageId: string,
   userId: string,
 ) {
-  // Renews only this user's own lock while it is still held, in one
-  // conditional statement. A lapsed lock is not revived: a save or restore by
-  // another user may already have checked it as absent. Start Editing takes
-  // it again under the page row lock.
-  const now = new Date();
-  const { count } = await prisma.wikiPageLock.updateMany({
-    where: { pageId, userId, expiresAt: { gt: now } },
-    data: {
-      expiresAt: new Date(now.getTime() + LOCK_DURATION_MS),
-      heartbeat: now,
-    },
-  });
-  if (count === 0) throw new NotFoundError("No active lock found");
+  // Renews only this user's own lock while it is still held. A lapsed lock
+  // is not revived: a save or restore by another user may already have
+  // checked it as absent; Start Editing takes it again. The renewal waits for
+  // the page row like those writers, then judges expiry on the database clock
+  // as it runs, so a renewal delayed past expiry (by the pool, the event loop
+  // or a save in progress) fails too. The columns hold UTC without a time
+  // zone, as Prisma writes them.
+  await prisma.$transaction(async (tx) => {
+    await lockPageRow(tx, pageId);
+    const count = await tx.$executeRaw`
+      UPDATE "WikiPageLock"
+      SET "expiresAt" = (clock_timestamp() AT TIME ZONE 'UTC')
+            + make_interval(secs => ${LOCK_DURATION_MS / 1000}),
+          "heartbeat" = clock_timestamp() AT TIME ZONE 'UTC'
+      WHERE "pageId" = ${pageId} AND "userId" = ${userId}
+        AND "expiresAt" > clock_timestamp() AT TIME ZONE 'UTC'
+    `;
+    if (count === 0) throw new NotFoundError("No active lock found");
+  }, PAGE_WRITE_TRANSACTION);
 }
 
 export async function checkLock(prisma: PrismaClient, pageId: string) {
@@ -99,7 +109,8 @@ export async function checkLock(prisma: PrismaClient, pageId: string) {
 }
 
 export async function cleanupExpiredLocks(prisma: PrismaClient) {
-  await prisma.wikiPageLock.deleteMany({
-    where: { expiresAt: { lt: new Date() } },
-  });
+  await prisma.$executeRaw`
+    DELETE FROM "WikiPageLock"
+    WHERE "expiresAt" < clock_timestamp() AT TIME ZONE 'UTC'
+  `;
 }

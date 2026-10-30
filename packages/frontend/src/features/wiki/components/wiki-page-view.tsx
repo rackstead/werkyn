@@ -98,7 +98,12 @@ function WikiPageSession({
   const page = pageData?.data;
   const breadcrumbs = breadcrumbsData?.data ?? [];
 
-  const readOnly = !isLockedByMe || finishing || showVersions;
+  // A draft refused for a conflict stays set aside until it is restored or
+  // discarded, and the page is not editable meanwhile: until the newer page
+  // (or lock) arrives it shows an older one, and edits made there would be
+  // refused again and could replace the set-aside draft.
+  const readOnly =
+    !isLockedByMe || finishing || showVersions || autosave.conflict !== null;
 
   // Losing the lock (or no longer being able to confirm it) sets unsaved
   // changes aside: the page shows the stored document again, and the changes
@@ -460,9 +465,9 @@ function conflictMessage(conflict: Error | null) {
   if (!isEditConflict(conflict)) return null;
   if (conflict.code === "EDIT_LOCKED") {
     const editor = conflict.current?.lockedBy?.displayName ?? "Another user";
-    return `${editor} is editing this page, so your changes were not saved. The stored page is shown.`;
+    return `${editor} is editing this page, so your changes were not saved. The stored page is shown. Restore or discard them to continue editing.`;
   }
-  return "This page was changed elsewhere while you were editing, so your changes were not saved. The stored page is shown; restoring your changes replaces it.";
+  return "This page was changed elsewhere while you were editing, so your changes were not saved. The stored page is shown; restoring your changes replaces it. Restore or discard them to continue editing.";
 }
 
 function EditableWikiTitle({

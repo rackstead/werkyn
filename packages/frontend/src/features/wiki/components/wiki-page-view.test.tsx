@@ -1008,20 +1008,49 @@ describe("server revisions and edit conflicts", () => {
     expect(stored.revision).toBe(4);
   });
 
-  it("an edit after a conflict is based on the stored page the editor shows", async () => {
+  it("after a conflict the page stays locked until the draft is restored or discarded, then edits build on the page shown", async () => {
     const id = `after-conflict-${++suffix}`;
     const stored = { revision: 1, title: id, content: paragraph("base") };
     serve(id, stored);
     const screen = render(view(id), { wrapper });
     await tick();
     Object.assign(stored, { revision: 2, content: paragraph("theirs") });
-    // The newer page reached this tab while the edit was pending.
+    fireEvent.change(body(screen), { target: { value: "mine: a long paragraph" } });
+    await tick(801);
+    expect(written).toHaveLength(1);
+    // Until the newer page arrives the editor shows the older one; it is
+    // locked, so nothing typed there can be refused again and replace the
+    // set-aside draft (independent review M1).
+    expect(body(screen).disabled).toBe(true);
+    fireEvent.change(body(screen), { target: { value: "base x" } });
+    await tick(801);
+    refetched(id, stored, screen);
+    await tick(801);
+    expect(written).toHaveLength(1);
+    // The original draft is what Restore brings back.
+    fireEvent.click(screen.getByText("Restore changes"));
+    await tick();
+    expect(written.at(-1)!.body).toEqual({
+      content: paragraph("mine: a long paragraph"),
+      expectedRevision: 2,
+    });
+    expect(stored).toMatchObject({ revision: 3, content: paragraph("mine: a long paragraph") });
+  });
+
+  it("discarding a conflicting draft unlocks the page and later edits build on the page shown", async () => {
+    const id = `discard-conflict-${++suffix}`;
+    const stored = { revision: 1, title: id, content: paragraph("base") };
+    serve(id, stored);
+    const screen = render(view(id), { wrapper });
+    await tick();
+    Object.assign(stored, { revision: 2, content: paragraph("theirs") });
     fireEvent.change(body(screen), { target: { value: "mine" } });
     refetched(id, stored, screen);
     await tick(801);
     expect(written.map((w) => (w.body as any).expectedRevision)).toEqual([1]);
-    // The remounted editor shows revision 2; an edit made there is based on
-    // it, while the refused draft stays offered.
+    fireEvent.click(screen.getByText("Discard"));
+    await tick();
+    expect(body(screen).disabled).toBe(false);
     fireEvent.change(body(screen), { target: { value: "theirs, edited" } });
     await tick(801);
     expect(written.at(-1)!.body).toEqual({
@@ -1029,7 +1058,7 @@ describe("server revisions and edit conflicts", () => {
       expectedRevision: 2,
     });
     expect(stored.revision).toBe(3);
-    expect(screen.getByText("Restore changes")).toBeTruthy();
+    expect(screen.queryByText("Restore changes")).toBeNull();
   });
 
   it("a rename from the page tree is stored after pending edits and not reported as a conflict", async () => {

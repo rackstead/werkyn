@@ -556,16 +556,11 @@ test("a late renewal cannot revive a lapsed lock under a save that already check
   await expireLock(page.id);
   // Bob's save takes the page row and passes the lock check (Alice's lock has
   // lapsed), then waits on Bob's user row for its version insert. Alice's
-  // renewal arrives in that window.
-  let renewal;
-  const [saved] = await race(
-    "User",
-    users.BOB.id,
-    [() => save("BOB", page.id, { content: doc("bob"), expectedRevision: 0 })],
-    async () => {
-      renewal = await req("ALICE", "PATCH", `/api/wiki/pages/${page.id}/lock/heartbeat`);
-    },
-  );
+  // renewal arrives in that window and waits for the page row.
+  const [saved, renewal] = await race("User", users.BOB.id, [
+    () => save("BOB", page.id, { content: doc("bob"), expectedRevision: 0 }),
+    () => req("ALICE", "PATCH", `/api/wiki/pages/${page.id}/lock/heartbeat`),
+  ]);
   status(renewal, 404);
   status(saved, 200);
   const lock = await app.prisma.wikiPageLock.findUnique({ where: { pageId: page.id } });
@@ -578,6 +573,26 @@ test("a late renewal cannot revive a lapsed lock under a save that already check
     1,
   );
   assert.deepEqual((await stored(page.id)).content, doc("bob"));
+});
+
+test("a renewal delayed past expiry does not revive the lock (database clock, review L1)", async () => {
+  const page = await newPage();
+  status(await acquire("ALICE", page.id), 200);
+  await app.prisma.wikiPageLock.update({
+    where: { pageId: page.id },
+    data: { expiresAt: new Date(Date.now() + 1000) },
+  });
+  // The renewal is sent before expiry but waits for the page row (held here as
+  // a save in progress, or a slow pool or event loop, would) until after it.
+  const [renewal] = await race(
+    "WikiPage",
+    page.id,
+    [() => req("ALICE", "PATCH", `/api/wiki/pages/${page.id}/lock/heartbeat`)],
+    () => sleep(1500),
+  );
+  status(renewal, 404);
+  const after = await app.prisma.wikiPageLock.findUnique({ where: { pageId: page.id } });
+  assert.ok(!after || after.expiresAt <= new Date(), "the lapsed lock was renewed");
 });
 
 test("two users taking a free lock at once: exactly one holds it", async () => {

@@ -120,6 +120,8 @@ function TaskDescriptionEditor({
       transformPastedText: pastedText,
     },
     onUpdate: ({ editor: e }) => {
+      // Locked while a refused draft waits for Restore or Discard (below).
+      if (!e.isEditable) return;
       autosave.schedule({ description: savableDescription(e.getHTML() || null) });
     },
     onBlur: () => {
@@ -127,12 +129,16 @@ function TaskDescriptionEditor({
     },
   });
 
-  // Update editable state if canEdit changes
+  // A draft refused for a conflict stays set aside until the user restores or
+  // discards it. The editor is locked meanwhile: until the newer description
+  // arrives it shows an older one, and edits made there would be refused
+  // again and could replace the set-aside draft.
+  const conflicted = autosave.conflict !== null;
   useEffect(() => {
     if (editor) {
-      editor.setEditable(canEdit, false);
+      editor.setEditable(canEdit && !conflicted, false);
     }
-  }, [editor, canEdit]);
+  }, [editor, canEdit, conflicted]);
 
   useEffect(() => {
     if (!editor) return;
@@ -200,7 +206,7 @@ function TaskDescriptionEditor({
         >
           <span className="flex-1">
             {isEditConflict(autosave.conflict)
-              ? "This description was changed elsewhere while you were editing, so your changes were not saved. The stored description is shown; restoring your changes replaces it."
+              ? "This description was changed elsewhere while you were editing, so your changes were not saved. The stored description is shown; restoring your changes replaces it. Restore or discard them to continue editing."
               : "Earlier changes to this description were not saved."}
           </span>
           <button

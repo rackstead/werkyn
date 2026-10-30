@@ -42,6 +42,19 @@ export async function lockPageRow(tx: Tx, pageId: string): Promise<PageRevision>
 }
 
 /**
+ * The database's current time. Lock expiry is set and compared on this one
+ * clock, so application servers with different clocks agree on it, and a
+ * statement that waited for a row is judged by when it ran, not when it was
+ * sent.
+ */
+export async function databaseNow(tx: Tx): Promise<Date> {
+  const [{ now }] = await tx.$queryRaw<Array<{ now: Date }>>`
+    SELECT clock_timestamp() AS now
+  `;
+  return now;
+}
+
+/**
  * Refuses a write while another user holds an unexpired edit lock on the page.
  * Writers without any lock (API clients, or a page nobody is editing) are not
  * affected; the caller holds the page row lock, so no lock can be acquired
@@ -61,7 +74,8 @@ export async function assertNotLockedByOther(
       user: { select: { id: true, displayName: true } },
     },
   });
-  if (!lock || lock.userId === actorId || lock.expiresAt <= new Date()) return;
+  if (!lock || lock.userId === actorId) return;
+  if (lock.expiresAt <= (await databaseNow(tx))) return;
   throw new EditConflictError(
     `Page is being edited by ${lock.user.displayName}`,
     "EDIT_LOCKED",

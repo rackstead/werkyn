@@ -77,7 +77,9 @@ export function Topbar() {
       }
       toast.success("Avatar updated");
     } catch {
-      toast.error("Failed to upload avatar");
+      // Only the account that chose the picture hears that it failed.
+      if (useAuthStore.getState().user?.id === user?.id)
+        toast.error("Failed to upload avatar");
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
   };

@@ -988,9 +988,9 @@ describe("independent review follow-ups", () => {
       ),
     });
     const fileIds = Array.from({ length: 12 }, (_, i) => `file-${i}`);
-    let outcome: Awaited<ReturnType<typeof result.current.mutateAsync>> | undefined;
+    let failure: unknown;
     act(() => {
-      void result.current.mutateAsync(fileIds).then((value) => (outcome = value));
+      void result.current.mutateAsync(fileIds).catch((error) => (failure = error));
     });
     await settle();
     expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(4);
@@ -999,8 +999,8 @@ describe("independent review follow-ups", () => {
     await settle();
     const tokens = calls.filter((c) => c.method === "PATCH").map((c) => c.token);
     expect(tokens).toEqual(["alice-token", "alice-token", "alice-token", "alice-token"]);
-    expect(outcome?.succeeded).toEqual([]);
-    expect(outcome?.failed).toHaveLength(12);
+    // Abandoned as a whole, so no per-file result is reported to Bob.
+    expect(failure).toBeInstanceOf(IdentityChangedError);
   });
 
   it("L1: the revocation survives the page being closed", async () => {
@@ -1010,5 +1010,41 @@ describe("independent review follow-ups", () => {
     });
     const logout = calls.findIndex((c) => c.path === "auth/logout");
     expect(inits[logout]?.keepalive).toBe(true);
+  });
+});
+
+describe("Qodo second pass", () => {
+  it("a request replayed after a refresh is never sent as the next account", async () => {
+    // Switch accounts at every microtask offset after the refresh resolves,
+    // including the gap between the post-refresh check and the replay.
+    for (let offset = 0; offset < 12; offset++) {
+      act(() =>
+        useAuthStore.setState({ user: alice, accessToken: "alice-token", workspaces: [acme] }),
+      );
+      calls.length = 0;
+      on("GET", "users/me", ({ token }) =>
+        token === "alice-token" ? json(401, { statusCode: 401 }) : json(200, { data: bob }),
+      );
+      const refresh = vi.fn(async () => {
+        let hops = offset;
+        const later = (): void => {
+          if (hops-- > 0) queueMicrotask(later);
+          else useAuthStore.setState({ user: bob, accessToken: "bob-token" });
+        };
+        queueMicrotask(later);
+        return true;
+      });
+      useAuthStore.setState({ refresh });
+      await api
+        .get("users/me")
+        .json()
+        .catch(() => {});
+      await settle();
+      expect(
+        calls.filter((c) => c.path === "users/me" && c.token === "bob-token"),
+        `offset ${offset}`,
+      ).toEqual([]);
+      act(() => useAuthStore.setState({ user: null, accessToken: null, workspaces: [] }));
+    }
   });
 });

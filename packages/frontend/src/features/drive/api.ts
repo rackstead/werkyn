@@ -399,6 +399,8 @@ async function runBulkFileAction(
       ? request(fileId)
       : Promise.reject(new IdentityChangedError()),
   );
+  // Abandoned as a whole: its outcome is not reported to the next account.
+  if (identityGeneration() !== generation) throw new IdentityChangedError();
   const outcome: BulkFileResult = { succeeded: [], failed: [] };
   results.forEach((result, i) => {
     if (result.status === "fulfilled") outcome.succeeded.push(fileIds[i]);

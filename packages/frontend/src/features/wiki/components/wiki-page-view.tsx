@@ -24,6 +24,7 @@ import { usePageLock } from "../hooks/use-page-lock";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import type { Block } from "@blocknote/core";
+import { isIdentityChangedError } from "@/lib/api-error";
 
 interface WikiPageViewProps {
   pageId: string;
@@ -171,9 +172,10 @@ function WikiPageSession({
   );
 
   const handleStartEditing = () => {
-    void acquire().catch(() =>
-      toast.error("Could not start editing this page"),
-    );
+    void acquire().catch((error) => {
+      if (!isIdentityChangedError(error))
+        toast.error("Could not start editing this page");
+    });
   };
 
   const finishEditing = useCallback(async () => {

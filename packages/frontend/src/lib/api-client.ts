@@ -181,7 +181,10 @@ export const api = ky.create({
                 hooks: {
                   beforeRequest: [
                     (retryRequest, retryOptions) => {
-                      assertRequestGeneration(retryOptions.context);
+                      // ky gives the replay its own copy of the context, so
+                      // check the generation the original request was sent in.
+                      if (identityGeneration() !== generation)
+                        throw new IdentityChangedError();
                       assertRequestIdentity(retryOptions.context);
                       retryRequest.headers.set(
                         "Authorization",
@@ -191,7 +194,8 @@ export const api = ky.create({
                   ],
                 },
               });
-              assertRequestGeneration(options.context);
+              if (identityGeneration() !== generation)
+                throw new IdentityChangedError();
               assertRequestIdentity(options.context);
               return retried;
             }

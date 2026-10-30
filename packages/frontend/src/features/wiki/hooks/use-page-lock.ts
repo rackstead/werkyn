@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useRef, useCallback } from "react";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/auth-store";
+import { isIdentityChangedError } from "@/lib/api-error";
 import {
   useWikiPageLock,
   useAcquireWikiLock,
@@ -108,6 +109,9 @@ export function usePageLock(
           toast.dismiss(notice);
         },
         (error) => {
+          // The account changed while it was pending: nothing to report to the
+          // next account, and the lock is not known to be gone.
+          if (isIdentityChangedError(error) || !isCurrentUser()) return;
           // Keep renewing after a transient failure; ownership then lapses on
           // its own once the server's lock could have expired. A definite
           // answer that the lock is gone makes the editor read-only now.

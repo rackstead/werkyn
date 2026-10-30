@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { after, before, test } from "node:test";
 
@@ -1071,11 +1072,17 @@ test("restore rejects invalid wiki hierarchies before any side effect", async ()
 
   // A restore whose transaction is refused removes the assets it staged.
   const staged = [];
-  const save = app.storage.save;
-  app.storage.save = async (...args) => {
-    const storagePath = await save.apply(app.storage, args);
-    staged.push(storagePath);
-    return storagePath;
+  const saveStream = app.storage.saveStream;
+  app.storage.saveStream = async (...args) => {
+    const saved = await saveStream.apply(app.storage, args);
+    staged.push(saved.storagePath);
+    return saved;
+  };
+  const picture = Buffer.from("png bytes");
+  const asset = {
+    size: picture.length,
+    open: () => Readable.from([picture]),
+    read: async () => picture,
   };
   try {
     await assert.rejects(
@@ -1084,13 +1091,13 @@ test("restore rejects invalid wiki hierarchies before any side effect", async ()
         wsA.id,
         users.MEMBER.id,
         backup([[["a", null]]]),
-        new Map([["assets/picture.png", Buffer.from("png bytes")]]),
+        new Map([["assets/picture.png", asset]]),
         app.storage,
       ),
       (error) => error.statusCode === 403,
     );
   } finally {
-    app.storage.save = save;
+    app.storage.saveStream = saveStream;
   }
   assert.equal(staged.length, 1);
   assert.equal(await exists(staged[0]), false);

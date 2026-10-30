@@ -161,11 +161,11 @@ test("ZIP restore and export apply the same backup.json limits", async () => {
     error.reason === "json-size" &&
     error.message === ARCHIVE_TOO_LARGE_MESSAGE;
 
-  assert.ok(readBackupArchive(zip(), BACKUP_ARCHIVE_LIMITS, json.length).jsonBuffer.equals(json));
-  assert.throws(() => readBackupArchive(zip(), BACKUP_ARCHIVE_LIMITS, json.length - 1), jsonTooLarge);
+  assert.ok((await readBackupArchive(zip(), BACKUP_ARCHIVE_LIMITS, json.length)).jsonBuffer.equals(json));
+  await assert.rejects(readBackupArchive(zip(), BACKUP_ARCHIVE_LIMITS, json.length - 1), jsonTooLarge);
   // The declared size is refused before anything is inflated; inflating this
   // entry would otherwise fail on its size.
-  assert.throws(() => readBackupArchive(zip(BACKUP_JSON_LIMITS.maxBytes + 1)), jsonTooLarge);
+  await assert.rejects(readBackupArchive(zip(BACKUP_JSON_LIMITS.maxBytes + 1)), jsonTooLarge);
 
   // Export refuses exactly what restore would refuse.
   const stats = measure(json);

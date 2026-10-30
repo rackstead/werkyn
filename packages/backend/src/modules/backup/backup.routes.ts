@@ -8,14 +8,32 @@ import {
   previewHandler,
   restoreHandler,
 } from "./backup.controller.js";
+import { limitBackupRequests } from "./backup-concurrency.js";
+import { backupStagingDir, prepareBackupStaging } from "./backup-staging.js";
+import { env } from "../../config/env.js";
 
 export default async function backupRoutes(fastify: FastifyInstance) {
+  // A staged file belongs to the request that created it, so any found before
+  // the server accepts requests were left by a process that stopped mid-request.
+  // If this sweep fails, the server still starts, and every backup request
+  // retries it before staging anything (and fails while it cannot).
+  fastify.addHook("onReady", async () => {
+    try {
+      await prepareBackupStaging(backupStagingDir(env.STORAGE_DIR), fastify.log);
+    } catch (error) {
+      fastify.log.error({ err: error }, "Could not clear the backup staging area");
+    }
+  });
+
+  // Every backup route is admitted per workspace and per process before it
+  // reads an upload or the database, after the caller is authorized.
+
   // POST /api/workspaces/:wid/backup/export
   fastify.route({
     method: "POST",
     url: "/:wid/backup/export",
     preHandler: [authenticate, authorize("ADMIN"), validate(BackupExportRequestSchema)],
-    handler: exportHandler,
+    handler: limitBackupRequests(exportHandler),
   });
 
   // POST /api/workspaces/:wid/backup/preview
@@ -23,7 +41,7 @@ export default async function backupRoutes(fastify: FastifyInstance) {
     method: "POST",
     url: "/:wid/backup/preview",
     preHandler: [authenticate, authorize("ADMIN")],
-    handler: previewHandler,
+    handler: limitBackupRequests(previewHandler),
   });
 
   // POST /api/workspaces/:wid/backup/restore
@@ -31,6 +49,6 @@ export default async function backupRoutes(fastify: FastifyInstance) {
     method: "POST",
     url: "/:wid/backup/restore",
     preHandler: [authenticate, authorize("ADMIN")],
-    handler: restoreHandler,
+    handler: limitBackupRequests(restoreHandler),
   });
 }

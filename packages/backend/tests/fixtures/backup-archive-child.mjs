@@ -1,8 +1,9 @@
 // Child process for tests that may exhaust memory. Usage:
 //   node --import tsx backup-archive-child.mjs <guarded|unguarded> <zip>...
-// "guarded" reads each archive with readBackupArchive; "unguarded" repeats the
-// adm-zip calls the restore route made before archives were inspected. One
-// JSON line is printed per archive, so a crash shows which archive caused it.
+// "guarded" reads each archive file with readBackupArchive, as the restore
+// route reads a staged upload; "unguarded" repeats the adm-zip calls the
+// restore route made before archives were inspected. One JSON line is printed
+// per archive, so a crash shows which archive caused it.
 import { readFileSync } from "node:fs";
 import AdmZip from "adm-zip";
 
@@ -23,12 +24,11 @@ function unguarded(buffer) {
 }
 
 for (const file of files) {
-  const buffer = readFileSync(file);
   const started = Date.now();
   const result = { file };
   try {
     const { jsonBuffer, assets } =
-      mode === "guarded" ? readBackupArchive(buffer) : unguarded(buffer);
+      mode === "guarded" ? await readBackupArchive(file) : unguarded(readFileSync(file));
     Object.assign(result, { ok: true, json: jsonBuffer.length, assets: assets.size });
   } catch (error) {
     Object.assign(result, {

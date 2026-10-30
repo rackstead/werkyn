@@ -15,6 +15,7 @@ import { rewriteUrls } from "./backup-assets.js";
 import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
 import { parseBackupJson } from "./backup-json.js";
+import type { BackupArchiveAsset } from "./backup-archive.js";
 
 /** Parse and validate a backup JSON buffer within the restore limits. */
 function parseBackupFile(buffer: Buffer): BackupFile {
@@ -108,7 +109,7 @@ export async function previewRestore(
   workspaceId: string,
   adminUserId: string,
   fileBuffer: Buffer,
-  assets?: Map<string, Buffer>,
+  assets?: ReadonlyMap<string, BackupArchiveAsset>,
 ): Promise<RestoreSummary> {
   const backup = parseBackupFile(fileBuffer);
   const userMapper = await buildUserMapper(prisma, workspaceId, adminUserId, backup);
@@ -185,7 +186,7 @@ export async function executeRestore(
   workspaceId: string,
   adminUserId: string,
   fileBuffer: Buffer,
-  assets?: Map<string, Buffer>,
+  assets?: ReadonlyMap<string, BackupArchiveAsset>,
   storage?: StorageProvider,
 ): Promise<RestoreSummary> {
   const backup = parseBackupFile(fileBuffer);
@@ -217,7 +218,7 @@ export async function executeRestore(
   const savedAssets: string[] = [];
 
   if (assets && assets.size > 0 && storage) {
-    for (const [assetPath, buffer] of assets) {
+    for (const [assetPath, asset] of assets) {
       if (!assetPath.startsWith("assets/")) continue;
 
       const filename = path.basename(assetPath);
@@ -225,12 +226,13 @@ export async function executeRestore(
       const fileId = crypto.randomUUID();
 
       try {
-        const storagePath = await storage.save(
+        // Streamed from the staged archive; never held in memory whole.
+        const { storagePath } = await storage.saveStream(
           `${workspaceId}/uploads`,
           "wiki/imports",
           fileId,
           ext,
-          buffer,
+          asset.open(),
         );
         savedAssets.push(storagePath);
         assetUrlMap.set(assetPath, `/storage/${storagePath}`);

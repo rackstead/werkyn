@@ -1071,6 +1071,9 @@ test("restore rejects invalid wiki hierarchies before any side effect", async ()
   await assertWikiForest(restored.map((s) => s.id));
 
   // A restore whose transaction is refused removes the assets it staged.
+  // Only files a page uses are staged.
+  const withAsset = JSON.parse(backup([[["a", null]]]).toString());
+  withAsset.wikiSpaces[0].pages[0].content = [{ type: "image", props: { url: "assets/picture.png" } }];
   const staged = [];
   const saveStream = app.storage.saveStream;
   app.storage.saveStream = async (...args) => {
@@ -1090,7 +1093,7 @@ test("restore rejects invalid wiki hierarchies before any side effect", async ()
         app.prisma,
         wsA.id,
         users.MEMBER.id,
-        backup([[["a", null]]]),
+        Buffer.from(JSON.stringify(withAsset)),
         new Map([["assets/picture.png", asset]]),
         app.storage,
       ),

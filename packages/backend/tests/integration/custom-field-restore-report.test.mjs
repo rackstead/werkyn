@@ -23,7 +23,7 @@ let app, admin, target, audited, clean;
 const suffix = crypto.randomUUID().slice(0, 20);
 
 const backupTask = (customFieldValues, title = "Restored task") => ({
-  _originalId: "task", title, priority: "NONE", position: 0, statusRef: "status", customFieldValues,
+  _originalId: `task-${title}`, title, priority: "NONE", position: 0, statusRef: "status", customFieldValues,
 });
 
 function backup(customFields, customFieldValues, tasks = [backupTask(customFieldValues)]) {
@@ -106,7 +106,7 @@ test("restore keeps valid custom fields and values, drops the rest, and preview 
   ]);
 });
 
-test("restore keeps each task's own values when task IDs repeat, and skips text PostgreSQL cannot store", async () => {
+test("restore keeps each task's own values, and skips text PostgreSQL cannot store", async () => {
   const file = backup([{ _originalId: "f", name: "Code", type: "TEXT", options: null, required: false, position: 0 }], null, [
     backupTask([{ fieldRef: "f", value: "first" }], "First"),
     backupTask([{ fieldRef: "f", value: "second" }], "Second"),

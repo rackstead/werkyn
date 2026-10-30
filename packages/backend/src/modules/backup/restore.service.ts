@@ -1,106 +1,369 @@
 import crypto from "node:crypto";
 import path from "node:path";
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import type { BackupFile, RestoreSummary } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
-import { IdMapper, UserMapper } from "./id-mapper.js";
-import { planCustomFieldRestore } from "./custom-field-restore.js";
-import {
-  ForbiddenError,
-  NotFoundError,
-  ValidationError,
-} from "../../utils/errors.js";
+import { cleanupBlobsNow } from "../../services/blob-cleanup.js";
+import { AppError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { logger } from "../../utils/logger.js";
 import { lockWorkspace } from "../../utils/workspace-lock.js";
-import { rewriteUrls } from "./backup-assets.js";
-import { toCustomFieldType, toPriority, toJsonValue } from "./backup-types.js";
-import { sanitizeDescription } from "../../utils/description-html.js";
-import { parseBackupJson } from "./backup-json.js";
 import type { BackupArchiveAsset } from "./backup-archive.js";
+import { parseBackupJson } from "./backup-json.js";
+import {
+  RESTORE_TABLES,
+  emptyCounts,
+  mapUsers,
+  planRestore,
+  restoreSummary,
+  rewriteAssetPaths,
+  type RestoreRow,
+  type RestoreRows,
+  type RestoreTable,
+  type RestoreTarget,
+} from "./restore-plan.js";
+import { MAX_RESTORE_JSON_DEPTH, validateBackup } from "./restore-validation.js";
+
+/**
+ * Backup restore (docs/remediation/backup-restore.md).
+ *
+ * 1. The file is parsed within the restore limits and validated as a whole
+ *    (restore-validation.ts); any refusal happens before a write.
+ * 2. Archive files that a wiki page refers to are written to storage. Each
+ *    one is first queued for deletion in "BlobCleanup", due an hour later,
+ *    so a crash at any later point leaves nothing behind for long.
+ * 3. One transaction locks the workspace, re-checks the administrator,
+ *    takes the restored files off the cleanup queue, and inserts the planned
+ *    rows (restore-plan.ts) in batches. Any failure rolls every row back and
+ *    the files are removed right away; a commit keeps both.
+ *
+ * Preview runs steps 1 and the plan without writing, so its counts, warnings
+ * and refusals are the ones restore produces for the same file and members.
+ */
 
 /** Parse and validate a backup JSON buffer within the restore limits. */
 function parseBackupFile(buffer: Buffer): BackupFile {
   const backup = parseBackupJson(buffer);
-  validateWikiGraph(backup);
+  validateBackup(backup);
   return backup;
 }
 
-/**
- * Preview and restore share this check, so an invalid page hierarchy is
- * rejected before any asset or database write. A parent must be another page
- * of the same space and the parent chain must end at a root. A parent that is
- * absent from the whole backup keeps the existing skip-with-warning behavior.
- */
-function validateWikiGraph(backup: BackupFile) {
-  const spaceOf = new Map<string, number>();
-  backup.wikiSpaces.forEach((ws, index) => {
-    for (const p of ws.pages) spaceOf.set(p._originalId, index);
-  });
-  backup.wikiSpaces.forEach((ws, index) => {
-    const parents = new Map<string, string | null>();
-    for (const p of ws.pages) {
-      if (parents.has(p._originalId))
-        throw new ValidationError(
-          "Invalid backup file: duplicate wiki page id",
-        );
-      parents.set(p._originalId, p.parentRef ?? null);
-    }
-    for (const p of ws.pages) {
-      if (!p.parentRef) continue;
-      if (!parents.has(p.parentRef) && spaceOf.has(p.parentRef))
-        throw new ValidationError(
-          "Invalid backup file: wiki page parent is in another space",
-        );
-    }
-    // Every chain is walked at most once (`done`), so this is linear.
-    const done = new Set<string>();
-    for (const start of parents.keys()) {
-      const path = new Set<string>();
-      let current: string | null | undefined = start;
-      while (current && parents.has(current) && !done.has(current)) {
-        if (path.has(current))
-          throw new ValidationError(
-            "Invalid backup file: wiki page hierarchy contains a cycle",
-          );
-        path.add(current);
-        current = parents.get(current);
-      }
-      for (const id of path) done.add(id);
-    }
-  });
-}
+type Db = PrismaClient | Prisma.TransactionClient;
 
-/** Build a UserMapper from backup metadata + workspace members. */
-async function buildUserMapper(
-  prisma: PrismaClient,
+async function loadTarget(
+  db: Db,
   workspaceId: string,
   adminUserId: string,
-  backup: BackupFile,
-): Promise<UserMapper> {
-  const mapper = new UserMapper(adminUserId);
-
-  const wsMembers = await prisma.workspaceMember.findMany({
+  assetUrls: ReadonlyMap<string, string>,
+): Promise<RestoreTarget> {
+  const members = await db.workspaceMember.findMany({
     where: { workspaceId },
-    include: {
-      user: { select: { id: true, email: true, displayName: true } },
-    },
+    select: { role: true, user: { select: { id: true, email: true, displayName: true } } },
   });
+  const spaces = await db.wikiSpace.findMany({
+    where: { workspaceId },
+    select: { slug: true, position: true },
+  });
+  return {
+    workspaceId,
+    adminUserId,
+    members: members.map((m) => ({ ...m.user, role: m.role })),
+    takenSlugs: new Set(spaces.map((s) => s.slug)),
+    nextWikiSpacePosition: spaces.reduce((max, s) => Math.max(max, s.position), -1) + 1,
+    assetUrls,
+  };
+}
 
-  const membersByEmail = new Map(
-    wsMembers.map((m) => [m.user.email.toLowerCase(), m.user]),
-  );
+// ─── Assets ─────────────────────────────────────────────
 
-  for (const ref of backup.metadata.userRefs) {
-    const match = membersByEmail.get(ref.email.toLowerCase());
-    mapper.addMapping(
-      ref.originalId,
-      ref.email,
-      ref.displayName,
-      match?.id ?? null,
-      match?.displayName ?? null,
+interface PlannedAsset {
+  assetPath: string;
+  asset: BackupArchiveAsset;
+  fileId: string;
+  ext: string;
+  storagePath: string;
+}
+
+interface AssetPlan {
+  /** Archive files some wiki page refers to, in archive order. */
+  used: PlannedAsset[];
+  unused: number;
+}
+
+const assetCategory = (workspaceId: string) => `${workspaceId}/uploads`;
+const ASSET_SCOPE = "wiki/imports";
+const assetUrl = (storagePath: string) => `/storage/${storagePath}`;
+
+/**
+ * Names a storage path for every `assets/` entry and keeps the ones that a
+ * wiki page refers to; the others would be files nothing points at, so they
+ * are not written. The URLs used for the check are the ones restore writes,
+ * so the result is exactly what the content rewrite will use.
+ */
+function planAssets(
+  workspaceId: string,
+  backup: BackupFile,
+  assets: ReadonlyMap<string, BackupArchiveAsset> | undefined,
+): AssetPlan {
+  const planned: PlannedAsset[] = [];
+  for (const [assetPath, asset] of assets ?? []) {
+    if (!assetPath.startsWith("assets/")) continue;
+    const ext = path.extname(path.basename(assetPath)) || ".bin";
+    const fileId = crypto.randomUUID();
+    const storagePath = path.join(assetCategory(workspaceId), ASSET_SCOPE, `${fileId}${ext}`);
+    planned.push({ assetPath, asset, fileId, ext, storagePath });
+  }
+  if (planned.length === 0) return { used: [], unused: 0 };
+  const replacements = planned.map((a) => [a.assetPath, assetUrl(a.storagePath)] as const);
+  const hits = new Set<string>();
+  for (const space of backup.wikiSpaces)
+    for (const page of space.pages) rewriteAssetPaths(page.content, replacements, hits);
+  const used = planned.filter((a) => hits.has(a.assetPath));
+  return { used, unused: planned.length - used.length };
+}
+
+/**
+ * How long a restored file stays queued for deletion if its restore never
+ * commits or rolls back (a crash). Restore removes the queue entry in its
+ * transaction, which takes far less than this.
+ */
+const STAGED_ASSET_GRACE_SECONDS = 60 * 60;
+
+/** Queue the paths, then write the files; a failure removes what was written. */
+async function stageAssets(
+  prisma: PrismaClient,
+  storage: StorageProvider,
+  workspaceId: string,
+  assets: PlannedAsset[],
+): Promise<void> {
+  if (assets.length === 0) return;
+  const paths = assets.map((a) => a.storagePath);
+  await prisma.$executeRaw`
+    INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+    SELECT p, CURRENT_TIMESTAMP + ${STAGED_ASSET_GRACE_SECONDS}::integer * interval '1 second'
+    FROM unnest(${paths}::text[]) AS p`;
+  try {
+    for (const a of assets) {
+      // Streamed from the staged archive; never held in memory whole.
+      const content = a.asset.open();
+      let saved: string;
+      try {
+        ({ storagePath: saved } = await storage.saveStream(
+          assetCategory(workspaceId),
+          ASSET_SCOPE,
+          a.fileId,
+          a.ext,
+          content,
+        ));
+      } finally {
+        content.destroy();
+      }
+      if (saved !== a.storagePath) {
+        await storage.delete(saved).catch(() => {});
+        throw new Error("Storage stored a restored file under an unexpected path");
+      }
+    }
+  } catch (error) {
+    await discardStagedAssets(prisma, storage, paths);
+    throw error;
+  }
+}
+
+/**
+ * Inside the restore transaction: the queued paths stop being cleanup work
+ * when (and only if) the transaction commits. A row the cleanup worker has
+ * already claimed (attempts > 0) may have lost its file, so the restore stops.
+ */
+async function claimStagedAssets(tx: Prisma.TransactionClient, paths: string[]) {
+  if (paths.length === 0) return;
+  const claimed = await tx.$queryRaw<Array<{ storagePath: string }>>`
+    DELETE FROM "BlobCleanup"
+    WHERE "storagePath" = ANY(${paths}::text[]) AND "attempts" = 0
+    RETURNING "storagePath"`;
+  if (claimed.length !== paths.length)
+    throw new AppError(
+      503,
+      "Service Unavailable",
+      "The restore took too long to keep its files; nothing was restored. Please try again.",
     );
+}
+
+/**
+ * After a failed restore: make the queued paths due now and remove them. If
+ * the transaction did commit after all, its rows are gone and nothing is
+ * removed. When the queue cannot be updated, the worker removes the files
+ * once the grace period ends.
+ */
+async function discardStagedAssets(prisma: PrismaClient, storage: StorageProvider, paths: string[]) {
+  if (paths.length === 0) return;
+  try {
+    await prisma.$executeRaw`
+      UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP
+      WHERE "storagePath" = ANY(${paths}::text[])`;
+  } catch (error) {
+    logger.error({ err: error }, "Could not schedule removal of files from a failed restore; the cleanup worker removes them later");
+    return;
+  }
+  await cleanupBlobsNow(prisma, storage, paths);
+}
+
+// ─── Writing ────────────────────────────────────────────
+
+/**
+ * Row IDs in Prisma's cuid shape (25 lowercase characters, time first), made
+ * here so batched inserts can reference rows they have not read back.
+ */
+let idCounter = 0;
+function newRowId(): string {
+  idCounter = (idCounter + 1) % 1_679_616;
+  return (
+    "c" +
+    Date.now().toString(36).padStart(8, "0") +
+    idCounter.toString(36).padStart(4, "0") +
+    crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+  );
+}
+
+const INSERT: { [K in RestoreTable]: (tx: Prisma.TransactionClient, data: RestoreRows[K][]) => Promise<unknown> } = {
+  project: (tx, data) => tx.project.createMany({ data }),
+  statusColumn: (tx, data) => tx.statusColumn.createMany({ data }),
+  label: (tx, data) => tx.label.createMany({ data }),
+  customField: (tx, data) => tx.customField.createMany({ data }),
+  projectMember: (tx, data) => tx.projectMember.createMany({ data }),
+  task: (tx, data) => tx.task.createMany({ data }),
+  taskAssignee: (tx, data) => tx.taskAssignee.createMany({ data }),
+  taskLabel: (tx, data) => tx.taskLabel.createMany({ data }),
+  subtask: (tx, data) => tx.subtask.createMany({ data }),
+  customFieldValue: (tx, data) => tx.customFieldValue.createMany({ data }),
+  comment: (tx, data) => tx.comment.createMany({ data }),
+  activityLog: (tx, data) => tx.activityLog.createMany({ data }),
+  taskDependency: (tx, data) => tx.taskDependency.createMany({ data }),
+  chatChannel: (tx, data) => tx.chatChannel.createMany({ data }),
+  chatChannelMember: (tx, data) => tx.chatChannelMember.createMany({ data }),
+  chatMessage: (tx, data) => tx.chatMessage.createMany({ data }),
+  chatReaction: (tx, data) => tx.chatReaction.createMany({ data }),
+  wikiSpace: (tx, data) => tx.wikiSpace.createMany({ data }),
+  wikiPage: (tx, data) => tx.wikiPage.createMany({ data }),
+  wikiPageComment: (tx, data) => tx.wikiPageComment.createMany({ data }),
+};
+
+/**
+ * Rows whose JSON nests deeper than this go in one by one: a batched insert
+ * holds one level less than a single-row one (MAX_RESTORE_JSON_DEPTH).
+ */
+const BATCHED_JSON_DEPTH = MAX_RESTORE_JSON_DEPTH - 1;
+
+/** Tables with JSON columns, for rows too deep to batch. */
+const INSERT_ONE: Partial<{
+  [K in RestoreTable]: (tx: Prisma.TransactionClient, data: RestoreRows[K]) => Promise<unknown>;
+}> = {
+  customField: (tx, data) => tx.customField.create({ data, select: { id: true } }),
+  customFieldValue: (tx, data) => tx.customFieldValue.create({ data, select: { id: true } }),
+  activityLog: (tx, data) => tx.activityLog.create({ data, select: { id: true } }),
+  wikiPage: (tx, data) => tx.wikiPage.create({ data, select: { id: true } }),
+  wikiPageComment: (tx, data) => tx.wikiPageComment.create({ data, select: { id: true } }),
+};
+
+/** Rows and approximate UTF-16 bytes buffered before one round of inserts. */
+const BATCH_ROWS = 1_000;
+const BATCH_BYTES = 4 * 1024 * 1024;
+
+/** Approximate bytes of `value`; records its nesting (objects and arrays) in `size.depth`. */
+function measure(value: unknown, level: number, size: { depth: number }): number {
+  if (typeof value === "string") return 2 * value.length + 8;
+  if (value === null || typeof value !== "object" || value instanceof Date) return 8;
+  if (level + 1 > size.depth) size.depth = level + 1;
+  let total = 16;
+  if (Array.isArray(value)) for (const item of value) total += measure(item, level + 1, size);
+  else
+    for (const key in value as Record<string, unknown>)
+      total += 2 * key.length + measure((value as Record<string, unknown>)[key], level + 1, size);
+  return total;
+}
+
+/**
+ * Buffers planned rows and inserts them with one createMany per table, in
+ * RESTORE_TABLES order. The plan yields every row after the rows it
+ * references, so each insert only references rows inserted before it or in
+ * the same statement (PostgreSQL checks foreign keys at the end of it).
+ */
+class BatchWriter {
+  private buffers = new Map<RestoreTable, unknown[]>();
+  private rows = 0;
+  private bytes = 0;
+
+  constructor(private readonly tx: Prisma.TransactionClient) {}
+
+  async add(entry: RestoreRow) {
+    const size = { depth: 0 };
+    let bytes = 0;
+    const data = entry.data as Record<string, unknown>;
+    for (const key in data) bytes += measure(data[key], 0, size);
+    if (size.depth > BATCHED_JSON_DEPTH) {
+      // Everything it may reference goes in first.
+      await this.flush();
+      const insert = INSERT_ONE[entry.table] as
+        | ((tx: Prisma.TransactionClient, row: unknown) => Promise<unknown>)
+        | undefined;
+      if (!insert) throw new Error(`No single-row insert for ${entry.table}`);
+      await insert(this.tx, entry.data);
+      return;
+    }
+    let buffer = this.buffers.get(entry.table);
+    if (!buffer) this.buffers.set(entry.table, (buffer = []));
+    buffer.push(entry.data);
+    this.rows++;
+    this.bytes += bytes;
+    if (this.rows >= BATCH_ROWS || this.bytes >= BATCH_BYTES) await this.flush();
   }
 
-  return mapper;
+  async flush() {
+    for (const table of RESTORE_TABLES) {
+      const data = this.buffers.get(table);
+      if (!data || data.length === 0) continue;
+      this.buffers.set(table, []);
+      await (INSERT[table] as (tx: Prisma.TransactionClient, rows: unknown[]) => Promise<unknown>)(
+        this.tx,
+        data,
+      );
+    }
+    this.rows = 0;
+    this.bytes = 0;
+  }
+}
+
+/**
+ * The transaction keeps the workspace row locked, so other workspace writers
+ * wait for it. Batched inserts restored 112,000 rows (75% of the backup.json
+ * object limit) in about 4 s locally, where one insert per row took 57 s. A
+ * restore that has not committed by this deadline is rolled back whole and
+ * answered with a 503.
+ */
+const RESTORE_TRANSACTION = {
+  isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+  maxWait: 10_000,
+  timeout: 60_000,
+} as const;
+
+/** Runs the plan, handing each row to `write`, and summarizes what it produced. */
+async function runPlan(
+  backup: BackupFile,
+  target: RestoreTarget,
+  assets: AssetPlan,
+  newId: () => string,
+  write: (row: RestoreRow) => void | Promise<void>,
+): Promise<RestoreSummary> {
+  const users = mapUsers(backup, target.members, target.adminUserId);
+  const warnings = [...users.getWarnings()];
+  const counts = emptyCounts();
+  for (const row of planRestore(backup, target, users, newId, warnings)) {
+    counts[row.table]++;
+    await write(row);
+  }
+  if (assets.unused > 0)
+    warnings.push(
+      `${assets.unused} file(s) in the archive are not used by any wiki page and were not restored`,
+    );
+  return restoreSummary(counts, assets.used.length, users, warnings);
 }
 
 /** Generate a preview summary without modifying the database. */
@@ -112,72 +375,10 @@ export async function previewRestore(
   assets?: ReadonlyMap<string, BackupArchiveAsset>,
 ): Promise<RestoreSummary> {
   const backup = parseBackupFile(fileBuffer);
-  const userMapper = await buildUserMapper(prisma, workspaceId, adminUserId, backup);
-
-  let statuses = 0;
-  let labels = 0;
-  let customFields = 0;
-  let tasks = 0;
-  let subtasks = 0;
-  let comments = 0;
-  let activityLogs = 0;
-  let messages = 0;
-  let reactions = 0;
-  const customFieldWarnings: string[] = [];
-
-  for (const p of backup.projects) {
-    statuses += p.statuses.length;
-    labels += p.labels.length;
-    customFields += p.customFields.length;
-    customFieldWarnings.push(...planCustomFieldRestore(p).warnings);
-    tasks += p.tasks.length;
-    for (const t of p.tasks) {
-      subtasks += t.subtasks.length;
-      comments += t.comments.length;
-      activityLogs += t.activityLogs.length;
-    }
-  }
-
-  for (const c of backup.channels) {
-    messages += c.messages.length;
-    for (const m of c.messages) {
-      reactions += m.reactions.length;
-    }
-  }
-
-  let wikiPages = 0;
-  let wikiComments = 0;
-  for (const ws of backup.wikiSpaces) {
-    wikiPages += ws.pages.length;
-    for (const p of ws.pages) {
-      wikiComments += p.comments.length;
-    }
-  }
-
-  return {
-    projects: backup.projects.length,
-    statuses,
-    labels,
-    customFields,
-    tasks,
-    subtasks,
-    comments,
-    activityLogs,
-    channels: backup.channels.length,
-    messages,
-    reactions,
-    wikiSpaces: backup.wikiSpaces.length,
-    wikiPages,
-    wikiComments,
-    images: assets?.size ?? 0,
-    userMappings: userMapper.getMappings().map((m) => ({
-      originalEmail: m.originalEmail,
-      originalName: m.originalName,
-      mappedUserId: m.resolvedId,
-      mappedName: m.resolvedName,
-    })),
-    warnings: [...userMapper.getWarnings(), ...customFieldWarnings],
-  };
+  const assetPlan = planAssets(workspaceId, backup, assets);
+  const target = await loadTarget(prisma, workspaceId, adminUserId, new Map());
+  let previewIds = 0;
+  return runPlan(backup, target, assetPlan, () => `preview-${++previewIds}`, () => {});
 }
 
 /** Restore a backup file into the workspace, creating new entities with new IDs. */
@@ -190,70 +391,15 @@ export async function executeRestore(
   storage?: StorageProvider,
 ): Promise<RestoreSummary> {
   const backup = parseBackupFile(fileBuffer);
-  const userMapper = await buildUserMapper(prisma, workspaceId, adminUserId, backup);
-  const idMapper = new IdMapper();
+  const assetPlan = planAssets(workspaceId, backup, assets);
+  if (assetPlan.used.length > 0 && !storage)
+    throw new Error("Restoring backup files requires a storage provider");
+  const paths = assetPlan.used.map((a) => a.storagePath);
+  const assetUrls = new Map(assetPlan.used.map((a) => [a.assetPath, assetUrl(a.storagePath)]));
+  await stageAssets(prisma, storage!, workspaceId, assetPlan.used);
 
-  const counts = {
-    projects: 0,
-    statuses: 0,
-    labels: 0,
-    customFields: 0,
-    tasks: 0,
-    subtasks: 0,
-    comments: 0,
-    activityLogs: 0,
-    channels: 0,
-    messages: 0,
-    reactions: 0,
-    wikiSpaces: 0,
-    wikiPages: 0,
-    wikiComments: 0,
-    images: 0,
-  };
-  const warnings = [...userMapper.getWarnings()];
-
-  // ─── Re-upload assets and build URL rewrite map ────────
-
-  const assetUrlMap = new Map<string, string>(); // "assets/file.png" → "/storage/new/path"
-  const savedAssets: string[] = [];
-
-  if (assets && assets.size > 0 && storage) {
-    for (const [assetPath, asset] of assets) {
-      if (!assetPath.startsWith("assets/")) continue;
-
-      const filename = path.basename(assetPath);
-      const ext = path.extname(filename) || ".bin";
-      const fileId = crypto.randomUUID();
-
-      try {
-        // Streamed from the staged archive; never held in memory whole.
-        const { storagePath } = await storage.saveStream(
-          `${workspaceId}/uploads`,
-          "wiki/imports",
-          fileId,
-          ext,
-          asset.open(),
-        );
-        savedAssets.push(storagePath);
-        assetUrlMap.set(assetPath, `/storage/${storagePath}`);
-        counts.images++;
-      } catch {
-        warnings.push(`Failed to re-upload asset: ${filename}`);
-      }
-    }
-  }
-
-  // Assets staged above have no rows when the transaction rolls back (for
-  // example after the role re-check below), so remove them best-effort.
-  const discardStagedAssets = async (error: unknown) => {
-    if (storage)
-      for (const storagePath of savedAssets)
-        await storage.delete(storagePath).catch(() => {});
-    throw error;
-  };
-
-  await prisma.$transaction(
-    async (tx) => {
+  try {
+    return await prisma.$transaction(async (tx) => {
       // New wiki spaces/pages are appended under the same workspace lock as
       // runtime wiki writers, with the administrator role re-read after it.
       if (!(await lockWorkspace(tx, workspaceId)))
@@ -262,391 +408,24 @@ export async function executeRestore(
         where: { userId_workspaceId: { userId: adminUserId, workspaceId } },
         select: { role: true },
       });
-      if (admin?.role !== "ADMIN")
-        throw new ForbiddenError("Insufficient permissions");
+      if (admin?.role !== "ADMIN") throw new ForbiddenError("Insufficient permissions");
+      await claimStagedAssets(tx, paths);
 
-      // ─── Restore Projects ───────────────────────────────
-
-      for (const pEntry of backup.projects) {
-        const newProject = await tx.project.create({
-          data: {
-            workspaceId,
-            name: pEntry.project.name,
-            description: pEntry.project.description,
-            color: pEntry.project.color,
-            icon: pEntry.project.icon,
-          },
-        });
-        counts.projects++;
-
-        // Statuses
-        for (const s of pEntry.statuses) {
-          const newStatus = await tx.statusColumn.create({
-            data: {
-              projectId: newProject.id,
-              name: s.name,
-              color: s.color,
-              position: s.position,
-              isCompletion: s.isCompletion,
-            },
-          });
-          idMapper.set(s._originalId, newStatus.id);
-          counts.statuses++;
-        }
-
-        // Labels
-        for (const l of pEntry.labels) {
-          const newLabel = await tx.label.create({
-            data: {
-              projectId: newProject.id,
-              name: l.name,
-              color: l.color,
-            },
-          });
-          idMapper.set(l._originalId, newLabel.id);
-          counts.labels++;
-        }
-
-        // Custom Fields, with the same option and value checks as the API
-        const fieldPlan = planCustomFieldRestore(pEntry);
-        warnings.push(...fieldPlan.warnings);
-        const restoredFieldIds = new Map<string, string>();
-        for (const f of fieldPlan.fields) {
-          const newField = await tx.customField.create({
-            data: {
-              projectId: newProject.id,
-              name: f.name,
-              type: toCustomFieldType(f.type),
-              options: f.options,
-              required: f.required,
-              position: f.position,
-            },
-          });
-          idMapper.set(f.originalId, newField.id);
-          restoredFieldIds.set(f.originalId, newField.id);
-          counts.customFields++;
-        }
-
-        // Members
-        for (const m of pEntry.members) {
-          const userId = userMapper.resolveOptional(m.userRef);
-          if (!userId) continue;
-          // Ensure user is workspace member
-          const isMember = await tx.workspaceMember.findUnique({
-            where: { userId_workspaceId: { userId, workspaceId } },
-          });
-          if (!isMember) continue;
-          await tx.projectMember.upsert({
-            where: { projectId_userId: { projectId: newProject.id, userId } },
-            update: {},
-            create: { projectId: newProject.id, userId },
-          });
-        }
-
-        // Tasks
-        for (const t of pEntry.tasks) {
-          const statusId = idMapper.get(t.statusRef);
-          if (!statusId) {
-            warnings.push(
-              `Skipped task "${t.title}" — status ref ${t.statusRef} not found`,
-            );
-            continue;
-          }
-
-          const newTask = await tx.task.create({
-            data: {
-              projectId: newProject.id,
-              statusId,
-              title: t.title,
-              description: sanitizeDescription(t.description),
-              priority: toPriority(t.priority),
-              position: t.position,
-              dueDate: t.dueDate,
-              startDate: t.startDate,
-            },
-          });
-          idMapper.set(t._originalId, newTask.id);
-          counts.tasks++;
-
-          // Assignees
-          for (const aRef of t.assignees) {
-            const userId = userMapper.resolveOptional(aRef);
-            if (!userId) continue;
-            await tx.taskAssignee.create({
-              data: { taskId: newTask.id, userId },
-            }).catch(() => {
-              // skip duplicates or FK violations
-            });
-          }
-
-          // Labels
-          for (const lRef of t.labels) {
-            const labelId = idMapper.get(lRef);
-            if (!labelId) continue;
-            await tx.taskLabel.create({
-              data: { taskId: newTask.id, labelId },
-            }).catch(() => {});
-          }
-
-          // Subtasks
-          for (const s of t.subtasks) {
-            const newSubtask = await tx.subtask.create({
-              data: {
-                taskId: newTask.id,
-                title: s.title,
-                completed: s.completed,
-                position: s.position,
-                assigneeId: userMapper.resolveOptional(s.assigneeRef),
-                dueDate: s.dueDate,
-              },
-            });
-            idMapper.set(s._originalId, newSubtask.id);
-            counts.subtasks++;
-          }
-
-          // Custom field values (checked and de-duplicated by the plan)
-          for (const v of fieldPlan.values.get(t) ?? []) {
-            const fieldId = restoredFieldIds.get(v.fieldRef);
-            if (!fieldId) continue;
-            await tx.customFieldValue.create({
-              data: {
-                taskId: newTask.id,
-                fieldId,
-                value: v.value,
-              },
-            });
-          }
-
-          // Comments
-          for (const c of t.comments) {
-            const newComment = await tx.comment.create({
-              data: {
-                taskId: newTask.id,
-                authorId: userMapper.resolveOptional(c.authorRef),
-                body: c.body,
-                createdAt: new Date(c.createdAt),
-              },
-            });
-            idMapper.set(c._originalId, newComment.id);
-            counts.comments++;
-          }
-
-          // Activity logs
-          for (const a of t.activityLogs) {
-            await tx.activityLog.create({
-              data: {
-                taskId: newTask.id,
-                action: a.action,
-                details: toJsonValue(a.details),
-                actorId: userMapper.resolveOptional(a.actorRef),
-                createdAt: new Date(a.createdAt),
-              },
-            });
-            counts.activityLogs++;
-          }
-        }
-
-        // Task dependencies (second pass — all tasks exist now)
-        for (const t of pEntry.tasks) {
-          const blockedTaskId = idMapper.get(t._originalId);
-          if (!blockedTaskId) continue;
-          for (const dep of t.dependencies) {
-            const blockingTaskId = idMapper.get(dep.blockingTaskRef);
-            if (!blockingTaskId) {
-              warnings.push(
-                `Skipped dependency for task "${t.title}" — blocking task ref ${dep.blockingTaskRef} not found`,
-              );
-              continue;
-            }
-            await tx.taskDependency.create({
-              data: { blockedTaskId, blockingTaskId },
-            }).catch(() => {});
-          }
-        }
-
-      }
-
-      // ─── Restore Channels ───────────────────────────────
-
-      for (const cEntry of backup.channels) {
-        const newChannel = await tx.chatChannel.create({
-          data: {
-            workspaceId,
-            name: cEntry.channel.name,
-            description: cEntry.channel.description,
-            type: cEntry.channel.type,
-            createdById: adminUserId,
-          },
-        });
-        counts.channels++;
-
-        // Members
-        for (const m of cEntry.members) {
-          const userId = userMapper.resolveOptional(m.userRef);
-          if (!userId) continue;
-          const isMember = await tx.workspaceMember.findUnique({
-            where: { userId_workspaceId: { userId, workspaceId } },
-          });
-          if (!isMember) continue;
-          await tx.chatChannelMember.upsert({
-            where: { channelId_userId: { channelId: newChannel.id, userId } },
-            update: {},
-            create: { channelId: newChannel.id, userId },
-          });
-        }
-
-        // Ensure admin is a member
-        await tx.chatChannelMember.upsert({
-          where: {
-            channelId_userId: { channelId: newChannel.id, userId: adminUserId },
-          },
-          update: {},
-          create: { channelId: newChannel.id, userId: adminUserId },
-        });
-
-        // Messages (chronological order so parents exist before replies)
-        for (const m of cEntry.messages) {
-          const parentId = m.parentRef ? idMapper.get(m.parentRef) : null;
-          // If parent ref exists but wasn't mapped yet, skip (shouldn't happen with chronological order)
-          if (m.parentRef && !parentId) {
-            warnings.push(
-              `Skipped message parent ref ${m.parentRef} — parent not found`,
-            );
-          }
-
-          const newMessage = await tx.chatMessage.create({
-            data: {
-              channelId: newChannel.id,
-              userId: userMapper.resolve(m.userRef),
-              content: m.content,
-              parentId: parentId ?? undefined,
-              createdAt: new Date(m.createdAt),
-            },
-          });
-          idMapper.set(m._originalId, newMessage.id);
-          counts.messages++;
-
-          // Reactions
-          for (const r of m.reactions) {
-            const userId = userMapper.resolveOptional(r.userRef);
-            if (!userId) continue;
-            await tx.chatReaction.create({
-              data: {
-                messageId: newMessage.id,
-                userId,
-                emoji: r.emoji,
-              },
-            }).catch(() => {});
-            counts.reactions++;
-          }
-        }
-      }
-      // ─── Restore Wiki Spaces ─────────────────────────────
-
-      // Determine starting position for new wiki spaces
-      const lastWikiSpace = await tx.wikiSpace.findFirst({
-        where: { workspaceId },
-        orderBy: { position: "desc" },
-        select: { position: true },
-      });
-      let wikiSpacePosition = (lastWikiSpace?.position ?? -1) + 1;
-
-      for (const wsEntry of backup.wikiSpaces) {
-        const slug =
-          wsEntry.space.name
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-|-$/g, "")
-            .slice(0, 80) +
-          "-" +
-          Date.now().toString(36);
-
-        const newSpace = await tx.wikiSpace.create({
-          data: {
-            workspaceId,
-            name: wsEntry.space.name,
-            slug,
-            description: wsEntry.space.description,
-            icon: wsEntry.space.icon,
-            position: wikiSpacePosition++,
-          },
-        });
-        counts.wikiSpaces++;
-
-        // Parent references resolve only to pages of this space; a global
-        // id lookup could match an unrelated restored entity.
-        const spacePageIds = new Map<string, string>();
-
-        // First pass: create all pages with parentId = null
-        for (const p of wsEntry.pages) {
-          // Rewrite asset URLs in page content if we have re-uploaded assets
-          const content =
-            assetUrlMap.size > 0 && p.content
-              ? rewriteUrls(p.content, assetUrlMap)
-              : p.content;
-
-          const newPage = await tx.wikiPage.create({
-            data: {
-              spaceId: newSpace.id,
-              title: p.title,
-              content: toJsonValue(content),
-              icon: p.icon,
-              position: p.position,
-              parentId: null,
-              createdById: userMapper.resolve(p.createdByRef ?? ""),
-            },
-          });
-          idMapper.set(p._originalId, newPage.id);
-          spacePageIds.set(p._originalId, newPage.id);
-          counts.wikiPages++;
-
-          // Comments
-          for (const c of p.comments) {
-            await tx.wikiPageComment.create({
-              data: {
-                pageId: newPage.id,
-                authorId: userMapper.resolve(c.authorRef ?? ""),
-                body: c.body,
-                resolved: c.resolved,
-                highlightId: c.highlightId,
-                selectionStart: toJsonValue(c.selectionStart),
-                selectionEnd: toJsonValue(c.selectionEnd),
-                createdAt: new Date(c.createdAt),
-              },
-            });
-            counts.wikiComments++;
-          }
-        }
-
-        // Second pass: set parentId for pages that have a parentRef
-        for (const p of wsEntry.pages) {
-          if (!p.parentRef) continue;
-          const newPageId = spacePageIds.get(p._originalId);
-          const newParentId = spacePageIds.get(p.parentRef);
-          if (!newPageId || !newParentId) {
-            warnings.push(
-              `Skipped parent link for wiki page "${p.title}" — parent ref ${p.parentRef} not found`,
-            );
-            continue;
-          }
-          await tx.wikiPage.update({
-            where: { id: newPageId },
-            data: { parentId: newParentId },
-          });
-        }
-      }
-    },
-    { timeout: 120_000 },
-  ).catch(discardStagedAssets);
-
-  return {
-    ...counts,
-    userMappings: userMapper.getMappings().map((m) => ({
-      originalEmail: m.originalEmail,
-      originalName: m.originalName,
-      mappedUserId: m.resolvedId,
-      mappedName: m.resolvedName,
-    })),
-    warnings,
-  };
+      // Members are read under the lock that membership changes also take.
+      const target = await loadTarget(tx, workspaceId, adminUserId, assetUrls);
+      const writer = new BatchWriter(tx);
+      const summary = await runPlan(backup, target, assetPlan, newRowId, (row) => writer.add(row));
+      await writer.flush();
+      return summary;
+    }, RESTORE_TRANSACTION);
+  } catch (error) {
+    if (storage) await discardStagedAssets(prisma, storage, paths);
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2028")
+      throw new AppError(
+        503,
+        "Service Unavailable",
+        "The restore did not finish in time and nothing was restored. Please try again.",
+      );
+    throw error;
+  }
 }

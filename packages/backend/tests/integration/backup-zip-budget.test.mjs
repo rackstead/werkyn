@@ -307,7 +307,15 @@ test("hostile backup archives get a 400 from a memory-limited server process", a
   }
   assert.equal(code, 0, stderr.slice(-400));
   assert.equal(results.get("legit preview").body.data.images, 2);
-  assert.equal(results.get("at-limits preview").body.data.images, 10_000 - 16);
+  // No page uses the at-limits files, so restore would not write them.
+  assert.equal(results.get("at-limits preview").body.data.images, 0);
+  assert.ok(
+    results
+      .get("at-limits preview")
+      .body.data.warnings.includes(
+        `${10_000 - 16} file(s) in the archive are not used by any wiki page and were not restored`,
+      ),
+  );
   // The 520 MiB entry was refused without being inflated.
   const rssGrowth =
     results.get("honest-huge restore").maxRssMiB - results.get("deep-name restore").maxRssMiB;

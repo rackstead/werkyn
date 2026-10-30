@@ -22,7 +22,8 @@
   "packageManager": "pnpm@9.15.0",
   "pnpm": {
     "overrides": {
-      "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.2"
+      "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.2",
+      "@prisma/config@6.19.3>deepmerge-ts": "8.0.2"
     }
   }
 }

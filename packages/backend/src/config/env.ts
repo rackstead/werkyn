@@ -4,7 +4,7 @@ import { logger } from "../utils/logger.js";
 function wholeNumber(name: string, fallback: number, min: number, max: number) {
   const range = `${name} must be a whole number from ${min} to ${max}`;
   return z.coerce
-    .number({ invalid_type_error: range })
+    .number({ error: range })
     .int(range)
     .min(min, range)
     .max(max, range)
@@ -15,18 +15,14 @@ const port = (name: string, fallback: number) => wholeNumber(name, fallback, 1, 
 
 function flag(name: string) {
   return z
-    .enum(["true", "false"], {
-      errorMap: () => ({ message: `${name} must be "true" or "false"` }),
-    })
+    .enum(["true", "false"], { error: `${name} must be "true" or "false"` })
     .optional();
 }
 
 // zod's default enum message repeats the received value; name the choices
 // instead so a secret pasted into the wrong variable is never logged.
 function oneOf<const T extends [string, ...string[]]>(name: string, values: T) {
-  return z.enum(values, {
-    errorMap: () => ({ message: `${name} must be one of: ${values.join(", ")}` }),
-  });
+  return z.enum(values, { error: `${name} must be one of: ${values.join(", ")}` });
 }
 
 function parseHttpUrl(value: string): URL | undefined {
@@ -47,7 +43,7 @@ const frontendUrl = z
     const url = parseHttpUrl(value.trim());
     if (!url || url.search || url.hash || /[?#]/.test(value)) {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         message:
           "FRONTEND_URL must be an absolute http(s) URL without credentials, query or fragment",
       });
@@ -63,14 +59,14 @@ const corsOrigins = z
   .transform((value, ctx) => {
     const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
     if (entries.length === 0) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "CORS_ORIGIN must list at least one origin" });
+      ctx.addIssue({ code: "custom", message: "CORS_ORIGIN must list at least one origin" });
       return z.NEVER;
     }
     const origins: string[] = [];
     for (const entry of entries) {
       if (entry === "*") {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: "custom",
           message: 'CORS_ORIGIN="*" is not allowed with credentialed requests; list explicit origins',
         });
         continue;
@@ -78,7 +74,7 @@ const corsOrigins = z
       const url = parseHttpUrl(entry);
       if (!url || url.pathname !== "/" || url.search || url.hash || /[?#]/.test(entry)) {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: "custom",
           message:
             "CORS_ORIGIN entries must be comma-separated http(s) origins such as https://app.example.com",
         });
@@ -92,8 +88,7 @@ const corsOrigins = z
 
 const DATABASE_PROTOCOLS = new Set(["postgresql:", "postgres:", "prisma:", "prisma+postgres:"]);
 
-const databaseUrl = z
-  .string({ required_error: "DATABASE_URL is required" })
+const databaseUrl = z.string({ error: "DATABASE_URL is required" })
   .min(1, "DATABASE_URL is required")
   .refine((value) => {
     try {
@@ -121,10 +116,9 @@ const envSchema = z.object({
 
   DATABASE_URL: databaseUrl,
 
-  JWT_SECRET: z.string({ required_error: "JWT_SECRET is required" }).min(1, "JWT_SECRET is required"),
+  JWT_SECRET: z.string({ error: "JWT_SECRET is required" }).min(1, "JWT_SECRET is required"),
 
-  COOKIE_SECRET: z
-    .string({ required_error: "COOKIE_SECRET is required" })
+  COOKIE_SECRET: z.string({ error: "COOKIE_SECRET is required" })
     .min(1, "COOKIE_SECRET is required"),
   COOKIE_DOMAIN: z
     .string()
@@ -166,7 +160,7 @@ const envSchema = z.object({
       : values.COOKIE_SECURE === "true";
   if (values.COOKIE_SAMESITE === "none" && !secure) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["COOKIE_SAMESITE"],
       message: "COOKIE_SAMESITE=none requires COOKIE_SECURE=true",
     });
@@ -179,7 +173,7 @@ const envSchema = z.object({
       /^(?:change-me|your-secret|your-cookie)/i.test(values[name])
     ) {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: [name],
         message: "Use a unique random secret of at least 32 characters in production",
       });

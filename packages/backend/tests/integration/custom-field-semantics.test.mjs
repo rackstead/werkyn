@@ -354,6 +354,13 @@ test("option and value caps are enforced, and an options edit at the caps stays 
     ["201 values", () => req("PUT", valueUrl(tasks[0], wide), { value: [...all, "extra"] })],
     ["201 options on update", () => req("PATCH", fieldUrl(wide), { options: [...caps, { value: "extra" }] })],
   ]);
+  // The cap names itself (PR97), also for a list far over it, which is refused
+  // on its length without checking each element.
+  for (const value of [[...all, "extra"], Array(300_000).fill(0)]) {
+    const tooMany = await req("PUT", valueUrl(tasks[0], wide), { value });
+    assert.equal(tooMany.statusCode, 400, tooMany.body);
+    assert.deepEqual(tooMany.json().details, [{ field: "value", message: "A MULTI_SELECT value can list at most 200 options" }]);
+  }
 
   // Worst case at the caps: every option renamed, so every element of every value changes.
   const renamedOptions = caps.map((option) => ({ value: option.value.replace(/x$/, "y") }));

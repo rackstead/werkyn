@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
+import type { z } from "zod";
 import { UpdateEmailConfigSchema, type UpdateEmailConfigInput } from "@pm/shared";
 import { useEmailConfig, useUpdateEmailConfig, useSendTestEmail } from "../email-api";
 import { ApiError } from "@/lib/api-client";
@@ -16,12 +17,14 @@ export function EmailSettings() {
   const sendTest = useSendTestEmail();
   const config = configRes?.data;
 
+  // The port field is coerced, so the form holds Zod 4's `unknown` input type
+  // and submits the parsed values.
   const {
     register,
     handleSubmit,
     reset,
     formState: { errors, isDirty },
-  } = useForm<UpdateEmailConfigInput>({
+  } = useForm<z.input<typeof UpdateEmailConfigSchema>, unknown, UpdateEmailConfigInput>({
     resolver: zodResolver(UpdateEmailConfigSchema),
     defaultValues: {
       host: "",

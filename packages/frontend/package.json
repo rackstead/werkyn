@@ -21,7 +21,7 @@
     "@fullcalendar/daygrid": "^6.1.20",
     "@fullcalendar/interaction": "^6.1.20",
     "@fullcalendar/react": "^6.1.20",
-    "@hookform/resolvers": "^3.9.1",
+    "@hookform/resolvers": "^5.9.2",
     "@mantine/core": "^8.3.14",
     "@pm/shared": "workspace:*",
     "@radix-ui/react-label": "^2.1.2",
@@ -51,7 +51,7 @@
     "tailwind-merge": "^3.0.1",
     "tippy.js": "^6.3.7",
     "unicode-emoji-json": "^0.8.0",
-    "zod": "^3.24.1",
+    "zod": "^4.6.7",
     "zustand": "^5.0.3"
   },
   "devDependencies": {

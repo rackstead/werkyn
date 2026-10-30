@@ -70,6 +70,24 @@ export function stripDisallowedControlCharacters(value: string, breakWith = "\n"
   return value.replace(BREAK_CONTROLS, breakWith).replace(MULTILINE_DISALLOWED, "");
 }
 
+// ─── Datetimes ──────────────────────────────────────────
+
+const DATETIME_WITH_SECONDS = z.iso.datetime();
+const DATETIME_TO_THE_MINUTE = z.iso.datetime({ precision: -1 });
+
+/**
+ * An ISO 8601 UTC datetime (`…Z`) with optional seconds and fractions, as Zod
+ * 3's `.datetime()` accepted. Zod 4's default requires the seconds.
+ */
+export function isoDateTime() {
+  return z
+    .string()
+    .refine(
+      (value) => DATETIME_WITH_SECONDS.safeParse(value).success || DATETIME_TO_THE_MINUTE.safeParse(value).success,
+      "Invalid datetime",
+    );
+}
+
 // ─── Numbers ────────────────────────────────────────────
 
 /** The largest value a PostgreSQL integer column holds; positions and counts stay within it. */

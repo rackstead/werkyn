@@ -1,3 +1,7 @@
+// Zod 3 issue wording for API and form errors; must load before any parse.
+import "./zod-messages.js";
+export { zod3CompatibleMessage } from "./zod-messages.js";
+
 // Schemas
 export * from "./schemas/auth.js";
 export * from "./schemas/api-key.js";

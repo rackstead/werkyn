@@ -7,7 +7,7 @@ export const NotificationQuerySchema = z.object({
     .enum(["true", "false"])
     .transform((v) => v === "true")
     .optional()
-    .default("false"),
+    .default(false),
   type: z.string().optional(),
 });
 export type NotificationQueryInput = z.infer<typeof NotificationQuerySchema>;

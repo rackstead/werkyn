@@ -54,8 +54,7 @@ and never held in memory as a whole:
   1 GiB archive budget, plus room for headers and a directory of 10,000
   entries. Beyond that the response is a 413 and the partial file is removed.
 - A request that sends no bytes for 60 seconds, whether before its file part
-  starts or during the file, is dropped (408). An export whose client reads
-  nothing for 60 seconds is dropped too.
+  starts or during the file, is dropped (408).
 - The staged file is removed on every path before the response is sent, so a
   client can start its next backup request as soon as it has the answer.
 - At startup, before the server accepts requests, staged files left by a
@@ -108,35 +107,41 @@ buffer before sending it. Now the archive is written to a staged file,
   next batch or image and removes its file.
 - The finished file is opened, its name removed, and the open file streamed
   to the client with `Content-Length`. Nothing is left on disk whether the
-  download completes or is abandoned, and a client that reads nothing for 60
-  seconds is dropped.
+  download completes or is abandoned. A client that reads nothing for 60
+  seconds is dropped: the download is watched for moving bytes, which stop
+  as soon as the client stops reading. A plain socket timeout would wait about
+  twice as long while a write is pending.
 
 ## Consistency
 
 An export is one consistent snapshot of the workspace, as pg_dump takes it.
-Every content read (projects, statuses, labels, fields, members, tasks,
-channels, messages, wiki spaces and pages, both reads of the pages, and the
-user references) runs in one read-only REPEATABLE READ transaction. Edits
+Every read (projects, statuses, labels, fields, members, tasks, channels,
+messages, wiki spaces and pages, both reads of the pages, the user
+references, and each embedded image's access check) runs in one read-only
+REPEATABLE READ transaction. Edits
 made while an export runs are not in it at all: a dependency reversed, a
 page re-parented or moved to another space, or a status added with a task
 moved into it all export as they were when the export started, so the
 archive never holds a cycle, a page twice, or a task whose status is
 missing.
 
-- Authorization is the exception: the ADMIN check and each embedded image's
-  access are read from current data, outside the snapshot, so a permission
-  removed during the export still applies.
+- The ADMIN check runs on current data immediately before the snapshot
+  opens. Each image's access is then read in the snapshot, so the export
+  copies what the admin could reach when it began, and needs only one
+  database connection (it works with a pool of one).
 - Image files are copied from storage, which has no snapshot. A file deleted
   after its page was read is left out and its URL kept, as a missing file
   always has been.
 - Exports run one at a time per process (the exclusive section), so the
-  snapshot holds one database connection for the build, plus short
-  authorization queries on another. It is closed on success, error,
-  cancellation and refusal, and its rows are never locked, so writers are not
-  blocked.
-- The snapshot may stay open for at most 10 minutes, image copy included.
-  Past that, or if no connection is free within 10 seconds, the export fails
-  with the retryable 409 and leaves no file.
+  snapshot holds one database connection for the build. It is closed on
+  success, error, cancellation and refusal, and its rows are never locked, so
+  writers are not blocked.
+- An export may take at most 10 minutes, image copy included, and the
+  snapshot is bounded a little above that. At the deadline, or as soon as the
+  client leaves, the export stops whatever it is waiting for, including a
+  storage read that has stalled, removes its file and closes the snapshot.
+  A deadline, or no free connection within 10 seconds, answers with the
+  retryable 409.
 - If a page ever referred to an image URL that the image copy had not
   examined, the export would be refused with a 409 rather than written with a
   missing file. With one snapshot this cannot happen; it remains as a guard.
@@ -193,10 +198,12 @@ are 16 MiB, 196 MiB in all) over HTTP from a fresh server process with a
 | Export | Peak RSS growth | Peak heap | Time | Archive |
 |---|---|---|---|---|
 | Before | 704 MiB (187 → 891) | 87 MiB (+39) | 7.4 s | 196.1 MiB, `backup.json` 17,001,365 bytes |
-| After | 28 MiB (220 → 248) | 68 MiB (+23) | 8.6 s | 196.1 MiB, `backup.json` 17,002,123 bytes |
+| After | 75 MiB (185 → 260) | 69 MiB (+20) | 7.8 s | 196.1 MiB, `backup.json` 17,002,123 bytes |
 
 Both archives hold 1,513 entries, 6,000 tasks, 20,000 messages and 500 pages.
-`backup.json` grew by the scope fields.
+`backup.json` grew by the scope fields. The "after" row is the final code,
+with the database snapshot; peak RSS varies between runs of the same code
+(237 to 260 MiB), peak heap less (66 to 69 MiB).
 
 ## Behavior changes
 
@@ -269,11 +276,19 @@ batches:
   space, and a new status with a task moved into it each export as they were
   before the edit, and the archive previews and restores with matching counts
   and no warnings;
-- a page that gains an image while images are copied exports as it was.
+- a page that gains an image while images are copied exports as it was;
+- an export with images completes through a pool of one connection;
+- a storage read that never delivers a byte is cut off by a client abort
+  (cancelled) and by the deadline (409), within seconds, with the stalled
+  stream destroyed and no open transaction or file left.
 
 On the code before the snapshot, the four edit scenarios exported a cycle,
 a page twice or a missing status, and the isolation check read `read
-committed`.
+committed`. Before the stop signal, the one-connection export timed out
+waiting for a second connection and the stalled read never ended.
+`tests/backup-staging.test.mjs` checks that a download whose client reads
+nothing is dropped after the idle timeout itself, and a slow but steady one
+never is.
 
 On the previous code all five integration tests and both unit test files fail.
 The existing backup suites (SEC-009, SEC-025, SEC-028 and restore tests) pass

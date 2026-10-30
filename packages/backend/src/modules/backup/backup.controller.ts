@@ -15,6 +15,7 @@ import {
   BACKUP_TRANSFER_LIMITS,
   backupStagingDir,
   receiveBackupUpload,
+  watchIdle,
   type StagedUpload,
 } from "./backup-staging.js";
 import { env } from "../../config/env.js";
@@ -60,14 +61,16 @@ export async function exportHandler(
     await file.dispose();
   }
   const sent = responseEnded(reply);
-  // A client that stops reading is dropped after the idle timeout, which
+  // A client that reads nothing for the idle timeout is dropped, which
   // destroys the stream and ends this request.
-  reply.raw.setTimeout(BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () => reply.raw.destroy());
+  const download = watchIdle(handle.createReadStream(), BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () =>
+    reply.raw.destroy(),
+  );
   reply
     .header("Content-Type", "application/zip")
     .header("Content-Length", String(file.size))
     .header("Content-Disposition", formatContentDisposition(filename))
-    .send(handle.createReadStream());
+    .send(download);
   // Hold the admission until the download has finished or been abandoned.
   await sent;
   return reply;

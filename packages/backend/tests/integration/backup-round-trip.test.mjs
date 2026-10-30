@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { after, before, test } from "node:test";
 
 if (!process.env.TEST_DATABASE_URL)
@@ -59,6 +60,15 @@ function upload(workspaceId, action, zip) {
     "content-type": `multipart/form-data; boundary=${boundary}`,
   });
 }
+
+/** Sessions of this database left inside a transaction. */
+const openTransactions = async () =>
+  Number(
+    (
+      await app.prisma.$queryRaw`SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE datname = current_database() AND state LIKE 'idle in transaction%'`
+    )[0].n,
+  );
 
 const stagedFiles = async () =>
   (await readdir(path.join(storageDir, ".tmp", "backup")).catch(() => [])).filter((name) =>
@@ -608,13 +618,6 @@ test("an export reads one read-only repeatable-read snapshot and always closes i
 
   // Over the limits, cancelled, or failing: the snapshot is rolled back and
   // the partial archive removed.
-  const openTransactions = async () =>
-    Number(
-      (
-        await app.prisma.$queryRaw`SELECT count(*)::int AS n FROM pg_stat_activity
-          WHERE datname = current_database() AND state LIKE 'idle in transaction%'`
-      )[0].n,
-    );
   const parsed = BackupExportRequestSchema.parse(request);
   await assert.rejects(
     exportBackup(app.prisma, source.id, parsed, app.storage, admin.id, undefined, {
@@ -850,4 +853,58 @@ test("a wiki page edited while images are copied is exported as it was when the 
   } finally {
     await file.dispose();
   }
+});
+
+test("an export needs one database connection, images included", { timeout: 60_000 }, async () => {
+  const { PrismaClient } = await import("@prisma/client");
+  const url = new URL(process.env.TEST_DATABASE_URL);
+  url.searchParams.set("connection_limit", "1");
+  url.searchParams.set("pool_timeout", "5");
+  const single = new PrismaClient({ datasources: { db: { url: url.toString() } } });
+  try {
+    const request = BackupExportRequestSchema.parse({ wikiSpaces: [{ spaceId: fixture.space.id }], includeFiles: true });
+    const { file } = await exportBackup(single, source.id, request, app.storage, admin.id);
+    try {
+      const contents = await readBackupArchive(file.path);
+      assert.equal(contents.assets.size, 2);
+    } finally {
+      await file.dispose();
+    }
+  } finally {
+    await single.$disconnect();
+  }
+});
+
+test("a stalled image read is cut off by a client abort or the deadline", { timeout: 60_000 }, async () => {
+  const { EXPORT_TOO_SLOW_MESSAGE } = await import("../../src/modules/backup/backup.service.ts");
+  // Storage that opens each image and then never delivers a byte.
+  const streams = [];
+  const storage = Object.create(app.storage);
+  storage.openReadStream = async () => {
+    const stream = new Readable({ read() {} });
+    streams.push(stream);
+    return stream;
+  };
+  const request = BackupExportRequestSchema.parse({ wikiSpaces: [{ spaceId: fixture.space.id }], includeFiles: true });
+
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 300);
+  let started = Date.now();
+  await assert.rejects(
+    exportBackup(app.prisma, source.id, request, storage, admin.id, undefined, undefined, { signal: controller.signal }),
+    { message: "The backup request was cancelled" },
+  );
+  assert.ok(Date.now() - started < 5_000, `${Date.now() - started} ms`);
+
+  started = Date.now();
+  await assert.rejects(
+    exportBackup(app.prisma, source.id, request, storage, admin.id, undefined, undefined, { timeoutMs: 500 }),
+    { statusCode: 409, message: EXPORT_TOO_SLOW_MESSAGE },
+  );
+  assert.ok(Date.now() - started < 5_000, `${Date.now() - started} ms`);
+
+  assert.equal(streams.length, 2);
+  for (const stream of streams) assert.ok(stream.destroyed, "the stalled read was destroyed");
+  assert.equal(await openTransactions(), 0);
+  assert.deepEqual(await stagedFiles(), []);
 });

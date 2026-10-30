@@ -42,10 +42,24 @@ const FIRST_BATCH = 50;
 /** Later queries of a list read about this much `backup.json` text each. */
 const BATCH_TARGET_CHARS = 4 * 1024 * 1024;
 /**
- * How long an export may keep its database snapshot open, image copy
- * included. An export that takes longer fails with a retryable 409.
+ * How long an export may take, image copy included; its database snapshot
+ * stays open that long at most. An export that takes longer fails with a
+ * retryable 409.
  */
-export const EXPORT_SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
+export const EXPORT_TIMEOUT_MS = 10 * 60_000;
+
+export const EXPORT_TOO_SLOW_MESSAGE =
+  "The export took longer than allowed. Try again, or export fewer projects, channels or wiki spaces.";
+
+/** The reason an export's deadline passed. */
+class ExportDeadlineError extends Error {}
+
+/** The error an export stopped by `signal` fails with. */
+function stopError(signal: AbortSignal): Error {
+  return signal.reason instanceof ExportDeadlineError
+    ? new ConflictError(EXPORT_TOO_SLOW_MESSAGE)
+    : new BackupRequestAbortedError();
+}
 
 /** The snapshot every content read of an export goes through. */
 type Snapshot = Prisma.TransactionClient;
@@ -65,6 +79,8 @@ export interface BackupExportOptions {
   signal?: AbortSignal;
   /** Most rows per query; tests use small batches. */
   batchSize?: number;
+  /** How long the export may take; tests use short deadlines. */
+  timeoutMs?: number;
 }
 
 export const WIKI_CHANGED_MESSAGE =
@@ -84,26 +100,47 @@ class ExportArchive {
   private readonly archive = archiver("zip", { zlib: { level: 6 } });
   private readonly output: WriteStream;
   private readonly written: Promise<void>;
-  private readonly failed: Promise<never>;
+  /** Why the archive failed or was stopped; every later wait fails with it. */
+  private failure: Error | undefined;
+  /** Rejecters of the waits in progress, removed as each settles. */
+  private readonly waiting = new Set<(error: Error) => void>();
+  private isStopped = false;
   private current: Readable | undefined;
 
+  /**
+   * `stop` ends the export at once, whatever it is waiting for: the stream
+   * being copied is destroyed, so a stalled storage read cannot hold it.
+   */
   constructor(
     readonly file: string,
     private readonly budget: BackupExportBudget,
+    stop: AbortSignal,
   ) {
     this.output = createWriteStream(file, { flags: "wx", mode: 0o600 });
     this.written = pipeline(this.archive, this.output);
-    this.failed = new Promise<never>((_, reject) => {
-      this.archive.on("error", reject);
-      this.archive.on("warning", reject);
-      this.written.catch(reject);
-    });
-    this.failed.catch(() => {});
+    const fail = (error: Error) => this.fail(error);
+    this.archive.on("error", fail);
+    this.archive.on("warning", fail);
+    this.written.catch(fail);
+    const onStop = () => {
+      this.isStopped = true;
+      this.current?.destroy();
+      this.fail(stopError(stop));
+    };
+    if (stop.aborted) onStop();
+    else stop.addEventListener("abort", onStop, { once: true });
+  }
+
+  private fail(error: Error) {
+    if (this.failure) return;
+    this.failure = error;
+    for (const reject of this.waiting) reject(error);
+    this.waiting.clear();
   }
 
   /**
    * Resolves when archiver has written the entry appended next. A failure is
-   * reported through `failed`; this promise may outlive the wait for it.
+   * reported through `fail`; this promise may outlive the wait for it.
    */
   private nextEntry(): Promise<unknown> {
     const entry = once(this.archive, "entry");
@@ -111,9 +148,40 @@ class ExportArchive {
     return entry;
   }
 
-  /** Wait for `promise`, or fail as soon as the archive does. */
-  private race<T>(promise: Promise<T>): Promise<T> {
-    return Promise.race([promise, this.failed]);
+  /**
+   * Wait for `promise`, or fail as soon as the archive fails or is stopped.
+   * Nothing is kept once the wait settles (a Promise.race against a promise
+   * that stays pending would keep every result until the export ends).
+   */
+  race<T>(promise: Promise<T>): Promise<T> {
+    if (this.failure) {
+      promise.catch(() => {});
+      return Promise.reject(this.failure);
+    }
+    return new Promise<T>((resolve, reject) => {
+      this.waiting.add(reject);
+      promise.then(
+        (value) => {
+          this.waiting.delete(reject);
+          resolve(value);
+        },
+        (error: unknown) => {
+          this.waiting.delete(reject);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /** Wait for a stream to open; one that opens after the export stopped is closed. */
+  opened(opening: Promise<Readable>): Promise<Readable> {
+    opening.then(
+      (stream) => {
+        if (this.isStopped) stream.destroy();
+      },
+      () => {},
+    );
+    return this.race(opening);
   }
 
   /** Append `source` as `name`, counting its bytes, and wait until it is written. */
@@ -278,11 +346,11 @@ class BatchSizer {
 async function* batches<T extends Position>(
   read: (page: { where: object; take: number }) => Promise<T[]>,
   sizer: BatchSizer,
-  signal?: AbortSignal,
+  checkStopped: () => void,
 ): AsyncGenerator<T[]> {
   let last: Position | undefined;
   for (;;) {
-    if (signal?.aborted) throw new BackupRequestAbortedError();
+    checkStopped();
     const take = sizer.size;
     const rows = await read({
       take,
@@ -309,11 +377,11 @@ async function* batches<T extends Position>(
  * `backup.json` are measured against the restore limits as they are written,
  * and an export that would exceed them stops with a 400 and leaves no file.
  *
- * Every content read runs in one read-only REPEATABLE READ transaction, so the
- * archive is one consistent snapshot of the workspace, as pg_dump takes it:
- * edits made during the export are not in it at all. Authorization is checked
- * against current data, outside the snapshot, so a permission removed during
- * the export still applies.
+ * Every read runs in one read-only REPEATABLE READ transaction, so the archive
+ * is one consistent snapshot of the workspace, as pg_dump takes it: edits made
+ * during the export are not in it at all. The ADMIN check runs on current data
+ * just before the snapshot opens; each image's access is then read in the
+ * snapshot, so the export needs one database connection only.
  */
 export async function exportBackup(
   prisma: PrismaClient,
@@ -326,14 +394,18 @@ export async function exportBackup(
   options: BackupExportOptions = {},
 ): Promise<BackupExportResult> {
   await assertBackupExportAccess(prisma, workspaceId, actorId);
-  const { signal } = options;
   const maxBatch = options.batchSize ?? EXPORT_BATCH;
-  const checkAborted = () => {
-    if (signal?.aborted) throw new BackupRequestAbortedError();
+  const timeoutMs = options.timeoutMs ?? EXPORT_TIMEOUT_MS;
+  // The client leaving or the deadline passing stops the export at once.
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new ExportDeadlineError()), timeoutMs);
+  const stop = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+  const checkStopped = () => {
+    if (stop.aborted) throw stopError(stop);
   };
 
   const file = await stagingPath("export", options.stagingDir ?? backupStagingDir(env.STORAGE_DIR));
-  const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits));
+  const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits), stop);
   let workspace: { name: string; slug: string };
   let size: number;
   try {
@@ -346,23 +418,26 @@ export async function exportBackup(
           select: { name: true, slug: true },
         });
         const assets = request.includeFiles
-          ? await archiveWikiAssets(db, prisma, workspaceId, request, storage, actorId, archive, maxBatch, checkAborted)
+          ? await archiveWikiAssets(db, workspaceId, request, storage, actorId, archive, maxBatch, checkStopped)
           : undefined;
         await archive.appendJson((write) =>
-          writeBackupJson(db, workspaceId, current, request, assets, write, maxBatch, signal),
+          writeBackupJson(db, workspaceId, current, request, assets, write, maxBatch, checkStopped),
         );
         return current;
       },
       {
         isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
         maxWait: 10_000,
-        timeout: EXPORT_SNAPSHOT_TIMEOUT_MS,
+        // A little longer than the export's own deadline, which ends it first.
+        timeout: timeoutMs + 5_000,
       },
     );
     size = await archive.finish();
   } catch (error) {
     await archive.discard();
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 
   const filename = `backup-${workspace.slug}-${new Date().toISOString().slice(0, 10)}.zip`;
@@ -380,18 +455,17 @@ interface ArchivedAssets {
  * Copy every authorized image the selected wiki pages embed into the archive
  * and return the rewrite from each copied URL to its archive path. Pages are
  * read here from the snapshot for their content only; `backup.json` reads the
- * same snapshot again. `authority` checks access against current data.
+ * same snapshot again. Each image's access is checked in the snapshot too.
  */
 async function archiveWikiAssets(
   db: Snapshot,
-  authority: PrismaClient,
   workspaceId: string,
   request: BackupExportRequest,
   storage: StorageProvider,
   actorId: string,
   archive: ExportArchive,
   maxBatch: number,
-  checkAborted: () => void,
+  checkStopped: () => void,
 ): Promise<ArchivedAssets> {
   const allStorageUrls = new Set<string>();
   for (const opt of request.wikiSpaces) {
@@ -410,8 +484,8 @@ async function archiveWikiAssets(
           take,
         }),
       sizer,
+      checkStopped,
     )) {
-      checkAborted();
       let chars = 0;
       for (const page of pages) {
         if (page.content) {
@@ -428,9 +502,9 @@ async function archiveWikiAssets(
   const archived = new Map<string, string>();
   const usedNames = new Set<string>();
   for (const url of allStorageUrls) {
-    checkAborted();
-    const ctx = await assertBackupExportAccess(authority, workspaceId, actorId);
-    const storagePaths = await resolveBackupAssetPaths(authority, ctx, url);
+    checkStopped();
+    const ctx = await assertBackupExportAccess(db, workspaceId, actorId);
+    const storagePaths = await resolveBackupAssetPaths(db, ctx, url);
     for (const storagePath of storagePaths) {
       const known = archived.get(storagePath);
       if (known) {
@@ -444,10 +518,11 @@ async function archiveWikiAssets(
         // A missing literal spelling of URI syntax must not become a read.
         if (
           (storagePaths.length > 1 || /[%?#]/.test(url)) &&
-          !(await storage.exists(storagePath))
+          !(await archive.race(storage.exists(storagePath)))
         ) continue;
-        source = await storage.openReadStream(storagePath);
+        source = await archive.opened(storage.openReadStream(storagePath));
       } catch {
+        checkStopped();
         // File not found on disk — skip, leave original URL in JSON
         continue;
       }
@@ -473,7 +548,7 @@ async function writeBackupJson(
   assets: ArchivedAssets | undefined,
   write: (text: string) => Promise<void>,
   maxBatch: number,
-  signal?: AbortSignal,
+  checkStopped: () => void,
 ) {
   const json = new PrettyJsonWriter(write);
   // Collect all user IDs referenced across the backup
@@ -593,7 +668,7 @@ async function writeBackupJson(
             take,
           }),
         sizer,
-        signal,
+        checkStopped,
       )) {
         const start = json.written;
         for (const t of dbTasks) {
@@ -717,7 +792,7 @@ async function writeBackupJson(
             take,
           }),
         sizer,
-        signal,
+        checkStopped,
       )) {
         const start = json.written;
         for (const m of dbMessages) {
@@ -779,7 +854,7 @@ async function writeBackupJson(
           take,
         }),
       sizer,
-      signal,
+      checkStopped,
     )) {
       const start = json.written;
       for (const p of dbPages) {
@@ -845,7 +920,7 @@ async function writeBackupJson(
   // ─── Metadata and user references ─────────────────────
   // Written last: it lists every user the content above refers to.
 
-  if (signal?.aborted) throw new BackupRequestAbortedError();
+  checkStopped();
   const userRefs = await db.user.findMany({
     where: { id: { in: Array.from(userIdSet) } },
     select: { id: true, email: true, displayName: true },

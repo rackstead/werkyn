@@ -36,7 +36,9 @@ writing anything.
    (`backup-json.ts`), the whole file is checked. Anything restore refuses is
    refused here, before any file or row is written.
 2. **Write the files.** Only archive files that some wiki page refers to are
-   kept. Each one gets a new storage path. Every path is first added to the
+   kept. At each `assets/` in a page's text, the longest archive path that
+   starts there is the one referred to, so a file named like the start of
+   another never takes its place. Each one gets a new storage path. Every path is first added to the
    durable cleanup queue (`BlobCleanup`, see `services/blob-cleanup.ts`), due
    one hour later. Then the files are written. If a write fails, everything
    written so far is removed and the restore stops with the storage error.
@@ -145,10 +147,11 @@ repaired as described, whatever its version.
   (create or update) still fails with a 500 from Prisma ("recursion limit
   exceeded"). Nothing is written. It is in the wiki module and the shared
   page schema, outside this change.
-- Rewriting asset paths in page content checks each string that contains
-  `assets/` against every archive file. That is fast for exports, but an
-  archive crafted with many files and many such strings still costs time
-  proportional to the two counts multiplied (as before).
+- Rewriting asset paths in page content looks at each `assets/` in a string
+  and tries the archive paths of each distinct length, longest first. That is
+  fast for exports, whose file names have few lengths. An archive crafted with
+  files of many lengths and content full of `assets/` still costs time
+  proportional to both counts multiplied, about as before.
 - Export completeness, streaming, transport and concurrent backup requests
   are handled separately (B03 export side).
 

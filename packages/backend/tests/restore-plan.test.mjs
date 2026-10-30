@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BackupFileSchema } from "@pm/shared";
 
-const { scopePositions, uniqueNames, rewriteAssetPaths, planRestore, mapUsers, emptyCounts } =
+const { scopePositions, uniqueNames, assetMatcher, rewriteAssetPaths, planRestore, mapUsers, emptyCounts } =
   await import("../src/modules/backup/restore-plan.ts");
 const { validateBackup, isStorableText, MAX_RESTORE_JSON_DEPTH } = await import(
   "../src/modules/backup/restore-validation.ts"
@@ -47,31 +47,46 @@ test("repeated names get the first free numbered suffix within the column length
   assert.equal(Array.from(result.names[1]).length, 10);
 });
 
-test("asset paths are rewritten in archive order and untouched values are shared", () => {
+test("asset paths are rewritten longest first and untouched values are shared", () => {
   const content = [
     { type: "image", props: { url: "assets/a.png" } },
     { type: "paragraph", content: [{ text: "See assets/b.png and assets/a.png" }] },
     { untouched: { deep: ["no files here"] } },
   ];
   const hits = new Set();
-  const rewritten = rewriteAssetPaths(
-    content,
-    [
+  const matcher = assetMatcher(
+    new Map([
       ["assets/a.png", "/storage/a"],
       ["assets/c.png", "/storage/c"],
-    ],
-    hits,
+    ]),
   );
+  const rewritten = rewriteAssetPaths(content, matcher, hits);
   assert.deepEqual([...hits], ["assets/a.png"]);
   assert.equal(rewritten[0].props.url, "/storage/a");
   assert.equal(rewritten[1].content[0].text, "See assets/b.png and /storage/a");
   assert.equal(rewritten[2], content[2]);
   assert.equal(content[0].props.url, "assets/a.png");
-  assert.equal(rewriteAssetPaths(content, []), content);
+  assert.equal(rewriteAssetPaths(content, assetMatcher(new Map())), content);
+
+  // A shorter archive path never consumes part of a longer one, in either
+  // archive order.
+  for (const order of [
+    ["assets/a", "assets/a.png"],
+    ["assets/a.png", "assets/a"],
+  ]) {
+    const urls = new Map(order.map((p) => [p, `/storage/${p.slice(7)}`]));
+    const found = new Set();
+    const text = rewriteAssetPaths("x assets/a.png y assets/a z assets/ab", assetMatcher(urls), found);
+    assert.equal(text, "x /storage/a.png y /storage/a z /storage/ab");
+    assert.deepEqual([...found].sort(), ["assets/a", "assets/a.png"]);
+    const only = new Set();
+    rewriteAssetPaths(["assets/a.png"], assetMatcher(urls), only);
+    assert.deepEqual([...only], ["assets/a.png"]);
+  }
 
   // A "__proto__" member stays an ordinary member.
   const proto = JSON.parse('{"__proto__": "assets/a.png", "x": 1}');
-  const out = rewriteAssetPaths(proto, [["assets/a.png", "/storage/a"]]);
+  const out = rewriteAssetPaths(proto, matcher);
   assert.equal(Object.getPrototypeOf(out), Object.prototype);
   assert.deepEqual(Object.getOwnPropertyDescriptor(out, "__proto__").value, "/storage/a");
   assert.equal(JSON.stringify(out), '{"__proto__":"/storage/a","x":1}');

@@ -182,34 +182,58 @@ function uniqueSlug(name: string, taken: Set<string>) {
   return slug;
 }
 
+/** Archive paths with their URLs, and the distinct path lengths, longest first. */
+export interface AssetMatcher {
+  urls: ReadonlyMap<string, string>;
+  lengths: number[];
+}
+
+export function assetMatcher(urls: ReadonlyMap<string, string>): AssetMatcher {
+  const lengths = [...new Set([...urls.keys()].map((p) => p.length))].sort((a, b) => b - a);
+  return { urls, lengths };
+}
+
 /**
- * Replaces each archive asset path found in a string with its URL, in archive
- * order (the semantics of rewriteUrls in backup-assets.ts), but skips strings
- * that cannot contain one: every asset path starts with "assets/" and no URL
- * contains it. Returns the same value when nothing changed, and records each
+ * At each "assets/" in `text`, from left to right, replaces the longest
+ * archive path that starts there with its URL and continues after it, so a
+ * path never consumes part of a longer one ("assets/a" in "assets/a.png").
+ * Every archive path starts with "assets/" and no URL contains it.
+ */
+function rewriteText(text: string, matcher: AssetMatcher, hits?: Set<string>): string {
+  let at = text.indexOf("assets/");
+  if (at < 0) return text;
+  let out = "";
+  let copied = 0;
+  while (at >= 0) {
+    let next = at + 1;
+    for (const length of matcher.lengths) {
+      if (at + length > text.length) continue;
+      const path = text.slice(at, at + length);
+      const url = matcher.urls.get(path);
+      if (url === undefined) continue;
+      out += text.slice(copied, at) + url;
+      copied = next = at + length;
+      hits?.add(path);
+      break;
+    }
+    at = text.indexOf("assets/", next);
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+
+/**
+ * Rewrites archive asset paths in every string of a JSON value (see
+ * rewriteText). Returns the same value when nothing changed, and records each
  * replaced path in `hits`. Recursion is bounded by MAX_RESTORE_JSON_DEPTH.
  */
-export function rewriteAssetPaths(
-  value: unknown,
-  replacements: ReadonlyArray<readonly [string, string]>,
-  hits?: Set<string>,
-): unknown {
-  if (replacements.length === 0) return value;
-  if (typeof value === "string") {
-    if (!value.includes("assets/")) return value;
-    let result = value;
-    for (const [from, to] of replacements) {
-      if (!result.includes(from)) continue;
-      result = result.replaceAll(from, to);
-      hits?.add(from);
-    }
-    return result;
-  }
+export function rewriteAssetPaths(value: unknown, matcher: AssetMatcher, hits?: Set<string>): unknown {
+  if (matcher.urls.size === 0) return value;
+  if (typeof value === "string") return rewriteText(value, matcher, hits);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     let out: unknown[] | undefined;
     value.forEach((item, index) => {
-      const next = rewriteAssetPaths(item, replacements, hits);
+      const next = rewriteAssetPaths(item, matcher, hits);
       if (next === item) return;
       out ??= value.slice();
       out[index] = next;
@@ -219,7 +243,7 @@ export function rewriteAssetPaths(
   let out: Record<string, unknown> | undefined;
   const record = value as Record<string, unknown>;
   for (const key in record) {
-    const next = rewriteAssetPaths(record[key], replacements, hits);
+    const next = rewriteAssetPaths(record[key], matcher, hits);
     if (next === record[key]) continue;
     out ??= { ...record };
     // defineProperty keeps a "__proto__" member an ordinary property.
@@ -267,7 +291,7 @@ export function* planRestore(
   const { workspaceId, adminUserId } = target;
   const memberIds = new Set(target.members.map((m) => m.id));
   const admins = new Set(target.members.filter((m) => m.role === "ADMIN").map((m) => m.id));
-  const assetReplacements = [...target.assetUrls];
+  const assets = assetMatcher(target.assetUrls);
 
   // Field references by project, to tell another project's field from one
   // left out of the export.
@@ -645,7 +669,7 @@ export function* planRestore(
         spaceId,
         parentId: parentOf[i] === null ? null : pageIds.get(parentOf[i]!)!,
         title: p.title,
-        content: json(rewriteAssetPaths(p.content, assetReplacements)),
+        content: json(rewriteAssetPaths(p.content, assets)),
         icon: p.icon,
         position: pagePositions[i],
         createdById: users.resolve(p.createdByRef ?? ""),

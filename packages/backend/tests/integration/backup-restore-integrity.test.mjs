@@ -435,6 +435,31 @@ test("archive files that no page uses are not written", async () => {
   assert.equal((await files()).filter((f) => !beforeFiles.includes(f)).length, 2);
 });
 
+test("a page keeps the file it names when another archive path is a prefix of it", async () => {
+  for (const [index, names] of [
+    ["assets/pic", "assets/pic.png"],
+    ["assets/pic.png", "assets/pic"],
+  ].entries()) {
+    const ws = await workspace(`overlap ${index}`);
+    const file = backup({
+      wikiSpaces: [
+        { space: { name: `Overlap ${index}` }, pages: [page("p", { content: [{ type: "image", props: { url: "assets/pic.png" } }] })] },
+      ],
+    });
+    const assets = Object.fromEntries(names.map((name) => [name, Buffer.from(`bytes of ${name}`)]));
+    const summary = await previewAndRestore(ws.id, file, assets);
+    assert.equal(summary.images, 1);
+    assert.ok(summary.warnings.includes("1 file(s) in the archive are not used by any wiki page and were not restored"));
+    const [restored] = await app.prisma.wikiPage.findMany({
+      where: { space: { workspaceId: ws.id } },
+      select: { content: true },
+    });
+    const url = restored.content[0].props.url;
+    assert.match(url, new RegExp(`^/storage/${ws.id}/uploads/wiki/imports/[0-9a-f-]{36}\\.png$`));
+    assert.equal((await app.storage.read(url.slice("/storage/".length))).toString(), "bytes of assets/pic.png");
+  }
+});
+
 // ─── References ─────────────────────────────────────────
 
 /** Two projects and two channels whose rows point at each other. */

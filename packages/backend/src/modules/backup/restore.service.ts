@@ -11,6 +11,7 @@ import type { BackupArchiveAsset } from "./backup-archive.js";
 import { parseBackupJson } from "./backup-json.js";
 import {
   RESTORE_TABLES,
+  assetMatcher,
   emptyCounts,
   mapUsers,
   planRestore,
@@ -96,8 +97,8 @@ const assetUrl = (storagePath: string) => `/storage/${storagePath}`;
 /**
  * Names a storage path for every `assets/` entry and keeps the ones that a
  * wiki page refers to; the others would be files nothing points at, so they
- * are not written. The URLs used for the check are the ones restore writes,
- * so the result is exactly what the content rewrite will use.
+ * are not written. The check uses the same matcher as the content rewrite,
+ * which then replaces exactly these paths.
  */
 function planAssets(
   workspaceId: string,
@@ -113,10 +114,10 @@ function planAssets(
     planned.push({ assetPath, asset, fileId, ext, storagePath });
   }
   if (planned.length === 0) return { used: [], unused: 0 };
-  const replacements = planned.map((a) => [a.assetPath, assetUrl(a.storagePath)] as const);
+  const matcher = assetMatcher(new Map(planned.map((a) => [a.assetPath, assetUrl(a.storagePath)])));
   const hits = new Set<string>();
   for (const space of backup.wikiSpaces)
-    for (const page of space.pages) rewriteAssetPaths(page.content, replacements, hits);
+    for (const page of space.pages) rewriteAssetPaths(page.content, matcher, hits);
   const used = planned.filter((a) => hits.has(a.assetPath));
   return { used, unused: planned.length - used.length };
 }

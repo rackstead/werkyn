@@ -1,4 +1,5 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { useAuthStore } from "@/stores/auth-store";
 import { RegisterForm } from "@/features/auth/components/register-form";
 import {
   Card,
@@ -15,6 +16,17 @@ const searchSchema = z.object({
 
 export const Route = createFileRoute("/register")({
   validateSearch: searchSchema,
+  // Signing in over a signed-in account would switch accounts without signing
+  // the first one out; a signed-in user continues to the app instead.
+  beforeLoad: ({ search }) => {
+    if (!useAuthStore.getState().accessToken) return;
+    if (search.inviteToken)
+      throw redirect({
+        to: "/invite/$token",
+        params: { token: search.inviteToken },
+      });
+    throw redirect({ to: "/" });
+  },
   component: RegisterPage,
 });
 

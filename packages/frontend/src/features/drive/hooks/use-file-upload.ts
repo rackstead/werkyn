@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { uploadSingleFile, type DriveFile } from "../api";
 import type { UploadItem } from "../components/upload-progress";
 import { toast } from "sonner";
+import { identityGeneration } from "@/lib/identity";
 
 interface UseFileUploadOptions {
   workspaceId: string;
@@ -54,6 +55,10 @@ export function useFileUpload({
       // Snapshot the current folder context at the time the user drops/selects files.
       const uploadParentId = parentIdRef.current ?? null;
       const uploadTeamFolderId = teamFolderIdRef.current;
+      // The files belong to the account that chose them: once the signed-in
+      // account changes, queued files are not uploaded as the next one.
+      const generation = identityGeneration();
+      const sameAccount = () => identityGeneration() === generation;
 
       const items: UploadItem[] = fileList.map((f) => ({
         id: Math.random().toString(36).slice(2) + Date.now().toString(36),
@@ -142,6 +147,17 @@ export function useFileUpload({
         const runNext = async (): Promise<void> => {
           const i = nextIndex++;
           if (i >= fileList.length) return;
+          if (!sameAccount()) {
+            if (mountedRef.current) {
+              setUploads((prev) =>
+                prev.map((u) =>
+                  u.id === items[i].id ? { ...u, status: "error" as const, speed: 0 } : u,
+                ),
+              );
+            }
+            await runNext();
+            return;
+          }
           await uploadOne(fileList[i], items[i]);
           await runNext();
         };
@@ -149,6 +165,7 @@ export function useFileUpload({
         await Promise.all(
           Array.from({ length: Math.min(MAX_CONCURRENT, fileList.length) }, () => runNext()),
         );
+        if (!sameAccount()) return;
 
         // Broad invalidation: sort params in the key mean we can't target
         // a specific sorted query, so invalidate all file queries.

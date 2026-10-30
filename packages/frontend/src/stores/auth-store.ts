@@ -301,11 +301,20 @@ let pendingLogout: Promise<void> | null = null;
  */
 export async function whenLoggedOut(): Promise<void> {
   await (pendingLogout ?? Promise.resolve());
+  await whenCookieRequestsSettle();
+}
+
+/** Waits (bounded) until no tab has a cookie-setting request in flight. */
+async function whenCookieRequestsSettle() {
   const giveUpAt = Date.now() + LOGOUT_TIMEOUT_MS;
   while (Date.now() < Math.min(busyUntil(), giveUpAt)) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
+
+// Counts the sign-outs this tab has made or accepted from another tab. A tab
+// still loading stops trying to restore a session once it sees one.
+let signOuts = 0;
 
 const LOGOUT_REFRESH_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 
@@ -318,10 +327,13 @@ async function revokeSession(
   // Another tab announced a newer sign-in or sign-out: the cookie may now
   // belong to that session, which this sign-out must not touch.
   const overtaken = () => compareEpochs(knownEpoch, logoutEpoch) > 0;
+  // keepalive: the UI is already signed out, so the user may close or reload
+  // the tab at once; the revocation must still reach the server.
   const signOut = (token: string | null) =>
     fetch(apiUrl("auth/logout"), {
       method: "POST",
       credentials: "include",
+      keepalive: true,
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       signal: controller.signal,
     });
@@ -329,6 +341,7 @@ async function revokeSession(
     fetch(apiUrl("auth/refresh"), {
       method: "POST",
       credentials: "include",
+      keepalive: true,
       signal: controller.signal,
     });
   const revoke = async () => {
@@ -388,6 +401,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
   /** Clears the session here and tells other tabs at `epoch` or older. */
   function endSession(epoch: Epoch) {
+    signOuts += 1;
     abortRefreshes();
     lastRefreshTime = 0;
     supersededSince = null;
@@ -402,6 +416,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
     const legacy = !isEpoch(message.epoch);
     if (!acceptEpoch(message.epoch)) return;
     if (message.type === "logout") {
+      signOuts += 1;
       abortRefreshes();
       lastRefreshTime = 0;
       supersededSince = null;
@@ -485,6 +500,10 @@ export const useAuthStore = create<AuthState>((set, get) => {
       if (Date.now() - lastRefreshTime < 5000) {
         return !!get().accessToken;
       }
+      // Without a session here, a sign-out or refresh still running in another
+      // tab decides whether the shared cookie is valid: let it finish first, so
+      // that a cookie about to be revoked does not sign this tab in.
+      if (!get().user) await whenCookieRequestsSettle();
 
       const start: RefreshStart = {
         generation: identityGeneration(),
@@ -550,13 +569,20 @@ export const useAuthStore = create<AuthState>((set, get) => {
     hydrate: async () => {
       let attempts = 0;
       const maxAttempts = 3;
+      const signOutsAtStart = signOuts;
+      // A sign-out announced after this page started loading is final for it:
+      // retrying would sign the account back in, in every tab, if that
+      // sign-out's revocation has not reached the server yet.
+      const signedOutSinceStart = () => signOuts !== signOutsAtStart;
 
       while (attempts < maxAttempts) {
         const success = await get().refresh();
         if (success) break;
         attempts++;
+        if (signedOutSinceStart()) break;
         if (attempts < maxAttempts) {
           await new Promise((r) => setTimeout(r, 1000));
+          if (signedOutSinceStart()) break;
         }
       }
 

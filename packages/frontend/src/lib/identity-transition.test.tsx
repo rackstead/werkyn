@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeWebSocket } from "@/test/fake-websocket";
@@ -31,6 +31,8 @@ import { useNotifications } from "@/features/notifications/api";
 import { useFiles } from "@/features/drive/api";
 import { useSubtasks, useToggleSubtask } from "@/features/subtasks/api";
 import { useRecentFiles } from "@/features/drive/hooks/use-recent-files";
+import { useFileUpload } from "@/features/drive/hooks/use-file-upload";
+import { useBulkTrashFiles } from "@/features/drive/api";
 import { api } from "@/lib/api-client";
 
 // ─── Accounts ───────────────────────────────────────────
@@ -75,6 +77,7 @@ type Handler = (call: Call) => Response | Promise<Response>;
 const handlers = new Map<string, Handler>();
 const calls: Call[] = [];
 const signals: (AbortSignal | null)[] = [];
+const inits: (RequestInit | undefined)[] = [];
 
 function json(status: number, body: unknown) {
   return new Response(status === 204 ? null : JSON.stringify(body), {
@@ -115,7 +118,9 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
   };
   calls.push(call);
   signals.push(init?.signal ?? request.signal);
-  const handler = handlers.get(`${call.method} ${call.path}`);
+  inits.push(init);
+  const handler =
+    handlers.get(`${call.method} ${call.path}`) ?? handlers.get(`${call.method} *`);
   if (!handler) return json(404, { statusCode: 404, message: "Not found" });
   return handler(call);
 });
@@ -279,6 +284,7 @@ beforeEach(() => {
   handlers.clear();
   calls.length = 0;
   signals.length = 0;
+  inits.length = 0;
   announced.length = 0;
   serveDefaults();
   localStorage.clear();
@@ -838,5 +844,171 @@ describe("review follow-ups", () => {
     } finally {
       Object.defineProperty(AbortSignal, "any", { value: original, configurable: true });
     }
+  });
+});
+
+// ─── Independent review, round 2 ────────────────────────
+
+describe("independent review follow-ups", () => {
+  const session = (user: typeof alice, accessToken: string) =>
+    json(200, { data: { user, accessToken, workspaces: [acme] } });
+
+  it("R1: a loading tab does not retry its way back into a session another tab signed out", async () => {
+    const first = deferred<Response>();
+    let refreshes = 0;
+    // The other tab's revocation has not reached the server: the cookie still works.
+    on("POST", "auth/refresh", () => (++refreshes === 1 ? first.promise : session(alice, "alice-token-2")));
+    let hydrated = false;
+    void useAuthStore
+      .getState()
+      .hydrate()
+      .then(() => (hydrated = true));
+    await settle();
+    otherTab.postMessage({ type: "logout", epoch: { at: Date.now(), tab: "other" } });
+    await deliverMessages();
+    first.resolve(session(alice, "alice-token-2"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await deliverMessages();
+    expect(hydrated).toBe(true);
+    expect(refreshes).toBe(1);
+    expect(useAuthStore.getState().user).toBeNull();
+    expect(announced.filter((m) => m.type === "refresh")).toEqual([]);
+  });
+
+  it("R1: a page opened during another tab's revocation waits for it before refreshing", async () => {
+    // Another tab is revoking the session (its sign-out was announced before
+    // this page existed, so this page never received it).
+    localStorage.setItem("pm-auth-busy:other", String(Date.now() + 5000));
+    let revoked = false;
+    let refreshes = 0;
+    on("POST", "auth/refresh", () => {
+      refreshes++;
+      return revoked ? json(401, { statusCode: 401 }) : session(alice, "alice-token-2");
+    });
+    void useAuthStore.getState().hydrate();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(refreshes).toBe(0);
+    revoked = true;
+    localStorage.removeItem("pm-auth-busy:other");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(refreshes).toBeGreaterThan(0);
+    expect(useAuthStore.getState().user).toBeNull();
+    expect(announced.filter((m) => m.type === "refresh")).toEqual([]);
+  });
+
+  it("R1: the tab that signed out stays signed out while another tab is loading", async () => {
+    signIn(alice, "alice-token");
+    vi.resetModules();
+    const tab2 = await import("@/stores/auth-store");
+    const tab2First = deferred<Response>();
+    let refreshes = 0;
+    on("POST", "auth/refresh", () => (++refreshes === 1 ? tab2First.promise : session(alice, "alice-token-2")));
+    // Tab A's revocation is slow: logout is answered only much later.
+    const revocation = deferred<Response>();
+    on("POST", "auth/logout", () => revocation.promise);
+    void tab2.useAuthStore.getState().hydrate();
+    await settle();
+    act(() => void useAuthStore.getState().logout());
+    await deliverMessages();
+    tab2First.resolve(session(alice, "alice-token-2"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    await deliverMessages();
+    expect(useAuthStore.getState().user).toBeNull();
+    expect(tab2.useAuthStore.getState().user).toBeNull();
+    expect(refreshes).toBe(1);
+    revocation.resolve(json(204, null));
+    await settle();
+  });
+
+  it("M4: queued uploads stop when another account signs in", async () => {
+    const sent: { name: string; token: string | null }[] = [];
+    const pending: { respond: () => void }[] = [];
+    class FakeXhr {
+      status = 0;
+      responseText = "";
+      withCredentials = false;
+      upload: { onprogress: unknown } = { onprogress: null };
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      private headers: Record<string, string> = {};
+      open() {}
+      setRequestHeader(name: string, value: string) {
+        this.headers[name] = value;
+      }
+      send(form: FormData) {
+        const name = (form.get("file") as File).name;
+        sent.push({ name, token: this.headers.Authorization?.replace(/^Bearer /, "") ?? null });
+        pending.push({
+          respond: () => {
+            this.status = 201;
+            this.responseText = JSON.stringify({ data: { id: name, name } });
+            this.onload?.();
+          },
+        });
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", FakeXhr);
+    signIn(alice, "alice-token");
+    const { result } = renderHook(() => useFileUpload({ workspaceId: "ws-acme" }), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    });
+    const files = Array.from({ length: 6 }, (_, i) => new File(["x"], `alice-${i}.txt`));
+    act(() => result.current.handleUpload(files));
+    await settle();
+    expect(sent.map((s) => s.token)).toEqual(["alice-token", "alice-token", "alice-token"]);
+    // Bob signs in directly (for example in another tab) while three are sent.
+    signIn(bob, "bob-token");
+    for (const upload of pending.splice(0)) upload.respond();
+    await settle();
+    expect(sent.filter((s) => s.token !== "alice-token")).toEqual([]);
+    expect(sent).toHaveLength(3);
+  });
+
+  it("M1: a bulk trash stops when another account signs in", async () => {
+    signIn(alice, "alice-token");
+    const held: (() => void)[] = [];
+    on("PATCH", "*", () => new Promise<Response>((resolve) => held.push(() => resolve(json(200, { data: {} })))));
+    const { result } = renderHook(() => useBulkTrashFiles("ws-acme"), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    });
+    const fileIds = Array.from({ length: 12 }, (_, i) => `file-${i}`);
+    let outcome: Awaited<ReturnType<typeof result.current.mutateAsync>> | undefined;
+    act(() => {
+      void result.current.mutateAsync(fileIds).then((value) => (outcome = value));
+    });
+    await settle();
+    expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(4);
+    signIn(bob, "bob-token");
+    for (const release of held.splice(0)) release();
+    await settle();
+    const tokens = calls.filter((c) => c.method === "PATCH").map((c) => c.token);
+    expect(tokens).toEqual(["alice-token", "alice-token", "alice-token", "alice-token"]);
+    expect(outcome?.succeeded).toEqual([]);
+    expect(outcome?.failed).toHaveLength(12);
+  });
+
+  it("L1: the revocation survives the page being closed", async () => {
+    signIn(alice, "alice-token");
+    await act(async () => {
+      await useAuthStore.getState().logout();
+    });
+    const logout = calls.findIndex((c) => c.path === "auth/logout");
+    expect(inits[logout]?.keepalive).toBe(true);
   });
 });

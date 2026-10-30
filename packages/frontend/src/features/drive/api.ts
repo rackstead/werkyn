@@ -10,6 +10,8 @@ import { queryClient } from "@/lib/query-client";
 import { useObjectUrl } from "@/lib/use-object-url";
 import { queryKeys } from "@/lib/query-keys";
 import { settleWithConcurrency } from "@/lib/settle-with-concurrency";
+import { IdentityChangedError } from "@/lib/api-error";
+import { identityGeneration } from "@/lib/identity";
 import { useAuthStore } from "@/stores/auth-store";
 import { apiBase } from "@/lib/api-url";
 
@@ -389,7 +391,14 @@ async function runBulkFileAction(
   fileIds: readonly string[],
   request: (fileId: string) => Promise<unknown>,
 ): Promise<BulkFileResult> {
-  const results = await settleWithConcurrency(fileIds, BULK_FILE_CONCURRENCY, request);
+  // The batch belongs to the account that started it: once the signed-in
+  // account changes, the files not yet sent are not sent as the next one.
+  const generation = identityGeneration();
+  const results = await settleWithConcurrency(fileIds, BULK_FILE_CONCURRENCY, (fileId) =>
+    identityGeneration() === generation
+      ? request(fileId)
+      : Promise.reject(new IdentityChangedError()),
+  );
   const outcome: BulkFileResult = { succeeded: [], failed: [] };
   results.forEach((result, i) => {
     if (result.status === "fulfilled") outcome.succeeded.push(fileIds[i]);

@@ -94,6 +94,16 @@ it("re-runs route guards when the account changes", async () => {
   expect(router.state.location.pathname).toBe("/acme");
   expect(workspaceContext()?.membership?.role).toBe("MEMBER");
 
+  // Signing in again over a signed-in account is not offered.
+  await router.navigate({ to: "/login" });
+  await settled();
+  expect(router.state.location.pathname).toBe("/acme");
+  await router.navigate({ to: "/register", search: { inviteToken: "tok" } });
+  await settled();
+  expect(router.state.location.pathname).toBe("/invite/tok");
+  await router.navigate({ to: "/$workspaceSlug", params: { workspaceSlug: "acme" } });
+  await settled();
+
   // Signing out leaves the authenticated routes.
   useAuthStore.setState({ user: null, accessToken: null, workspaces: [] });
   await settled();

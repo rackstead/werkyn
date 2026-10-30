@@ -142,6 +142,29 @@ export function watchIdle(source: Readable, idleTimeoutMs: number, onIdle: () =>
   return pipeline(source, watched, () => {});
 }
 
+/**
+ * Pass `source` through, calling `onSent` when the chunk that completes its
+ * first `size` bytes is handed on, in the same synchronous step and just
+ * before it, so before anything reading the stream can have every byte.
+ * Waiting for the stream to end or close would also wait for the read that
+ * finds the end of the file, which can finish after the client has it all.
+ */
+export function onLastByte(source: Readable, size: number, onSent: () => void): Readable {
+  let passed = 0;
+  let sent = false;
+  const counted = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      passed += chunk.length;
+      if (!sent && passed >= size) {
+        sent = true;
+        onSent();
+      }
+      callback(null, chunk);
+    },
+  });
+  return pipeline(source, counted, () => {});
+}
+
 export interface StagedUpload extends StagedFile {
   readonly filename: string;
 }

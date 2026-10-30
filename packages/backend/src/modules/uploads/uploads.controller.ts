@@ -3,12 +3,16 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileTypeFromBuffer } from "file-type";
 import {
-  AppError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
 } from "../../utils/errors.js";
 import { env } from "../../config/env.js";
+import {
+  receiveUpload,
+  UploadTooLargeError,
+  type ReceivedUpload,
+} from "../../utils/upload-stream.js";
 
 const ALLOWED_AVATAR_TYPES = [
   "image/jpeg",
@@ -25,24 +29,36 @@ export async function uploadHandler(
   request: FastifyRequest,
   reply: FastifyReply,
 ) {
-  const data = await request.file({
-    limits: { fileSize: Math.min(env.MAX_FILE_SIZE, WIKI_MAX_BYTES) },
+  // The purpose (and with it the avatar limit) is only known once the fields
+  // before the file have been read, so the stream is bounded by the larger
+  // wiki limit and avatars are checked again below.
+  const upload = await receiveUpload(request, reply, {
+    maxBytes: Math.min(env.MAX_FILE_SIZE, WIKI_MAX_BYTES),
+    idleTimeoutMs: request.server.requestLimits.uploadIdleTimeoutMs,
   });
-
-  if (!data) {
-    throw new ValidationError("No file uploaded");
+  try {
+    return await storeUpload(request, reply, upload);
+  } finally {
+    // Refused before its bytes were read: stop waiting for them.
+    upload.stream.destroy();
   }
+}
 
-  const workspaceId = (data.fields.workspaceId as { value?: string })?.value;
+async function storeUpload(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  upload: ReceivedUpload,
+) {
+  const workspaceId = (upload.fields.workspaceId as { value?: string })?.value;
   if (typeof workspaceId !== "string" || !SAFE_ID.test(workspaceId)) {
     throw new ValidationError("A valid workspaceId is required");
   }
 
-  const purpose = (data.fields.purpose as { value?: string })?.value;
+  const purpose = (upload.fields.purpose as { value?: string })?.value;
   if (purpose !== "avatar" && purpose !== "wiki") {
     throw new ValidationError("purpose must be avatar or wiki");
   }
-  const spaceId = (data.fields.spaceId as { value?: string })?.value;
+  const spaceId = (upload.fields.spaceId as { value?: string })?.value;
   if (
     spaceId !== undefined &&
     (typeof spaceId !== "string" || !SAFE_ID.test(spaceId))
@@ -50,7 +66,7 @@ export async function uploadHandler(
     throw new ValidationError("A valid spaceId is required");
   }
 
-  // Check permissions before buffering or writing uploaded content.
+  // Check permissions before reading or writing uploaded content.
   const member = await request.server.prisma.workspaceMember.findUnique({
     where: {
       userId_workspaceId: { userId: request.user!.id, workspaceId },
@@ -78,35 +94,21 @@ export async function uploadHandler(
     scopeId = `wiki/${space.id}`;
   }
 
-  const maxBytes = Math.min(
-    env.MAX_FILE_SIZE,
-    purpose === "avatar" ? AVATAR_MAX_BYTES : WIKI_MAX_BYTES,
-  );
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-  for await (const chunk of data.file) {
-    totalBytes += chunk.length;
-    if (totalBytes > maxBytes) {
-      throw new AppError(
-        413,
-        "Payload Too Large",
-        `Upload exceeds ${maxBytes} bytes`,
-      );
-    }
-    chunks.push(chunk);
-  }
-  if (data.file.truncated) {
-    throw new AppError(
-      413,
-      "Payload Too Large",
-      `Upload exceeds ${maxBytes} bytes`,
-    );
-  }
-  const buffer = Buffer.concat(chunks, totalBytes);
-  let ext = path.extname(data.filename) || ".bin";
   const fileId = crypto.randomUUID();
-
+  let storagePath: string;
   if (purpose === "avatar") {
+    // Type detection reads the whole file, so an avatar (at most
+    // AVATAR_MAX_BYTES) is held in memory; nothing is written unless it is
+    // a supported image.
+    const maxBytes = Math.min(env.MAX_FILE_SIZE, AVATAR_MAX_BYTES);
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    for await (const chunk of upload.stream) {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) throw new UploadTooLargeError(maxBytes);
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks, totalBytes);
     const detected = await fileTypeFromBuffer(buffer);
     if (!detected || !ALLOWED_AVATAR_TYPES.includes(detected.mime)) {
       throw new ValidationError(
@@ -114,16 +116,24 @@ export async function uploadHandler(
       );
     }
     // Static serving must use the detected image type, not an HTML/JS filename.
-    ext = `.${detected.ext}`;
+    storagePath = await request.server.storage.save(
+      `${workspaceId}/uploads`,
+      scopeId,
+      fileId,
+      `.${detected.ext}`,
+      buffer,
+    );
+  } else {
+    // Wiki media is streamed to storage; a failed or refused upload removes
+    // its partial file.
+    ({ storagePath } = await request.server.storage.saveStream(
+      `${workspaceId}/uploads`,
+      scopeId,
+      fileId,
+      path.extname(upload.filename) || ".bin",
+      upload.stream,
+    ));
   }
-
-  const storagePath = await request.server.storage.save(
-    `${workspaceId}/uploads`,
-    scopeId,
-    fileId,
-    ext,
-    buffer,
-  );
 
   const url = `/storage/${storagePath}`;
 

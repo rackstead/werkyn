@@ -32,6 +32,8 @@ export default async function filesRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/workspaces/:wid/files/upload",
+    // Bounded by its own size limit and idle timeout, not the request timeout.
+    config: { timeouts: { request: false } },
     preHandler: [authenticate, authorize("ADMIN", "MEMBER")],
     handler: uploadFileHandler,
   });

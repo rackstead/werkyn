@@ -7,6 +7,8 @@ export default async function uploadsRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/uploads",
+    // Bounded by its own size limit and idle timeout, not the request timeout.
+    config: { timeouts: { request: false } },
     preHandler: [authenticate],
     handler: uploadHandler,
   });

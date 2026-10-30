@@ -18,6 +18,7 @@ import {
 import {
   BACKUP_TRANSFER_LIMITS,
   backupStagingDir,
+  onLastByte,
   receiveBackupUpload,
   watchIdle,
   type StagedUpload,
@@ -66,13 +67,14 @@ export async function exportHandler(
   }
   // A client that reads nothing for the idle timeout is dropped, which
   // destroys the stream and ends this request.
-  const download = watchIdle(handle.createReadStream(), BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () =>
+  const watched = watchIdle(handle.createReadStream(), BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () =>
     reply.raw.destroy(),
   );
-  // The stream closes once its last byte has been handed to the response, in
-  // the same tick, before the client can have it all, or when the response is
-  // abandoned. The admission is released then, so a client that has the whole
-  // file can start its next backup request at once.
+  // The admission is held until the archive's last chunk is handed to the
+  // response, and released in that same synchronous step, so a client that
+  // has the whole file can start its next backup request at once. A download
+  // that is abandoned or fails first releases it when its stream closes.
+  const download = onLastByte(watched, file.size, () => releaseBackupAdmission(request));
   download.once("close", () => releaseBackupAdmission(request));
   reply
     .header("Content-Type", "application/zip")

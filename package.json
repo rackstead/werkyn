@@ -23,7 +23,22 @@
   "pnpm": {
     "overrides": {
       "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.2",
-      "@prisma/config@6.19.3>deepmerge-ts": "8.0.2"
+      "@prisma/config@6.19.3>deepmerge-ts": "8.0.2",
+      "@tiptap/core": "3.30.6",
+      "@tiptap/pm": "3.30.6",
+      "@tiptap/extensions": "3.30.6",
+      "@tiptap/extension-bold": "3.30.6",
+      "@tiptap/extension-bubble-menu": "3.30.6",
+      "@tiptap/extension-code": "3.30.6",
+      "@tiptap/extension-floating-menu": "3.30.6",
+      "@tiptap/extension-horizontal-rule": "3.30.6",
+      "@tiptap/extension-italic": "3.30.6",
+      "@tiptap/extension-link": "3.30.6",
+      "@tiptap/extension-paragraph": "3.30.6",
+      "@tiptap/extension-strike": "3.30.6",
+      "@tiptap/extension-text": "3.30.6",
+      "@tiptap/extension-underline": "3.30.6",
+      "prosemirror-transform": "1.12.4"
     }
   }
 }

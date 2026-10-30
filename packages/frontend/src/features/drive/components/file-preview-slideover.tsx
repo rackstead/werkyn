@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useMemo } from "react";
 import type { DriveFile } from "../api";
 import { useFilePreviewUrl, useFileTextContent } from "../api";
 import { getPreviewType, getFileIcon, formatFileSize } from "@/lib/file-icons";
@@ -26,6 +26,8 @@ export function FilePreviewSlideover({
   const needsBlobUrl = !isPdf && (previewType === "image" || previewType === "video" || previewType === "audio");
   const needsText = previewType === "text";
 
+  // This component owns blobUrl: the hook revokes it when the file changes or
+  // the preview closes.
   const { data: blobUrl } = useFilePreviewUrl(
     workspaceId,
     needsBlobUrl ? file.id : null,
@@ -45,13 +47,6 @@ export function FilePreviewSlideover({
     if (token) params.set("token", token);
     return `${baseUrl}/workspaces/${workspaceId}/files/${file.id}/download?${params.toString()}`;
   }, [isPdf, workspaceId, file.id]);
-
-  // Revoke blob URL on cleanup
-  useEffect(() => {
-    return () => {
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-    };
-  }, [blobUrl]);
 
   const Icon = getFileIcon(file.mimeType, false);
 

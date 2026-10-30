@@ -65,8 +65,9 @@ export async function buildApp(options: BuildAppOptions = {}) {
   const limits = Object.freeze({ ...REQUEST_LIMITS, ...options.requestLimits });
   const app = Fastify({
     logger: getLoggerConfig(),
-    // Header, request, idle and keep-alive timeouts; routes that stream a
-    // transfer opt out per route (see plugins/request-limits.ts).
+    // Header, request, idle and keep-alive timeouts. Authorized uploads lift
+    // the request deadline and backup routes suspend the idle timeout until
+    // they respond, each bounded instead (see plugins/request-limits.ts).
     ...requestLimitServerOptions(limits),
   });
 

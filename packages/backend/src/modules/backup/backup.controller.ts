@@ -24,6 +24,7 @@ import {
   type StagedUpload,
 } from "./backup-staging.js";
 import { env } from "../../config/env.js";
+import { liftRequestTimeout } from "../../plugins/request-limits.js";
 import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 
@@ -148,6 +149,10 @@ async function handleUpload(
   const upload = await receiveBackupUpload(request, {
     dir: backupStagingDir(env.STORAGE_DIR),
     maxBytes: Math.min(env.MAX_FILE_SIZE, BACKUP_TRANSFER_LIMITS.maxUploadBytes),
+    // Authorized, admitted and its file started: the upload is bounded by
+    // its own idle timeout and size limit from here on, not by the
+    // whole-request deadline.
+    onFile: () => liftRequestTimeout(request, reply),
   });
   let summary: RestoreSummary;
   try {

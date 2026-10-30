@@ -29,8 +29,7 @@ export default async function backupRoutes(fastify: FastifyInstance) {
   // reads an upload or the database, after the caller is authorized.
   // A backup request may wait its turn or build an export for minutes before
   // it answers, so the socket idle timeout is suspended until its response
-  // starts; uploads are bounded by their own idle timeout and size limit
-  // instead of the request timeout (plugins/request-limits.ts).
+  // starts (plugins/request-limits.ts).
 
   // POST /api/workspaces/:wid/backup/export
   fastify.route({
@@ -45,7 +44,7 @@ export default async function backupRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/:wid/backup/preview",
-    config: { timeouts: { request: false, idleBeforeResponse: false } },
+    config: { timeouts: { idleBeforeResponse: false } },
     preHandler: [authenticate, authorize("ADMIN")],
     handler: limitBackupRequests(previewHandler),
   });
@@ -54,7 +53,7 @@ export default async function backupRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/:wid/backup/restore",
-    config: { timeouts: { request: false, idleBeforeResponse: false } },
+    config: { timeouts: { idleBeforeResponse: false } },
     preHandler: [authenticate, authorize("ADMIN")],
     handler: limitBackupRequests(restoreHandler),
   });

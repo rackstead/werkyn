@@ -1,7 +1,12 @@
 import http, { type IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import fp from "fastify-plugin";
-import type { FastifyInstance, FastifyServerOptions } from "fastify";
+import type {
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+  FastifyServerOptions,
+} from "fastify";
 
 /**
  * How long the HTTP server waits for a client (see docs/remediation/p03a.md).
@@ -43,16 +48,11 @@ export const REQUEST_LIMITS: Readonly<RequestLimits> = Object.freeze({
 });
 
 /**
- * Timeouts a route opts out of, in its `config.timeouts`. Each opt-out is
- * replaced by the route's own bound (see docs/remediation/p03a.md).
+ * Timeouts a route opts out of, in its `config.timeouts`. The whole-request
+ * deadline is lifted from inside a handler instead (liftRequestTimeout), once
+ * the request has been authorized. See docs/remediation/p03a.md.
  */
 export interface RouteTimeouts {
-  /**
-   * false: the route streams its request body to storage and enforces its
-   * own size limit and idle timeout, so the whole-request deadline does not
-   * apply. The header deadline and the socket idle timeout still do.
-   */
-  request?: false;
   /**
    * false: the route may wait its turn or work for minutes before it answers
    * (backup exports, previews and restores), so the socket idle timeout is
@@ -72,8 +72,15 @@ declare module "fastify" {
 }
 
 /**
- * The request each socket is streaming for an exempt route. A whole-request
- * timeout reported while that request is still incomplete is ignored.
+ * How long a connection is kept, after a response sent before its request
+ * body arrived, for the client to read that response.
+ */
+export const UNREAD_BODY_GRACE_MS = 2_000;
+
+/**
+ * The request each socket is streaming under liftRequestTimeout(). A
+ * whole-request timeout reported while that request is still incomplete,
+ * and its response still open, is ignored.
  */
 const exemptRequests = new WeakMap<Socket, IncomingMessage>();
 
@@ -89,6 +96,37 @@ function serverSocket(request: IncomingMessage): Socket | undefined {
 }
 
 /**
+ * Lift the whole-request deadline for `request`, whose handler now streams
+ * the body itself under its own size limit and idle timeout (an upload can
+ * take far longer than the deadline). Call it only once the request has been
+ * authenticated and its file part has started: a refused request, or one
+ * whose file never starts, keeps the deadline, so a client cannot hold the
+ * connection by dripping a body nobody reads. The deadline applies again once
+ * the response has been sent. The header deadline and the socket idle
+ * timeout are not affected.
+ */
+export function liftRequestTimeout(request: FastifyRequest, reply: FastifyReply) {
+  const socket = serverSocket(request.raw);
+  if (!socket || reply.raw.writableEnded) return;
+  exemptRequests.set(socket, request.raw);
+  reply.raw.once("close", () => {
+    if (exemptRequests.get(socket) === request.raw) exemptRequests.delete(socket);
+  });
+  // A response sent before the body has fully arrived (a refusal, a 413, or
+  // a file stored before the closing boundary) leaves a connection that can
+  // serve nothing else. It is closed shortly after, so a client cannot keep
+  // it by trickling the rest of the body once the deadline has passed.
+  reply.raw.once("finish", () => {
+    if (request.raw.complete) return;
+    const timer = setTimeout(() => {
+      if (!request.raw.complete) socket.destroy();
+    }, UNREAD_BODY_GRACE_MS);
+    timer.unref();
+    socket.once("close", () => clearTimeout(timer));
+  });
+}
+
+/**
  * Fastify's default client error response (fastify.js
  * defaultClientErrorHandler), except that the whole-request timeout of an
  * exempt upload is ignored.
@@ -96,8 +134,8 @@ function serverSocket(request: IncomingMessage): Socket | undefined {
 function clientErrorHandler(this: FastifyInstance, error: Error & { code?: string }, socket: Socket) {
   if (error.code === "ECONNRESET" || socket.destroyed) return;
   if (error.code === "ERR_HTTP_REQUEST_TIMEOUT" && isExemptFromRequestTimeout(socket)) {
-    // Node has stopped tracking this request's deadline; the route's own idle
-    // timeout and size limit bound it from here.
+    // Node has stopped tracking this request's deadline; the handler's own
+    // idle timeout and size limit bound it from here.
     this.log.debug("Request timeout ignored for a streamed upload");
     return;
   }
@@ -149,11 +187,9 @@ export function requestLimitServerOptions(limits: RequestLimits): FastifyServerO
 export default fp<{ limits: Readonly<RequestLimits> }>(async (fastify, { limits }) => {
   fastify.decorate("requestLimits", limits);
   fastify.addHook("onRequest", async (request) => {
-    const timeouts = request.routeOptions.config?.timeouts;
-    const socket = serverSocket(request.raw);
-    if (!timeouts || !socket) return;
-    if (timeouts.request === false) exemptRequests.set(socket, request.raw);
-    if (timeouts.idleBeforeResponse === false) socket.setTimeout(0);
+    if (request.routeOptions.config?.timeouts?.idleBeforeResponse === false) {
+      serverSocket(request.raw)?.setTimeout(0);
+    }
   });
   // A client that stops reading the response is dropped like any other.
   // Node restores the idle timeout itself when the connection's next request

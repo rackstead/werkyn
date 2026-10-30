@@ -112,7 +112,9 @@ export class LocalStorageProvider implements StorageProvider {
     let handle: FileHandle | undefined;
     try {
       for (let attempt = 1; !handle; attempt++) {
-        created ??= await fs.mkdir(dir, { recursive: true });
+        // Each made path is an ancestor of dir (or dir); keep the highest.
+        const made = await fs.mkdir(dir, { recursive: true });
+        if (made && (!created || made.length < created.length)) created = made;
         try {
           handle = await fs.open(fullPath, "w");
         } catch (error) {

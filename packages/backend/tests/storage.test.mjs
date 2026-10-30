@@ -137,3 +137,26 @@ test("a stream that fails, ends early or was already destroyed is refused and le
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test("a failed write never removes a folder that a concurrent write into it needs", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "werkyn-storage-test-"));
+  try {
+    const storage = new LocalStorageProvider(temp);
+    const { readdir } = await import("node:fs/promises");
+    for (let round = 0; round < 200; round++) {
+      const scope = `round-${round}/nested`;
+      // Both start into the same new folders; one fails as soon as it opens.
+      const [failed, saved] = await Promise.allSettled([
+        storage.saveStream("files", scope, "fails", ".bin",
+          new Readable({ read() { this.destroy(new Error("client went away")); } })),
+        storage.saveStream("files", scope, "kept", ".bin", Readable.from([Buffer.from(`round ${round}`)])),
+      ]);
+      assert.equal(failed.status, "rejected", `round ${round}`);
+      assert.equal(saved.status, "fulfilled", `round ${round}: ${saved.reason?.message}`);
+      assert.equal(await readFile(path.join(temp, saved.value.storagePath), "utf8"), `round ${round}`);
+      assert.deepEqual(await readdir(path.join(temp, "files", scope)), ["kept.bin"]);
+    }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

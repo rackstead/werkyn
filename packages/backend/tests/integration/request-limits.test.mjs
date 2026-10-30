@@ -297,6 +297,65 @@ test("a request body that arrives too slowly is cut off with a 408", { timeout: 
   }
 });
 
+test("an upload route lifts the request deadline only once an authorized file starts", { timeout: 60_000 }, async () => {
+  // Refused before its body is read, or never starting a file, while the
+  // body is dripped: the deadline still applies, so the client cannot keep
+  // the connection.
+  for (const [label, url, authorization] of [
+    ["anonymous drive", `/api/workspaces/${workspace.id}/files/upload`, ""],
+    ["anonymous wiki", "/api/uploads", ""],
+    ["anonymous backup", `/api/workspaces/${workspace.id}/backup/preview`, ""],
+    ["foreign drive", `/api/workspaces/not-a-member/files/upload`, `Authorization: Bearer ${token}\r\n`],
+    // Authorized, but no file part ever starts.
+    ["drive without a file", `/api/workspaces/${workspace.id}/files/upload`, `Authorization: Bearer ${token}\r\n`],
+    ["wiki without a file", "/api/uploads", `Authorization: Bearer ${token}\r\n`],
+    ["backup without a file", `/api/workspaces/${workspace.id}/backup/preview`, `Authorization: Bearer ${token}\r\n`],
+  ]) {
+    const client = connect();
+    client.socket.write(
+      `POST ${url} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n${authorization}Content-Type: multipart/form-data; boundary=x\r\nContent-Length: 1000000\r\n\r\n`,
+    );
+    const drip = setInterval(() => client.socket.write("a"), 100);
+    try {
+      await closedWithin(client, LIMITS.requestTimeoutMs + LIMITS.connectionsCheckingIntervalMs + SLACK_MS, label);
+      assert.match(String(parseResponse(client.received()).status), /^4/, `${label}: ${client.received()}`);
+    } finally {
+      clearInterval(drip);
+    }
+  }
+  await waitFor(() => backupConcurrency.usage.admitted === 0, "the backup admission to be released");
+});
+
+test("an authorized upload cannot keep its connection by trickling after its response", { timeout: 30_000 }, async () => {
+  const { UNREAD_BODY_GRACE_MS } = await import("../../src/plugins/request-limits.ts");
+  // The file is stored once its part ends, before the closing boundary, and
+  // after the request deadline has passed. The client then sends a field
+  // that never ends, one byte at a time.
+  const bytes = crypto.randomBytes(256 * 1024);
+  const boundary = `request-limits-${crypto.randomUUID()}`;
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="early.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+  );
+  const next = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="note"\r\n\r\n`);
+  const client = connect();
+  client.socket.write(
+    `POST ${drive.url()} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${token}\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: 100000000\r\n\r\n`,
+  );
+  client.socket.write(head);
+  await trickle({ send: (chunk) => client.socket.write(chunk) }, bytes, 24, 100);
+  client.socket.write(next);
+  await waitFor(() => parseResponse(client.received()).json !== undefined, "the upload's response");
+  const answeredAt = Date.now();
+  assert.equal(parseResponse(client.received()).status, 201, client.received());
+  const drip = setInterval(() => client.socket.write("a"), 100);
+  try {
+    await closedWithin(client, UNREAD_BODY_GRACE_MS + SLACK_MS, "trickling after the response");
+    assert.ok(Date.now() - answeredAt >= UNREAD_BODY_GRACE_MS - 100);
+  } finally {
+    clearInterval(drip);
+  }
+});
+
 test("a client that stops reading a download is dropped", { timeout: 30_000 }, async () => {
   const client = connect();
   await new Promise((resolve) => client.socket.once("connect", resolve));

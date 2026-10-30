@@ -2,6 +2,7 @@ import { pipeline, Transform, type Readable } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { AppError, ValidationError } from "./errors.js";
+import { liftRequestTimeout } from "../plugins/request-limits.js";
 
 /**
  * Streamed uploads (Drive files, wiki media, avatars): limits and failures.
@@ -51,11 +52,14 @@ export interface ReceivedUpload {
 }
 
 /**
- * Wait for the request's file part and return it as a bounded stream.
+ * Wait for the request's file part and return it as a bounded stream. Call
+ * it only once the request has been authenticated (and, where the route can,
+ * authorized): once the file part starts, the upload is bounded by `limits`
+ * instead of the whole-request deadline.
  *
- * Until the file part starts, a client that sends nothing for
- * `idleTimeoutMs` gets a 408. A stalled client is not sending, so its
- * connection is closed after that response.
+ * Until the file part starts, the request deadline still applies, and a
+ * client that sends nothing for `idleTimeoutMs` gets a 408. A stalled client
+ * is not sending, so its connection is closed after that response.
  */
 export async function receiveUpload(
   request: FastifyRequest,
@@ -86,6 +90,7 @@ export async function receiveUpload(
     raw.off("data", onData);
   }
   if (!file) throw new ValidationError("No file uploaded");
+  liftRequestTimeout(request, reply);
   return {
     filename: file.filename,
     mimetype: file.mimetype,

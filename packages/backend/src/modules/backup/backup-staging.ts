@@ -181,7 +181,14 @@ export async function receiveBackupUpload(
     dir,
     maxBytes,
     idleTimeoutMs = BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
-  }: { dir: string; maxBytes: number; idleTimeoutMs?: number },
+    onFile,
+  }: {
+    dir: string;
+    maxBytes: number;
+    idleTimeoutMs?: number;
+    /** Called once the file part has started, before it is staged. */
+    onFile?: () => void;
+  },
 ): Promise<StagedUpload> {
   // The multipart parser reads the request from here on. Until the file part
   // starts, a request that stops sending is dropped, so it cannot hold its
@@ -211,6 +218,7 @@ export async function receiveBackupUpload(
   if (!file.filename.endsWith(".json") && !file.filename.endsWith(".zip")) {
     throw new ValidationError("Only .json and .zip files are accepted");
   }
+  onFile?.();
   let staged: StagedFile;
   try {
     staged = await stageStream(file.file, { dir, maxBytes, idleTimeoutMs });

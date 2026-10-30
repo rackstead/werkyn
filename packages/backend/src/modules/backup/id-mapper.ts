@@ -1,26 +1,3 @@
-/**
- * Maps original IDs from a backup file to newly created IDs during restore.
- */
-export class IdMapper {
-  private map = new Map<string, string>();
-
-  set(originalId: string, newId: string): void {
-    this.map.set(originalId, newId);
-  }
-
-  get(originalId: string): string | undefined {
-    return this.map.get(originalId);
-  }
-
-  require(originalId: string, label: string): string {
-    const newId = this.map.get(originalId);
-    if (!newId) {
-      throw new Error(`Missing ID mapping for ${label}: ${originalId}`);
-    }
-    return newId;
-  }
-}
-
 export interface MappedUser {
   originalId: string;
   originalEmail: string;

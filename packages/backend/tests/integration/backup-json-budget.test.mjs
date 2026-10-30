@@ -386,13 +386,15 @@ test("the most expensive accepted backup.json files preview in a 256 MiB heap", 
   const cases = {
     tasks: fill(
       `{"metadata":${meta()},"projects":[{"project":{"name":"p"},"tasks":[`,
-      () => '{"_originalId":"","title":"","priority":"","position":0,"statusRef":"s"}',
+      // Restore refuses repeated task ids and unknown priorities.
+      (i) => `{"_originalId":"${id(i)}","title":"","priority":"NONE","position":0,"statusRef":"s"}`,
       "]}]}",
     ),
     projects: fill(`{"metadata":${meta()},"projects":[`, () => '{"project":{"name":""}}', "]}"),
     pages: fill(
       `{"metadata":${meta()},"wikiSpaces":[{"space":{"name":"s"},"pages":[`,
-      (i) => `{"_originalId":"${id(i)}","title":"","position":0,"parentRef":"${id(i + 1)}"}`,
+      // Chains of 200 pages: restore refuses trees deeper than 256 pages.
+      (i) => `{"_originalId":"${id(i)}","title":"","position":0,"parentRef":${(i + 1) % 200 ? `"${id(i + 1)}"` : "null"}}`,
       "]}]}",
     ),
     // Preview answers with one mapping per user reference.

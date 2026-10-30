@@ -60,12 +60,16 @@ export async function exportHandler(
   } finally {
     await file.dispose();
   }
-  const sent = responseEnded(reply);
   // A client that reads nothing for the idle timeout is dropped, which
   // destroys the stream and ends this request.
   const download = watchIdle(handle.createReadStream(), BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () =>
     reply.raw.destroy(),
   );
+  // The stream closes once its last byte has been handed to the response, in
+  // the same tick, before the client can have it all, or when the response is
+  // abandoned. Releasing the admission then lets a client that has the whole
+  // file start its next backup request at once.
+  const sent = new Promise((resolve) => download.once("close", resolve));
   reply
     .header("Content-Type", "application/zip")
     .header("Content-Length", String(file.size))
@@ -76,15 +80,6 @@ export async function exportHandler(
   return reply;
 }
 
-/** Resolves once the response has been sent in full or its connection closed. */
-function responseEnded(reply: FastifyReply): Promise<void> {
-  const response = reply.raw;
-  if (response.writableFinished || response.destroyed) return Promise.resolve();
-  return new Promise((resolve) => {
-    response.once("finish", resolve);
-    response.once("close", resolve);
-  });
-}
 
 /** Quick check: ZIP files start with PK\x03\x04 */
 function isZipSignature(bytes: Buffer): boolean {

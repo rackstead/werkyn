@@ -40,7 +40,8 @@ writing anything.
    starts there is the one referred to, so a file named like the start of
    another never takes its place. Each one gets a new storage path. Every path is first added to the
    durable cleanup queue (`BlobCleanup`, see `services/blob-cleanup.ts`), due
-   one hour later. Then the files are written. If a write fails, everything
+   one hour later. Then the files are written, each streamed from the staged
+   archive. If a write fails, everything
    written so far is removed and the restore stops with the storage error.
 3. **One transaction** (READ COMMITTED, 10 s to start, 60 s in all):
    - lock the workspace row and re-read the administrator's role;
@@ -154,8 +155,10 @@ repaired as described, whatever its version.
   archive paths that repeat that prefix up to the name limit: about 8 s for a
   24 MiB `backup.json` locally (the previous rewrite took over a minute for
   its own worst case, and preview did not run it).
-- Export completeness, streaming, transport and concurrent backup requests
-  are handled separately (B03 export side).
+- Export completeness, upload staging, streaming and concurrent backup
+  requests are covered in [b03-backup-transport.md](b03-backup-transport.md).
+  An upload a crashed restore leaves in the staging folder is removed by the
+  sweep at the next start.
 
 ## Tests
 

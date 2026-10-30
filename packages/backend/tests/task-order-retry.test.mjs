@@ -10,7 +10,7 @@ Object.assign(process.env, {
 });
 const { Prisma } = await import("@prisma/client");
 const { withProjectOrder, ORDER_TRANSACTION_ATTEMPTS, ORDER_LOCK_TIMEOUT_MS, ProjectBusyError } = await import("../src/utils/task-order.ts");
-const { isLockTimeoutError, isRetryableDatabaseError } = await import("../src/utils/retryable-database-errors.ts");
+const { isLockTimeoutError, isRetryableDatabaseError, isStatementCanceledError } = await import("../src/utils/retryable-database-errors.ts");
 const { NotFoundError, ValidationError } = await import("../src/utils/errors.ts");
 const { logger } = await import("../src/utils/logger.ts");
 
@@ -61,7 +61,7 @@ const lockTimeoutModel = () =>
   );
 
 /** A root client whose transactions lock `project` (or find nothing) and record their options. */
-function fakeClient(project = { id: "p1", archived: false }) {
+function fakeClient(project = { id: "p1", archived: false }, { lockError } = {}) {
   const calls = { transactions: 0, locks: [], settings: [], statements: [], options: [] };
   const tx = {
     $executeRaw: async (strings, ...values) => {
@@ -77,6 +77,7 @@ function fakeClient(project = { id: "p1", archived: false }) {
       }
       calls.locks.push({ sql, values });
       calls.statements.push("lock");
+      if (lockError) throw lockError();
       return project ? [project] : [];
     },
   };
@@ -161,32 +162,55 @@ test("expired transactions and ordinary errors are not retried", async () => {
   }
 });
 
-test("a lock wait past the lock timeout is answered 503 and not retried", async () => {
+const isBusy = (error) =>
+  error instanceof ProjectBusyError &&
+  error.statusCode === 503 &&
+  error.error === "Service Unavailable" &&
+  error.message === "The project is busy. Try again in a moment.";
+
+test("waiting past the bound for the project lock is answered 503 and not retried", async () => {
   assert.equal(ORDER_LOCK_TIMEOUT_MS, 5_000);
+  // The project-lock statement runs under the statement timeout (57014) and the lock timeout (55P03).
+  for (const failure of [statementTimeoutRaw, lockTimeoutRaw]) {
+    for (const transactionClient of [false, true]) {
+      const client = fakeClient(undefined, { lockError: failure });
+      let ran = false;
+      const warnings = await capturingWarnings(() =>
+        assert.rejects(withProjectOrder(transactionClient ? client.tx : client, "p1", async () => { ran = true; }), isBusy));
+      assert.equal(ran, false);
+      assert.equal(client.calls.transactions, transactionClient ? 0 : 1, "the lock wait was retried");
+      assert.equal(warnings.length, 0);
+    }
+  }
+});
+
+test("a later lock wait past the bound is answered 503; other cancels keep their error", async () => {
+  assert.equal(isLockTimeoutError(lockTimeoutRaw()), true);
+  assert.equal(isLockTimeoutError(lockTimeoutModel()), true);
+  assert.equal(isLockTimeoutError(statementTimeoutRaw()), false);
+  assert.equal(isStatementCanceledError(statementTimeoutRaw()), true);
+  assert.equal(isStatementCanceledError(lockTimeoutRaw()), false);
   for (const failure of [lockTimeoutRaw, lockTimeoutModel, statementTimeoutRaw]) {
-    assert.equal(isLockTimeoutError(failure()), true);
     assert.equal(isRetryableDatabaseError(failure()), false);
   }
   assert.equal(isLockTimeoutError(deadlock()), false);
   assert.equal(isLockTimeoutError(known("P2028")), false);
-  for (const failure of [lockTimeoutRaw, lockTimeoutModel, statementTimeoutRaw]) {
+
+  for (const failure of [lockTimeoutRaw, lockTimeoutModel]) {
     const client = fakeClient();
-    const warnings = await capturingWarnings(() =>
-      assert.rejects(
-        withProjectOrder(client, "p1", async () => { throw failure(); }),
-        (error) =>
-          error instanceof ProjectBusyError &&
-          error.statusCode === 503 &&
-          error.error === "Service Unavailable" &&
-          error.message === "The project is busy. Try again in a moment.",
-      ));
+    await assert.rejects(withProjectOrder(client, "p1", async () => { throw failure(); }), isBusy);
     assert.equal(client.calls.transactions, 1, "a lock timeout was retried");
-    assert.equal(warnings.length, 0);
   }
-  // In a caller's transaction the caller sees the database error itself.
+  // A statement canceled after the lock (a database-wide statement timeout, a
+  // manual cancel) is not project contention: its own error is kept.
   const client = fakeClient();
+  const canceled = statementTimeoutRaw();
+  await assert.rejects(withProjectOrder(client, "p1", async () => { throw canceled; }), (thrown) => thrown === canceled);
+  assert.equal(client.calls.transactions, 1);
+  // In a caller's transaction the caller sees a later lock timeout as the database error itself.
+  const inner = fakeClient();
   const error = lockTimeoutRaw();
-  await assert.rejects(withProjectOrder(client.tx, "p1", async () => { throw error; }), (thrown) => thrown === error);
+  await assert.rejects(withProjectOrder(inner.tx, "p1", async () => { throw error; }), (thrown) => thrown === error);
 });
 
 test("a missing project is a 404 and is not retried", async () => {

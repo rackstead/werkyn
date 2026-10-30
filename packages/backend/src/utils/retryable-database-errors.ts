@@ -19,18 +19,22 @@ function sqlState(error: unknown): string | undefined {
   return undefined;
 }
 
-// A statement stopped by lock_timeout (55P03), or by a statement_timeout set
-// to bound a lock wait (57014, which a manual cancel also reports).
-const LOCK_TIMEOUT_SQLSTATES = new Set(["55P03", "57014"]);
-
 /**
- * True when a statement gave up waiting for a lock (see above). The
- * transaction is rolled back; unlike a deadlock it is not worth repeating at
- * once, since the lock is still held.
+ * True when a statement gave up waiting for a lock after `lock_timeout`
+ * (55P03). The transaction is rolled back; unlike a deadlock it is not worth
+ * repeating at once, since the lock is still held.
  */
 export function isLockTimeoutError(error: unknown): boolean {
-  const state = sqlState(error);
-  return state !== undefined && LOCK_TIMEOUT_SQLSTATES.has(state);
+  return sqlState(error) === "55P03";
+}
+
+/**
+ * True when a statement was canceled (57014): by `statement_timeout`, or by a
+ * manual cancel. Only the caller knows which statement and why, so callers
+ * check it around the one statement they bounded.
+ */
+export function isStatementCanceledError(error: unknown): boolean {
+  return sqlState(error) === "57014";
 }
 
 /**

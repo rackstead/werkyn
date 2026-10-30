@@ -2,7 +2,11 @@ import { Prisma, type PrismaClient } from "@prisma/client";
 import { setTimeout as sleep } from "node:timers/promises";
 import { AppError, NotFoundError, ValidationError } from "./errors.js";
 import { logger } from "./logger.js";
-import { isLockTimeoutError, isRetryableDatabaseError } from "./retryable-database-errors.js";
+import {
+  isLockTimeoutError,
+  isRetryableDatabaseError,
+  isStatementCanceledError,
+} from "./retryable-database-errors.js";
 
 // Task order, column and dependency-graph changes of one project are
 // serialized on the project row (DAT-012, docs/remediation/dat-012.md).
@@ -76,8 +80,10 @@ export class ProjectBusyError extends AppError {
  * wait of the transaction at the same bound (55P03 when exceeded). Waiting for
  * the project row can take two lock waits in a row (first for its place in
  * the row's queue, then for the holder's transaction), and lock_timeout
- * restarts for each, so this one statement is bounded by a statement_timeout
- * (57014), which is then restored for the rest of the transaction.
+ * restarts for each, so this one statement is bounded by a statement_timeout,
+ * which is then restored for the rest of the transaction. Either timeout on
+ * this statement (57014 or 55P03) becomes ProjectBusyError here; a cancel of
+ * any later statement keeps its own error.
  */
 async function lockProjectOrderWithinBound(tx: Db, projectId: string) {
   const bound = `${ORDER_LOCK_TIMEOUT_MS}ms`;
@@ -87,7 +93,15 @@ async function lockProjectOrderWithinBound(tx: Db, projectId: string) {
   await tx.$executeRaw`
     SELECT set_config('statement_timeout', ${bound}, true), set_config('lock_timeout', ${bound}, true)
   `;
-  const project = await lockProjectOrder(tx, projectId);
+  let project: LockedProject | null;
+  try {
+    project = await lockProjectOrder(tx, projectId);
+  } catch (error) {
+    // Only this statement runs under the statement timeout, so a cancel here
+    // is the bound; the lock timeout may fire first on the same wait.
+    if (isStatementCanceledError(error) || isLockTimeoutError(error)) throw new ProjectBusyError();
+    throw error;
+  }
   await tx.$executeRaw`SELECT set_config('statement_timeout', ${previous}, true)`;
   return project;
 }
@@ -118,10 +132,11 @@ function errorCode(error: unknown) {
 /**
  * Runs `work` with the project's order lock held: in a new READ COMMITTED
  * transaction retried up to ORDER_TRANSACTION_ATTEMPTS times, or inside the
- * caller's transaction (which then owns retrying and error answers). Every
- * lock wait after this point gives up after ORDER_LOCK_TIMEOUT_MS; in a new
- * transaction that is answered with ProjectBusyError (503) and not retried,
- * since the lock is still held. `work` must not have side effects outside
+ * caller's transaction (which then owns retrying and error answers). Waiting
+ * for the order lock gives up after ORDER_LOCK_TIMEOUT_MS with
+ * ProjectBusyError (503); every later lock wait gives up after the same bound
+ * (55P03), which a new transaction also answers with ProjectBusyError. Neither
+ * is retried, since the lock is still held. `work` must not have side effects outside
  * the transaction, since it can run more than once.
  */
 export async function withProjectOrder<T>(

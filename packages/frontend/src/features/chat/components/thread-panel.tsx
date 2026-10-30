@@ -12,6 +12,7 @@ import {
   useUnsubscribeThread,
   type ChatMessage,
 } from "../api";
+import { isIdentityChangedError } from "@/lib/api-error";
 
 interface ThreadPanelProps {
   workspaceId: string;
@@ -51,7 +52,8 @@ export function ThreadPanel({
     sendMessage
       .mutateAsync({ content, parentId: parentMessage.id })
       .catch((err: Error) => {
-        toast.error(`Reply not sent: ${err.message}`);
+        // A reply overtaken by an account change is not reported to the next account.
+        if (!isIdentityChangedError(err)) toast.error(`Reply not sent: ${err.message}`);
         throw err;
       });
 

@@ -10,7 +10,10 @@ import { queryClient } from "@/lib/query-client";
 import { useObjectUrl } from "@/lib/use-object-url";
 import { queryKeys } from "@/lib/query-keys";
 import { settleWithConcurrency } from "@/lib/settle-with-concurrency";
+import { IdentityChangedError } from "@/lib/api-error";
+import { identityGeneration } from "@/lib/identity";
 import { useAuthStore } from "@/stores/auth-store";
+import { apiBase } from "@/lib/api-url";
 
 export interface DriveFile {
   id: string;
@@ -216,7 +219,7 @@ export function uploadSingleFile(
 
   const promise = new Promise<DriveFile>((resolve, reject) => {
     const token = useAuthStore.getState().accessToken;
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+    const baseUrl = apiBase();
 
     const formData = new FormData();
     if (parentId) formData.append("parentId", parentId);
@@ -388,7 +391,16 @@ async function runBulkFileAction(
   fileIds: readonly string[],
   request: (fileId: string) => Promise<unknown>,
 ): Promise<BulkFileResult> {
-  const results = await settleWithConcurrency(fileIds, BULK_FILE_CONCURRENCY, request);
+  // The batch belongs to the account that started it: once the signed-in
+  // account changes, the files not yet sent are not sent as the next one.
+  const generation = identityGeneration();
+  const results = await settleWithConcurrency(fileIds, BULK_FILE_CONCURRENCY, (fileId) =>
+    identityGeneration() === generation
+      ? request(fileId)
+      : Promise.reject(new IdentityChangedError()),
+  );
+  // Abandoned as a whole: its outcome is not reported to the next account.
+  if (identityGeneration() !== generation) throw new IdentityChangedError();
   const outcome: BulkFileResult = { succeeded: [], failed: [] };
   results.forEach((result, i) => {
     if (result.status === "fulfilled") outcome.succeeded.push(fileIds[i]);
@@ -479,7 +491,7 @@ export function useThumbnailUrl(wid: string, fileId: string | null, hasThumbnail
     queryKey: ["file-thumbnail", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/thumbnail`,
@@ -511,7 +523,7 @@ export function useFilePreviewUrl(wid: string, fileId: string | null, mimeType?:
     queryKey: ["file-preview", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download?inline=true`,
@@ -555,7 +567,7 @@ export function useFileTextContent(wid: string, fileId: string | null) {
     queryKey: ["file-text", { wid, fileId }],
     queryFn: async () => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download?inline=true`,
@@ -580,7 +592,7 @@ export function useDownloadFile(wid: string) {
   return useMutation({
     mutationFn: async ({ fileId, fileName }: { fileId: string; fileName: string }) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/${fileId}/download`,
@@ -614,7 +626,7 @@ export function useArchiveFiles(wid: string) {
   return useMutation({
     mutationFn: async ({ fileIds, archiveName }: { fileIds: string[]; archiveName: string }) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const response = await fetch(
         `${baseUrl}/workspaces/${wid}/files/archive`,

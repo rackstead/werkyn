@@ -2,13 +2,13 @@ import { useMutation } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
+import { apiBase } from "@/lib/api-url";
 
 export function useExportBackup(wid: string) {
   return useMutation({
     mutationFn: async (data: BackupExportRequest) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl =
-        (import.meta.env.VITE_API_BASE_URL as string | undefined) || "/api";
+      const baseUrl = apiBase();
       const response = await fetch(`${baseUrl}/workspaces/${wid}/backup/export`, {
         method: "POST",
         headers: {

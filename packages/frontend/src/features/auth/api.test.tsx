@@ -3,6 +3,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAuthStore, type WorkspaceMembership } from "@/stores/auth-store";
+import { IdentityChangedError } from "@/lib/api-error";
 import { useVerifyEmail } from "./api";
 
 const { broadcast } = vi.hoisted(() => {
@@ -69,7 +70,8 @@ beforeEach(() => {
     defaultOptions: { mutations: { retry: false } },
   });
   fetchRequest = vi.fn((request: Request | string) => {
-    if (request === "/api/auth/logout") {
+    // Session calls honor the configured API base like every other request.
+    if (request === "http://localhost/api/auth/logout") {
       return Promise.resolve(new Response(null, { status: 204 }));
     }
     expect(request).toBeInstanceOf(Request);
@@ -102,6 +104,17 @@ async function beginVerification() {
     completion = result.current.mutateAsync({ token: "verification-token" });
   });
   await waitFor(() => expect(fetchRequest).toHaveBeenCalledTimes(1));
+  // An identity change rejects it before a test inspects the outcome.
+  void completion.catch(() => {});
+  return Object.assign(finishVerification(result, () => completion), {
+    completion: () => completion,
+  });
+}
+
+function finishVerification(
+  result: { current: { isSuccess: boolean } },
+  completion: () => Promise<unknown>,
+) {
   return async (verifiedUser: User) => {
     await act(async () => {
       respond(
@@ -110,10 +123,29 @@ async function beginVerification() {
           headers: { "Content-Type": "application/json" },
         }),
       );
-      await completion;
+      await completion();
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
   };
+}
+
+/** The verification was sent for an identity that has since been left. */
+async function expectDiscarded(
+  finish: Awaited<ReturnType<typeof beginVerification>>,
+  verifiedUser: User,
+) {
+  const discarded = expect(finish.completion()).rejects.toBeInstanceOf(
+    IdentityChangedError,
+  );
+  respond(
+    new Response(JSON.stringify({ data: { user: verifiedUser } }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+  await act(async () => {
+    await discarded;
+  });
 }
 
 it("does not verify another account already signed in when a token is redeemed", async () => {
@@ -146,7 +178,8 @@ it("does not verify the replacement account after a genuine deferred account swi
   const replacement = useAuthStore.getState();
   broadcast.mockClear();
 
-  await finish({ ...user("account-a"), emailVerified: true });
+  // Leaving account A aborts its pending verification request.
+  await expectDiscarded(finish, { ...user("account-a"), emailVerified: true });
 
   expect(useAuthStore.getState()).toBe(replacement);
   expect(broadcast).not.toHaveBeenCalled();
@@ -165,7 +198,7 @@ it("does not resurrect a session when logout completes before verification", asy
   expect(signedOut.accessToken).toBeNull();
   broadcast.mockClear();
 
-  await finish({ ...user("account-a"), emailVerified: true });
+  await expectDiscarded(finish, { ...user("account-a"), emailVerified: true });
 
   expect(useAuthStore.getState()).toBe(signedOut);
   expect(broadcast).not.toHaveBeenCalled();

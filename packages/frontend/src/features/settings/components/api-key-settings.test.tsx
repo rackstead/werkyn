@@ -6,6 +6,8 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { IdentityChangedError } from "@/lib/api-error";
 import { ApiKeySettings } from "./api-key-settings";
 
 const state = vi.hoisted(() => ({
@@ -69,6 +71,20 @@ afterEach(() => {
 });
 
 describe("API key settings", () => {
+  it("reports nothing when the account changed while the key was being created", async () => {
+    const error = vi.spyOn(toast, "error");
+    state.create.mockRejectedValue(new IdentityChangedError());
+    render(<ApiKeySettings />);
+    fireEvent.change(screen.getByLabelText("Key name"), {
+      target: { value: "Automation" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
+    await waitFor(() => expect(state.create).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(error).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Your new API key")).toBeNull();
+  });
+
   it("defaults to 30 days", async () => {
     render(<ApiKeySettings />);
     expect(

@@ -1,33 +1,19 @@
 import ky, { type KyResponse } from "ky";
 import { useAuthStore } from "@/stores/auth-store";
 import type { EditConflictState } from "@/lib/edit-conflict";
+import {
+  ApiError,
+  IdentityChangedError,
+  isIdentityChangedError,
+} from "./api-error";
+import { apiPrefixUrl } from "./api-url";
+import { identityGeneration, identitySignal } from "./identity";
 
-export class ApiError extends Error {
-  statusCode: number;
-  error: string;
-  details?: Array<{ field: string; message: string }>;
-  /** Machine-readable reason, for example REVISION_CONFLICT or EDIT_LOCKED. */
-  code?: string;
-  /** The stored state a 409 edit conflict was checked against. */
-  current?: EditConflictState;
-
-  constructor(
-    statusCode: number,
-    error: string,
-    message: string,
-    details?: Array<{ field: string; message: string }>,
-    conflict?: { code?: string; current?: EditConflictState },
-  ) {
-    super(message);
-    this.statusCode = statusCode;
-    this.error = error;
-    this.details = details;
-    this.code = conflict?.code;
-    this.current = conflict?.current;
-    this.name = "ApiError";
-  }
-}
-
+export {
+  ApiError,
+  IdentityChangedError,
+  isIdentityChangedError,
+} from "./api-error";
 
 export function mapApiErrorToForm(
   error: unknown,
@@ -82,13 +68,81 @@ function assertRequestIdentity(context: Record<string, unknown>) {
   }
 }
 
+// The identity generation each request was first sent in, keyed by its ky
+// context (one object per request, kept across ky's retries).
+const requestGenerations = new WeakMap<object, number>();
+
+/** Rejects a request, or its response, once the identity has changed. */
+function assertRequestGeneration(context: object) {
+  const current = identityGeneration();
+  const started = requestGenerations.get(context);
+  if (started === undefined) requestGenerations.set(context, current);
+  else if (started !== current) throw new IdentityChangedError();
+}
+
+/** `AbortSignal.any`, with a fallback for browsers that predate it. */
+function anySignal(signals: AbortSignal[]): {
+  signal: AbortSignal;
+  release: () => void;
+} {
+  if (typeof AbortSignal.any === "function")
+    return { signal: AbortSignal.any(signals), release: () => {} };
+  const controller = new AbortController();
+  const unlisten: (() => void)[] = [];
+  for (const source of signals) {
+    if (source.aborted) {
+      controller.abort(source.reason);
+      break;
+    }
+    const abort = () => controller.abort(source.reason);
+    source.addEventListener("abort", abort, { once: true });
+    unlisten.push(() => source.removeEventListener("abort", abort));
+  }
+  return {
+    signal: controller.signal,
+    release: () => unlisten.forEach((remove) => remove()),
+  };
+}
+
+// Requests are bound to the identity they were sent for: an identity change
+// aborts them at once, even if the underlying fetch ignores the abort, so a
+// late response cannot reach the next account's caches or callbacks.
+function fetchForCurrentIdentity(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  const identity = identitySignal();
+  const signals = [identity];
+  if (input instanceof Request) signals.push(input.signal);
+  if (init?.signal) signals.push(init.signal);
+  return new Promise<Response>((resolve, reject) => {
+    const abort = () => reject(identity.reason);
+    identity.addEventListener("abort", abort, { once: true });
+    const combined = anySignal(signals);
+    globalThis
+      .fetch(input, { ...init, signal: combined.signal })
+      .then(resolve, reject)
+      .finally(() => {
+        identity.removeEventListener("abort", abort);
+        combined.release();
+      });
+  });
+}
+
 export const api = ky.create({
-  prefixUrl: import.meta.env.VITE_API_BASE_URL || "/api",
+  prefixUrl: apiPrefixUrl(),
   timeout: 15000,
   credentials: "include",
+  fetch: fetchForCurrentIdentity,
+  // A request overtaken by an identity change is never sent again.
+  retry: {
+    shouldRetry: ({ error }) =>
+      isIdentityChangedError(error) ? false : undefined,
+  },
   hooks: {
     beforeRequest: [
       (request, options) => {
+        assertRequestGeneration(options.context);
         assertRequestIdentity(options.context);
         const token = useAuthStore.getState().accessToken;
         if (token) {
@@ -98,14 +152,20 @@ export const api = ky.create({
     ],
     afterResponse: [
       async (request, options, response) => {
+        assertRequestGeneration(options.context);
         assertRequestIdentity(options.context);
         if (!response.ok) {
-          // On 401, try to refresh token (unless it's the refresh endpoint)
+          // A 401 for a request that carried an access token means it expired:
+          // refresh it (unless this is the refresh endpoint). A request sent
+          // while signed out (sign-in, public pages) reports its own 401.
           if (
             response.status === 401 &&
+            request.headers.has("Authorization") &&
             !request.url.includes("/auth/refresh")
           ) {
+            const generation = identityGeneration();
             const refreshed = await useAuthStore.getState().refresh();
+            assertRequestGeneration(options.context);
             assertRequestIdentity(options.context);
             if (refreshed) {
               // Retry the original request with the new token
@@ -121,6 +181,10 @@ export const api = ky.create({
                 hooks: {
                   beforeRequest: [
                     (retryRequest, retryOptions) => {
+                      // ky gives the replay its own copy of the context, so
+                      // check the generation the original request was sent in.
+                      if (identityGeneration() !== generation)
+                        throw new IdentityChangedError();
                       assertRequestIdentity(retryOptions.context);
                       retryRequest.headers.set(
                         "Authorization",
@@ -130,11 +194,14 @@ export const api = ky.create({
                   ],
                 },
               });
+              if (identityGeneration() !== generation)
+                throw new IdentityChangedError();
               assertRequestIdentity(options.context);
               return retried;
             }
-            // Refresh failed — force logout
-            useAuthStore.getState().logout();
+            // The session can no longer be refreshed: sign this identity out,
+            // unless it has already changed while the refresh was running.
+            useAuthStore.getState().expireSession(generation);
           }
           throw await parseErrorResponse(response);
         }

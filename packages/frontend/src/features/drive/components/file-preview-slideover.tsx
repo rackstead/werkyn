@@ -7,6 +7,7 @@ import { Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slideover } from "@/components/ui/slideover";
 import { timeAgo } from "@/lib/time-ago";
+import { apiBase } from "@/lib/api-url";
 
 interface FilePreviewSlideoverProps {
   file: DriveFile;
@@ -42,7 +43,7 @@ export function FilePreviewSlideover({
   const pdfUrl = useMemo(() => {
     if (!isPdf) return undefined;
     const token = useAuthStore.getState().accessToken;
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+    const baseUrl = apiBase();
     const params = new URLSearchParams({ inline: "true" });
     if (token) params.set("token", token);
     return `${baseUrl}/workspaces/${workspaceId}/files/${file.id}/download?${params.toString()}`;

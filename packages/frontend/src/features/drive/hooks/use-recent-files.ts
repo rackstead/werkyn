@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
+import { useAuthStore } from "@/stores/auth-store";
 
 export interface RecentFileEntry {
   id: string;
@@ -15,22 +16,39 @@ export interface RecentFileEntry {
 
 const MAX_RECENT = 10;
 
-function getStorageKey(wid: string) {
-  return `drive-recent-${wid}`;
+// Recents hold file names and uploaders, so they are kept per account and
+// workspace: another account signed in to the same browser and workspace
+// cannot see them.
+function getStorageKey(userId: string, wid: string) {
+  return `drive-recent:${userId}:${wid}`;
 }
 
-function readRecents(wid: string): RecentFileEntry[] {
+// Earlier builds stored recents per workspace only, whoever was signed in.
+// They have no owner, so they are removed rather than shown to anyone.
+const LEGACY_KEY_PREFIX = "drive-recent-";
+try {
+  for (let index = localStorage.length - 1; index >= 0; index--) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(LEGACY_KEY_PREFIX)) localStorage.removeItem(key);
+  }
+} catch {
+  // Storage unavailable
+}
+
+function readRecents(userId: string, wid: string): RecentFileEntry[] {
+  if (!userId) return [];
   try {
-    const raw = localStorage.getItem(getStorageKey(wid));
+    const raw = localStorage.getItem(getStorageKey(userId, wid));
     return raw ? (JSON.parse(raw) as RecentFileEntry[]) : [];
   } catch {
     return [];
   }
 }
 
-function writeRecents(wid: string, entries: RecentFileEntry[]) {
+function writeRecents(userId: string, wid: string, entries: RecentFileEntry[]) {
+  if (!userId) return;
   try {
-    localStorage.setItem(getStorageKey(wid), JSON.stringify(entries));
+    localStorage.setItem(getStorageKey(userId, wid), JSON.stringify(entries));
   } catch {
     // Storage full — ignore
   }
@@ -49,12 +67,15 @@ interface AddRecentInput {
 }
 
 export function useRecentFiles(wid: string) {
-  const [recents, setRecents] = useState<RecentFileEntry[]>(() => readRecents(wid));
+  const userId = useAuthStore((s) => s.user?.id ?? "");
+  const [recents, setRecents] = useState<RecentFileEntry[]>(() =>
+    readRecents(userId, wid),
+  );
 
-  // Re-read on workspace change
+  // Re-read on account or workspace change
   useEffect(() => {
-    setRecents(readRecents(wid));
-  }, [wid]);
+    setRecents(readRecents(userId, wid));
+  }, [userId, wid]);
 
   const addRecent = useCallback(
     (file: AddRecentInput) => {
@@ -73,22 +94,22 @@ export function useRecentFiles(wid: string) {
         };
         const filtered = prev.filter((r) => r.id !== file.id);
         const next = [entry, ...filtered].slice(0, MAX_RECENT);
-        writeRecents(wid, next);
+        writeRecents(userId, wid, next);
         return next;
       });
     },
-    [wid],
+    [userId, wid],
   );
 
   const removeRecent = useCallback(
     (id: string) => {
       setRecents((prev) => {
         const next = prev.filter((r) => r.id !== id);
-        writeRecents(wid, next);
+        writeRecents(userId, wid, next);
         return next;
       });
     },
-    [wid],
+    [userId, wid],
   );
 
   return { recents, addRecent, removeRecent };

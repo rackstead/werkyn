@@ -388,7 +388,6 @@ it("clears only the requesting account's remembered state when a check is refuse
     requestedAt: "2026-10-27T00:00:00Z",
   });
   rememberInviteAdmission("first", "invite-token", pending("first"));
-  rememberInviteAdmission("second", "invite-token", pending("second"));
   let refuse!: () => void;
   respond("GET", "/api/invites/invite-token/admission", () =>
     new Promise<Response>((resolve) => {
@@ -400,10 +399,14 @@ it("clears only the requesting account's remembered state when a check is refuse
   fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
   await waitFor(() => expect(refuse).toBeTypeOf("function"));
   act(() => signIn("second"));
+  // Switching accounts clears everything remembered for the first one.
+  expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
+  act(() => rememberInviteAdmission("second", "invite-token", pending("second")));
   await act(async () => refuse());
   await waitFor(() =>
-    expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined(),
+    expect(screen.getByRole("button", { name: "Check status" })).toHaveProperty("disabled", false),
   );
+  expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
   expect(queryClient.getQueryData(["invite-admission", "second", "invite-token"])).toEqual(pending("second"));
   expect(screen.getByText(/waiting for an administrator/)).toBeTruthy();
 });
@@ -449,6 +452,7 @@ it("shares a committed join with the same account's other tabs only", async () =
   await waitFor(() => expect(state.navigate).toHaveBeenCalled());
   expect(state.broadcasts).toContainEqual({
     type: "workspaces",
+    epoch: expect.anything(),
     data: { userId: "applicant", workspaces: joined },
   });
   // A receiving tab signed in as another account ignores the message.

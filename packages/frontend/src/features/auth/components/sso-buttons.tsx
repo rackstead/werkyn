@@ -1,4 +1,6 @@
 import { Button } from "@/components/ui/button";
+import { apiUrl } from "@/lib/api-url";
+import { whenLoggedOut } from "@/stores/auth-store";
 
 interface SsoConnectorInfo {
   connectorId: string;
@@ -20,14 +22,21 @@ const CONNECTOR_ICONS: Record<string, string> = {
   ldap: "LDAP",
 };
 
+/** Where the browser goes to start single sign-on with a connector. */
+export function ssoLoginUrl(connectorId: string, returnUrl?: string) {
+  const params = new URLSearchParams();
+  params.set("connector_id", connectorId);
+  if (returnUrl) {
+    params.set("return_url", returnUrl);
+  }
+  return apiUrl("auth/oidc/login", params);
+}
+
 export function SsoButtons({ connectors, returnUrl }: SsoButtonsProps) {
-  const handleSsoLogin = (connectorId: string) => {
-    const params = new URLSearchParams();
-    params.set("connector_id", connectorId);
-    if (returnUrl) {
-      params.set("return_url", returnUrl);
-    }
-    window.location.href = `/api/auth/oidc/login?${params.toString()}`;
+  const handleSsoLogin = async (connectorId: string) => {
+    // Leaving the page would cancel a sign-out still revoking its session.
+    await whenLoggedOut();
+    window.location.href = ssoLoginUrl(connectorId, returnUrl);
   };
 
   return (
@@ -37,7 +46,7 @@ export function SsoButtons({ connectors, returnUrl }: SsoButtonsProps) {
           key={connector.connectorId}
           variant="outline"
           className="w-full"
-          onClick={() => handleSsoLogin(connector.connectorId)}
+          onClick={() => void handleSsoLogin(connector.connectorId)}
         >
           Sign in with {connector.name || CONNECTOR_ICONS[connector.type] || connector.type}
         </Button>

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import type { Block } from "@blocknote/core";
 import { useAuthStore } from "@/stores/auth-store";
 import { stripPastedStyleSheets } from "@/lib/pasted-html";
+import { apiBase } from "@/lib/api-url";
 
 function useIsDark() {
   return useSyncExternalStore(
@@ -58,7 +59,7 @@ export function WikiEditor({
     },
     uploadFile: async (file: File) => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const formData = new FormData();
       if (workspaceId) formData.append("workspaceId", workspaceId);

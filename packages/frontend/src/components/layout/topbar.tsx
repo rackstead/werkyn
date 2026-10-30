@@ -52,8 +52,9 @@ export function Topbar() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  const handleLogout = async () => {
-    await logout();
+  const handleLogout = () => {
+    // Local state is cleared at once; server revocation finishes on its own.
+    void logout();
     navigate({ to: "/login" });
   };
 
@@ -63,14 +64,22 @@ export function Topbar() {
     try {
       if (!workspaceId) return;
       const result = await uploadFile.mutateAsync({ file, purpose: "avatar", workspaceId });
-      const res = await api.patch("users/me", { json: { avatarUrl: result.data.url } }).json<{ data: { avatarUrl: string } }>();
+      const res = await api
+        .patch("users/me", {
+          json: { avatarUrl: result.data.url },
+          // The upload belongs to this account; never apply it to another.
+          context: user ? { expectedUserId: user.id } : {},
+        })
+        .json<{ data: { id: string; avatarUrl: string } }>();
       const currentUser = useAuthStore.getState().user;
-      if (currentUser) {
+      if (currentUser?.id === res.data.id) {
         useAuthStore.setState({ user: { ...currentUser, avatarUrl: res.data.avatarUrl } });
       }
       toast.success("Avatar updated");
     } catch {
-      toast.error("Failed to upload avatar");
+      // Only the account that chose the picture hears that it failed.
+      if (useAuthStore.getState().user?.id === user?.id)
+        toast.error("Failed to upload avatar");
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
   };

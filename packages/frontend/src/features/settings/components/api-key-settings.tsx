@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useApiKeys, useCreateApiKey, useRevokeApiKey } from "../api-keys";
+import { isIdentityChangedError } from "@/lib/api-error";
 
 export function ApiKeySettings() {
   const { data, isLoading, isError, refetch } = useApiKeys();
@@ -25,6 +26,8 @@ export function ApiKeySettings() {
       createKey.reset();
       toast.success("API key created");
     } catch (error) {
+      // Not reported to an account that signed in while it was pending.
+      if (isIdentityChangedError(error)) return;
       toast.error(
         error instanceof Error ? error.message : "Failed to create API key",
       );

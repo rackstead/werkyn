@@ -1,5 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth-store";
+import { apiBase } from "@/lib/api-url";
 
 interface UploadInput {
   file: File;
@@ -16,7 +17,7 @@ export function useUploadFile() {
   return useMutation({
     mutationFn: async ({ file, purpose, workspaceId, spaceId }: UploadInput): Promise<UploadResult> => {
       const token = useAuthStore.getState().accessToken;
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+      const baseUrl = apiBase();
 
       const formData = new FormData();
       formData.append("workspaceId", workspaceId);

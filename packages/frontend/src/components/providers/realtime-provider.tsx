@@ -35,13 +35,17 @@ export function RealtimeProvider({ children }: RealtimeProviderProps) {
         // Invalidate all queries to catch missed events
         queryClient.invalidateQueries();
       },
-      // The session behind the token expired or ended (4004/4005). One
-      // refresh yields a token that rebuilds this client, or signs out.
-      onSessionEnded: () => {
+      // The session behind the token expired (4004) or ended (4005). One
+      // refresh yields a token that rebuilds this client. An ended session
+      // that cannot be refreshed signs out, unless another tab supplied a new
+      // token meanwhile. After an expiry a failed refresh may be transient,
+      // so sign-out is left to the HTTP 401 path.
+      onSessionEnded: async (code) => {
         const auth = useAuthStore.getState();
-        void auth.refresh().then((refreshed) => {
-          if (!refreshed) return auth.logout();
-        });
+        if (await auth.refresh()) return;
+        if (code === 4005 && useAuthStore.getState().accessToken === accessToken) {
+          await auth.logout();
+        }
       },
     });
 

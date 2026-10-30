@@ -388,11 +388,12 @@ test("an authentication whose session lookup raced a logout is refused", async (
       };
     },
   });
-  // On code that never looks the session up, the user lookup stands in.
   const pending = realtime.authenticate(stub, a.token, gated);
   try {
-    const seen = await Promise.race([lookup, sleep(500).then(() => "no session lookup")]);
-    assert.notEqual(seen, null, "the lookup saw the live session");
+    const NO_LOOKUP = Symbol("no session lookup");
+    const seen = await Promise.race([lookup, sleep(2000).then(() => NO_LOOKUP)]);
+    assert.notEqual(seen, NO_LOOKUP, "authentication never looked the session up");
+    assert.ok(seen?.id, "the lookup saw the live session");
 
     const out = await http("POST", "/api/auth/logout", { token: a.token, cookie: a.cookie });
     assert.equal(out.statusCode, 204, out.body);

@@ -28,8 +28,9 @@ interface WebSocketClientOptions {
   getToken: () => string | null;
   onReconnect?: () => void;
   // Called once per socket closed with a session close code. Reconnecting
-  // with the same token cannot succeed; the owner renews or ends the session.
-  onSessionEnded?: (code: number) => void;
+  // with the same token cannot succeed, so the client waits until the
+  // returned promise settles while the owner renews or ends the session.
+  onSessionEnded?: (code: number) => Promise<unknown> | void;
 }
 
 export class WebSocketClient {
@@ -37,7 +38,8 @@ export class WebSocketClient {
   private url: string;
   private getToken: () => string | null;
   private onReconnect?: () => void;
-  private onSessionEnded?: (code: number) => void;
+  private onSessionEnded?: (code: number) => Promise<unknown> | void;
+  private renewing = false;
   private handlers = new Map<string, Set<EventHandler>>();
   private reconnectAttempts = 0;
   private maxReconnectDelay = 30_000;
@@ -112,10 +114,11 @@ export class WebSocketClient {
         this.ws = null;
         this.connected = false;
         if (this.destroyed) return;
-        // The normal backoff still applies, so a renewal that keeps the same
-        // token cannot turn into a reconnect loop.
+        if (this.onSessionEnded && SESSION_CLOSE_CODES.has(event.code)) {
+          this.renewSession(this.onSessionEnded, event.code);
+          return;
+        }
         this.scheduleReconnect();
-        if (SESSION_CLOSE_CODES.has(event.code)) this.onSessionEnded?.(event.code);
       };
 
       this.ws.onerror = () => {
@@ -245,8 +248,36 @@ export class WebSocketClient {
     }, delay);
   }
 
+  // One renewal at a time: neither the backoff timer nor a tab becoming
+  // visible reconnects with the old token while it runs. The owner replaces
+  // or disconnects this client when it gets a new token or signs out;
+  // otherwise the normal backoff resumes afterwards.
+  private renewSession(
+    onSessionEnded: (code: number) => Promise<unknown> | void,
+    code: number,
+  ): void {
+    this.renewing = true;
+    let renewal: Promise<unknown>;
+    try {
+      renewal = Promise.resolve(onSessionEnded(code));
+    } catch (error) {
+      renewal = Promise.reject(error);
+    }
+    void renewal
+      .catch(() => {})
+      .finally(() => {
+        this.renewing = false;
+        this.scheduleReconnect();
+      });
+  }
+
   private handleVisibility(): void {
-    if (document.visibilityState === "visible" && !this.connected && !this.destroyed) {
+    if (
+      document.visibilityState === "visible" &&
+      !this.connected &&
+      !this.renewing &&
+      !this.destroyed
+    ) {
       // Clear existing reconnect timer and reconnect immediately
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);

@@ -1,9 +1,10 @@
-import { open, readFile } from "node:fs/promises";
+import { open, readFile, type FileHandle } from "node:fs/promises";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
 import { exportBackup } from "./backup.service.js";
 import { previewRestore, executeRestore } from "./restore.service.js";
 import {
+  BACKUP_ARCHIVE_LIMITS,
   BackupArchiveError,
   readBackupArchive,
   type BackupArchiveContents,
@@ -32,25 +33,43 @@ export async function exportHandler(
   }
 
   const signal = clientAbortSignal(reply);
-  // The archive is built in memory, so the export keeps the exclusive section
-  // until its response has been sent or abandoned.
-  await backupConcurrency.exclusive(async () => {
-    const { zipBuffer, filename } = await exportBackup(
-      request.server.prisma,
-      wid,
-      body,
-      request.server.storage,
-      request.user!.id,
-    );
-    const sent = responseEnded(reply);
-    // A client that stops reading is dropped after the idle timeout.
-    reply.raw.setTimeout(BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () => reply.raw.destroy());
-    reply
-      .header("Content-Type", "application/zip")
-      .header("Content-Disposition", formatContentDisposition(filename))
-      .send(zipBuffer);
-    await sent;
-  }, signal);
+  // Build the archive in the exclusive section; it is staged on disk, so the
+  // download that follows runs outside it.
+  const { file, filename } = await backupConcurrency.exclusive(
+    () =>
+      exportBackup(
+        request.server.prisma,
+        wid,
+        body,
+        request.server.storage,
+        request.user!.id,
+        BACKUP_ARCHIVE_LIMITS,
+        BACKUP_JSON_LIMITS,
+        { stagingDir: backupStagingDir(env.STORAGE_DIR), signal },
+      ),
+    signal,
+  );
+
+  // Open the finished archive, then remove its name: the open file stays
+  // readable until the response ends or is abandoned, and nothing is left on
+  // disk either way.
+  let handle: FileHandle;
+  try {
+    handle = await open(file.path, "r");
+  } finally {
+    await file.dispose();
+  }
+  const sent = responseEnded(reply);
+  // A client that stops reading is dropped after the idle timeout, which
+  // destroys the stream and ends this request.
+  reply.raw.setTimeout(BACKUP_TRANSFER_LIMITS.idleTimeoutMs, () => reply.raw.destroy());
+  reply
+    .header("Content-Type", "application/zip")
+    .header("Content-Length", String(file.size))
+    .header("Content-Disposition", formatContentDisposition(filename))
+    .send(handle.createReadStream());
+  // Hold the admission until the download has finished or been abandoned.
+  await sent;
   return reply;
 }
 

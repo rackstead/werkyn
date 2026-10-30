@@ -17,6 +17,7 @@ import { useChannels, type ChatChannel } from "@/features/chat/api";
 import { useWikiSpaces } from "@/features/wiki/api";
 import { useExportBackup, usePreviewRestore, useExecuteRestore } from "../backup-api";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
+import { BackupScopeNotice } from "./backup-scope-notice";
 
 interface BackupSettingsProps {
   workspaceId: string;
@@ -447,6 +448,7 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
         <p className="text-sm text-muted-foreground mb-4">
           Select the projects, channels, and wiki spaces you want to include in the backup.
         </p>
+        <BackupScopeNotice action="export" />
 
         {projects.length > 0 && (
           <div className="mb-4">
@@ -542,6 +544,7 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
           Upload a backup file (.zip or legacy .json) to preview and restore data into this workspace.
           Restored items are created as new entities with new IDs.
         </p>
+        <BackupScopeNotice action="restore" />
 
         <div className="space-y-4">
           <div>

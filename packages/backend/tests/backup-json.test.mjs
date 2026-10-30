@@ -9,6 +9,7 @@ const {
   BACKUP_JSON_LIMITS,
   BACKUP_JSON_TOO_LARGE_MESSAGE,
   BackupJsonError,
+  BackupJsonMeter,
   inspectBackupJson,
   parseBackupJson,
 } = await import("../src/modules/backup/backup-json.ts");
@@ -144,6 +145,54 @@ test("validation stops after five problems and never quotes the upload", () => {
   assert.deepEqual(backup, { metadata: META, projects: [], channels: [], wikiSpaces: [] });
 });
 
+test("measuring in pieces counts exactly what measuring the whole file counts", () => {
+  // Escapes, quotes, structure inside strings and multi-byte characters, so
+  // pieces end inside an escape, a string and a character.
+  const text = JSON.stringify(
+    {
+      metadata: { version: "1.1", note: 'a "quoted" \\ back\\slash {not: [structure]}, é ☃ 😀' },
+      projects: [{ tasks: [{ title: "x,y:z", labels: ["a", "b"] }, {}], members: [] }],
+      nested: [[[{ deep: [1, 2, { deeper: null }] }]]],
+    },
+    null,
+    2,
+  );
+  const whole = Buffer.from(text);
+  const expected = inspectBackupJson(whole, unlimited);
+  for (let size = 1; size <= 7; size++) {
+    const meter = new BackupJsonMeter(unlimited);
+    for (let at = 0; at < whole.length; at += size) meter.write(whole.subarray(at, at + size));
+    assert.deepEqual(meter.stats, expected, `pieces of ${size}`);
+  }
+  for (let cut = 1; cut < whole.length; cut++) {
+    const meter = new BackupJsonMeter(unlimited);
+    meter.write(whole.subarray(0, cut)).write(whole.subarray(cut));
+    assert.deepEqual(meter.stats, expected, `cut at ${cut}`);
+  }
+
+  // A limit is enforced as soon as a piece crosses it, by the same reason code.
+  for (const [key, reason] of [
+    ["maxBytes", "json-size"],
+    ["maxTokens", "json-tokens"],
+    ["maxObjects", "json-objects"],
+    ["maxDepth", "json-depth"],
+  ]) {
+    const field = { maxBytes: "bytes", maxTokens: "tokens", maxObjects: "objects", maxDepth: "depth" }[key];
+    const limits = { ...unlimited, [key]: expected[field] - 1 };
+    const meter = new BackupJsonMeter(limits);
+    assert.throws(
+      () => {
+        for (let at = 0; at < whole.length; at += 3) meter.write(whole.subarray(at, at + 3));
+      },
+      (error) => error instanceof BackupJsonError && error.reason === reason,
+      key,
+    );
+    const exact = new BackupJsonMeter({ ...unlimited, [key]: expected[field] });
+    for (let at = 0; at < whole.length; at += 3) exact.write(whole.subarray(at, at + 3));
+    assert.deepEqual(exact.stats, expected, key);
+  }
+});
+
 test("ZIP restore and export apply the same backup.json limits", async () => {
   const {
     ARCHIVE_TOO_LARGE_MESSAGE,
@@ -179,6 +228,17 @@ test("ZIP restore and export apply the same backup.json limits", async () => {
   for (const key of Object.keys(exact)) {
     assert.throws(
       () => new BackupExportBudget(BACKUP_ARCHIVE_LIMITS, { ...exact, [key]: exact[key] - 1 }).addBackupJson(json),
+      { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE },
+      key,
+    );
+  }
+  // Written in pieces, the export budget refuses at the same limits.
+  for (const key of Object.keys(exact)) {
+    const budget = new BackupExportBudget(BACKUP_ARCHIVE_LIMITS, { ...exact, [key]: exact[key] - 1 });
+    assert.throws(
+      () => {
+        for (let at = 0; at < json.length; at += 5) budget.writeJson(json.subarray(at, at + 5));
+      },
       { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE },
       key,
     );

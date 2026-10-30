@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { z } from "zod";
-import { CreateTaskSchema, LoginSchema, RegisterSchema } from "../dist/index.js";
+import {
+  CreateInviteSchema,
+  CreateTaskSchema,
+  LoginSchema,
+  QueryBooleanSchema,
+  RegisterSchema,
+  SetCustomFieldValueSchema,
+  isoDateTime,
+} from "../dist/index.js";
 
 const messages = (schema, input) => schema.safeParse(input).error?.issues.map((issue) => issue.message);
 
@@ -50,4 +58,31 @@ test("a message the schema sets still wins", () => {
   assert.ok(login.error.issues.length > 0);
   assert.deepEqual(messages(CreateTaskSchema, { title: "" }), ["Title is required"]);
   assert.equal(RegisterSchema.safeParse({}).error.issues[0].message, "Required");
+});
+
+test("a union whose list option is over its cap names the cap, without checking each element", () => {
+  const cap = "A MULTI_SELECT value can list at most 200 options";
+  assert.deepEqual(messages(SetCustomFieldValueSchema, { value: Array(201).fill("a") }), [cap]);
+  // Zod 4.6.6 stops at the length, so 300,000 wrong elements give one issue
+  // (Zod 3 checked them all and said "Invalid input").
+  assert.deepEqual(messages(SetCustomFieldValueSchema, { value: Array(300_000).fill(0) }), [cap]);
+  // Within the cap, a bad element or a value of no option's type reads as on Zod 3.
+  for (const value of [["a", 5], {}]) {
+    const issues = SetCustomFieldValueSchema.safeParse({ value }).error.issues;
+    assert.deepEqual(issues.map((issue) => [issue.path.join("."), issue.message]), [["value", "Invalid input"]]);
+  }
+  // A union of a type and an enum still gives Zod 3's summary for a value of neither.
+  for (const value of [null, 0, "yes"]) assert.deepEqual(messages(QueryBooleanSchema, value), ["Invalid input"], String(value));
+});
+
+test("datetimes take optional seconds and fractions, as Zod 3's .datetime() did", () => {
+  const datetime = isoDateTime();
+  for (const value of ["2026-01-01T00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.123Z", "2026-01-01T23:59:59.123456Z"]) {
+    assert.equal(datetime.safeParse(value).success, true, value);
+  }
+  for (const value of ["2026-01-01", "2026-01-01T00:00", "2026-01-01T00:00:00+02:00", "2026-13-01T00:00Z", "2026-01-01T24:00Z", "soon"]) {
+    assert.deepEqual(messages(datetime, value), ["Invalid datetime"], value);
+  }
+  assert.deepEqual(messages(datetime, 5), ["Expected string, received number"]);
+  assert.equal(CreateInviteSchema.safeParse({ expiresAt: "2026-01-01T00:00Z" }).success, true);
 });

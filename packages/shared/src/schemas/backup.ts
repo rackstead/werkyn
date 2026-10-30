@@ -79,7 +79,9 @@ const BackupCustomFieldSchema = z.object({
 
 const BackupCustomFieldValueSchema = z.object({
   fieldRef: z.string(),
-  value: z.unknown(),
+  // Zod 4 requires an object key whose schema is a bare z.unknown(); Zod 3 did
+  // not. A missing value is restored as empty, as before.
+  value: z.unknown().optional(),
 });
 
 const BackupCommentSchema = z.object({

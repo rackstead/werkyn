@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isoDateTime } from "./common.js";
 
 export const CreateFileShareSchema = z.object({
   fileIds: z.array(z.string()).min(1, "At least one file required"),
@@ -15,14 +16,14 @@ export type DeleteFileShareInput = z.infer<typeof DeleteFileShareSchema>;
 export const CreateFileShareLinkSchema = z.object({
   fileIds: z.array(z.string()).min(1, "At least one file required"),
   password: z.string().max(100).optional(),
-  expiresAt: z.string().datetime().optional(),
+  expiresAt: isoDateTime().optional(),
 });
 export type CreateFileShareLinkInput = z.infer<typeof CreateFileShareLinkSchema>;
 
 export const UpdateFileShareLinkSchema = z.object({
   enabled: z.boolean().optional(),
   password: z.string().max(100).nullable().optional(),
-  expiresAt: z.string().datetime().nullable().optional(),
+  expiresAt: isoDateTime().nullable().optional(),
 });
 export type UpdateFileShareLinkInput = z.infer<typeof UpdateFileShareLinkSchema>;
 

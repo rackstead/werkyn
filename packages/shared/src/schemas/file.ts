@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { QueryBooleanSchema, singleLineText } from "./common.js";
+import { QueryBooleanSchema, singleLineText, isoDateTime } from "./common.js";
 
 export const CreateFolderSchema = z.object({
   name: singleLineText()
@@ -17,7 +17,7 @@ export const UpdateFileSchema = z.object({
     .optional(),
   parentId: z.string().nullable().optional(),
   teamFolderId: z.string().nullable().optional(),
-  trashedAt: z.string().datetime().nullable().optional(),
+  trashedAt: isoDateTime().nullable().optional(),
 });
 export type UpdateFileInput = z.infer<typeof UpdateFileSchema>;
 

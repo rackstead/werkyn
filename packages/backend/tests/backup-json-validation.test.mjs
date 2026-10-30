@@ -122,23 +122,21 @@ function mutate(doc, rand, count) {
   return doc;
 }
 
-/** What a single full Zod parse reports, with the same message rules. */
+/**
+ * What a single full Zod parse reports. Independent of parseBackupJson's error
+ * map: the parse uses only the shared default wording, and the two messages
+ * that would quote the upload are rewritten here from the finished issues.
+ */
 function reference(text) {
   const raw = JSON.parse(text);
-  const result = BackupFileSchema.safeParse(raw, {
-    error: (issue) => {
-      if (issue.code === "invalid_value") {
-        if (issue.input === undefined) return "Required";
-        if (typeof issue.input !== "string") return undefined;
-        return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(" | ")}`;
-      }
-      if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";
-      return undefined;
-    },
-  });
-  return result.success
-    ? { data: result.data }
-    : { message: FORMAT + result.error.issues.slice(0, 5).map((i) => i.message).join("; ") };
+  const result = BackupFileSchema.safeParse(raw, { reportInput: true });
+  if (result.success) return { data: result.data };
+  const message = (issue) => {
+    if (issue.code === "invalid_value" && typeof issue.input === "string") return issue.message.replace(/, received '[\s\S]*'$/, "");
+    if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";
+    return issue.message;
+  };
+  return { message: FORMAT + result.error.issues.slice(0, 5).map(message).join("; ") };
 }
 
 function bounded(text) {
@@ -182,6 +180,21 @@ test("enum problems read as on Zod 3 and never quote the upload", () => {
     `${FORMAT}Invalid enum value. Expected '1.0' | '1.1'; Invalid enum value. Expected 'PUBLIC' | 'PRIVATE'`,
   );
   assert.equal(bounded(JSON.stringify({ metadata: { ...META, version: undefined } })).message, `${FORMAT}Required`);
+});
+
+test("a custom field value without `value` is accepted whether the entry is small or walked", () => {
+  const task = (entry) => ({ _originalId: "t", title: "t", priority: "LOW", position: 0, statusRef: "s", customFieldValues: [entry] });
+  const doc = (entry, extra = []) => JSON.stringify({ metadata: META, projects: [{ project: { name: "p" }, tasks: [task(entry), ...extra] }] });
+  const small = { fieldRef: "cf" };
+  const walked = { fieldRef: "cf", junk: Array(BACKUP_VALIDATION_BATCH_VALUES + 100).fill(0) };
+  for (const entry of [small, walked]) {
+    const { data } = bounded(doc(entry));
+    assert.deepEqual(data.projects[0].tasks[0].customFieldValues, [{ fieldRef: "cf" }]);
+    assert.deepEqual(bounded(doc(entry)), reference(doc(entry)));
+    // A later problem is still the first reported, the same for both sizes.
+    const bad = { ...task({ fieldRef: "cf", value: 1 }), title: 5 };
+    assert.equal(bounded(doc(entry, [bad])).message, `${FORMAT}Expected string, received number`);
+  }
 });
 
 test("defaults are applied and unknown keys stripped as before", () => {
@@ -278,15 +291,18 @@ test("BackupFileSchema uses only constructs the bounded walk understands", () =>
     if (schema instanceof z.ZodDefault) return visit(schema.removeDefault(), at);
     if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) return visit(schema.unwrap(), at);
     if (schema instanceof z.ZodArray) {
-      const { minLength, maxLength, exactLength } = schema._def;
-      if (minLength || maxLength || exactLength) problems.push(`${at}: array length check`);
+      if (schema.def.checks?.length) problems.push(`${at}: array check`);
       return visit(schema.element, `${at}[]`);
     }
     if (schema instanceof z.ZodObject) {
-      if (schema._def.unknownKeys !== "strip" || !(schema._def.catchall instanceof z.ZodNever)) {
-        problems.push(`${at}: object is not in strip mode`);
+      if (schema.def.catchall !== undefined) problems.push(`${at}: object is not in strip mode`);
+      if (schema.def.checks?.length) problems.push(`${at}: object refinement`);
+      for (const [key, field] of Object.entries(schema.shape)) {
+        // Zod 4 requires a key whose schema is a bare z.unknown(), and the walk
+        // cannot see an absent key, so such a field must be .optional().
+        if (field instanceof z.ZodUnknown) problems.push(`${at ? `${at}.` : ""}${key}: required unknown`);
+        visit(field, at ? `${at}.${key}` : key);
       }
-      for (const [key, field] of Object.entries(schema.shape)) visit(field, at ? `${at}.${key}` : key);
       return;
     }
     if (!leaves.some((type) => schema instanceof type)) problems.push(`${at}: ${schema.constructor.name}`);
@@ -303,7 +319,9 @@ test("BackupFileSchema uses only constructs the bounded walk understands", () =>
   assert.equal(probe(z.object({ a: z.string() }).strict()), 1);
   assert.equal(probe(z.array(z.string()).max(5)), 1);
   assert.equal(probe(z.object({ a: z.union([z.string(), z.number()]) })), 1);
-  assert.equal(probe(z.object({ a: z.record(z.string()) })), 1);
+  assert.equal(probe(z.object({ a: z.record(z.string(), z.string()) })), 1);
+  assert.equal(probe(z.object({ a: z.unknown() })), 1);
+  assert.equal(probe(z.object({ a: z.unknown().optional() })), 0);
 });
 
 /** In-process best-of-three timings, so CI load affects both sides alike. */

@@ -75,8 +75,19 @@ export const zod3CompatibleMessage: z.core.$ZodErrorMap = (issue) => {
       return `Invalid enum value. Expected ${quoted(issue.values)}, received ${typeof issue.input === "string" ? `'${issue.input}'` : String(issue.input)}`;
     case "unrecognized_keys":
       return `Unrecognized key(s) in object: ${issue.keys.map((key) => `'${key}'`).join(", ")}`;
-    case "invalid_union":
+    case "invalid_union": {
+      // Since Zod 4.6.6 an array over its `.max()` stops early, and a union
+      // whose options all stopped reports only this summary. Zod 3 reported
+      // that option's length problem instead, so take it when it is the only one.
+      const overLong = issue.errors.filter((option) =>
+        option.some((inner) => inner.code === "too_big" && inner.path.length === 0),
+      );
+      if (overLong.length === 1) {
+        const tooBig = overLong[0].find((inner) => inner.code === "too_big" && inner.path.length === 0);
+        if (tooBig) return tooBig.message;
+      }
       return "Invalid input";
+    }
     case "invalid_format": {
       if (issue.format === "starts_with") return `Invalid input: must start with "${(issue as { prefix?: string }).prefix}"`;
       if (issue.format === "ends_with") return `Invalid input: must end with "${(issue as { suffix?: string }).suffix}"`;

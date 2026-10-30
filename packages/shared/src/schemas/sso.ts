@@ -122,7 +122,7 @@ export const CreateSsoConnectorSchema = z.object({
     .regex(/^[a-z0-9-]+$/, "Must be lowercase alphanumeric with dashes"),
   name: z.string().min(1).max(100),
   type: SsoConnectorType,
-  config: z.record(z.unknown()),
+  config: z.record(z.string(), z.unknown()),
   enabled: z.boolean().optional(),
   position: z.number().int().optional(),
 });
@@ -132,7 +132,7 @@ export type CreateSsoConnectorInput = z.infer<
 
 export const UpdateSsoConnectorSchema = z.object({
   name: z.string().min(1).max(100).optional(),
-  config: z.record(z.unknown()).optional(),
+  config: z.record(z.string(), z.unknown()).optional(),
   enabled: z.boolean().optional(),
   position: z.number().int().optional(),
 });

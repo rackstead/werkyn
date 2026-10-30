@@ -126,12 +126,13 @@ function mutate(doc, rand, count) {
 function reference(text) {
   const raw = JSON.parse(text);
   const result = BackupFileSchema.safeParse(raw, {
-    errorMap: (issue, ctx) => {
-      if (issue.code === "invalid_enum_value") {
-        return { message: `Invalid enum value. Expected ${issue.options.map((o) => `'${String(o)}'`).join(" | ")}` };
+    error: (issue) => {
+      if (issue.code === "invalid_value") {
+        if (issue.input === undefined) return "Required";
+        return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(" | ")}`;
       }
-      if (issue.code === "unrecognized_keys") return { message: "Unrecognized key(s) in object" };
-      return { message: ctx.defaultError };
+      if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";
+      return undefined;
     },
   });
   return result.success

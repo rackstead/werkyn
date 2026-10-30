@@ -109,8 +109,8 @@ importers:
         specifier: ^2.8.2
         version: 2.8.2
       zod:
-        specifier: ^3.24.1
-        version: 3.25.76
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@types/archiver':
         specifier: ^6.0.3
@@ -176,8 +176,8 @@ importers:
         specifier: ^6.1.20
         version: 6.1.20(@fullcalendar/core@6.1.20)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       '@hookform/resolvers':
-        specifier: ^3.9.1
-        version: 3.10.0(react-hook-form@7.71.1(react@19.2.4))
+        specifier: ^5.9.2
+        version: 5.9.2(@standard-schema/spec@1.1.0)(ajv@8.17.1)(effect@3.21.0)(react-hook-form@7.71.1(react@19.2.4))(zod@4.6.7)
       '@mantine/core':
         specifier: ^8.3.14
         version: 8.3.14(@mantine/hooks@8.3.14(react@19.2.4))(@types/react@19.2.13)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
@@ -266,8 +266,8 @@ importers:
         specifier: ^0.8.0
         version: 0.8.0
       zod:
-        specifier: ^3.24.1
-        version: 3.25.76
+        specifier: ^4.6.7
+        version: 4.6.7
       zustand:
         specifier: ^5.0.3
         version: 5.0.11(@types/react@19.2.13)(react@19.2.4)(use-sync-external-store@1.6.0(react@19.2.4))
@@ -312,8 +312,8 @@ importers:
   packages/shared:
     dependencies:
       zod:
-        specifier: ^3.24.1
-        version: 3.25.76
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       typescript:
         specifier: ^5.7.3
@@ -919,10 +919,83 @@ packages:
       prosemirror-state: ^1.0.0
       prosemirror-view: ^1.0.0
 
-  '@hookform/resolvers@3.10.0':
-    resolution: {integrity: sha512-79Dv+3mDF7i+2ajj7SkypSKHhl1cbln1OGavqrsF7p6mbUv11xpqpacPsGDCTRvCSjEEIez2ef1NveSVL3b0Ag==}
+  '@hookform/resolvers@5.9.2':
+    resolution: {integrity: sha512-RtjTnZqsC38s4NKp2XO3fD8IA5uyN4tB7McQ5C6uiMPcV+WWO8F+wVa3e+BXUpH2ScgxghAlwFRMVqjT9WChAQ==}
     peerDependencies:
-      react-hook-form: ^7.0.0
+      '@sinclair/typebox': '>=0.25.24'
+      '@standard-schema/spec': ^1.0.0
+      '@typeschema/main': '>=0.13.7'
+      '@vinejs/vine': ^2.0.0 || ^3.0.0 || ^4.0.0
+      ajv: ^8.12.0
+      ajv-errors: ^3.0.0
+      ajv-formats: ^2.1.1
+      arktype: ^2.0.0
+      ata-validator: ^1.23.0
+      class-transformer: '>=0.4.0'
+      class-validator: '>=0.12.0'
+      computed-types: ^1.0.0
+      effect: ^3.10.3
+      fluentvalidation-ts: ^3.0.0
+      fp-ts: ^2.7.0
+      io-ts: ^2.0.0
+      joi: ^17.0.0 || ^18.0.0
+      nope-validator: '>=0.12.0'
+      react-hook-form: ^7.55.0
+      superstruct: '>=0.12.0'
+      typanion: ^3.3.2
+      valibot: '>=0.31.0 || ^1.0.0-beta.4 || ^1.0.0-rc'
+      vest: '>=6.0.0'
+      yup: ^1.0.0
+      zod: ^3.25.0 || ^4.0.0
+    peerDependenciesMeta:
+      '@sinclair/typebox':
+        optional: true
+      '@standard-schema/spec':
+        optional: true
+      '@typeschema/main':
+        optional: true
+      '@vinejs/vine':
+        optional: true
+      ajv:
+        optional: true
+      ajv-errors:
+        optional: true
+      ajv-formats:
+        optional: true
+      arktype:
+        optional: true
+      ata-validator:
+        optional: true
+      class-transformer:
+        optional: true
+      class-validator:
+        optional: true
+      computed-types:
+        optional: true
+      effect:
+        optional: true
+      fluentvalidation-ts:
+        optional: true
+      fp-ts:
+        optional: true
+      io-ts:
+        optional: true
+      joi:
+        optional: true
+      nope-validator:
+        optional: true
+      superstruct:
+        optional: true
+      typanion:
+        optional: true
+      valibot:
+        optional: true
+      vest:
+        optional: true
+      yup:
+        optional: true
+      zod:
+        optional: true
 
   '@img/colour@1.1.0':
     resolution: {integrity: sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ==}
@@ -2012,6 +2085,9 @@ packages:
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
+
+  '@standard-schema/utils@0.3.0':
+    resolution: {integrity: sha512-e7Mew686owMaPJVNNLs55PUvgz371nKgwsc4vxE49zsODpJEnxgxRo2y/OKrqueavXgZNMDVj3DdHFlaSAeU8g==}
 
   '@tailwindcss/node@4.1.18':
     resolution: {integrity: sha512-DoR7U1P7iYhw16qJ49fgXUlry1t4CpXeErJHnQ44JgTSKMaZUdf17cfn5mHchfJ4KRBZRFA/Coo+MUF5+gOaCQ==}
@@ -4709,6 +4785,9 @@ packages:
   zod@3.25.76:
     resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
 
+  zod@4.6.7:
+    resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
+
   zustand@5.0.11:
     resolution: {integrity: sha512-fdZY+dk7zn/vbWNCYmzZULHRrss0jx5pPFiOuMZ/5HJN6Yv3u+1Wswy/4MpZEkEGhtNH+pwxZB8OKgUBPzYAGg==}
     engines: {node: '>=12.20.0'}
@@ -5322,9 +5401,15 @@ snapshots:
       prosemirror-transform: 1.12.4
       prosemirror-view: 1.42.5
 
-  '@hookform/resolvers@3.10.0(react-hook-form@7.71.1(react@19.2.4))':
+  '@hookform/resolvers@5.9.2(@standard-schema/spec@1.1.0)(ajv@8.17.1)(effect@3.21.0)(react-hook-form@7.71.1(react@19.2.4))(zod@4.6.7)':
     dependencies:
+      '@standard-schema/utils': 0.3.0
       react-hook-form: 7.71.1(react@19.2.4)
+    optionalDependencies:
+      '@standard-schema/spec': 1.1.0
+      ajv: 8.17.1
+      effect: 3.21.0
+      zod: 4.6.7
 
   '@img/colour@1.1.0': {}
 
@@ -6383,6 +6468,8 @@ snapshots:
   '@shikijs/vscode-textmate@10.0.2': {}
 
   '@standard-schema/spec@1.1.0': {}
+
+  '@standard-schema/utils@0.3.0': {}
 
   '@tailwindcss/node@4.1.18':
     dependencies:
@@ -9468,6 +9555,8 @@ snapshots:
       readable-stream: 4.7.0
 
   zod@3.25.76: {}
+
+  zod@4.6.7: {}
 
   zustand@5.0.11(@types/react@19.2.13)(react@19.2.4)(use-sync-external-store@1.6.0(react@19.2.4)):
     optionalDependencies:

@@ -1,14 +1,12 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
-import type { ZodSchema } from "zod";
+import type { ZodType } from "zod";
+import { validationDetails } from "../utils/validation-details.js";
 
-export function validate(schema: ZodSchema) {
+export function validate(schema: ZodType) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const result = schema.safeParse(request.body);
     if (!result.success) {
-      const details = result.error.issues.map((issue) => ({
-        field: issue.path.join("."),
-        message: issue.message,
-      }));
+      const details = validationDetails(result.error.issues);
       return reply.status(400).send({
         statusCode: 400,
         error: "Bad Request",
@@ -20,14 +18,11 @@ export function validate(schema: ZodSchema) {
   };
 }
 
-export function validateQuery(schema: ZodSchema) {
+export function validateQuery(schema: ZodType) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const result = schema.safeParse(request.query);
     if (!result.success) {
-      const details = result.error.issues.map((issue) => ({
-        field: issue.path.join("."),
-        message: issue.message,
-      }));
+      const details = validationDetails(result.error.issues);
       return reply.status(400).send({
         statusCode: 400,
         error: "Bad Request",
@@ -39,14 +34,11 @@ export function validateQuery(schema: ZodSchema) {
   };
 }
 
-export function validateParams(schema: ZodSchema) {
+export function validateParams(schema: ZodType) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const result = schema.safeParse(request.params);
     if (!result.success) {
-      const details = result.error.issues.map((issue) => ({
-        field: issue.path.join("."),
-        message: issue.message,
-      }));
+      const details = validationDetails(result.error.issues);
       return reply.status(400).send({
         statusCode: 400,
         error: "Bad Request",

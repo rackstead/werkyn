@@ -6,6 +6,7 @@ import {
   type CreateSsoConnectorInput,
   type UpdateSsoConnectorInput,
 } from "@pm/shared";
+import { validationDetails } from "../../utils/validation-details.js";
 import { ValidationError, NotFoundError } from "../../utils/errors.js";
 
 const SECRET_FIELDS = ["clientSecret", "bindPW"];
@@ -68,10 +69,7 @@ export async function createConnector(
     if (!result.success) {
       throw new ValidationError(
         "Invalid connector configuration",
-        result.error.errors.map((e) => ({
-          field: e.path.join("."),
-          message: e.message,
-        })),
+        validationDetails(result.error.issues),
       );
     }
   }
@@ -134,10 +132,7 @@ export async function updateConnector(
       if (!result.success) {
         throw new ValidationError(
           "Invalid connector configuration",
-          result.error.errors.map((e) => ({
-            field: e.path.join("."),
-            message: e.message,
-          })),
+          validationDetails(result.error.issues),
         );
       }
     }

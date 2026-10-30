@@ -8,6 +8,7 @@ import {
   LockedError,
 } from "../utils/errors.js";
 import { ZodError } from "zod";
+import { validationDetails } from "../utils/validation-details.js";
 import { env } from "../config/env.js";
 import { isRetryableDatabaseError } from "../utils/retryable-database-errors.js";
 
@@ -142,10 +143,7 @@ export default fp(async (fastify: FastifyInstance) => {
 
       // Zod validation errors
       if (error instanceof ZodError) {
-        const details = error.issues.map((issue) => ({
-          field: issue.path.join("."),
-          message: issue.message,
-        }));
+        const details = validationDetails(error.issues);
         return reply.status(400).send({
           statusCode: 400,
           error: "Bad Request",

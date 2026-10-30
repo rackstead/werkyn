@@ -1,5 +1,5 @@
 import { BackupFileSchema, type BackupFile } from "@pm/shared";
-import { z, type ZodErrorMap, type ZodIssueOptionalMessage, type ZodTypeAny } from "zod";
+import { z } from "zod";
 import { ValidationError } from "../../utils/errors.js";
 
 const MiB = 1024 * 1024;
@@ -138,16 +138,20 @@ const MAX_REPORTED_ISSUES = 5;
  */
 export const BACKUP_VALIDATION_BATCH_VALUES = 512;
 
-/** Zod's message, minus the uploaded value or keys it would otherwise quote. */
-function issueMessage(issue: ZodIssueOptionalMessage, defaultError: string) {
-  if (issue.code === "invalid_enum_value") {
-    return `Invalid enum value. Expected ${issue.options.map((o) => `'${String(o)}'`).join(" | ")}`;
+/**
+ * Messages that would quote the upload are replaced; every other issue keeps
+ * the shared default wording (see @pm/shared `zod3CompatibleMessage`).
+ */
+const error: z.core.$ZodErrorMap = (issue) => {
+  if (issue.code === "invalid_value") {
+    if (issue.input === undefined) return "Required";
+    return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(" | ")}`;
   }
   if (issue.code === "unrecognized_keys") return "Unrecognized key(s) in object";
-  return defaultError;
-}
+  return undefined;
+};
 
-const errorMap: ZodErrorMap = (issue, ctx) => ({ message: issueMessage(issue, ctx.defaultError) });
+type Schema = z.ZodType;
 
 /** One validation: problems found so far, and the values counted per container. */
 interface Walk {
@@ -201,24 +205,24 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * `.default()` that BackupFileSchema uses. Anything else is validated whole.
  * Problems are found in the order a full parse reports them.
  */
-function collectIssues(schema: ZodTypeAny, value: unknown, walk: Walk): void {
+function collectIssues(schema: Schema, value: unknown, walk: Walk): void {
   if (walk.messages.length >= walk.max) return;
   for (;;) {
     if (schema instanceof z.ZodDefault) {
       if (value === undefined) return;
-      schema = schema.removeDefault();
+      schema = schema.removeDefault() as Schema;
     } else if (schema instanceof z.ZodOptional) {
       if (value === undefined) return;
-      schema = schema.unwrap();
+      schema = schema.unwrap() as Schema;
     } else if (schema instanceof z.ZodNullable) {
       if (value === null) return;
-      schema = schema.unwrap();
+      schema = schema.unwrap() as Schema;
     } else {
       break;
     }
   }
   if (schema instanceof z.ZodArray && Array.isArray(value)) {
-    collectItemIssues(schema, value, walk);
+    collectItemIssues(schema.element as Schema, value, walk);
     return;
   }
   if (
@@ -226,7 +230,7 @@ function collectIssues(schema: ZodTypeAny, value: unknown, walk: Walk): void {
     isPlainObject(value) &&
     size(value, walk) > BACKUP_VALIDATION_BATCH_VALUES
   ) {
-    for (const [key, field] of Object.entries(schema.shape as Record<string, ZodTypeAny>)) {
+    for (const [key, field] of Object.entries(schema.shape as Record<string, Schema>)) {
       collectIssues(field, value[key], walk);
       if (walk.messages.length >= walk.max) return;
     }
@@ -234,16 +238,16 @@ function collectIssues(schema: ZodTypeAny, value: unknown, walk: Walk): void {
   }
   // A scalar, a small object or array, or a value Zod does not traverse
   // (`z.unknown()`, or the wrong kind of value, which gets one issue).
-  report(schema.safeParse(value, { errorMap }), walk);
+  report(schema.safeParse(value, { error }), walk);
 }
 
 /** Array elements in batches; an element too large for a batch is walked alone. */
-function collectItemIssues(schema: z.ZodArray<ZodTypeAny>, items: unknown[], walk: Walk): void {
-  const batchSchema = z.array(schema.element);
+function collectItemIssues(element: Schema, items: unknown[], walk: Walk): void {
+  const batchSchema = z.array(element);
   let batch: unknown[] = [];
   let batchValues = 0;
   const flush = () => {
-    if (batch.length > 0) report(batchSchema.safeParse(batch, { errorMap }), walk);
+    if (batch.length > 0) report(batchSchema.safeParse(batch, { error }), walk);
     batch = [];
     batchValues = 0;
   };
@@ -252,7 +256,7 @@ function collectItemIssues(schema: z.ZodArray<ZodTypeAny>, items: unknown[], wal
     const values = size(item, walk);
     if (values > BACKUP_VALIDATION_BATCH_VALUES) {
       flush();
-      collectIssues(schema.element, item, walk);
+      collectIssues(element, item, walk);
       continue;
     }
     if (batchValues + values > BACKUP_VALIDATION_BATCH_VALUES) flush();
@@ -298,7 +302,7 @@ export function parseBackupJson(
   if (messages.length === 0) {
     // Every value already passed in bounded pieces, so this finds no element
     // problems; it builds the result with defaults applied.
-    const result = BackupFileSchema.safeParse(raw, { errorMap });
+    const result = BackupFileSchema.safeParse(raw, { error });
     if (result.success) return result.data;
     report(result, walk);
   }

@@ -1,5 +1,5 @@
 import { BackupFileSchema, type BackupFile } from "@pm/shared";
-import type { ZodErrorMap, ZodIssueOptionalMessage } from "zod";
+import { z, type ZodErrorMap, type ZodIssueOptionalMessage, type ZodTypeAny } from "zod";
 import { ValidationError } from "../../utils/errors.js";
 
 const MiB = 1024 * 1024;
@@ -128,7 +128,12 @@ export function inspectBackupJson(
 /** Problems quoted in the response; validation stops once it has this many. */
 const MAX_REPORTED_ISSUES = 5;
 
-class IssueLimitReached extends Error {}
+/**
+ * Values (objects, arrays and scalars) handed to one Zod call. Zod builds an
+ * issue for every invalid value it visits before it returns, so a call never
+ * sees more than this many values, and at most this many issues exist at once.
+ */
+export const BACKUP_VALIDATION_BATCH_VALUES = 512;
 
 /** Zod's message, minus the uploaded value or keys it would otherwise quote. */
 function issueMessage(issue: ZodIssueOptionalMessage, defaultError: string) {
@@ -139,12 +144,125 @@ function issueMessage(issue: ZodIssueOptionalMessage, defaultError: string) {
   return defaultError;
 }
 
+const errorMap: ZodErrorMap = (issue, ctx) => ({ message: issueMessage(issue, ctx.defaultError) });
+
+/** True when `value` holds at most `budget.left` values; spends what it counts. */
+function fits(value: unknown, budget: { left: number }): boolean {
+  if (--budget.left < 0) return false;
+  if (value === null || typeof value !== "object") return true;
+  if (Array.isArray(value)) {
+    for (const item of value) if (!fits(item, budget)) return false;
+    return true;
+  }
+  for (const key in value) {
+    if (!fits((value as Record<string, unknown>)[key], budget)) return false;
+  }
+  return true;
+}
+
+/** How many values `value` holds, or `limit + 1` once it has more than `limit`. */
+function size(value: unknown, limit: number): number {
+  const budget = { left: limit };
+  return fits(value, budget) ? limit - budget.left : limit + 1;
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * Validates `value` against `schema` in pieces of at most
+ * BACKUP_VALIDATION_BATCH_VALUES values, and stops once `messages` holds
+ * `max` problems. Zod builds every issue of a call before returning and runs
+ * error maps only once it has them all (Zod 4), so a cap inside one call
+ * cannot bound memory; bounding what each call sees does. Objects and arrays
+ * too large for one call are walked here through the public schema API
+ * (`shape`, `element`, `unwrap`, `removeDefault`): the parts of `z.object`
+ * (unknown keys stripped), `z.array`, `.optional()`, `.nullable()` and
+ * `.default()` that BackupFileSchema uses. Anything else is validated whole.
+ * Problems are found in the order a full parse reports them.
+ */
+function collectIssues(schema: ZodTypeAny, value: unknown, messages: string[], max: number): void {
+  if (messages.length >= max) return;
+  for (;;) {
+    if (schema instanceof z.ZodDefault) {
+      if (value === undefined) return;
+      schema = schema.removeDefault();
+    } else if (schema instanceof z.ZodOptional) {
+      if (value === undefined) return;
+      schema = schema.unwrap();
+    } else if (schema instanceof z.ZodNullable) {
+      if (value === null) return;
+      schema = schema.unwrap();
+    } else {
+      break;
+    }
+  }
+  if (schema instanceof z.ZodArray && Array.isArray(value)) {
+    collectItemIssues(schema, value, messages, max);
+    return;
+  }
+  if (
+    schema instanceof z.ZodObject &&
+    isPlainObject(value) &&
+    size(value, BACKUP_VALIDATION_BATCH_VALUES) > BACKUP_VALIDATION_BATCH_VALUES
+  ) {
+    for (const [key, field] of Object.entries(schema.shape as Record<string, ZodTypeAny>)) {
+      collectIssues(field, value[key], messages, max);
+      if (messages.length >= max) return;
+    }
+    return;
+  }
+  // A scalar, a small object or array, or a value of the wrong kind (one issue).
+  report(schema.safeParse(value, { errorMap }), messages, max);
+}
+
+/** Array elements in batches; an element too large for a batch is walked alone. */
+function collectItemIssues(
+  schema: z.ZodArray<ZodTypeAny>,
+  items: unknown[],
+  messages: string[],
+  max: number,
+): void {
+  const batchSchema = z.array(schema.element);
+  let batch: unknown[] = [];
+  let batchValues = 0;
+  const flush = () => {
+    if (batch.length > 0) report(batchSchema.safeParse(batch, { errorMap }), messages, max);
+    batch = [];
+    batchValues = 0;
+  };
+  for (const item of items) {
+    if (messages.length >= max) return;
+    const values = size(item, BACKUP_VALIDATION_BATCH_VALUES);
+    if (values > BACKUP_VALIDATION_BATCH_VALUES) {
+      flush();
+      collectIssues(schema.element, item, messages, max);
+      continue;
+    }
+    if (batchValues + values > BACKUP_VALIDATION_BATCH_VALUES) flush();
+    batch.push(item);
+    batchValues += values;
+  }
+  if (messages.length < max) flush();
+}
+
+function report(result: { success: boolean; error?: z.ZodError }, messages: string[], max: number) {
+  if (result.success || !result.error) return;
+  for (const issue of result.error.issues) {
+    if (messages.length >= max) return;
+    messages.push(issue.message);
+  }
+}
+
 /**
  * Parse and validate an uploaded `backup.json` within `limits`. Validation
- * stops at the fifth problem: Zod otherwise builds an issue for every invalid
- * element, about 100 bytes of heap per byte of a file like `[{},{},…]`.
- * BackupFileSchema sets no custom messages, so every issue reaches the error
- * map below.
+ * stops at the fifth problem and never hands Zod more than
+ * BACKUP_VALIDATION_BATCH_VALUES values at once, so a file of many invalid
+ * elements (Zod builds an issue for each, about 100 bytes of heap per byte of
+ * a file like `[{},{},…]`) costs a handful of issues, whatever Zod version
+ * runs. Only a file without problems gets the full parse that applies
+ * defaults. BackupFileSchema sets no custom messages, so every issue gets the
+ * error map's message, which never quotes the upload.
  */
 export function parseBackupJson(
   json: Buffer,
@@ -159,23 +277,13 @@ export function parseBackupJson(
   }
 
   const messages: string[] = [];
-  const errorMap: ZodErrorMap = (issue, ctx) => {
-    const message = issueMessage(issue, ctx.defaultError);
-    messages.push(message);
-    if (messages.length >= MAX_REPORTED_ISSUES) throw new IssueLimitReached();
-    return { message };
-  };
-  let result: ReturnType<typeof BackupFileSchema.safeParse> | undefined;
-  try {
-    result = BackupFileSchema.safeParse(raw, { errorMap });
-  } catch (error) {
-    if (!(error instanceof IssueLimitReached)) throw error;
-  }
-  if (result?.success) return result.data;
-  if (messages.length === 0 && result) {
-    messages.push(
-      ...result.error.issues.slice(0, MAX_REPORTED_ISSUES).map((issue) => issue.message),
-    );
+  collectIssues(BackupFileSchema, raw, messages, MAX_REPORTED_ISSUES);
+  if (messages.length === 0) {
+    // Every value already passed in bounded pieces, so this finds no element
+    // problems; it builds the result with defaults applied.
+    const result = BackupFileSchema.safeParse(raw, { errorMap });
+    if (result.success) return result.data;
+    report(result, messages, MAX_REPORTED_ISSUES);
   }
   throw new ValidationError(`Invalid backup file format: ${messages.join("; ")}`);
 }

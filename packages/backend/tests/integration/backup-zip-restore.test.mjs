@@ -496,14 +496,14 @@ test("export refuses an archive that restore would refuse", async () => {
     exportBackup(app.prisma, source.id, request, app.storage, admin.id, { ...BACKUP_ARCHIVE_LIMITS, ...limits });
 
   const { zipBuffer } = await exportWith({});
-  const entries = inspectBackupArchive(zipBuffer);
+  const entries = await inspectBackupArchive(zipBuffer);
   const total = entries.reduce((sum, entry) => sum + entry.size, 0);
   const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
 
   // Exactly at the limits the export succeeds and restores under them.
   const exact = { maxTotalBytes: total, maxEntries: 4, maxEntryBytes: Math.max(...entries.map((e) => e.size)) };
   const fitting = await exportWith(exact);
-  assert.equal(readBackupArchive(fitting.zipBuffer, { ...BACKUP_ARCHIVE_LIMITS, ...exact }).assets.size, 2);
+  assert.equal((await readBackupArchive(fitting.zipBuffer, { ...BACKUP_ARCHIVE_LIMITS, ...exact })).assets.size, 2);
 
   await assert.rejects(exportWith({ maxTotalBytes: total - 1 }), tooLarge);
   // backup.json, the implied assets/ folder and two files are four entries.
@@ -534,7 +534,7 @@ test("export refuses a backup.json that restore would refuse to parse", async ()
       ...jsonLimits,
     });
 
-  const stats = inspectBackupJson(readBackupArchive((await exportWith({})).zipBuffer).jsonBuffer);
+  const stats = inspectBackupJson((await readBackupArchive((await exportWith({})).zipBuffer)).jsonBuffer);
   assert.ok(stats.depth > 40, `${stats.depth}`);
   const exact = {
     maxBytes: stats.bytes,
@@ -545,7 +545,7 @@ test("export refuses a backup.json that restore would refuse to parse", async ()
   // Exactly at the limits the export succeeds and its backup.json fits them;
   // one byte, token, object or level less refuses it.
   const fitting = await exportWith(exact);
-  assert.deepEqual(inspectBackupJson(readBackupArchive(fitting.zipBuffer).jsonBuffer, exact), stats);
+  assert.deepEqual(inspectBackupJson((await readBackupArchive(fitting.zipBuffer)).jsonBuffer, exact), stats);
   const tooLarge = { statusCode: 400, message: EXPORT_TOO_LARGE_MESSAGE };
   for (const key of Object.keys(exact))
     await assert.rejects(exportWith({ [key]: exact[key] - 1 }), tooLarge, key);

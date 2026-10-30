@@ -87,8 +87,12 @@ export function CustomFieldsManager({ projectId }: CustomFieldsManagerProps) {
   };
 
   const handleAddOption = () => {
-    if (!newOptionValue.trim()) return;
-    setNewOptions([...newOptions, { value: newOptionValue.trim() }]);
+    const value = newOptionValue.trim();
+    if (!value) return;
+    // Values identify options, so each may appear only once.
+    if (!newOptions.some((option) => option.value === value)) {
+      setNewOptions([...newOptions, { value }]);
+    }
     setNewOptionValue("");
   };
 

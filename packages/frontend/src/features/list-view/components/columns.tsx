@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isHttpUrl } from "@pm/shared";
 import { committedDate } from "@/lib/date-input";
 import { createColumnHelper } from "@tanstack/react-table";
 import type { Task } from "@/features/tasks/api";
@@ -27,6 +28,7 @@ import { Check, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CustomField } from "@/features/projects/api";
 import { useSetCustomFieldValue } from "@/features/projects/api";
+import { useCustomFieldSaver, type CustomFieldInput } from "@/features/tasks/custom-field-save";
 
 const columnHelper = createColumnHelper<Task>();
 
@@ -401,6 +403,11 @@ function CustomFieldDisplay({
       );
     }
     case "URL":
+      // Only http(s) values are links; values saved before URL fields were
+      // checked may use other schemes such as javascript: or data:.
+      if (!isHttpUrl(String(value))) {
+        return <span className="text-xs truncate">{String(value)}</span>;
+      }
       return (
         <a
           href={String(value)}
@@ -434,8 +441,13 @@ function InlineCustomFieldCell({
   const cfv = task.customFieldValues?.find((v) => v.fieldId === field.id);
   const value = cfv?.value;
 
-  const save = (newValue: string | number | boolean | string[] | null) => {
-    setFieldValue.mutate({ fieldId: field.id, value: newValue });
+  // Nothing is sent for an unchanged value or an emptied required field; the
+  // cell then shows the stored value again.
+  const { save: saveValue } = useCustomFieldSaver(field, value, (newValue, onError) =>
+    setFieldValue.mutate({ fieldId: field.id, value: newValue }, { onError }),
+  );
+  const save = (newValue: CustomFieldInput) => {
+    saveValue(newValue);
     setEditing(false);
   };
 

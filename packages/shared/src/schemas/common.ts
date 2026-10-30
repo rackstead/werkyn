@@ -52,6 +52,11 @@ export function multilineText() {
   return z.string().regex(MULTILINE_TEXT, "Must not contain control characters");
 }
 
+/** True when `value` is acceptable to multilineText(). */
+export function isMultilineText(value: string): boolean {
+  return MULTILINE_TEXT.test(value);
+}
+
 // The characters MULTILINE_TEXT rejects, and the two of them that stand for a
 // break: vertical tab (a manual line break in Word) and form feed (a page break).
 const MULTILINE_DISALLOWED = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;

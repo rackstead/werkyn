@@ -600,9 +600,9 @@ test("references outside their project, channel or space are dropped with warnin
     `User "${outsider.displayName}" (${outsider.email}) not found in workspace — references will use fallback or be skipped`,
     `Project "Beta ${tag}": skipped 1 custom field value(s) that refer to a field of another project`,
     `Project "Beta ${tag}": 2 task(s) refer to a status column that is not in the project and were placed in the first column`,
-    `Project "Beta ${tag}": skipped 1 assignment(s) of users who would have no access to the project`,
+    `Project "Beta ${tag}": skipped 1 assignment(s) of users who would have no access to the project (the backup lists no members for this project)`,
     `Project "Beta ${tag}": skipped 1 task label(s) that are not labels of the project`,
-    `Project "Beta ${tag}": cleared 1 subtask assignee(s) who would have no access to the project`,
+    `Project "Beta ${tag}": cleared 1 subtask assignee(s) who would have no access to the project (the backup lists no members for this project)`,
     `Project "Beta ${tag}": skipped 1 dependenc(ies) on tasks that are not in the project`,
     `Channel "random-${tag}": restored 2 repl(ies) without their thread because the parent message is not an earlier message of the channel`,
     `Skipped parent link for wiki page "Orphan" — parent ref gone-page not found`,
@@ -1051,6 +1051,42 @@ test("repeated names, positions and references are restored once, as documented"
     { title: "B", position: 0 },
     { title: "A", position: 1 },
   ]);
+});
+
+test("many repeated label, custom-field and space names preview in linear time", async () => {
+  const ws = await workspace("many names");
+  await app.prisma.wikiSpace.create({ data: { workspaceId: ws.id, name: "Taken", slug: "many", position: 0 } });
+  const labels = 50_000;
+  const spaces = 20_000;
+  const file = backup({
+    projects: [
+      project(`Many ${suffix}`, {
+        labels: Array.from({ length: labels }, (_, i) => ({ _originalId: `l${i}`, name: "Bug", color: "#000000" })),
+        customFields: Array.from({ length: 2_000 }, (_, i) => ({
+          _originalId: `f${i}`,
+          name: `${"x".repeat(95)}${i % 2 ? "a" : "b"}`,
+          type: "TEXT",
+          required: false,
+          position: i,
+        })),
+      }),
+    ],
+    wikiSpaces: Array.from({ length: spaces }, () => ({ space: { name: "Many" } })),
+  });
+  const started = performance.now();
+  const response = await upload(ws.id, "preview", file);
+  const ms = performance.now() - started;
+  assert.equal(response.statusCode, 200, response.body);
+  const summary = response.json().data;
+  assert.deepEqual([summary.labels, summary.customFields, summary.wikiSpaces], [labels, 2_000, spaces]);
+  assert.ok(
+    summary.warnings.includes(
+      `Project "Many ${suffix}": ${labels - 1} repeated label name(s) were restored with a numbered suffix, such as "Bug (2)"`,
+    ),
+    summary.warnings.join("\n"),
+  );
+  // About 1 s here; the quadratic repair took over a minute for these counts.
+  assert.ok(ms < 10_000, `preview took ${Math.round(ms)} ms`);
 });
 
 test("restores never touch existing rows and pick free wiki slugs", async () => {

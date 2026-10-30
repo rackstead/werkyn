@@ -47,6 +47,43 @@ test("repeated names get the first free numbered suffix within the column length
   assert.equal(Array.from(result.names[1]).length, 10);
 });
 
+test("repairing many repeated names takes linear time and stays within the column", () => {
+  const started = performance.now();
+  const many = uniqueNames(Array(50_000).fill("Bug"), 100);
+  assert.equal(new Set(many.names).size, 50_000);
+  assert.deepEqual(many.names.slice(0, 3), ["Bug", "Bug (2)", "Bug (3)"]);
+  assert.equal(many.names.at(-1), "Bug (50000)");
+  // Names already in the list are never reused, and each blocks one number.
+  const blocked = uniqueNames(["Bug", ...Array.from({ length: 1_000 }, (_, i) => `Bug (${i + 2})`), "Bug"], 100);
+  assert.equal(blocked.names.at(-1), "Bug (1002)");
+  // Long names that differ only at the end share one stem and its numbers.
+  const long = Array.from({ length: 20_000 }, (_, i) => `${"x".repeat(95)}${String(i % 10_000).padStart(5, "0")}`);
+  const cut = uniqueNames(long, 100);
+  assert.equal(new Set(cut.names).size, long.length);
+  assert.ok(cut.names.every((name) => Array.from(name).length <= 100));
+  assert.equal(cut.renamed.length, 10_000);
+  // The quadratic version took several minutes for these.
+  const ms = performance.now() - started;
+  assert.ok(ms < 2_000, `${Math.round(ms)} ms`);
+});
+
+test("each assets/ occurrence costs at most the longest archive path", () => {
+  // 1,000 archive paths of distinct lengths, none of them in the text.
+  const urls = new Map(Array.from({ length: 1_000 }, (_, i) => [`assets/${"q".repeat(i + 1)}`, `/storage/${i}`]));
+  urls.set("assets/hit.png", "/storage/hit");
+  const matcher = assetMatcher(urls);
+  const text = "assets/".repeat(1_000_000) + "assets/hit.png";
+  const hits = new Set();
+  const started = performance.now();
+  const rewritten = rewriteAssetPaths(text, matcher, hits);
+  const ms = performance.now() - started;
+  assert.ok(rewritten.endsWith("/storage/hit"));
+  assert.equal(rewritten.length, text.length - "assets/hit.png".length + "/storage/hit".length);
+  assert.deepEqual([...hits], ["assets/hit.png"]);
+  // Trying every path length took about 0.25 ms per occurrence (minutes here).
+  assert.ok(ms < 2_000, `${Math.round(ms)} ms`);
+});
+
 test("asset paths are rewritten longest first and untouched values are shared", () => {
   const content = [
     { type: "image", props: { url: "assets/a.png" } },

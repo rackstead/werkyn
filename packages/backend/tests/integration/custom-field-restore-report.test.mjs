@@ -132,7 +132,8 @@ test("a backup with an unknown custom-field type is rejected by preview and rest
   for (const run of [previewRestore, executeRestore]) {
     await assert.rejects(run(app.prisma, target.id, admin.id, file), (error) => {
       assert.equal(error.statusCode, 400);
-      assert.match(error.message, /custom field "Odd" .* has an unknown type/);
+      // Refusals name a position in the file, not its content.
+      assert.equal(error.message, "Invalid backup file: a custom field in project 1 has an unknown type");
       return true;
     });
   }

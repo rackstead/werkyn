@@ -258,12 +258,8 @@ export function validateBackup(backup: BackupFile): void {
     }
     for (const f of entry.customFields) {
       checkText(f.name, `a custom field name in ${where}`, L.customFieldName);
-      // Same message as planCustomFieldRestore, which preview and restore
-      // used to reach only after part of the plan had run.
       if (!CustomFieldTypeEnum.safeParse(f.type).success)
-        throw new ValidationError(
-          `Invalid backup file format: custom field "${f.name}" in project "${project.name}" has an unknown type`,
-        );
+        throw invalid(`a custom field in ${where} has an unknown type`);
     }
     for (const t of entry.tasks) {
       checkText(t.title, `a task title in ${where}`, L.taskTitle);

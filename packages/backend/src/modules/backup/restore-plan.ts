@@ -135,28 +135,36 @@ export function scopePositions(positions: number[]): { positions: number[]; renu
   return { positions, renumbered: false };
 }
 
-function withSuffix(name: string, suffix: string, limit: number) {
-  const chars = Array.from(name);
-  return chars.slice(0, Math.max(0, limit - suffix.length)).join("") + suffix;
-}
-
 /**
  * Names that must be unique within a project (labels, custom fields): the
  * first use keeps its name, later repeats become "Name (2)", "Name (3)"…,
  * never equal to another name in the list, within the column length.
+ *
+ * The next number to try is kept per stem, so each repeat costs O(1) on
+ * average: a suffix string "<stem> (<n>)" has exactly one stem and number,
+ * so no two stems ever produce the same candidate, and each original name
+ * can block at most one candidate. A name too long for any suffix the list
+ * can need is cut to leave room for it.
  */
 export function uniqueNames(names: string[], limit: number) {
   const taken = new Set(names);
   const used = new Set<string>();
+  const next = new Map<string, number>();
+  // n never exceeds the number of names plus the names it can collide with.
+  const room = ` (${2 * names.length + 1})`.length;
   const renamed: Array<[string, string]> = [];
   const result = names.map((name) => {
     if (!used.has(name)) {
       used.add(name);
       return name;
     }
-    let candidate = name;
-    for (let n = 2; taken.has(candidate) || used.has(candidate); n++)
-      candidate = withSuffix(name, ` (${n})`, limit);
+    const chars = Array.from(name);
+    const stem = chars.length + room > limit ? chars.slice(0, Math.max(0, limit - room)).join("") : name;
+    let n = next.get(stem) ?? 2;
+    let candidate: string;
+    do candidate = `${stem} (${n++})`;
+    while (taken.has(candidate) || used.has(candidate));
+    next.set(stem, n);
     used.add(candidate);
     renamed.push([name, candidate]);
     return candidate;
@@ -173,31 +181,97 @@ function slugBase(name: string) {
     .slice(0, 80);
 }
 
-/** The space's slug, or the first free "-2", "-3"… variant in the workspace. */
-function uniqueSlug(name: string, taken: Set<string>) {
-  const base = slugBase(name) || "space";
-  let slug = base;
-  for (let n = 2; taken.has(slug); n++) slug = `${base}-${n}`;
-  taken.add(slug);
-  return slug;
+/**
+ * Hands out each space's slug, or the first free "-2", "-3"… variant in the
+ * workspace. The next number is kept per base, so many spaces of one name
+ * cost O(1) each on average.
+ */
+function slugAllocator(taken: Set<string>) {
+  const next = new Map<string, number>();
+  return (name: string) => {
+    const base = slugBase(name) || "space";
+    let slug = base;
+    if (taken.has(slug)) {
+      let n = next.get(base) ?? 2;
+      do slug = `${base}-${n++}`;
+      while (taken.has(slug));
+      next.set(base, n);
+    }
+    taken.add(slug);
+    return slug;
+  };
 }
 
-/** Archive paths with their URLs, and the distinct path lengths, longest first. */
+/**
+ * Archive paths in a radix tree: each edge holds a run of characters, and a
+ * node that ends a path holds the path and its URL. It has at most two nodes
+ * per path and keeps the labels as slices of the paths.
+ */
+interface RadixNode {
+  path?: string;
+  url?: string;
+  edges: Map<string, { label: string; node: RadixNode }>;
+}
+
 export interface AssetMatcher {
-  urls: ReadonlyMap<string, string>;
-  lengths: number[];
+  size: number;
+  root: RadixNode;
 }
 
 export function assetMatcher(urls: ReadonlyMap<string, string>): AssetMatcher {
-  const lengths = [...new Set([...urls.keys()].map((p) => p.length))].sort((a, b) => b - a);
-  return { urls, lengths };
+  const root: RadixNode = { edges: new Map() };
+  for (const [path, url] of urls) {
+    let node = root;
+    let rest = path;
+    while (rest !== "") {
+      const edge = node.edges.get(rest[0]);
+      if (!edge) {
+        const leaf: RadixNode = { edges: new Map() };
+        node.edges.set(rest[0], { label: rest, node: leaf });
+        node = leaf;
+        rest = "";
+        break;
+      }
+      let common = 0;
+      while (common < edge.label.length && common < rest.length && edge.label[common] === rest[common])
+        common++;
+      if (common < edge.label.length) {
+        // Split the edge where the new path leaves it.
+        const middle: RadixNode = { edges: new Map() };
+        middle.edges.set(edge.label[common], { label: edge.label.slice(common), node: edge.node });
+        edge.label = edge.label.slice(0, common);
+        edge.node = middle;
+      }
+      node = edge.node;
+      rest = rest.slice(common);
+    }
+    node.path = path;
+    node.url = url;
+  }
+  return { size: urls.size, root };
+}
+
+/** The longest archive path that starts at `at` in `text`, if any. */
+function longestPath(text: string, at: number, matcher: AssetMatcher) {
+  let node = matcher.root;
+  let position = at;
+  let found: RadixNode | undefined;
+  for (;;) {
+    if (node.url !== undefined) found = node;
+    const edge = position < text.length ? node.edges.get(text[position]) : undefined;
+    if (!edge || !text.startsWith(edge.label, position)) break;
+    position += edge.label.length;
+    node = edge.node;
+  }
+  return found;
 }
 
 /**
  * At each "assets/" in `text`, from left to right, replaces the longest
  * archive path that starts there with its URL and continues after it, so a
  * path never consumes part of a longer one ("assets/a" in "assets/a.png").
- * Every archive path starts with "assets/" and no URL contains it.
+ * Every archive path starts with "assets/" and no URL contains it. Each
+ * occurrence costs at most the length of the longest archive path.
  */
 function rewriteText(text: string, matcher: AssetMatcher, hits?: Set<string>): string {
   let at = text.indexOf("assets/");
@@ -206,15 +280,11 @@ function rewriteText(text: string, matcher: AssetMatcher, hits?: Set<string>): s
   let copied = 0;
   while (at >= 0) {
     let next = at + 1;
-    for (const length of matcher.lengths) {
-      if (at + length > text.length) continue;
-      const path = text.slice(at, at + length);
-      const url = matcher.urls.get(path);
-      if (url === undefined) continue;
-      out += text.slice(copied, at) + url;
-      copied = next = at + length;
-      hits?.add(path);
-      break;
+    const match = longestPath(text, at, matcher);
+    if (match) {
+      out += text.slice(copied, at) + match.url;
+      copied = next = at + match.path!.length;
+      hits?.add(match.path!);
     }
     at = text.indexOf("assets/", next);
   }
@@ -227,7 +297,7 @@ function rewriteText(text: string, matcher: AssetMatcher, hits?: Set<string>): s
  * replaced path in `hits`. Recursion is bounded by MAX_RESTORE_JSON_DEPTH.
  */
 export function rewriteAssetPaths(value: unknown, matcher: AssetMatcher, hits?: Set<string>): unknown {
-  if (matcher.urls.size === 0) return value;
+  if (matcher.size === 0) return value;
   if (typeof value === "string") return rewriteText(value, matcher, hits);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
@@ -292,6 +362,7 @@ export function* planRestore(
   const memberIds = new Set(target.members.map((m) => m.id));
   const admins = new Set(target.members.filter((m) => m.role === "ADMIN").map((m) => m.id));
   const assets = assetMatcher(target.assetUrls);
+  const allocateSlug = slugAllocator(target.takenSlugs);
 
   // Field references by project, to tell another project's field from one
   // left out of the export.
@@ -524,9 +595,16 @@ export function* planRestore(
         });
       }
     }
-    note(droppedAssignees, "skipped # assignment(s) of users who would have no access to the project");
+    // Without project members only workspace admins keep their assignments.
+    const why =
+      projectMembers.size > 0
+        ? ""
+        : entry.members.length === 0
+          ? " (the backup lists no members for this project)"
+          : " (none of the project's members in the backup is a member of this workspace)";
+    note(droppedAssignees, `skipped # assignment(s) of users who would have no access to the project${why}`);
     note(droppedLabels, "skipped # task label(s) that are not labels of the project");
-    note(clearedSubtaskAssignees, "cleared # subtask assignee(s) who would have no access to the project");
+    note(clearedSubtaskAssignees, `cleared # subtask assignee(s) who would have no access to the project${why}`);
     note(renumberedSubtasks, "renumbered the subtasks of # task(s) with repeated or invalid positions");
     note(invalidDates.count, "skipped # due or start date(s) that are not valid YYYY-MM-DD dates");
 
@@ -620,7 +698,7 @@ export function* planRestore(
       id: spaceId,
       workspaceId,
       name: entry.space.name,
-      slug: uniqueSlug(entry.space.name, target.takenSlugs),
+      slug: allocateSlug(entry.space.name),
       description: entry.space.description,
       icon: entry.space.icon,
       position,

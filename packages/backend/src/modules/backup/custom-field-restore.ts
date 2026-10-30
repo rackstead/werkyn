@@ -67,9 +67,8 @@ export function planCustomFieldRestore(
   for (const field of entry.customFields) {
     const type = CustomFieldTypeEnum.safeParse(field.type);
     if (!type.success) {
-      throw new ValidationError(
-        `Invalid backup file format: custom field "${field.name}" in project "${project}" has an unknown type`,
-      );
+      // validateBackup refuses this before any plan runs.
+      throw new ValidationError("Invalid backup file: a custom field has an unknown type");
     }
     let options: SelectOption[] | undefined;
     if (isSelectFieldType(type.data)) {

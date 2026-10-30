@@ -109,11 +109,11 @@ same.
 | --- | --- |
 | Task column outside its project | The project's first column; a project without columns skips its tasks |
 | Label, blocking task or custom-field value of another project, or missing | Dropped |
-| Assignee who would have no access to the restored project (not a workspace admin, not a restored member) | Dropped (task), cleared (subtask) |
+| Assignee who would have no access to the restored project (not a workspace admin, not a restored member) | Dropped (task), cleared (subtask); the warning says when the backup lists no project members (an export without members) |
 | User whose email matches no workspace member | As before: skipped where optional, the restoring admin where required |
 | Reply whose parent is not an earlier message of the same channel | A top-level message |
 | Page parent missing from the backup | A root page (as before) |
-| Repeated label or custom-field name in a project | Later ones are renamed "Name (2)", "Name (3)"… |
+| Repeated label or custom-field name in a project | Later ones are renamed "Name (2)", "Name (3)"… (a name too long for the suffix is shortened first) |
 | Repeated assignees, labels, dependencies, reactions, members | Written once, no warning |
 | Positions repeated or not an integer in 0..2147483647 within a scope (a column's tasks, a project's columns or fields, a task's subtasks, a page's children) | That scope renumbered 0..n-1 in its previous order |
 | More than one completion column | The first keeps it |
@@ -147,11 +147,13 @@ repaired as described, whatever its version.
   (create or update) still fails with a 500 from Prisma ("recursion limit
   exceeded"). Nothing is written. It is in the wiki module and the shared
   page schema, outside this change.
-- Rewriting asset paths in page content looks at each `assets/` in a string
-  and tries the archive paths of each distinct length, longest first. That is
-  fast for exports, whose file names have few lengths. An archive crafted with
-  files of many lengths and content full of `assets/` still costs time
-  proportional to both counts multiplied, about as before.
+- Rewriting asset paths in page content (in preview too, to count the files
+  pages use) walks the archive paths as a radix tree at each `assets/` in a
+  string, so each occurrence costs at most the longest archive path (1,024
+  bytes). The worst case is content made of nothing but `assets/` against
+  archive paths that repeat that prefix up to the name limit: about 8 s for a
+  24 MiB `backup.json` locally (the previous rewrite took over a minute for
+  its own worst case, and preview did not run it).
 - Export completeness, streaming, transport and concurrent backup requests
   are handled separately (B03 export side).
 

@@ -32,6 +32,17 @@ const { hashToken } = await import("../../src/utils/tokens.js");
 const { hashPassword } = await import("../../src/utils/passwords.js");
 const { startRefreshSession } =
   await import("../../src/modules/auth/refresh-sessions.js");
+const { PrismaClient } = await import("@prisma/client");
+const { refreshLockLimits } =
+  await import("../../src/modules/auth/refresh-sessions.js");
+const { openRawSocket } = await import("./support/raw-websocket.mjs");
+const controlUrl = new URL(process.env.TEST_DATABASE_URL);
+controlUrl.searchParams.set("connection_limit", "1");
+const control = new PrismaClient({ datasourceUrl: controlUrl.toString() });
+// The holder and observer have separate single-connection pools. Observation
+// cannot queue behind either blocked HTTP actor in the application pool.
+const observer = new PrismaClient({ datasourceUrl: controlUrl.toString() });
+const sockets = new Set();
 const domain = `pending-logout-${crypto.randomBytes(5).toString("hex")}.example.test`;
 const password = "Owned-fixture-Password-123";
 const families = new Set();
@@ -156,17 +167,6 @@ async function record(id) {
   });
 }
 
-const { PrismaClient } = await import("@prisma/client");
-const { refreshLockLimits } =
-  await import("../../src/modules/auth/refresh-sessions.js");
-const { openRawSocket } = await import("./support/raw-websocket.mjs");
-const controlUrl = new URL(process.env.TEST_DATABASE_URL);
-controlUrl.searchParams.set("connection_limit", "1");
-const control = new PrismaClient({ datasourceUrl: controlUrl.toString() });
-// The holder and observer have separate single-connection pools. Observation
-// cannot queue behind either blocked HTTP actor in the application pool.
-const observer = new PrismaClient({ datasourceUrl: controlUrl.toString() });
-const sockets = new Set();
 const trusted = {
   origin: "http://localhost:5173",
   "x-werkyn-session-recovery": "1",

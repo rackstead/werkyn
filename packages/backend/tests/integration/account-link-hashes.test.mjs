@@ -190,7 +190,8 @@ async function snapshot(user) {
 }
 
 // Separate connections hold and observe real SQL row locks. The barrier
-// checks the specific blocker PID before the holder lets the actors proceed.
+// follows the specific blocker PID, including a delete queued behind another
+// waiter on that row, before the holder lets the actors proceed.
 async function withLock(lock, body, { rollback = false, beforeRelease } = {}) {
   let release, ready, holderPid;
   const gate = new Promise((resolve) => {
@@ -225,9 +226,18 @@ async function withLock(lock, body, { rollback = false, beforeRelease } = {}) {
   async function waitBlocked(expected = 1) {
     const deadline = performance.now() + 5000;
     while (performance.now() < deadline) {
-      const [{ count }] =
-        await control.$queryRaw`SELECT count(*)::int AS count FROM pg_stat_activity
-        WHERE datname = current_database() AND ${holderPid}::int = ANY(pg_blocking_pids(pid))`;
+      const [{ count }] = await control.$queryRaw`
+        WITH RECURSIVE blocked(pid) AS (
+          SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND ${holderPid}::int = ANY(pg_blocking_pids(pid))
+          UNION
+          SELECT activity.pid FROM pg_stat_activity AS activity
+          JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))
+          WHERE activity.datname = current_database()
+        )
+        SELECT count(*)::int AS count FROM blocked
+      `;
       if (count >= expected) return;
       await sleep(10);
     }
@@ -602,6 +612,10 @@ test("change, forgot-password and cleanup settle without deadlock and later issu
   const old = await app.prisma.passwordResetToken.findFirstOrThrow({
     where: { userId: user.id },
   });
+  await app.prisma.passwordResetToken.update({
+    where: { id: old.id },
+    data: { expiresAt: new Date(Date.now() - 1000) },
+  });
   let newer;
   const results = await withLock(
     (tx) =>
@@ -613,6 +627,7 @@ test("change, forgot-password and cleanup settle without deadlock and later issu
       });
       await waitBlocked();
       start(() => cleanupExpiredTokensAndAttempts(app.prisma));
+      await waitBlocked(2);
       const changed = await bounded(start(() => change(user, session)));
       assert.equal(changed.status, 503, changed.body);
     },
@@ -621,6 +636,62 @@ test("change, forgot-password and cleanup settle without deadlock and later issu
   assert.equal(results[2].status, 503);
   assert.equal((await reset(raw)).status, 404);
   assert.equal((await reset(newer.raw)).status, 200);
+});
+
+test("a reset link inserted after the delete makes password change retry without discarding the newer link", async () => {
+  const user = await makeUser();
+  const session = await login(user);
+  const before = await snapshot(user);
+  const name = `account_link_insert_${crypto.randomBytes(5).toString("hex")}`;
+  const sequence = `${name}_seq`;
+  const key = crypto.randomInt(1, 1_000_000_000);
+  let issued;
+  try {
+    await control.$executeRawUnsafe(`CREATE SEQUENCE "${sequence}"`);
+    // Statement triggers run after an empty DELETE too. Only the first
+    // invocation pauses; forgot-password can insert while change holds User.
+    await control.$executeRawUnsafe(`
+      CREATE FUNCTION "${name}"() RETURNS trigger AS $$
+      BEGIN
+        IF nextval('"${sequence}"') = 1 THEN
+          PERFORM pg_advisory_xact_lock(${key});
+        END IF;
+        RETURN NULL;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await control.$executeRawUnsafe(`
+      CREATE TRIGGER "${name}" AFTER DELETE ON "PasswordResetToken"
+      FOR EACH STATEMENT EXECUTE FUNCTION "${name}"()
+    `);
+    const [busy] = await withLock(
+      (tx) => tx.$executeRaw`SELECT pg_advisory_xact_lock(${key}::bigint)`,
+      async (start, waitBlocked) => {
+        start(() => change(user, session));
+        await waitBlocked();
+        issued = await forgot(user);
+      },
+    );
+    assert.equal(busy.status, 503, busy.body);
+    assert.equal(
+      busy.json.message,
+      "This account is busy. Try again in a moment.",
+    );
+    const after = await snapshot(user);
+    assert.deepEqual(after.user, before.user);
+    assert.deepEqual(after.families, before.families);
+    assert.deepEqual(after.sessions, before.sessions);
+    assert.equal(after.links.length, 1);
+    assert.equal(after.links[0].tokenHash, hashToken(issued.raw));
+    assert.equal(after.links[0].usedAt, null);
+    assert.equal((await reset(issued.raw)).status, 200);
+  } finally {
+    await control.$executeRawUnsafe(
+      `DROP TRIGGER IF EXISTS "${name}" ON "PasswordResetToken"`,
+    );
+    await control.$executeRawUnsafe(`DROP FUNCTION IF EXISTS "${name}"()`);
+    await control.$executeRawUnsafe(`DROP SEQUENCE IF EXISTS "${sequence}"`);
+  }
 });
 
 test("reset refuses a skipped sibling delete that later rolls back", async () => {

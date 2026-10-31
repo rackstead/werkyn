@@ -10,13 +10,12 @@ stopped, and a `start` after the stop starts Dex again. Stopping sends SIGTERM, 
 SIGKILL after 5 s, and waits up to 2 s more for the exit before another Dex starts (if it
 still has not exited, an error is logged and the queue moves on).
 
-Dex's PostgreSQL TLS mode now follows `sslmode` in `DATABASE_URL`, so Dex requires TLS
-whenever Werkyn is told to:
+Dex's PostgreSQL TLS mode follows `sslmode` in `DATABASE_URL` as follows:
 
-| `sslmode` in `DATABASE_URL` | Werkyn (Prisma 6.19) | Dex `ssl.mode` |
+| `sslmode` in `DATABASE_URL` | Werkyn (Prisma 6.19.3) | Dex `ssl.mode` |
 | --- | --- | --- |
 | none, `disable`, `allow`, `prefer` | plaintext for `disable`, otherwise `prefer` | `disable` (the bundled Compose database has no TLS) |
-| `require` | TLS required, certificate not checked | `require` |
+| `require` with `sslaccept` omitted or `accept_invalid_certs` | TLS required, certificate not checked | `require` |
 | `require` with `sslaccept=strict` | TLS required, certificate verified | `verify-full` |
 | `verify-ca`, `verify-full`, `REQUIRE` | `prefer`: Prisma only knows lowercase `disable`, `prefer` and `require` | the same mode, so only Dex requires TLS |
 | anything else | `prefer` | Dex is not started and the error is logged |
@@ -24,6 +23,10 @@ whenever Werkyn is told to:
 Dex's driver cannot fall back between TLS and plaintext, so modes that let Werkyn fall
 back to plaintext (`prefer`, or no `sslmode`, which Prisma treats as `prefer`) keep Dex on
 plaintext.
+
+`channel_binding` does not configure Dex's TLS mode: `channel_binding=require`
+without an explicit `sslmode` can make Prisma require TLS while Dex uses plaintext.
+Use the verified-TLS settings below for both connections.
 
 To require verified TLS for both Werkyn and Dex, use
 
@@ -36,6 +39,25 @@ Prisma then requires TLS and checks the server certificate against `ca.pem`, and
 the system's trusted CAs. A `verify-ca` or `verify-full` mode only makes Dex
 verify: Prisma treats it as `prefer` and connects in plaintext to a server without TLS.
 `sslmode=require` on its own requires TLS on both connections but checks no certificate.
+
+With PostgreSQL Dex storage, a present `sslaccept` must be exactly `strict` or
+`accept_invalid_certs`, in lowercase. Empty, unknown, uppercase and whitespace-padded
+values are rejected, including with `disable`, `allow`, `prefer` or no `sslmode`.
+URL parameter names and values are percent-decoded before checking; names are
+case-sensitive, as in Prisma. For example, `ssl%61ccept=%73trict` means
+`sslaccept=strict`, while `SSLACCEPT` is ignored by both parsers.
+
+Prisma 6.19.3 treats every present value other than exact `accept_invalid_certs` as
+strict. Dex previously verified only a value that lowercased to `strict`, so a typo
+such as `sslaccept=bogus` left Dex's `require` connection unverified while Prisma
+verified it. Dex now refuses the configuration before writing it or starting a
+process. The logged error names `sslaccept` and its allowed choices without repeating
+the value or URL, and the manager does not retry this configuration error.
+For an existing URL with an invalid value, replace it with `sslaccept=strict` and
+configure the trusted CA as above to retain certificate verification. If unverified
+TLS is intentional, use exact `sslaccept=accept_invalid_certs`; omitting it keeps
+the same default. Apply the corrected environment and restart Werkyn to start Dex
+again.
 
 Dex is stricter than Werkyn in two cases, and both fail closed:
 

@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { z } from "zod";
-import { TaskSlideover } from "@/features/tasks";
+import { TaskSlideover, usePreloadTaskSlideover } from "@/features/tasks";
 import { FilterBar, type Filters } from "@/components/shared/filter-bar";
 import { TaskTable } from "@/features/list-view/components/task-table";
 import { BulkActions } from "@/features/list-view/components/bulk-actions";
@@ -43,6 +43,7 @@ function ListRoute() {
   const permissions = usePermissions(membership, user?.id);
 
   useRealtime(projectId);
+  usePreloadTaskSlideover();
 
   const { mutate: updateTask } = useUpdateTask();
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});

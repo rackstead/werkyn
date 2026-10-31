@@ -1,5 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
+import { ChunkLoadErrorNotice } from "@/components/shared/lazy-load"
+import { isChunkLoadError } from "@/lib/lazy-import"
 
 interface ErrorBoundaryProps {
   children: ReactNode
@@ -30,6 +32,11 @@ export class ErrorBoundary extends Component<
 
   render() {
     if (this.state.hasError) {
+      // Trying again cannot help: the failed chunk stays failed until reload.
+      if (isChunkLoadError(this.state.error)) {
+        return <ChunkLoadErrorNotice />
+      }
+
       if (this.props.fallback) {
         return this.props.fallback
       }

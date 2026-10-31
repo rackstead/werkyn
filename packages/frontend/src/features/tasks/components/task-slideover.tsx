@@ -19,16 +19,18 @@ const TaskDescription = lazy(() =>
   })),
 );
 
-interface TaskSlideoverProps {
+export interface TaskSlideoverProps {
   taskId: string;
   workspaceSlug: string;
   onClose: () => void;
+  onCloseAutoFocus?: (event: Event) => void;
 }
 
 export function TaskSlideover({
   taskId,
   workspaceSlug,
   onClose,
+  onCloseAutoFocus,
 }: TaskSlideoverProps) {
   const { data, isLoading, isError } = useTask(taskId);
   const task = data?.data;
@@ -49,6 +51,7 @@ export function TaskSlideover({
       title="Task details"
       titleClassName="text-sm text-muted-foreground"
       onClose={onClose}
+      onCloseAutoFocus={onCloseAutoFocus}
       layout
       className={isFullscreen ? undefined : "max-w-2xl border-l"}
       actions={

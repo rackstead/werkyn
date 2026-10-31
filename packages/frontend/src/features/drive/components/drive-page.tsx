@@ -24,7 +24,7 @@ import {
   type SortBy,
   type SortOrder,
 } from "../api";
-import { FilePreviewSlideover } from "./file-preview-slideover";
+import { FilePreviewSlideover, UploadProgress } from "./lazy-drive-panels";
 import { DriveBulkActions } from "./drive-bulk-actions";
 import { useFileUpload } from "../hooks/use-file-upload";
 import { useFileSelection } from "../hooks/use-file-selection";
@@ -40,7 +40,6 @@ import { CreateFolderDialog } from "./create-folder-dialog";
 import { RenameDialog } from "./rename-dialog";
 import { MoveDialog } from "./move-dialog";
 import { UploadDropzone } from "./upload-dropzone";
-import { UploadProgress } from "./upload-progress";
 import { TeamFoldersSection } from "./team-folders-section";
 import { StarredSection } from "./starred-section";
 import { RecentFilesSection } from "./recent-files-section";

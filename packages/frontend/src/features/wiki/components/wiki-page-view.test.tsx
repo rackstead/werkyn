@@ -1,9 +1,10 @@
 import { type ReactNode } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as wiki from "../api";
 import { WikiPageView } from "./wiki-page-view";
+import { WikiEditor } from "./lazy-wiki-editor";
 import { wikiAutosaveKey } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
 import { PendingEditsError } from "@/lib/autosave-queue";
@@ -91,6 +92,10 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+// The page view loads its editor from a separate chunk; load the mock once so
+// every test renders it synchronously, as a preloaded editor renders.
+beforeAll(() => WikiEditor.preload());
 
 beforeEach(() => {
   vi.useFakeTimers();

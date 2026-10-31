@@ -195,6 +195,25 @@ test("retry begun after share revocation creates no stored content or actual soc
   }
 });
 
+test("revoking an inherited folder share hides history and refuses its queued delivery", async () => {
+  const f = await fixture();
+  const parent = await file(f, { isFolder: true });
+  await app.prisma.file.update({ where: { id: f.file.id }, data: { parentId: parent.id } });
+  const grant = await share(f, parent);
+  const stored = await seed(f);
+  const id = await enqueue(f);
+  assert.equal(await canonical(f), true);
+  assert.deepEqual((await visible(f)).rows.map((n) => n.id), [stored.id]);
+  await app.prisma.fileShare.delete({ where: { id: grant.id } });
+  assert.equal(await canonical(f), false);
+  const result = await visible(f);
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.count, 0);
+  assert.equal(result.raw.includes(stored.title), false);
+  assert.equal(await deliverNotification(app.prisma, app, id), "completed");
+  assert.equal(await app.prisma.notification.count({ where: { userId: f.reader.id } }), 1);
+});
+
 async function team(f) {
   const root = await file(f, { isFolder: true, ownerId: null });
   const row = await app.prisma.teamFolder.create({ data: { workspaceId: f.ws.id, folderId: root.id, name: "Private team" } });

@@ -120,6 +120,44 @@ describe("lazyNamed", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reload" }));
     expect(reload).toHaveBeenCalledTimes(1);
   });
+
+  it.each([new Error("Module evaluation failed"), "Import was refused"])(
+    "offers reload for any rejected import, including %s",
+    async (reason) => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const reload = stubReload();
+      const LazyGreeting = lazyNamed(
+        (): Promise<{ Greeting: typeof Greeting }> => Promise.reject(reason),
+        "Greeting",
+      );
+      await LazyGreeting.preload();
+
+      render(
+        <ErrorBoundary>
+          <Suspense fallback={<p>Loading</p>}>
+            <LazyGreeting name="Ada" />
+          </Suspense>
+        </ErrorBoundary>,
+      );
+      expect(screen.getByRole("alert").textContent).toContain("Part of the app could not be loaded");
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      expect(reload).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("keeps the generic retry for an error thrown by a successfully loaded component", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    function Broken(): never {
+      throw new Error("Render failed");
+    }
+    const LazyBroken = lazyNamed(async () => ({ Broken }), "Broken");
+    await LazyBroken.preload();
+    render(<ErrorBoundary><LazyBroken /></ErrorBoundary>);
+    expect(screen.getByText("Render failed")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+  });
 });
 
 describe("error screens", () => {

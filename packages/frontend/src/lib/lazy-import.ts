@@ -1,5 +1,14 @@
 import { createElement, use, type ComponentProps, type ComponentType } from "react";
 
+// Import failures stay cached by the browser/loader. A boundary-only retry
+// cannot recover them, even when their message is not a known network error.
+class LazyImportError extends Error {
+  constructor(cause: unknown) {
+    super("Part of the app could not be loaded", { cause });
+    this.name = "LazyImportError";
+  }
+}
+
 // Error messages browsers give when a dynamic import cannot be fetched or
 // evaluated, plus Vite's own when a lazy chunk's stylesheet fails to load.
 // After a deploy, a tab still running the previous build asks for chunk files
@@ -13,6 +22,7 @@ const CHUNK_LOAD_ERROR_MESSAGES = [
 
 /** Whether an error means a lazily loaded part of the app failed to load. */
 export function isChunkLoadError(error: unknown): boolean {
+  if (error instanceof LazyImportError) return true;
   const message = error instanceof Error ? error.message : undefined;
   if (typeof message !== "string") return false;
   return CHUNK_LOAD_ERROR_MESSAGES.some((text) => message.includes(text));
@@ -46,7 +56,7 @@ export function lazyNamed<
         component = module[name] as ComponentType<Props>;
       },
       (error: unknown) => {
-        failure = { error };
+        failure = { error: new LazyImportError(error) };
       },
     ));
 

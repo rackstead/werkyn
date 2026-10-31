@@ -735,9 +735,17 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
     for (let i = 0; i < 2; i++) {
       const user = await makeUser();
       const session = await signIn(user);
+      // This storm deliberately revokes sessions repeatedly. Use an actual
+      // independent credential so each change still exercises the hash lock.
+      const key = await inject({
+        method: "POST", url: "/api/api-keys",
+        headers: { authorization: `Bearer ${session.access}` },
+        payload: { name: "Password atomicity storm" },
+      });
+      assert.equal(key.statusCode, 201, key.body);
       states.push({
         user,
-        access: session.access,
+        access: key.json().data.key,
         cookie: session.refresh,
         known: password,
       });

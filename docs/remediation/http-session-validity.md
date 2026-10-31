@@ -29,9 +29,12 @@ expiry; every application issuer already supplies it.
 Operational failures during JWT account/family lookup or API-key verification
 receive `503 Service Unavailable` with the fixed message
 `Authentication is temporarily unavailable. Try again in a moment.` The server
-logs only `Authentication lookup failed`, without the exception, SQL, database
-details or credentials. The failure ends no session and no protected handler
-runs, so retrying after recovery remains possible.
+logs `Authentication lookup failed` with a fixed lookup stage, failure category
+and allowlisted Prisma/SQLSTATE codes, without the exception, messages, SQL,
+connection details or credentials. Schema/query-shape faults and programming
+errors receive a safe generic `500`, with bounded diagnostics, rather than a
+retryable availability response. The failure ends no session and no protected
+handler runs, so retrying after operational recovery remains possible.
 
 Header/query selection stays the same: a Bearer header takes precedence over
 the query token, JWT query tokens remain supported, and durable `wk_` API keys
@@ -59,13 +62,24 @@ and obtains its access JWT through the refresh route. Direct fixture changes
 simulate elapsed time, removed rows, API-key expiry and unavailable relations;
 session-ending behavior itself goes through the application APIs.
 
-The 14 cases cover valid reads/writes, concurrent rotation/read rounds,
+The 15 cases cover valid reads/writes, concurrent rotation/read rounds,
 logout/login/change/reset/reuse revocation, unrelated/newer sessions, denied
 profile and credential side effects, malformed/unknown/foreign families,
 expired and removed current tokens, deleted accounts/families, legacy grace,
 API keys, header/query precedence and public shares. Actual unavailable user,
-family and API-key relations prove the safe `503` response, absence of protected
-handler execution, credential-free logs and recovery. The same suite had
-11 failures on the preceding middleware and passes all 14 after this change.
+family and API-key relations prove safe schema-fault `500` responses. A real
+connection failure proves operational `503`; injected validation and TypeError
+faults prove safe programming `500`. All refuse protected handler execution,
+keep credentials out of logs and preserve recovery. The initial 14-case suite
+had 11 failures on the preceding middleware. Its initial missing-table `503`
+expectation was corrected to `500` when failure categories were distinguished;
+the actual connection-failure check separately covers operational `503`.
 The two count-query fixtures now obtain real session tokens through refresh;
 their four query/count/order regression cases remain unchanged.
+
+The benchmark smoke invokes the actual performance CLI against a bounded
+fixture, using the documented signing/database variables without unrelated
+cookie configuration. Its actor sessions are created before warmup/timing and
+removed after success and failed requests without deleting unrelated sessions.
+This proves tooling compatibility; the historical performance measurements in
+`p02a.md` precede this authentication change and need a later broad remeasurement.

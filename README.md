@@ -410,7 +410,7 @@ WebSocket authentication refuses tokens of an ended family or without `sid`;
 see [docs/remediation/dat-006.md](docs/remediation/dat-006.md). Every HTTP use of
 a session-bound access token checks that its family belongs to the account,
 is unrevoked and has an unexpired current refresh token. Ended sessions receive
-`401` before protected work; authentication lookup failures receive a safe
+`401` before protected work; operational authentication lookup failures receive a safe
 `503`. Older tokens without `sid` retain their JWT expiry grace, at most
 15 minutes after upgrading from a version that issued them. Personal API keys
 stay valid until revoked or expired. See

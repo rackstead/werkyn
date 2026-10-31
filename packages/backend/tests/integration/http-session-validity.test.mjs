@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +38,7 @@ const { default: errors } = await import("../../src/plugins/errors.ts");
 const { baseLoggerOptions } = await import("../../src/utils/logger.ts");
 const { resetTransporter } = await import("../../src/utils/mailer.ts");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.ts");
+const { Prisma, PrismaClient } = await import("@prisma/client");
 
 const domain = `http-session-${crypto.randomBytes(5).toString("hex")}.example.test`;
 const password = "Fixture-password-123";
@@ -44,6 +47,7 @@ let users = 0;
 let requests = 0;
 const workspaces = [];
 const families = new Set();
+const extraUserIds = [];
 before(async () => {
   resetTransporter();
   app = await buildApp();
@@ -54,7 +58,7 @@ after(async () => {
   try {
     await app?.prisma.workspace.deleteMany({ where: { id: { in: workspaces } } });
     await app?.prisma.rotatedRefreshToken.deleteMany({ where: { familyId: { in: [...families] } } });
-    await app?.prisma.user.deleteMany({ where: { email: { endsWith: `@${domain}` } } });
+    await app?.prisma.user.deleteMany({ where: { OR: [{ email: { endsWith: `@${domain}` } }, { id: { in: extraUserIds } }] } });
     await app?.prisma.loginAttempt.deleteMany({ where: { email: { endsWith: `@${domain}` } } });
   } finally {
     await app?.close();
@@ -339,7 +343,7 @@ test("public shares retain their unauthenticated contract even when the caller s
   }
 });
 
-test("real user/family lookup failures answer safe 503 before protected work and log no raw query or credential", async () => {
+test("real operational failures answer503; schema/programming faults answer500 with bounded credential-free diagnostics before protected work", async () => {
   const user = await makeUser();
   const session = await login(user);
   const keyResponse = await request("POST", "/api/api-keys", { token: session.token, payload: { name: "Failure fixture" } });
@@ -361,8 +365,8 @@ test("real user/family lookup failures answer safe 503 before protected work and
         const tokens = table === "User" ? [session.token, sign(user), keyResponse.json.data.key] : table === "ApiKey" ? [keyResponse.json.data.key] : [session.token];
         for (const token of tokens) {
           const response = await request("GET", "/protected", { token, base });
-          assert.equal(response.status, 503, response.body);
-          assert.deepEqual(response.json, { statusCode: 503, error: "Service Unavailable", message: "Authentication is temporarily unavailable. Try again in a moment." });
+          assert.equal(response.status, 500, response.body);
+          assert.deepEqual(response.json, { statusCode: 500, error: "Internal Server Error", message: "An unexpected error occurred" });
         }
         assert.equal((await request("GET", "/protected", { token: "invalid-jwt", base })).status, 401);
         assert.equal((await request("GET", "/protected", { token: sign(user, { sid: null }), base })).status, 401);
@@ -371,12 +375,86 @@ test("real user/family lookup failures answer safe 503 before protected work and
         await app.prisma.$executeRawUnsafe(`ALTER TABLE "HttpSessionUnavailable" RENAME TO "${table}"`);
       }
     }
+    const socket = http.createServer();
+    await new Promise((resolve) => socket.listen(0, "127.0.0.1", resolve));
+    const unavailablePort = socket.address().port;
+    await new Promise((resolve) => socket.close(resolve));
+    const unavailableUrl = new URL(process.env.TEST_DATABASE_URL);
+    unavailableUrl.hostname = "127.0.0.1";
+    unavailableUrl.port = String(unavailablePort);
+    unavailableUrl.searchParams.set("connect_timeout", "1");
+    const unavailable = new PrismaClient({ datasourceUrl: unavailableUrl.href });
+    try {
+      probe.prisma = unavailable;
+      const response = await request("GET", "/protected", { token: session.token, base });
+      assert.equal(response.status, 503, response.body);
+      assert.deepEqual(response.json, { statusCode: 503, error: "Service Unavailable", message: "Authentication is temporarily unavailable. Try again in a moment." });
+    } finally {
+      probe.prisma = app.prisma;
+      await unavailable.$disconnect();
+    }
+    for (const error of [new TypeError(`private-code-error ${session.token}`), new Prisma.PrismaClientValidationError(`private-query-shape ${session.cookie}`, { clientVersion: "test" })]) {
+      probe.prisma = new Proxy(app.prisma, { get(target, key) {
+        if (key === "user") return new Proxy(target.user, { get(delegate, operation) {
+          if (operation === "findUnique") return async () => { throw error; };
+          return Reflect.get(delegate, operation);
+        } });
+        return Reflect.get(target, key);
+      } });
+      const response = await request("GET", "/protected", { token: session.token, base });
+      assert.equal(response.status, 500, response.body);
+      assert.deepEqual(response.json, { statusCode: 500, error: "Internal Server Error", message: "An unexpected error occurred" });
+    }
+    probe.prisma = app.prisma;
+    assert.equal(downstream, 0);
     assert.deepEqual(await app.prisma.user.findUniqueOrThrow({ where: { id: user.id } }), before);
     assert.equal((await me(session.token)).status, 200, "operational failure must not revoke the session");
     const logs = logLines.join("");
     assert.match(logs, /Authentication lookup failed/);
-    for (const privateValue of [session.token, session.cookie, session.sid, keyResponse.json.data.key, user.email, password, "HttpSessionUnavailable", "SELECT", "P2021"]) assert.equal(logs.includes(privateValue), false, privateValue);
+    for (const privateValue of [session.token, session.cookie, session.sid, keyResponse.json.data.key, user.email, password, secret, unavailableUrl.href, "HttpSessionUnavailable", "SELECT", "private-code-error", "private-query-shape"]) assert.equal(logs.includes(privateValue), false, privateValue);
+    const diagnostics = logLines.map((line) => JSON.parse(line).authentication);
+    assert.ok(diagnostics.some((d) => d.stage === "session_account" && d.category === "schema" && d.code === "P2021"));
+    assert.ok(diagnostics.some((d) => d.stage === "api_key" && d.category === "schema"));
+    assert.ok(diagnostics.some((d) => d.category === "initialization" && d.statusCode === 503));
+    assert.ok(diagnostics.some((d) => d.category === "programming" && d.statusCode === 500));
+    assert.ok(diagnostics.some((d) => d.category === "query_validation" && d.statusCode === 500));
   } finally {
     await probe.close();
   }
+});
+
+test("the actual performance benchmark uses real actor sessions outside timings and cleans them after success and failure", async () => {
+  const admin = await app.prisma.user.create({ data: { email: "perf-user-0000@perf.invalid", displayName: "Benchmark admin", emailVerified: true } });
+  extraUserIds.push(admin.id);
+  const member = await makeUser();
+  const preserved = await additionalSession(member);
+  const unrelated = await login(await makeUser());
+  const workspace = await app.prisma.workspace.create({ data: { name: "Bounded benchmark smoke", slug: "perf-large", members: { create: [{ userId: admin.id, role: "ADMIN" }, { userId: member.id, role: "MEMBER" }] } } });
+  workspaces.push(workspace.id);
+  const project = await app.prisma.project.create({ data: { name: "Benchmark", workspaceId: workspace.id, members: { create: { userId: member.id } } } });
+  const status = await app.prisma.statusColumn.create({ data: { name: "Open", projectId: project.id } });
+  await app.prisma.task.create({ data: { title: "Benchmark", projectId: project.id, statusId: status.id, assignees: { create: { userId: member.id } }, activities: { create: { actorId: member.id, action: "created" } } } });
+  await app.prisma.chatChannel.create({ data: { workspaceId: workspace.id, name: "general", createdById: member.id } });
+  const actorIds = [admin.id, member.id];
+  const actorFamilies = () => app.prisma.refreshTokenFamily.count({ where: { userId: { in: actorIds } } });
+  const cliEnvironment = { ...process.env };
+  delete cliEnvironment.COOKIE_SECRET;
+  const run = (base) => promisify(execFile)(process.execPath, ["--import", "tsx", "scripts/perf/bench.ts", "read", "--samples=1", "--warmup=1", "--only=dashboard"], {
+    cwd: path.resolve(import.meta.dirname, "../.."),
+    env: { ...cliEnvironment, BENCH_URL: base }, timeout: 30_000,
+  });
+  assert.equal(await actorFamilies(), 1);
+  const success = await run(origin);
+  assert.match(success.stdout, /workspace: dashboard \(member\).*1 items/);
+  assert.match(success.stdout, /workspace: dashboard \(admin\).*1 items/);
+  assert.equal(await actorFamilies(), 1, "success must remove only benchmark-created families");
+  assert.equal((await me(preserved.token)).status, 200);
+  const socket = http.createServer();
+  await new Promise((resolve) => socket.listen(0, "127.0.0.1", resolve));
+  const unavailablePort = socket.address().port;
+  await new Promise((resolve) => socket.close(resolve));
+  await assert.rejects(run(`http://127.0.0.1:${unavailablePort}`), { code: 1 });
+  assert.equal(await actorFamilies(), 1, "failure must also remove only benchmark-created families");
+  assert.equal((await me(preserved.token)).status, 200);
+  assert.equal((await me(unrelated.token)).status, 200);
 });

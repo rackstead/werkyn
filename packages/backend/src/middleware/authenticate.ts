@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import { verifyAccessToken } from "../utils/tokens.js";
 import { AppError, UnauthorizedError } from "../utils/errors.js";
 import { verifyApiKey } from "../modules/api-keys/api-keys.service.js";
+import { describeAuthenticationFailure } from "../utils/authentication-failures.js";
 
 export async function authenticate(
   request: FastifyRequest,
@@ -21,6 +22,7 @@ export async function authenticate(
     throw new UnauthorizedError("Invalid or expired token");
   }
 
+  let lookupStage: "api_key" | "account" | "session_account" = "account";
   try {
     let userId: string;
     let sessionId: string | undefined;
@@ -29,6 +31,7 @@ export async function authenticate(
       if (!authHeader?.startsWith("Bearer ")) {
         throw new UnauthorizedError("API keys require an Authorization header");
       }
+      lookupStage = "api_key";
       const key = await verifyApiKey(request.server.prisma, token);
       userId = key.userId;
       request.apiKeyId = key.id;
@@ -60,6 +63,7 @@ export async function authenticate(
     // One statement checks the account and its owned, unrevoked, unexpired
     // session. Rotation replaces the current token atomically, so the query
     // sees its predecessor or successor, never a gap. No cache delays logout.
+    lookupStage = sessionId === undefined ? "account" : "session_account";
     const user = await request.server.prisma.user.findUnique({
       where: {
         id: userId,
@@ -93,11 +97,19 @@ export async function authenticate(
     if (error instanceof UnauthorizedError) throw error;
     // Database exceptions can contain queries and credential-related values.
     // Keep both the response and this operational event independent of them.
-    request.log.error("Authentication lookup failed");
+    const failure = describeAuthenticationFailure(error);
+    request.log.error(
+      { authentication: { stage: lookupStage, ...failure } },
+      "Authentication lookup failed",
+    );
     throw new AppError(
-      503,
-      "Service Unavailable",
-      "Authentication is temporarily unavailable. Try again in a moment.",
+      failure.statusCode,
+      failure.statusCode === 503
+        ? "Service Unavailable"
+        : "Internal Server Error",
+      failure.statusCode === 503
+        ? "Authentication is temporarily unavailable. Try again in a moment."
+        : "An unexpected error occurred",
     );
   }
 }

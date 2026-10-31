@@ -83,7 +83,9 @@ export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 60 * 1000,
-      retry: 1,
+      // Keep one failed API operation to one attempt at both client layers.
+      // Polling, explicit refetches and refetch-on-focus remain separate events.
+      retry: false,
       refetchOnWindowFocus: true,
     },
     mutations: {

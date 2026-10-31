@@ -20,7 +20,6 @@ const bob = {
 };
 const client = api.extend({
   prefixUrl: "https://api.example.test/api",
-  retry: 0,
 });
 const expected = {
   context: { expectedUserId: "alice" },

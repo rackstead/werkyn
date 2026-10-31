@@ -36,6 +36,26 @@ export function redactText(text: string): string {
     );
 }
 
+// Known structured URL fields: reply-from logs { source }, mailer logs
+// { previewUrl }, and request/error contexts can carry { url }. Pino also
+// accepts a structured msg rather than a string argument. Inspect only these
+// fields, without walking arbitrary payloads, requests or caller-owned graphs.
+const STRUCTURED_TEXT_FIELDS = ["source", "url", "previewUrl", "msg", "message", "stack"] as const;
+
+function redactStructuredText<T extends object>(value: T): T {
+  let cleaned = value;
+  for (const field of STRUCTURED_TEXT_FIELDS) {
+    if (!Object.hasOwn(value, field)) continue;
+    const text = (value as Record<string, unknown>)[field];
+    if (typeof text !== "string") continue;
+    const redacted = redactText(text);
+    if (redacted === text) continue;
+    if (cleaned === value) cleaned = { ...value };
+    (cleaned as Record<string, unknown>)[field] = redacted;
+  }
+  return cleaned;
+}
+
 const SECRET_FIELDS = [
   "password",
   "passwordHash",
@@ -100,19 +120,25 @@ export function serializeRequest(request: RequestLike) {
 export function serializeError(error: Error): pino.SerializedError {
   const serialized = pino.stdSerializers.err(error);
   if (!serialized || typeof serialized !== "object") return serialized;
-  if (typeof serialized.message === "string") serialized.message = redactText(serialized.message);
-  if (typeof serialized.stack === "string") serialized.stack = redactText(serialized.stack);
-  return serialized;
+  return redactStructuredText(serialized);
 }
 
 /**
- * Redacts string arguments, such as Fastify's "Route GET:<url> not found".
+ * Redacts string arguments and known structured URL/message fields, including
+ * reply-from's source, without changing the original objects or forwarded URL.
  * pino uses `err.message` as the message when a call passes only an Error
  * (or `{ err }`), so that case gets an explicit redacted message too.
  */
 export const logMethodHook = {
   logMethod(this: pino.Logger, args: unknown[], method: pino.LogFn) {
-    const cleaned = args.map((arg) => (typeof arg === "string" ? redactText(arg) : arg));
+    const cleaned = args.map((arg) => {
+      if (typeof arg === "string") return redactText(arg);
+      // Preserve Error identity so pino still uses the error serializer.
+      if (arg && typeof arg === "object" && !(arg instanceof Error) && !Array.isArray(arg)) {
+        return redactStructuredText(arg);
+      }
+      return arg;
+    });
     const [first, second] = cleaned;
     if (typeof second !== "string" && first && typeof first === "object") {
       const error = first instanceof Error ? first : (first as { err?: unknown }).err;

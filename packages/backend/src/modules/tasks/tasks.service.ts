@@ -19,6 +19,7 @@ import {
   ValidationError,
 } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
+import { enqueueNotification } from "../notifications/notification-delivery.js";
 import { assertProjectAccess, assertTaskEdit } from "../../utils/project-access.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
 import {
@@ -36,6 +37,47 @@ import {
   withProjectOrder,
   writeColumnOrder,
 } from "../../utils/task-order.js";
+
+type TaskNotification = {
+  task: { id: string; projectId: string; title: string };
+  recipients: string[];
+} & (
+  | { kind: "status"; statusName: string }
+  | { kind: "assignment"; projectName: string }
+  | { kind: "duplicate" }
+);
+
+/** Only durable database work belongs in the mutation's existing transaction. */
+async function enqueueTaskNotification(
+  tx: Prisma.TransactionClient,
+  actorId: string,
+  actorDisplayName: string | undefined,
+  notification: TaskNotification,
+): Promise<string[]> {
+  if (!notification.recipients.some((id) => id !== actorId)) return [];
+  const actorName = actorDisplayName ?? (await tx.user.findUniqueOrThrow({
+    where: { id: actorId }, select: { displayName: true },
+  })).displayName;
+  const { task, recipients } = notification;
+  const id = await enqueueNotification(tx, {
+    recipients,
+    type: notification.kind === "status" ? "TASK_STATUS_CHANGED" : "TASK_ASSIGNED",
+    title: notification.kind === "status"
+      ? `"${task.title}" moved to ${notification.statusName}`
+      : `You were assigned to "${task.title}"`,
+    body: notification.kind === "status"
+      ? `${actorName} changed the status`
+      : notification.kind === "assignment"
+        ? `${actorName} assigned you to this task`
+        : `${actorName} duplicated a task and assigned you`,
+    data: {
+      taskId: task.id, projectId: task.projectId, actorId, actorName, taskTitle: task.title,
+      ...(notification.kind === "assignment" ? { projectName: notification.projectName } : {}),
+    },
+    excludeUserId: actorId,
+  });
+  return id ? [id] : [];
+}
 
 export async function listTasks(
   prisma: PrismaClient,
@@ -320,6 +362,18 @@ export async function updateTask(
   actorRole: string,
   data: UpdateTaskInput,
 ) {
+  return (await updateTaskWithNotifications(prisma, taskId, actorId, actorRole, data)).result;
+}
+
+/** The HTTP controller also needs committed outbox IDs; direct callers keep their DTO. */
+export async function updateTaskWithNotifications(
+  prisma: PrismaClient,
+  taskId: string,
+  actorId: string,
+  actorRole: string,
+  data: UpdateTaskInput,
+  actorDisplayName?: string,
+) {
   actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   const existing = await prisma.task.findUnique({
     where: { id: taskId },
@@ -429,7 +483,13 @@ export async function updateTask(
         status: true,
       },
     });
-    return scopeTaskRelations(task);
+    const result = scopeTaskRelations(task);
+    const notificationDeliveryIds = data.statusId && data.statusId !== fromStatusId
+      ? await enqueueTaskNotification(tx, actorId, actorDisplayName, {
+        kind: "status", task: result, statusName: result.status?.name || "new status",
+        recipients: result.assignees.map((assignee) => assignee.userId),
+      }) : [];
+    return { result, projectId: result.projectId, notificationDeliveryIds };
   });
 }
 
@@ -478,6 +538,16 @@ export async function moveTask(
   taskId: string,
   actorId: string,
   data: MoveTaskInput,
+) {
+  return (await moveTaskWithNotifications(prisma, taskId, actorId, data)).result;
+}
+
+export async function moveTaskWithNotifications(
+  prisma: PrismaClient,
+  taskId: string,
+  actorId: string,
+  data: MoveTaskInput,
+  actorDisplayName?: string,
 ) {
   await assertTaskEdit(prisma, taskId, actorId);
   const task = await prisma.task.findUnique({
@@ -557,7 +627,14 @@ export async function moveTask(
       });
     }
 
-    return { ...updatedTask, warning };
+    const notificationDeliveryIds = data.statusId !== current.statusId
+      ? await enqueueTaskNotification(tx, actorId, actorDisplayName, {
+        kind: "status", task: updatedTask, statusName: updatedTask.status?.name || "new status",
+        recipients: (await tx.taskAssignee.findMany({
+          where: { taskId }, select: { userId: true },
+        })).map((assignee) => assignee.userId),
+      }) : [];
+    return { result: { ...updatedTask, warning }, projectId: updatedTask.projectId, notificationDeliveryIds };
   });
 }
 
@@ -600,6 +677,17 @@ export async function addAssignee(
   actorId: string,
   actorRole: string,
   data: TaskAssigneeInput,
+) {
+  return (await addAssigneeWithNotifications(prisma, taskId, actorId, actorRole, data)).result;
+}
+
+export async function addAssigneeWithNotifications(
+  prisma: PrismaClient,
+  taskId: string,
+  actorId: string,
+  actorRole: string,
+  data: TaskAssigneeInput,
+  actorDisplayName?: string,
 ) {
   const task = await prisma.task.findUnique({
     where: { id: taskId },
@@ -644,7 +732,17 @@ export async function addAssignee(
       details: { userId: data.userId },
     });
 
-    return assignee;
+    let notificationDeliveryIds: string[] = [];
+    if (data.userId !== actorId) {
+      const context = await tx.task.findUniqueOrThrow({
+        where: { id: taskId },
+        select: { id: true, projectId: true, title: true, project: { select: { name: true } } },
+      });
+      notificationDeliveryIds = await enqueueTaskNotification(tx, actorId, actorDisplayName, {
+        kind: "assignment", task: context, projectName: context.project.name, recipients: [data.userId],
+      });
+    }
+    return { result: assignee, projectId: task.projectId, notificationDeliveryIds };
   });
 }
 
@@ -985,6 +1083,15 @@ export async function duplicateTask(
   taskId: string,
   actorId: string,
 ) {
+  return (await duplicateTaskWithNotifications(prisma, taskId, actorId)).result;
+}
+
+export async function duplicateTaskWithNotifications(
+  prisma: PrismaClient,
+  taskId: string,
+  actorId: string,
+  actorDisplayName?: string,
+) {
   const source = await prisma.task.findUnique({
     where: { id: taskId },
     include: {
@@ -1083,7 +1190,10 @@ export async function duplicateTask(
       details: { duplicatedFrom: taskId },
     });
 
-    return task;
+    const notificationDeliveryIds = await enqueueTaskNotification(tx, actorId, actorDisplayName, {
+      kind: "duplicate", task, recipients: task.assignees.map((assignee) => assignee.userId),
+    });
+    return { result: task, projectId: task.projectId, notificationDeliveryIds };
   });
 }
 

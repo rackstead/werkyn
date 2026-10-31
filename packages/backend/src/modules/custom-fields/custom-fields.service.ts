@@ -10,9 +10,10 @@ import {
   type SetCustomFieldValueInput,
 } from "@pm/shared";
 import { ConflictError, NotFoundError, ValidationError } from "../../utils/errors.js";
+import { assertCompleteOrder, withProjectOrder } from "../../utils/task-order.js";
 import { migrateOptionValue, optionTargets } from "./custom-field-options.js";
 
-// Lock order for custom-field writes, after the Project row (FOR KEY SHARE,
+// Lock order for value writes and definition edits, after the Project row (FOR KEY SHARE,
 // first as in utils/task-references.ts):
 //   - a value write holds its CustomField row FOR SHARE while it checks and
 //     stores the value, so concurrent value writes do not wait for each other;
@@ -69,25 +70,26 @@ export async function createCustomField(
     throw new ValidationError(message, [{ field: "options", message }]);
   }
 
-  // Compute next position
-  const maxPos = await prisma.customField.aggregate({
-    where: { projectId },
-    _max: { position: true },
-  });
-  const position = (maxPos._max.position ?? -1) + 1;
-
   try {
-    return await prisma.customField.create({
-      data: {
-        projectId,
-        name: data.name,
-        type: data.type,
-        options: isSelectFieldType(data.type)
-          ? (data.options as Prisma.InputJsonValue)
-          : undefined,
-        required: data.required,
-        position,
-      },
+    return await withProjectOrder(prisma, projectId, async (tx) => {
+      // Definition set/order writers share the Project-first order lock, so
+      // an append cannot invalidate a reorder's complete-set check.
+      const maxPos = await tx.customField.aggregate({
+        where: { projectId },
+        _max: { position: true },
+      });
+      return tx.customField.create({
+        data: {
+          projectId,
+          name: data.name,
+          type: data.type,
+          options: isSelectFieldType(data.type)
+            ? (data.options as Prisma.InputJsonValue)
+            : undefined,
+          required: data.required,
+          position: (maxPos._max.position ?? -1) + 1,
+        },
+      });
     });
   } catch (error: unknown) {
     if (isUniqueViolation(error)) {
@@ -242,14 +244,16 @@ export async function deleteCustomField(
   projectId: string,
   fieldId: string,
 ) {
-  const field = await prisma.customField.findFirst({
-    where: { id: fieldId, projectId },
-  });
-  if (!field) {
-    throw new NotFoundError("Custom field not found");
-  }
+  return withProjectOrder(prisma, projectId, async (tx) => {
+    const field = await tx.customField.findFirst({
+      where: { id: fieldId, projectId },
+    });
+    if (!field) {
+      throw new NotFoundError("Custom field not found");
+    }
 
-  await prisma.customField.delete({ where: { id: fieldId } });
+    await tx.customField.delete({ where: { id: fieldId } });
+  });
 }
 
 export async function reorderCustomFields(
@@ -257,7 +261,7 @@ export async function reorderCustomFields(
   projectId: string,
   data: ReorderCustomFieldsInput,
 ) {
-  return prisma.$transaction(async (tx) => {
+  return withProjectOrder(prisma, projectId, async (tx) => {
     const fields = await tx.customField.findMany({
       where: { projectId },
       select: { id: true },
@@ -269,6 +273,7 @@ export async function reorderCustomFields(
         throw new NotFoundError(`Custom field ${id} not found in project`);
       }
     }
+    assertCompleteOrder(data.orderedIds, validIds, "custom field of the project");
 
     const updates = data.orderedIds.map((id, index) =>
       tx.customField.update({

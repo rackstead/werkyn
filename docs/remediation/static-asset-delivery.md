@@ -7,10 +7,11 @@ Dex, storage and upload routes retain their existing global or route-specific
 limits. A query parameter containing an asset path does not change the route's
 policy. Missing reserved server paths remain errors rather than SPA documents.
 
-Existing successful frontend assets in `assets/` whose names follow Vite's
-`name-[hash:8].ext` output convention receive
+Existing successful frontend script, style, font, image, media and recognized
+data assets in `assets/` whose names follow Vite's `name-[hash:8].ext` convention receive
 `Cache-Control: public, max-age=31536000, immutable`. The same policy applies to
-HEAD, range and conditional 304 responses. This recognizes packaged Vite output
+HEAD, range and conditional 304 responses. Other file types conservatively
+revalidate. This recognizes packaged Vite output
 names; the server does not cryptographically recompute a filename's hash and no
 manifest is introduced. Deployment must preserve this naming contract and change
 the filename whenever compiled bytes change.
@@ -39,13 +40,19 @@ membership and response policy. Run it against a migrated disposable database:
 TEST_DATABASE_URL=<disposable-url> pnpm --filter @pm/backend exec node --import tsx --test tests/integration/frontend-static-delivery.test.mjs
 ```
 
-The seven new cases produced six expected failures before this change: the
+The original seven cases produced six expected failures before this change: the
 101st frontend request received 429, fingerprinted assets had zero cache age,
 missing chunks and reserved-path variants returned the SPA document, and the
 requested cache policy was absent. The private-upload control already passed.
-After the change all seven pass; together with the existing static path,
-workspace upload-root and untrusted-content suites, 26 focused cases pass.
+After the change all eight cases pass; together with the existing static path,
+workspace upload-root and untrusted-content suites, 27 focused cases pass.
 Backend typechecking, including performance scripts, also passes.
+
+The additional percent-filename case passes against both the unchanged server
+and this change: a filename containing a literal percent is served through its
+URL-encoded `%25` spelling (GET/HEAD), while a malformed raw percent target keeps
+the HTTP router's existing 400 response. No permissive URL-decoding exception is
+introduced for malformed encodings.
 
 This change does not add compression, minimum transfer rates, proxy admission,
 or cross-process rate-limit state. Those remain separate operational choices.

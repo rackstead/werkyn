@@ -33,6 +33,7 @@ const files = new Map([
   ["robots.txt", "User-agent: *\nDisallow:\n"],
   ["api/not-a-file.js", "benign frontend fixture must not shadow an API miss"],
   ["ASSETS/unpackaged-AbCd1234.js", "public file outside the packaged asset namespace"],
+  ["assets/progress.100%", "public file with a literal percent in its name"],
 ]);
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
@@ -136,7 +137,7 @@ test("only fingerprinted build assets get long immutable caching, including HEAD
 });
 
 test("HTML, SPA documents and unhashed public files must revalidate", async () => {
-  for (const target of ["/", "/index.html", "/workspace/project?view=list", "/assets/runtime.js", "/favicon.ico", "/robots.txt", "/assets/nested/", "/assets/document-DeFg4567.html", "/assets/directory-EfGh5678.js", "/ASSETS/unpackaged-AbCd1234.js"]) {
+  for (const target of ["/", "/index.html", "/workspace/project?view=list", "/assets/runtime.js", "/favicon.ico", "/robots.txt", "/assets/nested/", "/assets/document-DeFg4567.html", "/assets/directory-EfGh5678.js", "/ASSETS/unpackaged-AbCd1234.js", "/assets/progress.100%25"]) {
     for (const method of ["GET", "HEAD"]) {
       const response = await request(target, { method });
       assert.equal(response.statusCode, 200, `${method} ${target}`);
@@ -188,6 +189,18 @@ test("noncanonical targets never gain the frontend exemption or immutable cachin
     if (response.headers["x-ratelimit-limit"] !== undefined) {
       assert.equal(Number(response.headers["x-ratelimit-limit"]), 100, target);
     }
+  }
+});
+
+test("a literal percent filename serves through one encoded pass while a malformed raw target stays rejected", async () => {
+  const malformed = await request("/assets/progress.100%", { ip: "127.0.0.87" });
+  assert.equal(malformed.statusCode, 400);
+  assert.ok(!malformed.body.includes(files.get("assets/progress.100%")));
+  for (const method of ["GET", "HEAD"]) {
+    const encoded = await request("/assets/progress.100%25", { method, ip: "127.0.0.87" });
+    assert.equal(encoded.statusCode, 200, method);
+    assert.equal(encoded.body, method === "HEAD" ? "" : files.get("assets/progress.100%"));
+    assert.doesNotMatch(encoded.headers["cache-control"] ?? "", /immutable/);
   }
 });
 

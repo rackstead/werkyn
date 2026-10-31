@@ -1,6 +1,6 @@
 import { Suspense, type ComponentProps } from "react";
 import { lazyNamed } from "@/lib/lazy-import";
-import { LoadingPanel } from "@/components/shared/lazy-panel";
+import { LoadingPanel, useLazyPanelFocus } from "@/components/shared/lazy-panel";
 
 // The preview panel (PDF, image, video and audio viewers in an animated dialog)
 // loads when a file is first opened.
@@ -16,13 +16,14 @@ const UploadProgressPanel = lazyNamed(
 );
 
 export function FilePreviewSlideover(
-  props: ComponentProps<typeof FilePreviewPanel>,
+  props: Omit<ComponentProps<typeof FilePreviewPanel>, "onCloseAutoFocus">,
 ) {
+  const focus = useLazyPanelFocus(props.onClose);
   return (
     <Suspense
-      fallback={<LoadingPanel title="Loading preview" onClose={props.onClose} />}
+      fallback={<LoadingPanel title="Loading preview" {...focus} />}
     >
-      <FilePreviewPanel {...props} />
+      <FilePreviewPanel {...props} {...focus} />
     </Suspense>
   );
 }

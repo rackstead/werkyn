@@ -1,6 +1,6 @@
 import { Suspense, useEffect, type ComponentProps } from "react";
 import { lazyNamed, whenIdle } from "@/lib/lazy-import";
-import { LoadingPanel } from "@/components/shared/lazy-panel";
+import { LoadingPanel, useLazyPanelFocus } from "@/components/shared/lazy-panel";
 
 // The task panel brings its own dependencies (dialog and animation libraries,
 // drag and drop for subtasks, comments, attachments; the description editor is
@@ -10,14 +10,15 @@ const TaskSlideoverPanel = lazyNamed(
   "TaskSlideover",
 );
 
-type TaskSlideoverProps = ComponentProps<typeof TaskSlideoverPanel>;
+type TaskSlideoverProps = Omit<ComponentProps<typeof TaskSlideoverPanel>, "onCloseAutoFocus">;
 
 export function TaskSlideover(props: TaskSlideoverProps) {
+  const focus = useLazyPanelFocus(props.onClose);
   return (
     <Suspense
-      fallback={<LoadingPanel title="Loading task" onClose={props.onClose} />}
+      fallback={<LoadingPanel title="Loading task" {...focus} />}
     >
-      <TaskSlideoverPanel {...props} />
+      <TaskSlideoverPanel {...props} {...focus} />
     </Suspense>
   );
 }

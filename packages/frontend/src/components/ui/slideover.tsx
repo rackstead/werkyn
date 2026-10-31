@@ -15,6 +15,8 @@ interface SlideoverProps {
   /** Controls shown before the Close button. */
   actions?: ReactNode;
   onClose: () => void;
+  /** A lazy parent can retain the opener across its loading-shell handover. */
+  onCloseAutoFocus?: (event: Event) => void;
   className?: string;
   /** Animate size changes of the panel (framer-motion `layout`). */
   layout?: boolean;
@@ -34,11 +36,12 @@ export function Slideover({
   titleTooltip,
   actions,
   onClose,
+  onCloseAutoFocus,
   className,
   layout,
   children,
 }: SlideoverProps) {
-  const returnFocus = useReturnFocus<HTMLDivElement>();
+  const returnFocus = useReturnFocus<HTMLDivElement>({ onCloseAutoFocus });
   const onCloseRef = useRef(onClose);
   const escapeRef = useRef<KeyboardEvent | null>(null);
   useEffect(() => {

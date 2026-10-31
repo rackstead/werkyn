@@ -14,10 +14,11 @@ process.env.COOKIE_SECRET = "dashboard-counts-cookie-secret";
 const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-dashboard-counts-"));
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
-const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 
 let app, workspace, projects;
 const users = {}, tokens = {};
+const familyIds = [];
 let requests = 0;
 
 const DAY = 86_400_000;
@@ -56,7 +57,11 @@ before(async () => {
   const suffix = crypto.randomUUID().slice(0, 20);
   for (const actor of ["ADMIN", "MEMBER"]) {
     const user = await app.prisma.user.create({ data: { email: `dashboard-${actor}-${suffix}@example.test`, displayName: actor, emailVerified: true } });
-    users[actor] = user; tokens[actor] = signAccessToken({ sub: user.id, email: user.email, sid: "dashboard-counts" });
+    const session = await startRefreshSession(app.prisma, user.id);
+    familyIds.push(session.familyId);
+    const signedIn = await app.inject({ method: "POST", url: "/api/auth/refresh", cookies: { refresh_token: session.refreshToken } });
+    assert.equal(signedIn.statusCode, 200, signedIn.body);
+    users[actor] = user; tokens[actor] = signedIn.json().data.accessToken;
   }
   workspace = await app.prisma.workspace.create({ data: { name: "Dashboard counts", slug: `dashboard-${suffix}`,
     members: { create: [{ userId: users.ADMIN.id, role: "ADMIN" }, { userId: users.MEMBER.id, role: "MEMBER" }] } } });
@@ -97,6 +102,7 @@ before(async () => {
 
 after(async () => {
   if (workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } }).catch(() => {});
+  await app.prisma.rotatedRefreshToken.deleteMany({ where: { familyId: { in: familyIds } } });
   await app.prisma.user.deleteMany({ where: { id: { in: Object.values(users).map((u) => u.id) } } });
   await app?.close();
   await rm(storageDir, { recursive: true, force: true });

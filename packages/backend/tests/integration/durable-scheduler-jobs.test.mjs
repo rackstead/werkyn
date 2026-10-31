@@ -847,13 +847,21 @@ test("a file-share notification retried after its recipient left the workspace i
     data: { email: `durable-jobs-leaver-${uid()}@example.test`, displayName: "Leaver", emailVerified: true },
   });
   await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: leaver.id, role: "MEMBER" } });
+  const sharedFile = await app.prisma.file.create({
+    data: { workspaceId: workspace.id, name: "secret plan.pdf", ownerId: users.ADMIN.id, uploadedById: users.ADMIN.id },
+  });
+  await app.prisma.fileShare.createMany({
+    data: [leaver.id, users.MEMBER.id].map((userId) => ({
+      workspaceId: workspace.id, fileId: sharedFile.id, sharedById: users.ADMIN.id, sharedWithId: userId,
+    })),
+  });
   const title = `Shared "secret plan.pdf" ${uid()}`;
   try {
     await setHook("fault", "Notification:INSERT");
     try {
       await notify(app.prisma, A.fastify, {
         recipients: [leaver.id, users.MEMBER.id], type: "FILE_SHARED", title,
-        data: { fileId: `file-${uid()}`, workspaceId: workspace.id },
+        data: { fileId: sharedFile.id, workspaceId: workspace.id },
       });
     } finally {
       await clearHooks();
@@ -864,6 +872,7 @@ test("a file-share notification retried after its recipient left the workspace i
     assert.deepEqual(rows.map((r) => r.userId), [users.MEMBER.id]);
     assert.equal(pushes.filter(([, userId]) => userId === leaver.id).length, 0, "nothing pushed to the former member");
   } finally {
+    await app.prisma.file.delete({ where: { id: sharedFile.id } });
     await app.prisma.user.delete({ where: { id: leaver.id } });
   }
 });

@@ -32,7 +32,7 @@ const children = new Set();
 const sockets = new Set();
 const broadcasts = [];
 const loggedErrors = [];
-let app, control, port, broadcastFailure = false;
+let app, control, port, broadcastFailure = false, deliveryLogFailure = false;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(check, label, timeoutMs = 3000) {
@@ -174,6 +174,11 @@ function closeSocket(socket) {
 
 before(async () => {
   app = await buildApp();
+  const deliveryError = app.log.error.bind(app.log);
+  app.log.error = (...args) => {
+    if (deliveryLogFailure && args[1] === "Could not claim notification delivery") throw deliveryLogFailure;
+    deliveryError(...args);
+  };
   app.addHook("onRequest", async (request) => {
     const error = request.log.error.bind(request.log);
     request.log.error = (...args) => { loggedErrors.push(args); error(...args); };
@@ -181,7 +186,7 @@ before(async () => {
   const broadcast = app.broadcast.bind(app);
   app.broadcast = (...args) => {
     broadcasts.push(args);
-    if (broadcastFailure && args[1] === "comment_created") throw new Error("synthetic postcommit broadcast failure");
+    if (broadcastFailure && args[1] === "comment_created") throw broadcastFailure;
     return broadcast(...args);
   };
   await app.listen({ host: "127.0.0.1", port: 0 });
@@ -195,7 +200,7 @@ before(async () => {
       scoped_task := CASE WHEN TG_TABLE_NAME = 'ActivityLog' THEN item->>'taskId' ELSE item->'data'->>'taskId' END;
       SELECT * INTO active FROM "cbo_hook" WHERE "taskId" = scoped_task AND "stage" = TG_TABLE_NAME;
       IF FOUND AND (active."notificationType" = '' OR active."notificationType" = item->>'type') THEN
-        IF active."kind" = 'fault' THEN
+        IF active."kind" = 'fault' OR (active."kind" = 'claim-fault' AND TG_OP = 'UPDATE') THEN
           PERFORM nextval('"cbo_faults"');
           RAISE EXCEPTION 'synthetic comment outbox fault';
         ELSIF active."kind" = 'barrier' THEN
@@ -207,12 +212,14 @@ before(async () => {
   for (const table of ["ActivityLog", "NotificationDelivery", "Notification"]) {
     await app.prisma.$executeRawUnsafe(`CREATE TRIGGER "cbo_hook" BEFORE INSERT ON "${table}" FOR EACH ROW EXECUTE FUNCTION cbo_hook()`);
   }
+  await app.prisma.$executeRawUnsafe('CREATE TRIGGER "cbo_claim_hook" BEFORE UPDATE ON "NotificationDelivery" FOR EACH ROW EXECUTE FUNCTION cbo_hook()');
 });
 
 after(async () => {
   for (const socket of sockets) closeSocket(socket);
   for (const child of children) child.kill("SIGKILL");
   if (app) {
+    await app.prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS "cbo_claim_hook" ON "NotificationDelivery"');
     for (const table of ["ActivityLog", "NotificationDelivery", "Notification"]) {
       await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "cbo_hook" ON "${table}"`);
     }
@@ -463,7 +470,7 @@ test("postcommit broadcast failure preserves201 and the durable notification", a
   const f = await fixture("broadcast-fault");
   const startErrors = loggedErrors.length;
   await hook(f, "Notification", "fault");
-  broadcastFailure = true;
+  broadcastFailure = new Error("synthetic postcommit broadcast failure");
   try {
     const response = await post(f, "Broadcast failure must not erase committed success");
     assert.equal(response.status, 201);
@@ -477,6 +484,76 @@ test("postcommit broadcast failure preserves201 and the durable notification", a
     assert.equal((await counts(f)).notifications, 1);
     assert.equal((await counts(f)).outbox, 0);
   } finally { broadcastFailure = false; await unhook(f); }
+});
+
+test("postcommit diagnostics retain safe kind and network codes without exception text or getters", async (t) => {
+  const marker = "private-postcommit-diagnostic-marker";
+  let accessorReads = 0;
+  const cases = [
+    { name: "TypeError", error: () => new TypeError(marker), expected: { errorKind: "type_error" } },
+    { name: "network code", error: () => Object.assign(new Error(marker), { code: "ECONNRESET" }), expected: { errorKind: "error", errorCode: "ECONNRESET" } },
+    { name: "unrecognized code", error: () => Object.assign(new Error(marker), { code: marker }), expected: { errorKind: "error" } },
+    { name: "accessor fields", error: () => {
+      const error = new TypeError(marker);
+      for (const field of ["name", "message", "stack", "cause", "code"]) {
+        Object.defineProperty(error, field, { configurable: true, get() {
+          accessorReads += 1;
+          throw new Error(marker);
+        } });
+      }
+      return error;
+    }, expected: { errorKind: "type_error" } },
+    { name: "unknown thrown value", error: () => marker, expected: { errorKind: "unknown" } },
+    { name: "uninspectable value", error: () => new Proxy(Object.create(null), {
+      getOwnPropertyDescriptor() { throw new Error(marker); },
+    }), expected: { errorKind: "unknown" } },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const f = await fixture("diagnostics");
+      const startErrors = loggedErrors.length;
+      broadcastFailure = item.error();
+      try {
+        const response = await post(f, "Postcommit diagnostic control");
+        assert.equal(response.status, 201);
+        const entries = loggedErrors.slice(startErrors);
+        const entry = entries.find((args) => args[1] === "Could not broadcast committed comment");
+        assert(entry);
+        assert.deepEqual(entry[0], { stage: "comment_broadcast", commentId: response.body.data.id, ...item.expected });
+        assert.equal(JSON.stringify(entries).includes(marker), false);
+        assert.equal(accessorReads, 0);
+        await waitFor(async () => (await counts(f)).notifications === 1 && (await counts(f)).outbox === 0, "delivery after safely logged callback failure");
+      } finally { broadcastFailure = false; }
+    });
+  }
+});
+
+test("postcommit logger rejection records committed delivery IDs and keeps durable recovery", async () => {
+  const f = await fixture("claim-fault", { mention: true });
+  const startErrors = loggedErrors.length;
+  await hook(f, "NotificationDelivery", "claim-fault");
+  // Claim errors normally resolve pending; this supplied logger callback
+  // throws to exercise the controller's defensive detached-promise catch.
+  deliveryLogFailure = Object.assign(new TypeError("private-detached-log-marker"), { code: "EPIPE" });
+  try {
+    const response = await post(f, `Claim failure @[${f.mentioned.id}]`);
+    assert.equal(response.status, 201);
+    const message = "Committed comment notification remains queued for retry";
+    await waitFor(() => loggedErrors.slice(startErrors).filter((args) => args[1] === message).length === 2, "both detached delivery rejections logged");
+    const entries = loggedErrors.slice(startErrors).filter((args) => args[1] === message);
+    const ids = (await app.prisma.notificationDelivery.findMany({ where: scoped(f.task.id), select: { id: true } })).map((row) => row.id);
+    assert.deepEqual(entries.map((args) => args[0].notificationDeliveryId).sort(), ids.sort());
+    for (const [context] of entries) assert.deepEqual(context, {
+      stage: "notification_delivery", commentId: response.body.data.id,
+      notificationDeliveryId: context.notificationDeliveryId, errorKind: "type_error", errorCode: "EPIPE",
+    });
+    assert.equal(JSON.stringify(entries).includes("synthetic comment outbox fault"), false);
+    assert.equal(JSON.stringify(entries).includes("private-detached-log-marker"), false);
+    assert.deepEqual(await counts(f), { comments: 1, activity: 1, outbox: 2, notifications: 0, broadcasts: 1 });
+    deliveryLogFailure = false;
+    await unhook(f); await drain();
+    assert.deepEqual(await counts(f), { comments: 1, activity: 1, outbox: 0, notifications: 2, broadcasts: 1 });
+  } finally { deliveryLogFailure = false; await unhook(f); }
 });
 
 test("two deliberate unkeyed creates remain two distinct committed intents", async () => {

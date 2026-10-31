@@ -18,6 +18,11 @@ worker retries queued notification delivery. A client can still lose the HTTP
 response after a commit. This change adds no HTTP idempotency key; deliberately
 submitting the same text twice creates two comments and two sets of intents.
 
+Postcommit request logs retain the operation stage, committed IDs, a fixed
+error kind and a small allowlist of network error codes. They copy no arbitrary
+exception name, message, stack or cause, and do not read accessor properties.
+Unrecognized or uninspectable thrown values receive fixed fallback context.
+
 The HTTP response remains `{ data: comment }`. Existing internal service
 fields remain, with committed delivery IDs added for the controller; those
 IDs are not exposed in the comment response. The existing `@[userId]` parser

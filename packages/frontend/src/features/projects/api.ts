@@ -259,7 +259,7 @@ export function useReorderStatuses(pid: string) {
       api
         .patch(`projects/${pid}/statuses/reorder`, { json: data })
         .json<{ data: StatusColumn[] }>(),
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.statuses(pid) });
     },
   });
@@ -371,7 +371,7 @@ export function useReorderCustomFields(pid: string) {
       api
         .patch(`projects/${pid}/custom-fields/reorder`, { json: data })
         .json<{ data: CustomField[] }>(),
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.customFields(pid) });
     },
   });

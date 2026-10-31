@@ -41,8 +41,11 @@ function task(id: string, dueDate: string | null, complete = false): Task {
   const statusId = complete ? "done" : "open";
   return { id, title: id, projectId: "p", statusId, dueDate, position: 0,
     priority: "NONE", assignees: [], labels: [], customFieldValues: [],
+    description: null, startDate: null, archived: false,
+    createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    _count: { subtasks: 0, blockedBy: 0 },
     status: { id: statusId, name: complete ? "Done" : "Open", color: null, isCompletion: complete },
-  } as Task;
+  };
 }
 const rowFor = (title: string) => screen.getByRole("button", { name: title }).closest("tr")!;
 const labelFor = (title: string, date: string) => within(rowFor(title)).getByText(date);

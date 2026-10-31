@@ -1,6 +1,20 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { ConflictError, NotFoundError } from "./errors.js";
-import { isRetryableDatabaseError } from "./retryable-database-errors.js";
+import {
+  isLockTimeoutError,
+  isRetryableDatabaseError,
+  isStatementCanceledError,
+} from "./retryable-database-errors.js";
+
+/** Server-side bound: Prisma's transaction deadline does not cancel blocked SQL. */
+export const WORKSPACE_LOCK_TIMEOUT_MS = 5_000;
+
+/** Existing response for an abandoned workspace transaction or a bounded lock wait. */
+export class WorkspaceBusyError extends ConflictError {
+  constructor() {
+    super("The workspace is busy. Please try again.");
+  }
+}
 
 /**
  * Workspace-row mutex shared by every writer whose correctness depends on a
@@ -27,9 +41,34 @@ export async function lockWorkspace(
   tx: Prisma.TransactionClient,
   workspaceId: string,
 ): Promise<boolean> {
-  const rows = await tx.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "Workspace" WHERE id = ${workspaceId} FOR NO KEY UPDATE
+  // pg_settings reports these two timeouts in integer milliseconds, including
+  // transaction-local settings. Keep any stricter nonzero caller/role limit.
+  const settings = await tx.$queryRaw<{ name: string; timeoutMs: number }[]>`
+    SELECT name, setting::integer AS "timeoutMs" FROM pg_settings
+    WHERE name IN ('statement_timeout', 'lock_timeout')
   `;
+  const previousStatement = settings.find((setting) => setting.name === "statement_timeout")!.timeoutMs;
+  const previousLock = settings.find((setting) => setting.name === "lock_timeout")!.timeoutMs;
+  const bounded = (previous: number) => `${Math.min(previous || WORKSPACE_LOCK_TIMEOUT_MS, WORKSPACE_LOCK_TIMEOUT_MS)}ms`;
+  await tx.$executeRaw`
+    SELECT set_config('statement_timeout', ${bounded(previousStatement)}, true),
+           set_config('lock_timeout', ${bounded(previousLock)}, true)
+  `;
+  let rows: { id: string }[];
+  try {
+    // One acquisition can wait twice (tuple queue, then holder transaction).
+    // lock_timeout restarts per wait, so bound this whole statement as well.
+    rows = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "Workspace" WHERE id = ${workspaceId} FOR NO KEY UPDATE
+    `;
+  } catch (error) {
+    if (isLockTimeoutError(error) || isStatementCanceledError(error)) throw new WorkspaceBusyError();
+    throw error;
+  }
+  // Later statements may do legitimate long work, especially backup restore.
+  // Keep only the lock-wait cap until commit/rollback; all settings are LOCAL
+  // and automatically revert before this connection returns to the pool.
+  await tx.$executeRaw`SELECT set_config('statement_timeout', ${`${previousStatement}ms`}, true)`;
   return rows.length === 1;
 }
 
@@ -51,7 +90,7 @@ export async function lockWorkspaces(
 
 const LOCKED_TRANSACTION_OPTIONS = {
   isolationLevel: "ReadCommitted",
-  // Waiting for the workspace lock counts toward the transaction timeout.
+  // Server-side timeouts in lockWorkspace also cancel SQL blocked on a lock.
   maxWait: 5_000,
   timeout: 10_000,
 } as const;
@@ -72,7 +111,9 @@ function isRetryableTransactionError(error: unknown) {
  * When the workspace does not exist (or was deleted while waiting) it returns
  * `onMissing()` if given, otherwise throws NotFoundError. A transaction the
  * database abandons (deadlock, start or lock-wait timeout) becomes a
- * retryable 409; no partial work is committed in either case.
+ * retryable 409; no partial work is committed in either case. Acquisition and
+ * later individual lock waits are bounded at 5 s (or a stricter caller limit).
+ * A later statement cancellation keeps its original error.
  */
 export async function withWorkspaceLock<T>(
   prisma: PrismaClient,
@@ -89,8 +130,8 @@ export async function withWorkspaceLock<T>(
       return work(tx);
     }, LOCKED_TRANSACTION_OPTIONS);
   } catch (error) {
-    if (isRetryableTransactionError(error)) {
-      throw new ConflictError("The workspace is busy. Please try again.");
+    if (isLockTimeoutError(error) || isRetryableTransactionError(error)) {
+      throw new WorkspaceBusyError();
     }
     throw error;
   }

@@ -44,7 +44,9 @@ writing anything.
    archive. If a write fails, everything
    written so far is removed and the restore stops with the storage error.
 3. **One transaction** (READ COMMITTED, 10 s to start, 60 s in all):
-   - lock the workspace row and re-read the administrator's role;
+   - acquire the workspace row within 5 s (or a stricter caller limit) and
+     re-read the administrator's role; later individual lock/FK waits have
+     the same cap, while statement runtime retains its original timeout;
    - delete the queued cleanup entries for this restore's files;
    - read the workspace members;
    - run the restore plan (`restore-plan.ts`) and insert its rows in batches.

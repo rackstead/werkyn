@@ -71,9 +71,9 @@ function fakeClient(project = { id: "p1", archived: false }, { lockError } = {})
     },
     $queryRaw: async (strings, ...values) => {
       const sql = strings.join("?");
-      if (sql.includes("current_setting")) {
+      if (sql.includes("pg_settings")) {
         calls.statements.push("read setting");
-        return [{ previous: "0" }];
+        return [{ name: "statement_timeout", timeoutMs: 0 }, { name: "lock_timeout", timeoutMs: 0 }];
       }
       calls.locks.push({ sql, values });
       calls.statements.push("lock");
@@ -133,7 +133,7 @@ test("a deadlocked or serialization-failed transaction is retried, up to the att
       });
       assert.deepEqual(client.calls.settings[i + 1], {
         sql: "SELECT set_config('statement_timeout', ?, true)",
-        values: ["0"],
+        values: ["0ms"],
       });
     }
     assert.deepEqual(client.calls.options[0], { isolationLevel: "ReadCommitted", maxWait: 5_000, timeout: 10_000 });

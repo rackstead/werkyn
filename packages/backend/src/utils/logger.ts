@@ -6,7 +6,8 @@ const LEVELS = new Set(["fatal", "error", "warn", "info", "debug", "trace", "sil
 
 /**
  * Options shared by the standalone logger and the Fastify request logger:
- * credential fields are censored and URL tokens are removed from messages.
+ * credential fields are censored and URL tokens are removed from messages
+ * and the known structured URL fields, before JSON or pretty output.
  */
 export function baseLoggerOptions(level: string | undefined): LoggerOptions {
   return {

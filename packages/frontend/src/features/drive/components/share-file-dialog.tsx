@@ -34,6 +34,7 @@ import {
 import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { toast } from "sonner";
+import { formatDateISO } from "@/features/time/utils";
 
 interface ShareFileDialogProps {
   open: boolean;
@@ -436,7 +437,7 @@ function LinkTab({
               id="link-expiration"
               type="date"
               value={expiresAt}
-              min={new Date().toISOString().split("T")[0]}
+              min={formatDateISO(new Date())}
               onChange={(e) => setExpiresAt(e.target.value)}
             />
           </div>
@@ -559,7 +560,7 @@ function LinkTab({
                     <div className="flex items-center gap-2">
                       <Input
                         type="date"
-                        min={new Date().toISOString().split("T")[0]}
+                        min={formatDateISO(new Date())}
                         value={expiresAt}
                         onChange={(e) => setExpiresAt(e.target.value)}
                       />

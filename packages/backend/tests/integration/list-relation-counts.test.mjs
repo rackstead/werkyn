@@ -14,9 +14,10 @@ process.env.COOKIE_SECRET = "list-relation-counts-cookie-secret";
 const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-list-counts-"));
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
-const { signAccessToken } = await import("../../src/utils/tokens.js");
+const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
 
 let app, user, token, workspace, project, other, channel;
+const familyIds = [];
 const tasks = {}, messages = {};
 let requests = 0;
 
@@ -50,7 +51,11 @@ before(async () => {
   app = await buildApp(); await app.ready();
   const suffix = crypto.randomUUID().slice(0, 20);
   user = await app.prisma.user.create({ data: { email: `list-counts-${suffix}@example.test`, displayName: "Counter", emailVerified: true } });
-  token = signAccessToken({ sub: user.id, email: user.email, sid: "list-counts" });
+  const session = await startRefreshSession(app.prisma, user.id);
+  familyIds.push(session.familyId);
+  const signedIn = await app.inject({ method: "POST", url: "/api/auth/refresh", cookies: { refresh_token: session.refreshToken } });
+  assert.equal(signedIn.statusCode, 200, signedIn.body);
+  token = signedIn.json().data.accessToken;
   workspace = await app.prisma.workspace.create({ data: { name: "List counts", slug: `list-counts-${suffix}`, members: { create: { userId: user.id, role: "ADMIN" } } } });
   project = await app.prisma.project.create({ data: { workspaceId: workspace.id, name: "Counted" } });
   other = await app.prisma.project.create({ data: { workspaceId: workspace.id, name: "Other" } });
@@ -90,6 +95,7 @@ before(async () => {
 
 after(async () => {
   if (workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } }).catch(() => {});
+  await app.prisma.rotatedRefreshToken.deleteMany({ where: { familyId: { in: familyIds } } });
   if (user) await app.prisma.user.delete({ where: { id: user.id } }).catch(() => {});
   await app?.close();
   await rm(storageDir, { recursive: true, force: true });

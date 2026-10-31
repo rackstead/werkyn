@@ -189,7 +189,8 @@ test("held workspace cancels acquisition on the server and releases the full poo
 
 test("pool admission refusal returns workspace busy without a callback or late write, then one retry succeeds", async () => {
   const f = await fixture(), before = callbacks.length, pids = [];
-  let release, released = false;
+  const setupStart = performance.now();
+  let release, deadline, released = false;
   const finish = new Promise((resolve) => { release = () => { released = true; resolve(); }; });
   // Hold all five application connections without any PostgreSQL lock wait.
   // This keeps transaction admission unavailable beyond its existing 5 s
@@ -200,11 +201,14 @@ test("pool admission refusal returns workspace busy without a callback or late w
     await finish;
   }, { timeout: 10_000, maxWait: 5000 }));
   const settled = Promise.allSettled(holders);
-  const deadline = setTimeout(release, 7500);
   try {
     assert(await until(() => pids.length === 5), "pool never filled with barrier transactions");
     assert.equal(new Set(pids).size, 5);
     assert.equal((await waiters(-1)).length, 0, "pool barrier unexpectedly waits for a row lock");
+    // Keep setup within the existing 4 s readiness bound so even the first
+    // holder's 10 s transaction has time for the full 5 s admission wait.
+    assert(performance.now() - setupStart < 4000, "pool barrier setup exceeded the readiness bound");
+    deadline = setTimeout(release, 7500);
     const start = performance.now();
     const response = await call("POST", `/lock-probe/${f.workspace.id}`);
     const ms = Math.round(performance.now() - start);

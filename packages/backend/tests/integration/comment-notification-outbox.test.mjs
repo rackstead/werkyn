@@ -29,6 +29,7 @@ const backend = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const BARRIER = 438_115_077;
 const fixtures = [];
 const children = new Set();
+const sockets = new Set();
 const broadcasts = [];
 const loggedErrors = [];
 let app, control, port, broadcastFailure = false;
@@ -156,9 +157,19 @@ async function startChild(mode) {
 }
 async function socketFor(targetPort, token) {
   const socket = await openRawSocket(targetPort);
-  socket.sendJSON({ type: "auth", token });
-  await socket.next((message) => message.event === "authenticated");
-  return socket;
+  sockets.add(socket);
+  try {
+    socket.sendJSON({ type: "auth", token });
+    await socket.next((message) => message.event === "authenticated");
+    return socket;
+  } catch (error) {
+    closeSocket(socket);
+    throw error;
+  }
+}
+function closeSocket(socket) {
+  socket?.socket.destroy();
+  sockets.delete(socket);
 }
 
 before(async () => {
@@ -199,6 +210,7 @@ before(async () => {
 });
 
 after(async () => {
+  for (const socket of sockets) closeSocket(socket);
   for (const child of children) child.kill("SIGKILL");
   if (app) {
     for (const table of ["ActivityLog", "NotificationDelivery", "Notification"]) {
@@ -320,7 +332,7 @@ test("process death after commit keeps both intents for a fresh retry worker", a
     await Promise.all([peer.drain(50), mentioned.drain(50)]);
     assert.equal(peer.inbox.filter(isToast).length + mentioned.inbox.filter(isToast).length, 0);
   } finally {
-    peer?.socket.destroy(); mentioned?.socket.destroy();
+    closeSocket(peer); closeSocket(mentioned);
     await retry?.stop(); await killed.stop();
   }
 });
@@ -338,9 +350,10 @@ test("activity failure rolls back the required comment and all intents", async (
 test("duplicate mentions, assigned mentions and actor exclusion retain the public response and one toast each", async () => {
   const f = await fixture("recipients", { mention: true });
   await app.prisma.taskAssignee.createMany({ data: [f.actor, f.mentioned].map((u) => ({ taskId: f.task.id, userId: u.id })) });
-  const peer = await socketFor(port, f.peer.token);
-  const mentioned = await socketFor(port, f.mentioned.token);
+  let peer, mentioned;
   try {
+    peer = await socketFor(port, f.peer.token);
+    mentioned = await socketFor(port, f.mentioned.token);
     const body = `Review @[${f.mentioned.id}] @[${f.mentioned.id}] @[${f.actor.id}]`;
     const response = await post(f, body);
     assert.equal(response.status, 201);
@@ -368,7 +381,7 @@ test("duplicate mentions, assigned mentions and actor exclusion retain the publi
     await Promise.all([peer.drain(50), mentioned.drain(50)]);
     assert.equal(peer.inbox.filter(isToast).length + mentioned.inbox.filter(isToast).length, 0);
     assert.deepEqual(await counts(f), { comments: 1, activity: 1, outbox: 0, notifications: 2, broadcasts: 1 });
-  } finally { peer.socket.destroy(); mentioned.socket.destroy(); }
+  } finally { closeSocket(peer); closeSocket(mentioned); }
 });
 
 test("actor-only intents skip enqueue and preserve successful comment creation", async () => {
@@ -398,10 +411,11 @@ test("preference filtering remains at delivery and does not fail the comment", a
 
 test("failed first delivery preserves201 and committed intents recover once", async () => {
   const f = await fixture("delivery-fault", { mention: true });
-  const peer = await socketFor(port, f.peer.token);
-  const mentioned = await socketFor(port, f.mentioned.token);
-  await hook(f, "Notification", "fault");
+  let peer, mentioned;
   try {
+    peer = await socketFor(port, f.peer.token);
+    mentioned = await socketFor(port, f.mentioned.token);
+    await hook(f, "Notification", "fault");
     const response = await post(f, `Retry both @[${f.mentioned.id}]`);
     assert.equal(response.status, 201);
     await waitFor(async () => (await app.prisma.notificationDelivery.count({
@@ -415,15 +429,16 @@ test("failed first delivery preserves201 and committed intents recover once", as
     await drain(); await Promise.all([peer.drain(50), mentioned.drain(50)]);
     assert.equal(peer.inbox.filter(isToast).length + mentioned.inbox.filter(isToast).length, 0);
     assert.deepEqual(await counts(f), { comments: 1, activity: 1, outbox: 0, notifications: 2, broadcasts: 1 });
-  } finally { await unhook(f); peer.socket.destroy(); mentioned.socket.destroy(); }
+  } finally { closeSocket(peer); closeSocket(mentioned); await unhook(f); }
 });
 
 test("lost project access before retry filters the recipient without repeating the other intent", async () => {
   const f = await fixture("lost-access", { mention: true });
-  const peer = await socketFor(port, f.peer.token);
-  const mentioned = await socketFor(port, f.mentioned.token);
-  await hook(f, "Notification", "fault");
+  let peer, mentioned;
   try {
+    peer = await socketFor(port, f.peer.token);
+    mentioned = await socketFor(port, f.mentioned.token);
+    await hook(f, "Notification", "fault");
     assert.equal((await post(f, `Access retry @[${f.mentioned.id}]`)).status, 201);
     await waitFor(async () => (await app.prisma.notificationDelivery.count({
       where: { ...scoped(f.task.id), lastError: { not: null } },
@@ -441,7 +456,7 @@ test("lost project access before retry filters the recipient without repeating t
     assert.deepEqual(rows.map((row) => [row.userId, row.type]), [[f.mentioned.id, "COMMENT_MENTION"]]);
     await drain(); await mentioned.drain(50);
     assert.equal(mentioned.inbox.filter(isToast).length, 0);
-  } finally { await unhook(f); peer.socket.destroy(); mentioned.socket.destroy(); }
+  } finally { closeSocket(peer); closeSocket(mentioned); await unhook(f); }
 });
 
 test("postcommit broadcast failure preserves201 and the durable notification", async () => {

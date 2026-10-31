@@ -242,6 +242,33 @@ export async function revokeRefreshFamily(
   }, refreshTransactionOptions);
 }
 
+export type ConditionalRevocationResult =
+  | { status: "revoked"; familyId: string }
+  | { status: "absent" }
+  | { status: "superseded" };
+
+/**
+ * The cookie proves ownership; the supplied id only selects the session the
+ * browser intended to end. Do not lock or change a different current family.
+ */
+export async function revokeMatchingRefreshFamily(
+  prisma: PrismaClient,
+  rawToken: string | undefined,
+  expectedFamilyId: string,
+): Promise<ConditionalRevocationResult> {
+  if (!rawToken) return { status: "absent" };
+  const tokenHash = hashToken(rawToken);
+  return prisma.$transaction(async (tx): Promise<ConditionalRevocationResult> => {
+    await limitLockWaits(tx);
+    const familyId = await findFamilyId(tx, tokenHash);
+    if (!familyId) return { status: "absent" };
+    if (familyId !== expectedFamilyId) return { status: "superseded" };
+    if (!(await lockFamily(tx, familyId))) return { status: "absent" };
+    await revokeLockedFamily(tx, familyId, "logout");
+    return { status: "revoked", familyId };
+  }, refreshTransactionOptions);
+}
+
 /**
  * Revokes every family of a user inside the caller's READ COMMITTED
  * transaction, which should start with limitLockWaits. Families are locked in

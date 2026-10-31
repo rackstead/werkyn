@@ -20,6 +20,10 @@ Object.assign(process.env, {
 const { buildApp } = await import("../../src/app.ts");
 const { createApiKey } =
   await import("../../src/modules/api-keys/api-keys.service.ts");
+const pageService =
+  await import("../../src/modules/wiki/wiki-pages.service.ts");
+const commentService =
+  await import("../../src/modules/wiki/wiki-comments.service.ts");
 const { inspectBackupJson, parseBackupJson } =
   await import("../../src/modules/backup/backup-json.ts");
 const { validateBackup } =
@@ -31,6 +35,140 @@ const events = [];
 let app, port, workspace, space, actor, other, outsider;
 let requests = 0;
 const keys = new Map();
+let literalCounter = 0;
+
+function unstorableMembers() {
+  const proto = JSON.parse('{"__proto__":{"secret_marker":true},"safe":true}');
+  const raw = {
+    __prismaRawParameters__: true,
+    values: [1, { secret_marker: true }],
+  };
+  return [proto, raw, { items: [proto] }, { items: [raw] }];
+}
+
+function literalControls() {
+  return [
+    { $type: "ordinary", value: { note: "literal" } },
+    {
+      __prismaRawParameters__: false,
+      values: [1, 2],
+      constructor: "literal",
+      prototype: false,
+      toJSON: "literal",
+    },
+    { __prismaRawParameters__: "true", values: { note: "literal" } },
+  ];
+}
+
+async function storedJson(table, column, id) {
+  // Identifiers are fixed test-owned constants; compare the actual PG text,
+  // independently of Prisma's returned JSON value.
+  assert.ok(
+    [
+      "WikiPage:content",
+      "WikiPageComment:selectionStart",
+      "WikiPageComment:selectionEnd",
+      "ActivityLog:details",
+    ].includes(`${table}:${column}`),
+  );
+  const [row] = await app.prisma.$queryRawUnsafe(
+    `SELECT "${column}"::text AS json FROM "${table}" WHERE "id" = $1`,
+    id,
+  );
+  return row.json === null ? null : JSON.parse(row.json);
+}
+
+async function refusedService(run, field, pageId) {
+  const before = await state(pageId);
+  let error;
+  try {
+    await run();
+  } catch (caught) {
+    error = caught;
+  }
+  assert.deepEqual(
+    await state(pageId),
+    before,
+    "refused direct service must have no domain effects",
+  );
+  assert.equal(error?.statusCode, 400);
+  assert.ok(error.details.some((detail) => detail.field === field));
+  assert.doesNotMatch(
+    JSON.stringify({ message: error.message, details: error.details }),
+    /__proto__|__prismaRawParameters__|secret_marker/,
+  );
+}
+
+function literalBackup(value, target) {
+  const label = `Literal ${++literalCounter}-${suffix.slice(0, 8)}`;
+  const date = "2026-01-01T00:00:00.000Z";
+  const field = (name) =>
+    target === "all" || target === name ? value : { safe: true };
+  return {
+    label,
+    file: {
+      metadata: {
+        version: "1.1",
+        exportedAt: date,
+        sourceWorkspace: { name: "s", slug: "s" },
+        userRefs: [],
+      },
+      wikiSpaces: [
+        {
+          space: { name: label },
+          pages: [
+            {
+              _originalId: "p",
+              title: label,
+              position: 0,
+              content: field("content"),
+              comments: [
+                {
+                  _originalId: "c",
+                  body: "c",
+                  highlightId: "h",
+                  selectionStart: field("selectionStart"),
+                  selectionEnd: field("selectionEnd"),
+                  createdAt: date,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      projects: [
+        {
+          project: { name: label },
+          statuses: [
+            {
+              _originalId: "s",
+              name: "Open",
+              position: 0,
+              isCompletion: false,
+            },
+          ],
+          tasks: [
+            {
+              _originalId: "t",
+              title: label,
+              priority: "NONE",
+              position: 0,
+              statusRef: "s",
+              activityLogs: [
+                {
+                  _originalId: "a",
+                  action: "created",
+                  details: field("details"),
+                  createdAt: date,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
 
 function nested(levels, kind = "object") {
   let value = "leaf";
@@ -173,16 +311,19 @@ async function state(pageId) {
       where: { workspaceId: workspace.id },
     }),
     versions: await app.prisma.wikiPageVersion.count({
-      where: { page: { spaceId: space.id } },
+      where: { page: { space: { workspaceId: workspace.id } } },
     }),
     comments: await app.prisma.wikiPageComment.count({
-      where: { page: { spaceId: space.id } },
+      where: { page: { space: { workspaceId: workspace.id } } },
     }),
     activity: await app.prisma.activityLog.count({
       where: { task: { project: { workspaceId: workspace.id } } },
     }),
     notifications: await app.prisma.notification.count({
       where: { userId: { in: [...keys.keys()] } },
+    }),
+    deliveries: await app.prisma.notificationDelivery.count({
+      where: { recipientIds: { hasSome: [...keys.keys()] } },
     }),
     events: events.length,
     files: await storedFiles(),
@@ -853,5 +994,244 @@ test("backup numeric overflow is refused in preview and restore before rows, fil
         );
       });
     }
+  }
+});
+
+test("literal members: direct writes refuse serializer-interpreted objects without domain effects", async (t) => {
+  const page = await create();
+  for (const [index, value] of unstorableMembers().entries()) {
+    await t.test(`create ${index}`, () =>
+      refusedService(
+        () =>
+          pageService.createPage(app.prisma, workspace.id, space.id, actor.id, {
+            title: "Refused",
+            content: value,
+          }),
+        "content",
+      ),
+    );
+    await t.test(`update ${index}`, () =>
+      refusedService(
+        () =>
+          pageService.updatePage(app.prisma, page.id, actor.id, {
+            content: value,
+          }),
+        "content",
+        page.id,
+      ),
+    );
+    for (const field of ["selectionStart", "selectionEnd"])
+      await t.test(`${field} ${index}`, () =>
+        refusedService(
+          () =>
+            commentService.createComment(app.prisma, page.id, actor.id, {
+              body: "Refused",
+              highlightId: "h",
+              [field]: value,
+            }),
+          field,
+          page.id,
+        ),
+      );
+  }
+});
+
+test("literal members: HTTP refuses enabled raw markers with fixed field errors", async (t) => {
+  const page = await create();
+  for (const value of [unstorableMembers()[1], unstorableMembers()[3]]) {
+    await t.test("create", () =>
+      refused(
+        "POST",
+        `/wiki/spaces/${space.id}/pages`,
+        { title: "Refused", content: value },
+        "content",
+      ),
+    );
+    await t.test("update", () =>
+      refused(
+        "PATCH",
+        `/wiki/pages/${page.id}`,
+        { content: value },
+        "content",
+        page.id,
+      ),
+    );
+    for (const field of ["selectionStart", "selectionEnd"])
+      await t.test(field, () =>
+        refused(
+          "POST",
+          `/wiki/pages/${page.id}/comments`,
+          { body: "Refused", highlightId: "h", [field]: value },
+          field,
+          page.id,
+        ),
+      );
+  }
+});
+
+test("literal members: unsupported legacy snapshots and historical restores refuse atomically", async (t) => {
+  for (const [index, value] of unstorableMembers().slice(0, 2).entries()) {
+    const page = await create();
+    const json = JSON.stringify(value);
+    await app.prisma
+      .$executeRaw`UPDATE "WikiPage" SET "content" = ${json}::jsonb WHERE "id" = ${page.id}`;
+    assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
+    await t.test(`snapshot ${index}`, () =>
+      refused(
+        "POST",
+        `/wiki/pages/${page.id}/versions`,
+        { name: "Legacy" },
+        "content",
+        page.id,
+      ),
+    );
+    await t.test(`replacement ${index}`, () =>
+      refused(
+        "PATCH",
+        `/wiki/pages/${page.id}`,
+        { content: "replacement" },
+        "content",
+        page.id,
+      ),
+    );
+    assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
+    const ordinary = await create("current");
+    const version = result(
+      await request("POST", `/wiki/pages/${ordinary.id}/versions`, {
+        name: "Legacy",
+      }),
+      201,
+    ).data;
+    await app.prisma
+      .$executeRaw`UPDATE "WikiPageVersion" SET "content" = ${json}::jsonb WHERE "id" = ${version.id}`;
+    await t.test(`restore ${index}`, () =>
+      refused(
+        "POST",
+        `/wiki/versions/${version.id}/restore`,
+        undefined,
+        "content",
+        ordinary.id,
+      ),
+    );
+  }
+});
+
+test("literal members: backup preview and restore refuse every affected JSON field before effects", async (t) => {
+  for (const [index, value] of unstorableMembers().entries()) {
+    for (const field of [
+      "content",
+      "selectionStart",
+      "selectionEnd",
+      "details",
+    ]) {
+      const { file } = literalBackup(value, field);
+      for (const action of ["preview", "restore"]) {
+        await t.test(`${field} ${index} ${action}`, async () => {
+          const before = await state();
+          const response = await upload(
+            action,
+            Buffer.from(JSON.stringify(file)),
+          );
+          assert.deepEqual(
+            await state(),
+            before,
+            "refused backup must preserve rows, bytes, events and admission",
+          );
+          const body = result(response, 400);
+          assert.match(
+            body.message,
+            /^Invalid backup file: .*contains an object member that cannot be stored literally$/,
+          );
+          assert.doesNotMatch(
+            response.body,
+            /__proto__|__prismaRawParameters__|secret_marker/,
+          );
+          const good = literalBackup({ safe: true }, "all");
+          result(
+            await upload("preview", Buffer.from(JSON.stringify(good.file))),
+            200,
+          );
+          assert.deepEqual(
+            await state(),
+            before,
+            "next preview succeeds without an admission leak",
+          );
+        });
+      }
+    }
+  }
+});
+
+test("literal members: supported controls round trip through services, HTTP, versions and backup into PG", async (t) => {
+  for (const [index, value] of literalControls().entries()) {
+    await t.test(`control ${index}`, async () => {
+      const page = await create(value);
+      assert.deepEqual(page.content, value);
+      assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
+      await pageService.updatePage(app.prisma, page.id, actor.id, {
+        content: value,
+      });
+      assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
+      const version = result(
+        await request("POST", `/wiki/pages/${page.id}/versions`, {
+          name: "Literal",
+        }),
+        201,
+      ).data;
+      await pageService.updatePage(app.prisma, page.id, actor.id, {
+        content: "replaced",
+      });
+      assert.deepEqual(
+        result(
+          await request("POST", `/wiki/versions/${version.id}/restore`),
+          200,
+        ).data.content,
+        value,
+      );
+      assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
+      const comment = result(
+        await request("POST", `/wiki/pages/${page.id}/comments`, {
+          body: "Literal",
+          highlightId: "h",
+          selectionStart: value,
+          selectionEnd: value,
+        }),
+        201,
+      ).data;
+      for (const field of ["selectionStart", "selectionEnd"])
+        assert.deepEqual(
+          await storedJson("WikiPageComment", field, comment.id),
+          value,
+        );
+      const { label, file } = literalBackup(value, "all");
+      const before = await state();
+      result(await upload("preview", Buffer.from(JSON.stringify(file))), 200);
+      assert.deepEqual(await state(), before);
+      result(await upload("restore", Buffer.from(JSON.stringify(file))), 200);
+      const restored = await app.prisma.wikiPage.findFirstOrThrow({
+        where: { title: label, space: { workspaceId: workspace.id } },
+      });
+      assert.deepEqual(
+        await storedJson("WikiPage", "content", restored.id),
+        value,
+      );
+      const restoredComment = await app.prisma.wikiPageComment.findFirstOrThrow(
+        { where: { pageId: restored.id } },
+      );
+      for (const field of ["selectionStart", "selectionEnd"])
+        assert.deepEqual(
+          await storedJson("WikiPageComment", field, restoredComment.id),
+          value,
+        );
+      const activity = await app.prisma.activityLog.findFirstOrThrow({
+        where: {
+          task: { title: label, project: { workspaceId: workspace.id } },
+        },
+      });
+      assert.deepEqual(
+        await storedJson("ActivityLog", "details", activity.id),
+        value,
+      );
+    });
   }
 });

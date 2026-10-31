@@ -25,13 +25,25 @@ around page content and seven around comment selections, and its existing
 whole-file cap is 128. These limits are separate from the wiki parent-page
 hierarchy and its graph budget.
 
-Accepted values remain format-independent JSON: objects, arrays, strings,
-finite numbers, booleans and null. Normal editor documents need no migration.
+Supported values remain format-independent JSON: objects, arrays, strings,
+finite numbers, booleans and null, subject to the literal-member exclusions
+below. Normal editor documents need no migration.
 String values and member names must contain neither U+0000 nor an unpaired
 UTF-16 surrogate. Valid surrogate pairs, Unicode normalization forms and other
 characters that JSON storage supports are retained. HTTP's existing request
 body byte limit continues to bound wide inputs; no new item-count limit is
 introduced here.
+
+Objects with an own `__proto__` member or an own
+`__prismaRawParameters__` marker equal to boolean `true` are refused at every
+nested position. The locked Prisma serializer drops the former during normal
+member copying and interprets the latter as raw-parameter data, so accepting
+them would silently change literal JSON. Direct marker accessors are also
+refused without invoking them. These inherited serializer behaviors are not
+new regressions; the storage contract explicitly excludes them. Ordinary
+`$type`, `values`, `constructor`, `prototype`, string-valued `toJSON` and
+disabled/non-true raw markers remain supported literal data. No submitted
+JSON is escaped, stripped, rewritten or cloned to bypass these exclusions.
 
 Omitted fields remain omitted. Creating a page with omitted or null content
 keeps the existing SQL NULL behavior. A PATCH that omits content keeps the
@@ -68,8 +80,9 @@ The bounds ensure compatibility with the backup depth envelope. Aggregate
 backup byte, token and object budgets still apply, so a whole space may need
 to be exported in parts. The backup parser's bounded validation and memory
 budgets are unchanged. Its existing JSON storage check also rejects non-finite
-numbers in page content, selections and activity details, preventing overflow
-numbers in an uploaded JSON file from being silently restored as null.
+numbers and the same unsupported object members in page content, selections
+and activity details, so preview and restore refuse values that would be
+silently changed. Overflow numbers are rejected before being converted to null.
 Other shared JSON fields, graph limits and the broader
 C07 contract work remain separate.
 

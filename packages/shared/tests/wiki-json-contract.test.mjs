@@ -170,14 +170,84 @@ test("wide JSON and harmless shared subobjects remain compatible", () => {
     CreateWikiPageSchema.parse({ title: "Wide", content: wide }).content,
     wide,
   );
-  const ownProto = JSON.parse(
-    '{"__proto__":{"safe":true},"constructor":"plain","prototype":false}',
-  );
+  const literalKeys = {
+    constructor: "plain",
+    prototype: false,
+    toJSON: "literal",
+  };
   assert.equal(
-    CreateWikiPageSchema.parse({ title: "Keys", content: ownProto }).content,
-    ownProto,
+    CreateWikiPageSchema.parse({ title: "Keys", content: literalKeys }).content,
+    literalKeys,
   );
   assert.equal({}.safe, undefined);
+});
+
+test("serializer-interpreted object members are refused at every nested position", () => {
+  const proto = JSON.parse('{"__proto__":{"literal":true},"safe":true}');
+  const raw = { __prismaRawParameters__: true, values: [1, 2] };
+  for (const value of [
+    proto,
+    raw,
+    { items: [proto] },
+    { items: [raw] },
+    { __prismaRawParameters__: true },
+  ]) {
+    for (const [, schema, base, field] of inputs) {
+      const result = schema.safeParse({ ...base, [field]: value });
+      assert.equal(result.success, false);
+      assert.deepEqual(result.error.issues[0].path, [field]);
+      assert.doesNotMatch(
+        result.error.issues[0].message,
+        /__proto__|__prismaRawParameters__|"literal"/,
+      );
+    }
+  }
+});
+
+test("supported literal keys and non-true markers retain identity", () => {
+  for (const marker of [false, null, 0, 1, "true", {}, []]) {
+    const value = {
+      __prismaRawParameters__: marker,
+      values: [1, 2],
+      constructor: "literal",
+      prototype: false,
+      toJSON: "literal",
+    };
+    assert.equal(
+      CreateWikiPageSchema.parse({ title: "Keys", content: value }).content,
+      value,
+    );
+  }
+  const value = {
+    $type: "ordinary",
+    value: { constructor: "literal", toJSON: "literal" },
+  };
+  assert.equal(
+    CreateWikiPageSchema.parse({ title: "Type", content: value }).content,
+    value,
+  );
+});
+
+test("raw marker descriptors are checked without invoking accessors", () => {
+  let calls = 0;
+  const getter = Object.defineProperty({}, "__prismaRawParameters__", {
+    get() {
+      calls++;
+      throw new Error("must not run");
+    },
+  });
+  const enabled = Object.defineProperty(
+    { values: [1] },
+    "__prismaRawParameters__",
+    { value: true },
+  );
+  for (const value of [getter, enabled])
+    assert.equal(
+      CreateWikiPageSchema.safeParse({ title: "Descriptor", content: value })
+        .success,
+      false,
+    );
+  assert.equal(calls, 0);
 });
 
 test("very deep direct input is rejected before recursion can overflow", () => {

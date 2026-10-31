@@ -1,5 +1,10 @@
 import { Priority } from "@prisma/client";
-import { CustomFieldTypeEnum, MAX_JSON_STORAGE_DEPTH, type BackupFile } from "@pm/shared";
+import {
+  CustomFieldTypeEnum,
+  MAX_JSON_STORAGE_DEPTH,
+  hasUnstorableJsonMembers,
+  type BackupFile,
+} from "@pm/shared";
 import { ValidationError } from "../../utils/errors.js";
 import { graphLimits } from "../../utils/graph-limits.js";
 
@@ -84,6 +89,8 @@ export function checkJsonValue(value: unknown, what: string, level = 0): void {
     return;
   }
   if (value === null || typeof value !== "object") return;
+  if (hasUnstorableJsonMembers(value))
+    throw invalid(`${what} contains an object member that cannot be stored literally`);
   if (level >= MAX_RESTORE_JSON_DEPTH)
     throw invalid(`${what} is nested more than ${MAX_RESTORE_JSON_DEPTH} levels deep`);
   if (Array.isArray(value)) {

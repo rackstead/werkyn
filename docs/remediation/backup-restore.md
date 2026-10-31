@@ -92,6 +92,12 @@ and never quote its content.
   or member name, or a non-finite number. This covers page content, activity
   details and comment selections. 123 is the deepest Prisma stores in one insert. The
   `backup.json` depth limit of 128 already keeps page content within it.
+- **Serializer-interpreted object members** in those JSON fields: own
+  `__proto__`, or an own `__prismaRawParameters__` marker equal to `true`.
+  These would be dropped or interpreted instead of stored literally. Preview
+  and restore refuse them at nested positions before effects; supported
+  literal keys and disabled markers are retained. See
+  [wiki-json-contract.md](wiki-json-contract.md).
 - **Timestamps PostgreSQL cannot store** (comments, activity, messages, page
   comments), and an **unknown priority or custom-field type**.
 - **A dependency cycle among the tasks of one project**, including a task

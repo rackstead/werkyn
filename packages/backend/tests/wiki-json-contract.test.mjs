@@ -53,6 +53,44 @@ test("direct page service callers refuse unsupported JSON before entering a tran
   }
 });
 
+test("direct service callers refuse serializer-interpreted members before any database access", async () => {
+  const prisma = new Proxy(
+    {},
+    {
+      get() {
+        assert.fail("database must not be accessed");
+      },
+    },
+  );
+  const proto = JSON.parse('{"__proto__":{"literal":true},"safe":true}');
+  for (const content of [
+    proto,
+    { __prismaRawParameters__: true, values: [1, 2] },
+    { nested: [proto] },
+  ]) {
+    await assert.rejects(
+      createPage(prisma, "w", "s", "u", { title: "p", content }),
+      invalid("content"),
+    );
+    await assert.rejects(
+      updatePage(prisma, "p", "u", { content }),
+      invalid("content"),
+    );
+    for (const field of ["selectionStart", "selectionEnd"])
+      await assert.rejects(
+        createComment(prisma, "p", "u", {
+          body: "c",
+          highlightId: "h",
+          [field]: content,
+        }),
+        invalid(field),
+      );
+    assert.throws(() => checkJsonValue(content, "page content"), {
+      statusCode: 400,
+    });
+  }
+});
+
 test("direct comment service callers validate both selections before any database access", async () => {
   const cycle = [];
   cycle.push(cycle);

@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import * as commentsService from "./comments.service.js";
-import { notify } from "../../utils/notify.js";
+import { deliverNotification } from "../notifications/notification-delivery.js";
 import type { CreateCommentInput, UpdateCommentInput, CommentQueryInput } from "@pm/shared";
 
 export async function listCommentsHandler(
@@ -23,63 +23,26 @@ export async function createCommentHandler(
 ) {
   const params = request.params as { tid: string };
   const body = request.body as CreateCommentInput;
-  const { comment, projectId, mentionedUserIds } = await commentsService.createComment(
+  const { comment, projectId, notificationDeliveryIds } = await commentsService.createComment(
     request.server.prisma,
     params.tid,
     request.user!.id,
     body,
   );
-  request.server.broadcast(projectId, "comment_created", {
-    taskId: params.tid,
-    commentId: comment.id,
-  });
-
-  // Fetch task info for notifications
-  const task = await request.server.prisma.task.findUnique({
-    where: { id: params.tid },
-    select: { title: true, assignees: { select: { userId: true } } },
-  });
-  if (task) {
-    // Notify assignees about new comment (exclude mentioned users — they get a separate notification)
-    const assigneeIds = task.assignees.map((a) => a.userId);
-    const mentionSet = new Set(mentionedUserIds);
-    const commentRecipients = assigneeIds.filter((id) => !mentionSet.has(id));
-    if (commentRecipients.length > 0) {
-      notify(request.server.prisma, request.server, {
-        recipients: commentRecipients,
-        type: "COMMENT_ADDED",
-        title: `New comment on "${task.title}"`,
-        body: `${request.user!.displayName}: ${body.body.slice(0, 100)}`,
-        data: {
-          taskId: params.tid,
-          projectId,
-          commentId: comment.id,
-          actorId: request.user!.id,
-          actorName: request.user!.displayName,
-          taskTitle: task.title,
-        },
-        excludeUserId: request.user!.id,
-      }).catch((err) => request.log.error(err, "Failed to send comment notification"));
-    }
-
-    // Notify mentioned users
-    if (mentionedUserIds.length > 0) {
-      notify(request.server.prisma, request.server, {
-        recipients: mentionedUserIds,
-        type: "COMMENT_MENTION",
-        title: `${request.user!.displayName} mentioned you in "${task.title}"`,
-        body: body.body.slice(0, 100),
-        data: {
-          taskId: params.tid,
-          projectId,
-          commentId: comment.id,
-          actorId: request.user!.id,
-          actorName: request.user!.displayName,
-          taskTitle: task.title,
-        },
-        excludeUserId: request.user!.id,
-      }).catch((err) => request.log.error(err, "Failed to send mention notification"));
-    }
+  try {
+    request.server.broadcast(projectId, "comment_created", {
+      taskId: params.tid,
+      commentId: comment.id,
+    });
+  } catch {
+    request.log.error({ commentId: comment.id }, "Could not broadcast committed comment");
+  }
+  for (const id of notificationDeliveryIds) {
+    void deliverNotification(request.server.prisma, request.server, id, { log: request.server.log })
+      .catch(() => request.log.error(
+        { commentId: comment.id, notificationDeliveryId: id },
+        "Committed comment notification remains queued for retry",
+      ));
   }
   return reply.status(201).send({ data: comment });
 }

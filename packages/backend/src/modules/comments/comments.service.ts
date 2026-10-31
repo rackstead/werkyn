@@ -2,6 +2,10 @@ import type { PrismaClient } from "@prisma/client";
 import type { CreateCommentInput, UpdateCommentInput, CommentQueryInput } from "@pm/shared";
 import { ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { logActivity } from "../../utils/activity-log.js";
+import {
+  enqueueNotifications,
+  type NotificationRequest,
+} from "../notifications/notification-delivery.js";
 
 export function parseMentions(body: string): string[] {
   const regex = /@\[([^\]]+)\]/g;
@@ -11,6 +15,16 @@ export function parseMentions(body: string): string[] {
     userIds.push(match[1]);
   }
   return [...new Set(userIds)];
+}
+
+// Keep the existing code-unit limit without cutting a valid surrogate pair.
+function notificationExcerpt(body: string): string {
+  const prefix = body.slice(0, 100);
+  const last = prefix.charCodeAt(prefix.length - 1);
+  const next = body.charCodeAt(100);
+  return last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff
+    ? prefix.slice(0, -1)
+    : prefix;
 }
 
 export async function listComments(
@@ -63,35 +77,70 @@ export async function createComment(
   authorId: string,
   data: CreateCommentInput,
 ) {
-  const task = await prisma.task.findUnique({
-    where: { id: taskId },
-    select: { id: true, projectId: true },
-  });
-  if (!task) throw new NotFoundError("Task not found");
-
-  const comment = await prisma.comment.create({
-    data: {
-      taskId,
-      authorId,
-      body: data.body,
-    },
-    include: {
-      author: {
-        select: { id: true, displayName: true, avatarUrl: true },
+  return prisma.$transaction(async (tx) => {
+    const task = await tx.task.findUnique({
+      where: { id: taskId },
+      select: {
+        id: true,
+        projectId: true,
+        title: true,
+        assignees: { select: { userId: true } },
       },
-    },
+    });
+    if (!task) throw new NotFoundError("Task not found");
+
+    const comment = await tx.comment.create({
+      data: { taskId, authorId, body: data.body },
+      include: {
+        author: { select: { id: true, displayName: true, avatarUrl: true } },
+      },
+    });
+    await logActivity(tx, {
+      taskId,
+      actorId: authorId,
+      action: "comment_added",
+      details: { commentId: comment.id },
+    });
+
+    const mentionedUserIds = parseMentions(data.body);
+    const mentionSet = new Set(mentionedUserIds);
+    const commentRecipients = task.assignees
+      .map((assignee) => assignee.userId)
+      .filter((id) => !mentionSet.has(id));
+    const actorName = comment.author?.displayName ?? "Someone";
+    const excerpt = notificationExcerpt(data.body);
+    const notificationData = {
+      taskId,
+      projectId: task.projectId,
+      commentId: comment.id,
+      actorId: authorId,
+      actorName,
+      taskTitle: task.title,
+    };
+    const notifications: NotificationRequest[] = [];
+    if (commentRecipients.length > 0) {
+      notifications.push({
+        recipients: commentRecipients,
+        type: "COMMENT_ADDED",
+        title: `New comment on "${task.title}"`,
+        body: `${actorName}: ${excerpt}`,
+        data: notificationData,
+        excludeUserId: authorId,
+      });
+    }
+    if (mentionedUserIds.length > 0) {
+      notifications.push({
+        recipients: mentionedUserIds,
+        type: "COMMENT_MENTION",
+        title: `${actorName} mentioned you in "${task.title}"`,
+        body: excerpt,
+        data: notificationData,
+        excludeUserId: authorId,
+      });
+    }
+    const notificationDeliveryIds = await enqueueNotifications(tx, notifications);
+    return { comment, projectId: task.projectId, mentionedUserIds, notificationDeliveryIds };
   });
-
-  await logActivity(prisma, {
-    taskId,
-    actorId: authorId,
-    action: "comment_added",
-    details: { commentId: comment.id },
-  });
-
-  const mentionedUserIds = parseMentions(data.body);
-
-  return { comment, projectId: task.projectId, mentionedUserIds };
 }
 
 export async function updateComment(

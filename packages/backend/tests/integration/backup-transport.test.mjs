@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -413,6 +413,51 @@ test("an export whose client leaves mid-download frees its admission and leaves 
   request.destroy();
   await waitFor(() => backupConcurrency.usage.admitted === 0, "the admission to be released");
   assert.deepEqual(await staged(), []);
+});
+
+test("an export's admission is released before its last byte reaches the client", { timeout: 60_000 }, async () => {
+  const { d, dProject } = workspaces;
+  // Hold back every read that finds the end of a file, as a busy disk or
+  // thread pool can. The archive's last byte then reaches the client well
+  // before its read stream ends or closes.
+  const probe = await open(path.join(root, "probe"), "w");
+  const fileHandle = Object.getPrototypeOf(probe);
+  await probe.close();
+  const read = fileHandle.read;
+  fileHandle.read = async function (...args) {
+    const result = await read.apply(this, args);
+    if (result.bytesRead === 0) await new Promise((resolve) => setTimeout(resolve, 500));
+    return result;
+  };
+  try {
+    const request = track(
+      http.request(`${base}/api/workspaces/${d.id}/backup/export`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      }),
+    );
+    let admittedAtLastByte;
+    const finished = new Promise((resolve, reject) => {
+      request.on("error", reject);
+      request.on("response", (response) => {
+        const expected = Number(response.headers["content-length"]);
+        let received = 0;
+        response.on("data", (chunk) => {
+          received += chunk.length;
+          // Read at once, in the same callback that delivers the last byte.
+          if (received === expected) admittedAtLastByte = backupConcurrency.usage.admitted;
+        });
+        response.on("error", reject);
+        response.on("end", () => resolve(response.statusCode));
+      });
+    });
+    request.end(JSON.stringify({ projects: [{ projectId: dProject.id }] }));
+    assert.equal(await finished, 200);
+    assert.equal(admittedAtLastByte, 0, "the admission was still held when the client had the whole file");
+  } finally {
+    fileHandle.read = read;
+  }
+  await waitFor(() => backupConcurrency.usage.admitted === 0, "the export's admission to be released");
 });
 
 test("an upload over the size limit gets a 413 and leaves nothing staged", { timeout: 60_000 }, async () => {

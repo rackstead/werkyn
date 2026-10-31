@@ -13,6 +13,7 @@ const {
   BackupUploadTooLargeError,
   UPLOAD_INTERRUPTED_MESSAGE,
   backupStagingDir,
+  onLastByte,
   prepareBackupStaging,
   receiveBackupUpload,
   stageStream,
@@ -305,4 +306,47 @@ test("a download that stops moving is dropped after exactly the idle timeout", a
   await new Promise((resolve) => done.once("close", resolve));
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(late, false);
+});
+
+test("a download reports its last byte as it is handed on, not when the file read ends", async () => {
+  const size = 3 * 64 * 1024 + 5;
+  const bytes = crypto.randomBytes(size);
+  // Like a file read stream whose read that finds the end of the file is slow.
+  let offset = 0;
+  const source = new Readable({
+    read() {
+      if (offset >= size) {
+        setTimeout(() => this.push(null), 200);
+        return;
+      }
+      const chunk = bytes.subarray(offset, offset + 64 * 1024);
+      offset += chunk.length;
+      this.push(chunk);
+    },
+  });
+  let sentAt;
+  let calls = 0;
+  const counted = onLastByte(source, size, () => {
+    calls++;
+    sentAt = received;
+  });
+  let received = 0;
+  let sentBeforeLastByte;
+  const chunks = [];
+  counted.on("data", (chunk) => {
+    received += chunk.length;
+    chunks.push(chunk);
+    if (received === size) sentBeforeLastByte = sentAt !== undefined;
+  });
+  await new Promise((resolve) => counted.once("close", resolve));
+  assert.equal(sentBeforeLastByte, true, "reported only after the consumer had every byte");
+  assert.equal(calls, 1);
+  assert.deepEqual(Buffer.concat(chunks), bytes);
+
+  // A download abandoned before its last byte never reports it.
+  let abandoned = false;
+  const partial = onLastByte(Readable.from([Buffer.alloc(10), Buffer.alloc(10)]), 30, () => (abandoned = true));
+  partial.resume();
+  await new Promise((resolve) => partial.once("close", resolve));
+  assert.equal(abandoned, false);
 });

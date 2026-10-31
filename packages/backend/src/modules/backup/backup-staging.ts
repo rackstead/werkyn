@@ -142,6 +142,29 @@ export function watchIdle(source: Readable, idleTimeoutMs: number, onIdle: () =>
   return pipeline(source, watched, () => {});
 }
 
+/**
+ * Pass `source` through, calling `onSent` when the chunk that completes its
+ * first `size` bytes is handed on, in the same synchronous step and just
+ * before it, so before anything reading the stream can have every byte.
+ * Waiting for the stream to end or close would also wait for the read that
+ * finds the end of the file, which can finish after the client has it all.
+ */
+export function onLastByte(source: Readable, size: number, onSent: () => void): Readable {
+  let passed = 0;
+  let sent = false;
+  const counted = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      passed += chunk.length;
+      if (!sent && passed >= size) {
+        sent = true;
+        onSent();
+      }
+      callback(null, chunk);
+    },
+  });
+  return pipeline(source, counted, () => {});
+}
+
 export interface StagedUpload extends StagedFile {
   readonly filename: string;
 }
@@ -158,7 +181,14 @@ export async function receiveBackupUpload(
     dir,
     maxBytes,
     idleTimeoutMs = BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
-  }: { dir: string; maxBytes: number; idleTimeoutMs?: number },
+    onFile,
+  }: {
+    dir: string;
+    maxBytes: number;
+    idleTimeoutMs?: number;
+    /** Called once the file part has started, before it is staged. */
+    onFile?: () => void;
+  },
 ): Promise<StagedUpload> {
   // The multipart parser reads the request from here on. Until the file part
   // starts, a request that stops sending is dropped, so it cannot hold its
@@ -188,6 +218,7 @@ export async function receiveBackupUpload(
   if (!file.filename.endsWith(".json") && !file.filename.endsWith(".zip")) {
     throw new ValidationError("Only .json and .zip files are accepted");
   }
+  onFile?.();
   let staged: StagedFile;
   try {
     staged = await stageStream(file.file, { dir, maxBytes, idleTimeoutMs });

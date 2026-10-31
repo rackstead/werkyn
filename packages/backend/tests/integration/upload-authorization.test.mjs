@@ -294,6 +294,8 @@ test("malformed truncated multipart rejects without storing partial content", as
     headers: { "content-type": body.contentType, authorization: `Bearer ${sessions.ADMIN}` },
     payload: body.payload.subarray(0, body.payload.length - 12),
   });
-  assert.ok(response.statusCode >= 400, response.body);
+  // The client's malformed body, not a server error.
+  assert.equal(response.statusCode, 400, response.body);
+  assert.equal(response.json().message, "The upload did not complete");
   assert.deepEqual(await storageSnapshot(), initial);
 });

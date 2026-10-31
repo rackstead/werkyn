@@ -50,10 +50,9 @@ interface DexPostgresSsl {
 }
 
 /**
- * Derives Dex's PostgreSQL TLS settings from the sslmode in DATABASE_URL, so
- * Dex requires TLS whenever Werkyn does. Dex's driver supports only disable,
- * require, verify-ca and verify-full and cannot fall back between plaintext
- * and TLS:
+ * Derives Dex's PostgreSQL TLS settings from the sslmode in DATABASE_URL.
+ * Dex's driver supports only disable, require, verify-ca and verify-full and
+ * cannot fall back between plaintext and TLS:
  * - no sslmode, disable, allow or prefer: plaintext, since these let Werkyn
  *   connect without TLS too (the bundled Compose database has none);
  * - require: TLS required (verify-full with Prisma's sslaccept=strict);
@@ -66,6 +65,9 @@ interface DexPostgresSsl {
  * weaker setting than Werkyn (sslmode=disable&sslmode=require gave Dex
  * plaintext while Werkyn used TLS). Prisma does not document how it reads
  * repeated parameters, so Dex does not guess.
+ *
+ * sslaccept must be omitted or exactly strict / accept_invalid_certs: Prisma
+ * verifies for any other present value, so guessing could weaken Dex's TLS.
  */
 export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
   for (const name of TLS_PARAMETERS) {
@@ -74,6 +76,17 @@ export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
         `DATABASE_URL gives "${name}" more than once; give each TLS parameter once so Werkyn and Dex use the same setting`,
       );
     }
+  }
+
+  const sslAccept = params.get("sslaccept");
+  if (
+    sslAccept !== null &&
+    sslAccept !== "strict" &&
+    sslAccept !== "accept_invalid_certs"
+  ) {
+    throw new Error(
+      "DATABASE_URL sslaccept is not supported for Dex; use strict or accept_invalid_certs (case-sensitive), or omit it",
+    );
   }
 
   const requested = (params.get("sslmode") ?? "disable").toLowerCase();
@@ -85,10 +98,7 @@ export function dexPostgresSsl(params: URLSearchParams): DexPostgresSsl {
       mode = "disable";
       break;
     case "require":
-      mode =
-        params.get("sslaccept")?.toLowerCase() === "strict"
-          ? "verify-full"
-          : "require";
+      mode = sslAccept === "strict" ? "verify-full" : "require";
       break;
     case "verify-ca":
     case "verify-full":

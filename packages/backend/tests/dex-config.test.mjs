@@ -51,8 +51,10 @@ const prisma = {
 };
 
 const originalDatabaseUrl = env.DATABASE_URL;
+const originalStorageType = env.DEX_STORAGE_TYPE;
 afterEach(() => {
   env.DATABASE_URL = originalDatabaseUrl;
+  env.DEX_STORAGE_TYPE = originalStorageType;
 });
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
@@ -127,8 +129,14 @@ test("Dex keeps plaintext PostgreSQL for a URL without sslmode (local Compose)",
 test("Dex requires TLS whenever DATABASE_URL requires it", async () => {
   for (const [query, ssl] of [
     ["sslmode=require", { mode: "require" }],
+    ["sslmode=require&sslaccept=accept_invalid_certs", { mode: "require" }],
     ["sslmode=REQUIRE", { mode: "require" }],
     ["sslmode=require&sslaccept=strict", { mode: "verify-full" }],
+    ["sslmode=require&ssl%61ccept=%73trict", { mode: "verify-full" }],
+    [
+      "sslmode=require&sslaccept=accept%5finvalid%5fcerts",
+      { mode: "require" },
+    ],
     [
       "sslmode=verify-ca&sslrootcert=/etc/ssl/db-ca.pem",
       { mode: "verify-ca", caFile: "/etc/ssl/db-ca.pem" },
@@ -187,6 +195,96 @@ const sslFor = (query) =>
     new URL(`postgresql://u:p@db.example.net/werkyn?${query}`).searchParams,
   );
 
+const unsupportedSslacceptMessage =
+  "DATABASE_URL sslaccept is not supported for Dex; use strict or accept_invalid_certs (case-sensitive), or omit it";
+
+test("canonical sslaccept values preserve every supported TLS mode and the omitted default", () => {
+  for (const [mode, defaultMode, strictMode] of [
+    [undefined, "disable", "disable"],
+    ["disable", "disable", "disable"],
+    ["allow", "disable", "disable"],
+    ["prefer", "disable", "disable"],
+    ["require", "require", "verify-full"],
+    ["REQUIRE", "require", "verify-full"],
+    ["verify-ca", "verify-ca", "verify-ca"],
+    ["verify-full", "verify-full", "verify-full"],
+  ]) {
+    for (const accept of [undefined, "strict", "accept_invalid_certs"]) {
+      const params = new URLSearchParams();
+      if (mode !== undefined) params.set("sslmode", mode);
+      if (accept !== undefined) params.set("sslaccept", accept);
+      assert.deepEqual(
+        dexPostgresSsl(params),
+        { mode: accept === "strict" ? strictMode : defaultMode },
+        params.toString(),
+      );
+    }
+  }
+});
+
+test("unsupported sslaccept values cannot silently disable Dex certificate verification", () => {
+  for (const value of [
+    "bogus",
+    "",
+    "STRICT",
+    "Strict",
+    "ACCEPT_INVALID_CERTS",
+    "Accept_Invalid_Certs",
+    "strict ",
+    " accept_invalid_certs",
+    "postgresql://private-user:private-password@private-db/private-name\nprivate-token",
+  ]) {
+    // Reject invalid settings consistently, even with an otherwise inactive
+    // TLS mode, so changing sslmode later cannot reveal a latent typo.
+    for (const mode of ["require", undefined, "disable", "allow", "prefer", "verify-ca", "verify-full"]) {
+      const params = new URLSearchParams({ sslaccept: value });
+      if (mode !== undefined) params.set("sslmode", mode);
+      assert.throws(
+        () => dexPostgresSsl(params),
+        { message: unsupportedSslacceptMessage },
+        `sslmode=${mode}, sslaccept=${JSON.stringify(value)}`,
+      );
+    }
+  }
+  for (const query of [
+    "sslmode=require&sslaccept",
+    "sslmode=require&ssl%61ccept=bogus",
+    "sslmode=require&sslaccept=%41CCEPT_INVALID_CERTS",
+    "sslmode=require&sslaccept=strict%00",
+    "sslmode=require&sslaccept=strict+",
+  ]) {
+    assert.throws(() => sslFor(query), { message: unsupportedSslacceptMessage }, query);
+  }
+});
+
+test("invalid PostgreSQL sslaccept rejects configuration without writing or exposing supplied values", async () => {
+  const file = await generateDexConfig(prisma);
+  const previous = readFileSync(file, "utf8");
+  const privateValue = "postgresql://private-user:private-password@private-db/private-name\nprivate-token";
+  for (const value of ["bogus", "", "ACCEPT_INVALID_CERTS", privateValue]) {
+    env.DATABASE_URL =
+      `postgresql://private-user:private-password@private-db/private-name?sslmode=require&sslaccept=${encodeURIComponent(value)}`;
+    await assert.rejects(generateDexConfig(prisma), (err) => {
+      assert.equal(err.message, unsupportedSslacceptMessage);
+      assert.doesNotMatch(err.stack, /private-user|private-password|private-db|private-name|private-token/);
+      return true;
+    });
+    assert.equal(readFileSync(file, "utf8"), previous, "the existing config was replaced");
+    assert.deepEqual(readdirSync(configDir), ["dex-config.yaml"]);
+  }
+});
+
+test("SQLite config does not parse PostgreSQL sslaccept settings", async () => {
+  env.DEX_STORAGE_TYPE = "sqlite3";
+  env.DATABASE_URL =
+    "postgresql://u:p@db.example.net/werkyn?sslmode=require&sslaccept=bogus&sslaccept=";
+  const file = await generateDexConfig(prisma);
+  assert.deepEqual(parse(readFileSync(file, "utf8")).storage, {
+    type: "sqlite3",
+    config: { file: path.join(configDir, "dex.db") },
+  });
+});
+
 test("a repeated TLS parameter is rejected, since Werkyn and Dex could read different values", async () => {
   // Prisma reads the last value and URLSearchParams.get the first, so each of
   // these could leave Dex weaker than Werkyn (or the reverse).
@@ -207,6 +305,8 @@ test("a repeated TLS parameter is rejected, since Werkyn and Dex could read diff
       "sslmode=require&sslaccept=strict&sslaccept=accept_invalid_certs",
       "sslaccept",
     ],
+    ["sslmode=require&sslaccept=bogus&ssl%61ccept=strict", "sslaccept"],
+    ["sslmode=require&sslaccept=&sslaccept=", "sslaccept"],
     [
       "sslmode=require&sslaccept=strict&sslcert=/etc/ssl/ca.pem&sslcert=/etc/ssl/other-ca.pem",
       "sslcert",
@@ -255,6 +355,12 @@ test("parameters that are not TLS settings may repeat, and names are case-sensit
   });
   assert.deepEqual(sslFor("sslmode=require&SslMode=disable"), {
     mode: "require",
+  });
+  assert.deepEqual(sslFor("sslmode=require&SSLACCEPT=bogus&sslAccept="), {
+    mode: "require",
+  });
+  assert.deepEqual(sslFor("sslmode=require&SSLACCEPT=bogus&sslaccept=strict"), {
+    mode: "verify-full",
   });
 });
 

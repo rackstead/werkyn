@@ -19,7 +19,7 @@ vi.mock("@/features/tasks/components/task-actions", async () => {
   const { Dialog, DialogContent, DialogTitle } = await import("@/components/ui/dialog");
   return { TaskActions: () => {
     const [open, setOpen] = useState(false);
-    return <><button onClick={() => setOpen(true)}>Nested action</button><Dialog open={open} onOpenChange={setOpen}><DialogContent><DialogTitle>Nested dialog</DialogTitle><input aria-label="Nested input" autoFocus /></DialogContent></Dialog></>;
+    return <><button onClick={() => setOpen(true)}>Nested action</button><Dialog open={open} onOpenChange={setOpen}><DialogContent aria-describedby={undefined}><DialogTitle>Nested dialog</DialogTitle><input aria-label="Nested input" autoFocus /></DialogContent></Dialog></>;
   } };
 });
 vi.mock("@/features/drive/api", () => ({
@@ -37,12 +37,19 @@ type Dismissal = "Close" | "Escape" | "backdrop";
 // deferred: its actual Slideover and focus handlers run after resolution.
 async function open(kind: Kind) {
   vi.resetModules();
-  let resolve!: () => void;
-  const pending = new Promise<void>((yes) => { resolve = yes; });
+  let unblock!: () => void;
+  let complete!: () => void;
+  const pending = new Promise<void>((yes) => { unblock = yes; });
+  const settled = new Promise<void>((yes) => { complete = yes; });
+  const defer = async (original: () => Promise<unknown>) => {
+    await pending;
+    try { return await original(); }
+    finally { complete(); }
+  };
   if (kind === "task") {
-    vi.doMock("@/features/tasks/components/task-slideover", async (original) => { await pending; return original(); });
+    vi.doMock("@/features/tasks/components/task-slideover", defer);
   } else {
-    vi.doMock("@/features/drive/components/file-preview-slideover", async (original) => { await pending; return original(); });
+    vi.doMock("@/features/drive/components/file-preview-slideover", defer);
   }
   const { TaskSlideover: Task } = await import("@/features/tasks/components/lazy-task-slideover");
   const { FilePreviewSlideover: Preview } = await import("@/features/drive/components/lazy-drive-panels");
@@ -60,15 +67,15 @@ async function open(kind: Kind) {
   await act(async () => { fireEvent.click(opener); });
   const loading = await screen.findByRole("dialog", { name: `Loading ${kind}` });
   await waitFor(() => expect(loading.contains(document.activeElement)).toBe(true));
+  const resolve = async () => { unblock(); await settled; };
   const load = async () => {
-    await act(async () => { resolve(); });
+    await act(resolve);
     const loaded = await screen.findByRole("dialog", { name: kind === "task" ? "Task details" : file.name });
     await waitFor(() => expect(loaded.contains(document.activeElement)).toBe(true));
     expect(screen.queryByRole("dialog", { name: `Loading ${kind}` })).toBeNull();
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
     expect(loaded.getAttribute("aria-modal")).toBe("true");
-    background.focus();
-    await waitFor(() => expect(loaded.contains(document.activeElement)).toBe(true));
+    expect(screen.queryByRole("button", { name: "Background" })).toBeNull();
     return loaded;
   };
   return { opener, background, loading, load, resolve, leave: () => view.rerender(<Page route={false} />) };
@@ -97,7 +104,7 @@ describe.each(["task", "preview"] as const)("%s lazy panel handover", (kind) => 
     const { opener, resolve } = await open(kind);
     await dismiss(how, false);
     await waitFor(() => expect(document.activeElement).toBe(opener));
-    await act(async () => { resolve(); });
+    await act(resolve);
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
   });

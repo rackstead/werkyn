@@ -11,8 +11,10 @@ import path from "node:path";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error("Owned TEST_DATABASE_URL required");
+const applicationUrl = new URL(process.env.TEST_DATABASE_URL);
+applicationUrl.searchParams.set("connection_limit", "5");
 Object.assign(process.env, {
-  DATABASE_URL: process.env.TEST_DATABASE_URL,
+  DATABASE_URL: applicationUrl.toString(),
   NODE_ENV: "test",
   LOG_LEVEL: "error",
   JWT_SECRET: "pending-logout-owned-local-signing-key-20261031",
@@ -39,6 +41,11 @@ let app,
   users = 0,
   requests = 0;
 before(async () => {
+  assert.equal(
+    new URL(process.env.DATABASE_URL).searchParams.get("connection_limit"),
+    "5",
+  );
+  await Promise.all([control.$connect(), observer.$connect()]);
   app = await buildApp();
   origin = await app.listen({ host: "127.0.0.1", port: 0 });
   passwordHash = await hashPassword(password);
@@ -46,7 +53,7 @@ before(async () => {
 after(async () => {
   try {
     for (const socket of sockets) socket.destroy();
-    await control.$disconnect();
+    await Promise.all([control.$disconnect(), observer.$disconnect()]);
     await app?.prisma.rotatedRefreshToken.deleteMany({
       where: { familyId: { in: [...families] } },
     });
@@ -156,6 +163,9 @@ const { openRawSocket } = await import("./support/raw-websocket.mjs");
 const controlUrl = new URL(process.env.TEST_DATABASE_URL);
 controlUrl.searchParams.set("connection_limit", "1");
 const control = new PrismaClient({ datasourceUrl: controlUrl.toString() });
+// The holder and observer have separate single-connection pools. Observation
+// cannot queue behind either blocked HTTP actor in the application pool.
+const observer = new PrismaClient({ datasourceUrl: controlUrl.toString() });
 const sockets = new Set();
 const trusted = {
   origin: "http://localhost:5173",
@@ -228,7 +238,7 @@ async function heldFamily(id, run) {
   }
 }
 async function waiterCount(holderPid) {
-  const [{ n }] = await app.prisma.$queryRaw`
+  const [{ n }] = await observer.$queryRaw`
     SELECT count(*)::int AS n FROM pg_stat_activity
     WHERE datname = current_database() AND pid <> ${holderPid}
       AND wait_event_type = 'Lock' AND query LIKE '%RefreshTokenFamily%'

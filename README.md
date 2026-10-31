@@ -70,6 +70,14 @@ sample secrets. Changing `POSTGRES_PASSWORD` in `.env` does not change the passw
 inside an existing PostgreSQL volume: rotate that role's password in PostgreSQL
 and update `.env` together. Keep the volume; deleting it deletes your data.
 
+The account-link migration `20261031120000_hash_account_link_tokens` requires a
+coordinated upgrade: stop every older server and worker, back up PostgreSQL,
+then start the matching new version (container startup applies migrations).
+Do not start the new version while older instances still use the database.
+The migration preserves outstanding links but removes raw token columns;
+rolling back application code alone cannot restore compatibility. See the
+[upgrade and rollback guidance](docs/remediation/sec-026.md).
+
 ## Features
 
 ### Project Management
@@ -409,14 +417,18 @@ backfills families for existing sessions, so users stay signed in. See
 A password-reset link works once: when the same link is submitted several
 times at once, one request changes the password and ends the sessions, and the
 others get `410` and change nothing. An email-verification link is likewise
-consumed by exactly one request. See
+consumed by exactly one request. Only SHA-256 digests of these account links
+are stored; outstanding links survive the coordinated upgrade described in
 [docs/remediation/sec-026.md](docs/remediation/sec-026.md).
 
 A password change writes the new password only if the current password it
 verified is still the account's password when the change commits. A change
 whose current password was replaced meanwhile by a password reset or another
 change gets `400 Current password is incorrect` and changes nothing. A
-successful reset also invalidates the account's other unused reset links. See
+successful password change or reset also invalidates the account's earlier
+unused reset links. A skipped deletion that might roll back, or a concurrently
+inserted link observed during invalidation, makes the password operation return
+its retryable busy 503 without changing anything. See
 [docs/remediation/sec-027.md](docs/remediation/sec-027.md).
 
 ## Contributing

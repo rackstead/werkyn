@@ -154,7 +154,7 @@ function reset(token, newPassword) {
 async function issueResetToken(user) {
   const token = crypto.randomBytes(32).toString("hex");
   await control.passwordResetToken.create({
-    data: { userId: user.id, token, expiresAt: new Date(Date.now() + HOUR_MS) },
+    data: { userId: user.id, tokenHash: hashToken(token), expiresAt: new Date(Date.now() + HOUR_MS) },
   });
   return token;
 }
@@ -503,7 +503,7 @@ test("a change that verified the old password before a reset committed is refuse
 });
 
 for (const first of ["reset", "change"]) {
-  test(`a reset and a change queued on the user row (${first} first) leave the reset's password and no session`, async () => {
+  test(`a reset and a change queued on the user row (${first} first) preserve the first successful credential change`, async () => {
     const user = await makeUser();
     const session = await signIn(user);
     const token = await issueResetToken(user);
@@ -525,7 +525,7 @@ for (const first of ["reset", "change"]) {
     );
     const byName = { [first]: responses[0], [second]: responses[1] };
 
-    assert.equal(byName.reset.statusCode, 200, describe(...responses));
+    assert.equal(byName.reset.statusCode, first === "reset" ? 200 : 404, describe(...responses));
     if (first === "reset") {
       // The change verified the password the reset replaced.
       assert.equal(byName.change.statusCode, 400, describe(...responses));
@@ -533,16 +533,19 @@ for (const first of ["reset", "change"]) {
     } else {
       assert.equal(byName.change.statusCode, 200, describe(...responses));
     }
-    await assertPassword(user, resetTo, changeTo, password);
+    const winner = first === "reset" ? resetTo : changeTo;
+    const refused = first === "reset" ? changeTo : resetTo;
+    await assertPassword(user, winner, refused, password);
     const used = await control.passwordResetToken.findUnique({
-      where: { token },
+      where: { tokenHash: hashToken(token) },
     });
-    assert(used.usedAt);
+    if (first === "reset") assert(used.usedAt);
+    else assert.equal(used, null);
     assert.equal(await activeTokenCount(user), 0);
     for (const family of await families(user)) assert(family.revokedAt);
     assert.equal((await refresh(session.refresh)).statusCode, 401);
-    assert.equal((await login(user, changeTo)).statusCode, 401);
-    await signIn(user, resetTo);
+    assert.equal((await login(user, refused)).statusCode, 401);
+    await signIn(user, winner);
   });
 }
 
@@ -833,8 +836,8 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
     );
 
     const allowed = {
-      change: [200, 400],
-      reset: [200, 404, 410],
+      change: [200, 400, 503],
+      reset: [200, 404, 410, 503],
       login: [200, 401, 423],
       refresh: [200, 401, 409],
     };
@@ -850,6 +853,13 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
         );
       if (outcome.kind === "change" && outcome.status === 400)
         assert.deepEqual(JSON.parse(outcome.body), INCORRECT);
+      if (outcome.status === 503)
+        assert.equal(
+          JSON.parse(outcome.body).message,
+          outcome.kind === "change"
+            ? "This account is busy. Try again in a moment."
+            : "This link is busy. Try again in a moment.",
+        );
     }
     const mix = {};
     for (const { kind, status } of outcomes)
@@ -864,7 +874,7 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
       const winners = statuses.filter((s) => s === 200).length;
       assert(winners <= 1, `reset token used ${winners} times`);
       const row = await control.passwordResetToken.findUnique({
-        where: { token },
+        where: { tokenHash: hashToken(token) },
       });
       if (winners === 1) assert(row?.usedAt, "a used token is marked used");
     }

@@ -275,7 +275,7 @@ test("a password reset closes the sockets of every session of that user", async 
   await settle(a1, b1, o1);
   const resetToken = crypto.randomBytes(32).toString("hex");
   await app.prisma.passwordResetToken.create({
-    data: { userId: f.owner.id, token: resetToken, expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
+    data: { userId: f.owner.id, tokenHash: hashToken(resetToken), expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
   });
 
   const response = await measureCloses(

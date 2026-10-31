@@ -112,6 +112,32 @@ export async function changePassword(
     if (current?.passwordHash !== user.passwordHash) {
       throw new ValidationError("Current password is incorrect");
     }
+    // Invalidate pre-existing unused reset links before the password and
+    // families change. The account lock excludes every reset. Other token
+    // holders are forgot-password/cleanup deletes; skip them so multi-row
+    // deletes cannot wait for one another in opposite row orders.
+    await tx.$executeRaw`
+      DELETE FROM "PasswordResetToken"
+      WHERE id IN (
+        SELECT id FROM "PasswordResetToken"
+        WHERE "userId" = ${userId} AND "usedAt" IS NULL
+        FOR UPDATE SKIP LOCKED
+      )
+    `;
+    // A skipped deleter may still roll back. Its old row remains visible to
+    // this nonlocking READ COMMITTED check until it commits; refuse and roll
+    // back this change rather than leave that link usable after success.
+    const remaining = await tx.passwordResetToken.findFirst({
+      where: { userId, usedAt: null },
+      select: { id: true },
+    });
+    if (remaining) {
+      throw new AppError(
+        503,
+        "Service Unavailable",
+        "This account is busy. Try again in a moment.",
+      );
+    }
     await tx.user.update({
       where: { id: userId },
       data: { passwordHash },

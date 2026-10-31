@@ -11,6 +11,7 @@ declare module "fastify" {
 
   interface FastifyRequest {
     apiKeyId?: string;
+    accessClaims?: import("../utils/authenticated-user.js").AccessClaims;
     user?: {
       id: string;
       email: string;

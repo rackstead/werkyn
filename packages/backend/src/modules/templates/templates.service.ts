@@ -11,6 +11,7 @@ import {
   projectLabelIds,
 } from "../../utils/task-references.js";
 import { nextTaskPosition, withProjectOrder } from "../../utils/task-order.js";
+import { enqueueNotification } from "../notifications/notification-delivery.js";
 
 type TemplateReferences = Pick<UpdateTemplateInput, "statusId" | "assigneeIds" | "labelIds">;
 
@@ -168,6 +169,38 @@ export async function createTaskFromTemplate(
   overrides?: InstantiateTemplateInput,
   dueOffsetFrom?: string,
 ) {
+  const { task } = await createTaskFromTemplateResult(
+    prisma, projectId, templateId, actorId, actorRole, overrides, dueOffsetFrom,
+  );
+  return task;
+}
+
+/** Manual creation also commits its existing assignment intent with the task. */
+export function createTaskFromTemplateWithNotifications(
+  prisma: PrismaClient,
+  projectId: string,
+  templateId: string,
+  actorId: string,
+  actorRole: string,
+  actorName: string,
+  overrides?: InstantiateTemplateInput,
+) {
+  return createTaskFromTemplateResult(
+    prisma, projectId, templateId, actorId, actorRole, overrides, undefined,
+    { actorName },
+  );
+}
+
+async function createTaskFromTemplateResult(
+  prisma: PrismaClient | Prisma.TransactionClient,
+  projectId: string,
+  templateId: string,
+  actorId: string | null,
+  actorRole: string,
+  overrides?: InstantiateTemplateInput,
+  dueOffsetFrom?: string,
+  notificationContext?: { actorName: string },
+) {
   const template = await prisma.taskTemplate.findFirst({
     where: { id: templateId, projectId },
   });
@@ -270,6 +303,24 @@ export async function createTaskFromTemplate(
       });
     }
 
-    return task;
+    const notificationDeliveryIds: string[] = [];
+    if (notificationContext && actorId) {
+      const id = await enqueueNotification(tx, {
+        recipients: task.assignees.map((assignee) => assignee.userId),
+        type: "TASK_ASSIGNED",
+        title: `You were assigned to "${task.title}"`,
+        body: `${notificationContext.actorName} created a task from a template`,
+        data: {
+          taskId: task.id,
+          projectId,
+          actorId,
+          actorName: notificationContext.actorName,
+          taskTitle: task.title,
+        },
+        excludeUserId: actorId,
+      });
+      if (id) notificationDeliveryIds.push(id);
+    }
+    return { task, notificationDeliveryIds };
   });
 }

@@ -14,6 +14,7 @@ import cookiePlugin from "./plugins/cookie.js";
 import rateLimitPlugin from "./plugins/rate-limit.js";
 import securityPlugin from "./plugins/security.js";
 import staticPlugin from "./plugins/static.js";
+import { FRONTEND_REVALIDATE, frontendPathname, isFrontendAssetPath } from "./plugins/frontend-static.js";
 import websocketPlugin from "./plugins/websocket.js";
 import multipartPlugin from "./plugins/multipart.js";
 import storagePlugin from "./plugins/storage.js";
@@ -135,15 +136,11 @@ export async function buildApp(options: BuildAppOptions = {}) {
     );
 
     app.setNotFoundHandler((request, reply) => {
-      if (
-        request.url.startsWith("/api/") ||
-        request.url.startsWith("/dex") ||
-        request.url.startsWith("/storage/") ||
-        request.url.startsWith("/uploads/")
-      ) {
-        return reply.code(404).send({ error: "Not Found" });
+      const pathname = frontendPathname(request);
+      if (pathname === undefined || isFrontendAssetPath(pathname)) {
+        return reply.code(404).header("Cache-Control", "no-store").send({ error: "Not Found" });
       }
-      return reply.type("text/html").send(indexHtml);
+      return reply.type("text/html").header("Cache-Control", FRONTEND_REVALIDATE).send(indexHtml);
     });
   }
 

@@ -11,8 +11,9 @@ import type {
   CopyFileInput,
   ArchiveFilesInput,
 } from "@pm/shared";
-import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
+import { receiveUpload } from "../../utils/upload-stream.js";
+import { env } from "../../config/env.js";
 
 function getAccessCtx(request: FastifyRequest) {
   return {
@@ -27,35 +28,34 @@ export async function uploadFileHandler(
   reply: FastifyReply,
 ) {
   const params = request.params as { wid: string };
-  const data = await request.file();
-
-  if (!data) {
-    throw new ValidationError("No file uploaded");
-  }
-
-  const parentId =
-    (data.fields.parentId as { value?: string })?.value || undefined;
-
-  // Detect client disconnect and destroy the upload stream to trigger cleanup
-  request.raw.on("close", () => {
-    if (request.raw.destroyed || !request.raw.complete) {
-      data.file.destroy(new Error("Client disconnected"));
-    }
+  // Streamed to storage: over MAX_FILE_SIZE is a 413, a stalled client a 408
+  // and a disconnect or malformed body a 400, each leaving nothing stored.
+  const upload = await receiveUpload(request, reply, {
+    maxBytes: env.MAX_FILE_SIZE,
+    idleTimeoutMs: request.server.requestLimits.uploadIdleTimeoutMs,
   });
 
-  const file = await filesService.uploadFileStream(
-    request.server.prisma,
-    request.server.storage,
-    params.wid,
-    request.user!.id,
-    parentId,
-    data.filename,
-    data.mimetype,
-    data.file,
-    getAccessCtx(request),
-  );
+  const parentId =
+    (upload.fields.parentId as { value?: string })?.value || undefined;
 
-  return reply.status(201).send({ data: file });
+  try {
+    const file = await filesService.uploadFileStream(
+      request.server.prisma,
+      request.server.storage,
+      params.wid,
+      request.user!.id,
+      parentId,
+      upload.filename,
+      upload.mimetype,
+      upload.stream,
+      getAccessCtx(request),
+    );
+    return reply.status(201).send({ data: file });
+  } finally {
+    // Refused before its bytes were read (no access, unknown folder): stop
+    // waiting for them.
+    upload.stream.destroy();
+  }
 }
 
 export async function createFolderHandler(

@@ -206,3 +206,23 @@ test("undecodable image bytes are stored without a thumbnail", async () => {
     assert.equal(await thumbnail(file), null, name);
   }
 });
+
+test("images larger than the thumbnail source limit are stored without being read back into memory", { timeout: 60_000 }, async () => {
+  const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
+  assert.equal(THUMBNAIL_SOURCE_MAX_BYTES, 32 * 1024 * 1024);
+  // Uncompressed noise: a decodable PNG just over the limit, and one under it.
+  const noise = (width, height) =>
+    sharp(crypto.randomBytes(width * height * 3), { raw: { width, height, channels: 3 } })
+      .png({ compressionLevel: 0 })
+      .toBuffer();
+  const over = await noise(3400, 3400);
+  assert.ok(over.length > THUMBNAIL_SOURCE_MAX_BYTES, `${over.length}`);
+  const large = await upload("large.png", "image/png", over);
+  assert.equal(large.thumbnailPath, null);
+  assert.equal(await thumbnail(large), null);
+
+  const under = await noise(3000, 3000);
+  assert.ok(under.length < THUMBNAIL_SOURCE_MAX_BYTES, `${under.length}`);
+  const thumbed = await thumbnail(await upload("under.png", "image/png", under));
+  assert.deepEqual([thumbed.width, thumbed.height], [400, 400]);
+});

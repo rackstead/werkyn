@@ -33,6 +33,14 @@ import {
   type AccessContext,
 } from "./file-access.js";
 
+/**
+ * Thumbnails are made from a copy of the original held in memory, so only
+ * images up to this size get one. Larger files are stored without a
+ * thumbnail, as undecodable images already are, instead of being read whole
+ * into memory (see docs/remediation/p03a.md).
+ */
+export const THUMBNAIL_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
+
 export async function uploadFileStream(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -69,7 +77,11 @@ export async function uploadFileStream(
 
   // Generate thumbnail for images (non-SVG)
   let thumbnailPath: string | null = null;
-  if (mimeType.startsWith("image/") && !mimeType.includes("svg")) {
+  if (
+    mimeType.startsWith("image/") &&
+    !mimeType.includes("svg") &&
+    size <= THUMBNAIL_SOURCE_MAX_BYTES
+  ) {
     try {
       const originalBuffer = await storage.read(storagePath);
       const thumbBuffer = await sharp(originalBuffer)

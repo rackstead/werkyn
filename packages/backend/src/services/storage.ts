@@ -1,8 +1,9 @@
-import fs from "node:fs/promises";
+import fs, { type FileHandle } from "node:fs/promises";
 import fss from "node:fs";
 import { once } from "node:events";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Transform, type Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { GoneError } from "../utils/errors.js";
 
 /**
@@ -101,52 +102,76 @@ export class LocalStorageProvider implements StorageProvider {
   ): Promise<{ storagePath: string; size: number }> {
     const { relPath, fullPath } = this.buildPath(category, scopeId, fileId, ext);
     const maxSize = options?.maxSize ?? 0;
+    const dir = path.dirname(fullPath);
 
-    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    // The file is created before any byte is read. Directories this call
+    // creates are removed again if it fails while they are still empty, so a
+    // failed write leaves nothing behind; a concurrent failure may remove a
+    // directory between mkdir and open, which is retried.
+    let created: string | undefined;
+    let handle: FileHandle | undefined;
+    try {
+      for (let attempt = 1; !handle; attempt++) {
+        // Each made path is an ancestor of dir (or dir); keep the highest.
+        const made = await fs.mkdir(dir, { recursive: true });
+        if (made && (!created || made.length < created.length)) created = made;
+        try {
+          handle = await fs.open(fullPath, "w");
+        } catch (error) {
+          if (!isMissingBlobError(error) || attempt >= 3) throw error;
+        }
+      }
+    } catch (err) {
+      stream.destroy();
+      await this.removeEmptyDirectories(dir, created);
+      throw err;
+    }
 
     let bytesWritten = 0;
-
-    const writeStream = fss.createWriteStream(fullPath, {
+    const meter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytesWritten += chunk.length;
+        if (maxSize > 0 && bytesWritten > maxSize) {
+          callback(new Error(`File size exceeds limit of ${maxSize} bytes`));
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
+    const writeStream = handle.createWriteStream({
       highWaterMark: 2 * 1024 * 1024, // 2MB buffer for efficient disk writes
     });
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        stream.on("data", (chunk: Buffer) => {
-          bytesWritten += chunk.length;
-          if (maxSize > 0 && bytesWritten > maxSize) {
-            stream.destroy(
-              new Error(`File size exceeds limit of ${maxSize} bytes`),
-            );
-            return;
-          }
-          const ok = writeStream.write(chunk);
-          if (!ok) {
-            stream.pause();
-            writeStream.once("drain", () => stream.resume());
-          }
-        });
-
-        stream.on("end", () => {
-          writeStream.end(() => resolve());
-        });
-
-        stream.on("error", (err) => {
-          writeStream.destroy();
-          reject(err);
-        });
-
-        writeStream.on("error", (err) => {
-          stream.destroy();
-          reject(err);
-        });
-      });
-
+      // pipeline() applies backpressure, fails if the source ends early or
+      // was already destroyed, and settles only once the file is closed.
+      await pipeline(stream, meter, writeStream);
       return { storagePath: relPath, size: bytesWritten };
     } catch (err) {
       // Clean up partial file on any error
       await fs.unlink(fullPath).catch(() => {});
+      await this.removeEmptyDirectories(dir, created);
       throw err;
+    }
+  }
+
+  /**
+   * Remove `dir` and its parents up to `top` (a directory a write created),
+   * while they are empty. Never removes the storage root or anything above it.
+   */
+  private async removeEmptyDirectories(dir: string, top: string | undefined) {
+    if (!top) return;
+    for (
+      let current = dir;
+      current.startsWith(this.rootDir + path.sep) &&
+      (current === top || current.startsWith(top + path.sep));
+      current = path.dirname(current)
+    ) {
+      try {
+        await fs.rmdir(current);
+      } catch {
+        return; // not empty (another write uses it) or already gone
+      }
     }
   }
 

@@ -83,9 +83,6 @@ export async function listTasks(
     customFieldValues: {
       include: { field: true },
     },
-    _count: {
-      select: { subtasks: true, blockedBy: { where: { blockingTask: { projectId } } } },
-    },
     status: true,
   };
 
@@ -113,7 +110,7 @@ export async function listTasks(
       include,
       orderBy,
     });
-    return { data: tasks.map(scopeTaskRelations) };
+    return { data: (await withTaskCounts(prisma, projectId, tasks)).map(scopeTaskRelations) };
   }
 
   // Paginated view
@@ -129,7 +126,7 @@ export async function listTasks(
   ]);
 
   return {
-    data: tasks.map(scopeTaskRelations),
+    data: (await withTaskCounts(prisma, projectId, tasks)).map(scopeTaskRelations),
     pagination: {
       page: query.page,
       limit: query.limit,
@@ -137,6 +134,40 @@ export async function listTasks(
       totalPages: Math.ceil(total / query.limit),
     },
   };
+}
+
+/**
+ * Adds `_count` with each listed task's subtasks and its blockers in the same
+ * project. Counted here for the listed tasks only: for a list, Prisma's
+ * `_count` include joins a count over every subtask and dependency row.
+ */
+async function withTaskCounts<T extends { id: string }>(
+  prisma: PrismaClient,
+  projectId: string,
+  tasks: T[],
+) {
+  if (tasks.length === 0) return [];
+  const ids = tasks.map((t) => t.id);
+  const [subtasks, blockers] = await Promise.all([
+    prisma.$queryRaw<{ taskId: string; count: number }[]>`
+      SELECT "taskId", count(*)::int AS "count" FROM "Subtask"
+      WHERE "taskId" = ANY(${ids})
+      GROUP BY "taskId"`,
+    prisma.$queryRaw<{ taskId: string; count: number }[]>`
+      SELECT d."blockedTaskId" AS "taskId", count(*)::int AS "count"
+      FROM "TaskDependency" d JOIN "Task" b ON b."id" = d."blockingTaskId"
+      WHERE d."blockedTaskId" = ANY(${ids}) AND b."projectId" = ${projectId}
+      GROUP BY d."blockedTaskId"`,
+  ]);
+  const subtaskCounts = new Map(subtasks.map((c) => [c.taskId, c.count]));
+  const blockerCounts = new Map(blockers.map((c) => [c.taskId, c.count]));
+  return tasks.map((t) => ({
+    ...t,
+    _count: {
+      subtasks: subtaskCounts.get(t.id) ?? 0,
+      blockedBy: blockerCounts.get(t.id) ?? 0,
+    },
+  }));
 }
 
 export async function createTask(

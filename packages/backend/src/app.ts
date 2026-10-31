@@ -19,6 +19,11 @@ import multipartPlugin from "./plugins/multipart.js";
 import storagePlugin from "./plugins/storage.js";
 import dexProxyPlugin from "./plugins/dex-proxy.js";
 import healthPlugin from "./plugins/health.js";
+import requestLimitsPlugin, {
+  REQUEST_LIMITS,
+  requestLimitServerOptions,
+  type RequestLimits,
+} from "./plugins/request-limits.js";
 import authRoutes from "./modules/auth/auth.routes.js";
 import apiKeysRoutes from "./modules/api-keys/api-keys.routes.js";
 import usersRoutes from "./modules/users/users.routes.js";
@@ -51,12 +56,23 @@ import { broadcast, broadcastToWorkspace, broadcastToUser, broadcastToChannel } 
 import { env } from "./config/env.js";
 import { setPrisma } from "./utils/mailer.js";
 
-export async function buildApp() {
+export interface BuildAppOptions {
+  /** Overrides of the HTTP timeouts in REQUEST_LIMITS (tests use short ones). */
+  requestLimits?: Partial<RequestLimits>;
+}
+
+export async function buildApp(options: BuildAppOptions = {}) {
+  const limits = Object.freeze({ ...REQUEST_LIMITS, ...options.requestLimits });
   const app = Fastify({
     logger: getLoggerConfig(),
+    // Header, request, idle and keep-alive timeouts. Authorized uploads lift
+    // the request deadline and backup routes suspend the idle timeout until
+    // they respond, each bounded instead (see plugins/request-limits.ts).
+    ...requestLimitServerOptions(limits),
   });
 
   // Plugins (order matters)
+  await app.register(requestLimitsPlugin, { limits });
   await app.register(prismaPlugin);
   await app.register(errorPlugin);
   await app.register(corsPlugin);

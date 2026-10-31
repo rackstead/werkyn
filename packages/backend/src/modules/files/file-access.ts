@@ -51,10 +51,14 @@ export function teamFolderAccessWhere(
  * include descendants in the same scope. UNION deduplicates legacy cycles.
  * Revoking a group does not revoke a separate explicit grant; both are checked
  * from current database state on every request.
+ *
+ * "scoped" is NOT MATERIALIZED so that its conditions are applied only to the
+ * shared rows and their children (found through the share and parentId
+ * indexes); materialized, it reads every file of the workspace per request.
  */
 async function sharedFileIds(prisma: Db, ctx: AccessContext) {
   const files = await prisma.$queryRaw<{ id: string }[]>`
-    WITH RECURSIVE scoped AS (
+    WITH RECURSIVE scoped AS NOT MATERIALIZED (
       SELECT f.id, f."parentId", f."ownerId", f."isFolder",
         COALESCE(t.id, f."teamFolderId") AS "teamFolderId"
       FROM "File" f LEFT JOIN "TeamFolder" t ON t."folderId" = f.id

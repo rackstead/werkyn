@@ -16,11 +16,10 @@ async function start() {
   const app = await buildApp();
 
   try {
+    // Header, request, idle and keep-alive timeouts are set by buildApp();
+    // long uploads, downloads and backups are bounded per route instead of
+    // by disabling them (see plugins/request-limits.ts).
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
-
-    // Disable default timeouts for large file uploads
-    app.server.requestTimeout = 0;
-    app.server.headersTimeout = 0;
 
     // Scheduled jobs. Runs of one job never overlap, and stop() signals the
     // run in progress to stop at its next safe point and waits for it.

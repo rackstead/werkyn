@@ -35,7 +35,9 @@ Admitted requests take turns in one exclusive section, in arrival order. That
 section covers reading `backup.json`, parsing and validating it, and the
 preview or restore itself, and for export, building the archive. The finished
 export is staged on disk, so its download runs outside the section but keeps
-the request's admission until it has been sent or abandoned. These are the
+the request's admission until it has been sent or abandoned (released as the
+last chunk is handed to the response, so a client that has the whole file can
+start its next request; see `docs/remediation/p03a.md`). These are the
 steps whose memory the SEC-028 budget bounds for a single request, so the
 budget, and its recommendation of at least a 384 MiB heap, now holds for the
 whole process rather than per request. Uploads to the staging area run outside

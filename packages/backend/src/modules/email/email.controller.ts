@@ -4,7 +4,8 @@ import * as emailService from "./email.service.js";
 import type { UpdateEmailConfigInput } from "@pm/shared";
 import { env } from "../../config/env.js";
 import { requireSenderMailbox } from "../../utils/mail-sender.js";
-import { testMailFailureMessage } from "../../utils/mail-diagnostics.js";
+import { describeMailConfigFailure, testMailFailureMessage } from "../../utils/mail-diagnostics.js";
+import { logger } from "../../utils/logger.js";
 
 export async function getEmailConfigHandler(
   request: FastifyRequest,
@@ -30,11 +31,21 @@ export async function sendTestEmailHandler(
   request: FastifyRequest,
   reply: FastifyReply,
 ) {
+  let rawConfig: Awaited<ReturnType<typeof emailService.getRawEmailConfig>>;
   try {
-    const rawConfig = await emailService.getRawEmailConfig(
+    rawConfig = await emailService.getRawEmailConfig(
       request.server.prisma,
     );
+  } catch (error) {
+    logger.error({ database: describeMailConfigFailure(error) }, "Failed to read email config for admin test");
+    return reply.status(503).send({
+      statusCode: 503,
+      error: "Service Unavailable",
+      message: "Email settings could not be loaded. Check database connectivity and try again.",
+    });
+  }
 
+  try {
     // Determine SMTP settings: DB config first, then env fallback
     const host = rawConfig?.host || env.SMTP_HOST;
     const port = rawConfig?.host ? rawConfig.port : env.SMTP_PORT;

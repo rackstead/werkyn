@@ -12,6 +12,7 @@ const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const mailer = await import("../../src/utils/mailer.ts");
 const { default: emailRoutes } = await import("../../src/modules/email/email.routes.ts");
 const { default: errors } = await import("../../src/plugins/errors.ts");
+const { sendTestEmailHandler } = await import("../../src/modules/email/email.controller.ts");
 const prisma = new PrismaClient();
 const suffix = crypto.randomBytes(6).toString("hex");
 let app, smtp, admin, member, base;
@@ -94,4 +95,25 @@ test("environment transport fallback and account default sender remain intact", 
   env.SMTP_FROM = "";
   assert.deepEqual(await mailer.sendPasswordResetEmail(admin.email, "synthetic-token"), { status: "sent", transport: "environment" });
   assert.equal(smtp.messages.at(-1).envelope.from, "<noreply@example.com>");
+});
+
+test("a real configuration-query failure remains a safe server error", async () => {
+  const unavailableSchema = new URL(process.env.TEST_DATABASE_URL);
+  unavailableSchema.searchParams.set("schema", `mail_policy_missing_${suffix}`);
+  const brokenPrisma = new PrismaClient({ datasourceUrl: unavailableSchema.href });
+  const probe = Fastify({ logger: false });
+  probe.decorate("prisma", brokenPrisma);
+  probe.post("/test", { preHandler: async (request) => { request.user = admin; } }, sendTestEmailHandler);
+  await probe.listen({ host: "127.0.0.1", port: 0 });
+  try {
+    const response = await fetch(`http://127.0.0.1:${probe.server.address().port}/test`, { method: "POST" });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.match(body.message, /database/);
+    assert.equal(JSON.stringify(body).includes(unavailableSchema.href), false);
+    assert.equal(JSON.stringify(body).includes("P2021"), false);
+  } finally {
+    await probe.close();
+    await brokenPrisma.$disconnect();
+  }
 });

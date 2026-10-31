@@ -31,6 +31,38 @@ const COMMANDS = new Set([
   "NOOP",
 ]);
 
+const DATABASE_CATEGORIES = new Map([
+  ["P1000", "authentication"],
+  ["P1001", "unavailable"],
+  ["P1002", "timeout"],
+  ["P1003", "database_missing"],
+  ["P1008", "timeout"],
+  ["P1010", "authorization"],
+  ["P1011", "tls"],
+  ["P1012", "configuration"],
+  ["P1013", "configuration"],
+  ["P1014", "schema"],
+  ["P1015", "configuration"],
+  ["P1016", "query"],
+  ["P1017", "unavailable"],
+  ["P2021", "schema"],
+  ["P2022", "schema"],
+  ["P2024", "timeout"],
+  ["P2037", "capacity"],
+]);
+
+/** Database failures have their own fixed vocabulary; no query, URL or params. */
+export function describeMailConfigFailure(error: unknown) {
+  try {
+    const code = (error as { code?: unknown } | null)?.code;
+    const category = typeof code === "string" ? DATABASE_CATEGORIES.get(code) : undefined;
+    if (category) return { category, code: code as string };
+  } catch {
+    // Do not let a hostile thrown object's getter mask the original failure.
+  }
+  return { category: "unknown" };
+}
+
 export function describeMailFailure(error: unknown) {
   const failure = (error ?? {}) as Record<string, unknown>;
   try {

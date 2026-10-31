@@ -2,7 +2,7 @@ import nodemailer, { type Transporter, type TransportOptions } from "nodemailer"
 import type { PrismaClient } from "@prisma/client";
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
-import { describeMailFailure } from "./mail-diagnostics.js";
+import { describeMailConfigFailure, describeMailFailure } from "./mail-diagnostics.js";
 import { requireSenderMailbox } from "./mail-sender.js";
 
 /** Where the active transport came from. Ethereal is development-only. */
@@ -75,7 +75,7 @@ async function getTransporter(): Promise<{
         return transporter;
       }
     } catch (error) {
-      logger.warn({ smtp: describeMailFailure(error) }, "Failed to read email config from DB, falling back to env vars");
+      logger.warn({ database: describeMailConfigFailure(error) }, "Failed to read email config from DB, falling back to env vars");
     }
   }
 

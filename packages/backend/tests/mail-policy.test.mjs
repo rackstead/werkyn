@@ -124,3 +124,21 @@ test("diagnostic fields accept only known labels and integer SMTP reply codes", 
   }
   assert.deepEqual(describeMailFailure({ get code() { throw new Error(privateText); } }), {});
 });
+
+test("database fallback retains bounded database cause metadata without upstream text", async () => {
+  const server = await smtp();
+  const result = await run({ environment: environment(server.port), readFailure: { message: privateText, code: "P1001", meta: privateText } });
+  assert.equal(result.result.status, "sent");
+  const log = JSON.parse(result.logs.split("\n").at(-1));
+  assert.deepEqual(log.database, { category: "unavailable", code: "P1001" });
+  privateFree(result.serialized);
+});
+
+test("admin configuration read failures are safe server errors, not bad SMTP settings", async () => {
+  const result = await run({ environment: environment(1), readFailure: { message: privateText, code: "P1001", meta: privateText }, admin: true });
+  assert.equal(result.status, 503);
+  assert.match(result.body.message, /database/);
+  const log = JSON.parse(result.logs.split("\n").at(-1));
+  assert.deepEqual(log.database, { category: "unavailable", code: "P1001" });
+  privateFree(result.serialized);
+});

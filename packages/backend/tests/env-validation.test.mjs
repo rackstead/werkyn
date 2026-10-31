@@ -94,6 +94,14 @@ test("boolean flags accept only true or false", () => {
   }
 });
 
+test("SMTP_FROM accepts only one mailbox and reports invalid settings without echoing them", () => {
+  for (const value of ["sender@example.test\r\nBcc: other@example.test", "Team: sender@example.test;", "sender(comment)@example.test", "sender@example.test, other@example.test"]) {
+    const result = rejects({ SMTP_FROM: value }, "SMTP_FROM", /single mailbox/);
+    assert.equal(JSON.stringify(result.errors).includes(value), false);
+  }
+  for (const value of ["", "sender@example.test", '"Werkyn, Team" <sender@example.test>', "Équipe <sender@example.test>"]) accepts({ SMTP_FROM: value });
+});
+
 test("URL settings must be usable http(s) URLs and origins", () => {
   for (const value of ["localhost:5173", "ftp://example.com", "javascript:alert(1)", "https://user:pw@example.com", "https://example.com/?next=x", "not a url"]) {
     rejects({ FRONTEND_URL: value }, "FRONTEND_URL");

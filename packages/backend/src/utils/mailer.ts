@@ -2,6 +2,8 @@ import nodemailer, { type Transporter, type TransportOptions } from "nodemailer"
 import type { PrismaClient } from "@prisma/client";
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
+import { describeMailConfigFailure, describeMailFailure } from "./mail-diagnostics.js";
+import { requireSenderMailbox } from "./mail-sender.js";
 
 /** Where the active transport came from. Ethereal is development-only. */
 export type MailTransportSource = "database" | "environment" | "ethereal";
@@ -73,7 +75,7 @@ async function getTransporter(): Promise<{
         return transporter;
       }
     } catch (error) {
-      logger.warn({ err: error }, "Failed to read email config from DB, falling back to env vars");
+      logger.warn({ database: describeMailConfigFailure(error) }, "Failed to read email config from DB, falling back to env vars");
     }
   }
 
@@ -122,7 +124,8 @@ async function getTransporter(): Promise<{
   return transporter;
 }
 
-async function getFromAddress(): Promise<string> {
+async function getFromAddress() {
+  let stored: string | undefined;
   // Try DB config first
   if (prismaRef) {
     try {
@@ -130,7 +133,7 @@ async function getFromAddress(): Promise<string> {
         where: { id: "singleton" },
       });
       if (dbConfig?.fromAddress) {
-        return dbConfig.fromAddress;
+        stored = dbConfig.fromAddress;
       }
     } catch {
       // fall through
@@ -138,26 +141,7 @@ async function getFromAddress(): Promise<string> {
   }
 
   // Env fallback
-  return env.SMTP_FROM || "noreply@example.com";
-}
-
-function scrub(text: string, secrets: string[]): string {
-  let result = text;
-  for (const secret of secrets) {
-    if (secret) result = result.split(secret).join("[REDACTED]");
-  }
-  return result.slice(0, 500);
-}
-
-/** Only SMTP diagnostics; never the message, links, recipients or credentials. */
-function describeFailure(error: unknown, secrets: string[]) {
-  const failure = (error ?? {}) as Record<string, unknown>;
-  return {
-    code: typeof failure.code === "string" ? failure.code : undefined,
-    responseCode: typeof failure.responseCode === "number" ? failure.responseCode : undefined,
-    command: typeof failure.command === "string" ? failure.command.split(" ")[0] : undefined,
-    message: typeof failure.message === "string" ? scrub(failure.message, secrets) : undefined,
-  };
+  return requireSenderMailbox(stored || env.SMTP_FROM || "noreply@example.com");
 }
 
 /**
@@ -167,7 +151,6 @@ function describeFailure(error: unknown, secrets: string[]) {
 async function deliver(
   kind: MailKind,
   message: { to: string; subject: string; text: string; html: string },
-  secrets: string[],
 ): Promise<MailDeliveryResult> {
   let source: MailTransportSource | undefined;
   try {
@@ -195,11 +178,14 @@ async function deliver(
       return { status: "not_configured" };
     }
 
-    const failure = describeFailure(error, secrets);
+    const failure = describeMailFailure(error);
     stats.failed += 1;
     stats.lastFailureAt = new Date().toISOString();
     stats.lastFailureCode = failure.code ?? null;
-    logger.error({ kind, transport: source, smtp: failure }, `Failed to send ${kind} email`);
+    const guidance = failure.code === "EADDRESS"
+      ? ". Check From Address under Admin > Email or SMTP_FROM; use one mailbox without line breaks, comments or groups."
+      : "";
+    logger.error({ kind, transport: source, smtp: failure }, `Failed to send ${kind} email${guidance}`);
     return { status: "failed", transport: source, code: failure.code };
   }
 }
@@ -223,7 +209,6 @@ export async function sendVerificationEmail(
       text: `Please verify your email address by clicking the link below:\n\n${verifyUrl}\n\nThis link will expire in 24 hours.`,
       html: `<p>Please verify your email address by clicking the link below:</p><p><a href="${verifyUrl}">Verify Email</a></p><p>This link will expire in 24 hours.</p>`,
     },
-    [token, encodeURIComponent(token), inviteToken ?? "", inviteToken ? encodeURIComponent(inviteToken) : ""],
   );
 }
 
@@ -241,6 +226,5 @@ export async function sendPasswordResetEmail(
       text: `You requested a password reset. Click the link below to reset your password:\n\n${resetUrl}\n\nThis link will expire in 1 hour. If you didn't request this, you can ignore this email.`,
       html: `<p>You requested a password reset. Click the link below to reset your password:</p><p><a href="${resetUrl}">Reset Password</a></p><p>This link will expire in 1 hour. If you didn't request this, you can ignore this email.</p>`,
     },
-    [token],
   );
 }

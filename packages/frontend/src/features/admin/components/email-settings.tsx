@@ -156,10 +156,11 @@ export function EmailSettings() {
           <Label htmlFor="smtp-from">From Address</Label>
           <Input
             id="smtp-from"
-            type="email"
-            placeholder="noreply@example.com"
+            type="text"
+            placeholder="Werkyn <noreply@example.com>"
             {...register("fromAddress")}
           />
+          <p className="text-xs text-muted-foreground">One mailbox, optionally with a display name. Leave empty to use the sender fallback.</p>
           {errors.fromAddress && (
             <p className="text-sm text-destructive">{errors.fromAddress.message}</p>
           )}

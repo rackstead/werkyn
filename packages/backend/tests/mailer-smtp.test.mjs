@@ -197,7 +197,7 @@ test("a refused connection is a failed result", async () => {
   const [context] = logs.find((entry) => entry.level === "error").args;
   assert.equal(context.smtp.code, "ESOCKET");
   assert.equal(context.smtp.command, "CONN");
-  assert.match(context.smtp.message, /ECONNREFUSED/);
+  assert.equal(context.smtp.message, undefined);
   assert.equal(logged().includes(reset), false);
 });
 
@@ -227,7 +227,7 @@ test("implicit TLS against a plaintext server fails before any mail command", as
   assert.equal(server.sessions.flatMap((session) => session.commands).some((line) => /^(MAIL|RCPT|DATA)/i.test(line)), false);
 });
 
-test("a configured sender carrying CRLF never adds headers or recipients", async () => {
+test("a configured sender carrying CRLF fails before opening an SMTP session", async () => {
   const server = await capture();
   useSmtp(server.port);
   for (const fromAddress of [
@@ -240,17 +240,11 @@ test("a configured sender carrying CRLF never adds headers or recipients", async
       emailConfig: { findUnique: async () => ({ host: "127.0.0.1", port: server.port, secure: false, user: "", pass: "", fromAddress }) },
     });
     const result = await mailer.sendPasswordResetEmail(RECIPIENT, token());
-    assert.equal(result.status, "sent");
+    assert.equal(result.status, "failed");
+    assert.equal(result.code, "EADDRESS");
   }
-  assert.equal(server.messages.length, 3);
-  for (const { envelope, data } of server.messages) {
-    assert.deepEqual(envelope.to, [`<${RECIPIENT}>`]);
-    const message = parseMessage(data);
-    onlyHeaders(message, ACCOUNT_HEADERS);
-    assert.equal(message.get("To"), RECIPIENT);
-    assert.equal(message.get("Subject"), "Reset your password");
-    for (const line of message.headerLines) assert.doesNotMatch(line, /^(bcc|x-injected):/i);
-  }
+  assert.equal(server.sessions.length, 0);
+  assert.equal(server.messages.length, 0);
 });
 
 test("CRLF in display names and subjects is encoded, never a new header or recipient", async () => {

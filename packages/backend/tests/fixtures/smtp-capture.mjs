@@ -74,17 +74,17 @@ function serve(initialSocket, session, options) {
     session.auth = { user, pass };
     const ok =
       !options.rejectAuth && options.auth && options.auth.user === user && options.auth.pass === pass;
-    reply(ok ? "235 2.7.0 Authentication successful" : "535 5.7.8 Authentication credentials invalid");
+    reply(ok ? "235 2.7.0 Authentication successful" : (options.authFailure ?? "535 5.7.8 Authentication credentials invalid"));
   };
 
   const onLine = (line) => {
     if (mode === "data") {
       if (line === ".") {
-        session.messages.push({ envelope, data: data.join("\r\n") + "\r\n" });
+        if (!options.rejectMessage) session.messages.push({ envelope, data: data.join("\r\n") + "\r\n" });
         envelope = { from: null, to: [] };
         data = [];
         mode = "command";
-        reply("250 2.0.0 Ok: queued as CAPTURE1");
+        reply(options.rejectMessage ?? "250 2.0.0 Ok: queued as CAPTURE1");
       } else {
         data.push(line.startsWith(".") ? line.slice(1) : line);
       }
@@ -144,9 +144,11 @@ function serve(initialSocket, session, options) {
         reply("250 2.1.0 Ok");
       }
     } else if (verb === "RCPT") {
+      if (options.rejectRecipient) { reply(options.rejectRecipient); return; }
       envelope.to.push(line.slice(line.indexOf(":") + 1).trim());
       reply("250 2.1.5 Ok");
     } else if (verb === "DATA") {
+      if (options.rejectData) { reply(options.rejectData); return; }
       mode = "data";
       reply("354 End data with <CR><LF>.<CR><LF>");
     } else if (verb === "RSET") {

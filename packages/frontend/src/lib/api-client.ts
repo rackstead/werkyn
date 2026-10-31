@@ -71,6 +71,9 @@ function assertRequestIdentity(context: Record<string, unknown>) {
 // The identity generation each request was first sent in, keyed by its ky
 // context (one object per request, kept across ky's retries).
 const requestGenerations = new WeakMap<object, number>();
+// A refresh/replay consumes the authentication recovery for this request.
+// An explicit caller retry must not restart it after an ambiguous replay error.
+const refreshAttempts = new WeakSet<object>();
 
 /** Rejects a request, or its response, once the identity has changed. */
 function assertRequestGeneration(context: object) {
@@ -134,12 +137,22 @@ export const api = ky.create({
   timeout: 15000,
   credentials: "include",
   fetch: fetchForCurrentIdentity,
-  // A request overtaken by an identity change is never sent again.
+  // Application errors and ambiguous transport failures are final by default,
+  // for reads and mutations alike. Callers that can safely repeat an operation
+  // (for example an idempotency-key chat send) must opt in with a bounded limit.
   retry: {
+    limit: 0,
     shouldRetry: ({ error }) =>
       isIdentityChangedError(error) ? false : undefined,
   },
   hooks: {
+    beforeRetry: [
+      ({ options, error }) => {
+        if (refreshAttempts.has(options.context)) throw error;
+        assertRequestGeneration(options.context);
+        assertRequestIdentity(options.context);
+      },
+    ],
     beforeRequest: [
       (request, options) => {
         assertRequestGeneration(options.context);
@@ -163,6 +176,7 @@ export const api = ky.create({
             request.headers.has("Authorization") &&
             !request.url.includes("/auth/refresh")
           ) {
+            refreshAttempts.add(options.context);
             const generation = identityGeneration();
             const refreshed = await useAuthStore.getState().refresh();
             assertRequestGeneration(options.context);
@@ -178,6 +192,10 @@ export const api = ky.create({
               // actual retry dispatch, which may occur after an account switch.
               const retried = await ky(request, {
                 ...options,
+                // The authentication replay is the final dispatch, including
+                // when the original caller explicitly enabled safe retries.
+                retry: 0,
+                throwHttpErrors: false,
                 hooks: {
                   beforeRequest: [
                     (retryRequest, retryOptions) => {
@@ -197,6 +215,7 @@ export const api = ky.create({
               if (identityGeneration() !== generation)
                 throw new IdentityChangedError();
               assertRequestIdentity(options.context);
+              if (!retried.ok) throw await parseErrorResponse(retried);
               return retried;
             }
             // The session can no longer be refreshed: sign this identity out,

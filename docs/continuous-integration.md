@@ -8,6 +8,11 @@ checks TypeScript, and builds production assets. The container check builds the
 Dockerfile without logging into a registry or pushing an image. No application
 database or deployment secret is required.
 
+Validation and the container both use Node 22. The container pins the full Node
+patch, Alpine version and multi-platform image digest; the container policy gate
+checks that its Node major matches validation and that test-only `adm-zip` stays
+out of the production dependency importer.
+
 `pnpm test` first builds and tests the shared package, then validates the
 workflow's event/permission policy, runs the backend unit suite, and runs the
 frontend regression suite. All three test commands and the backend integration

@@ -13,6 +13,11 @@ import oidcRoutes from "./oidc/oidc.routes.js";
 import { validate } from "../../middleware/validate.js";
 import { authenticate } from "../../middleware/authenticate.js";
 import {
+  RecoverLogoutSchema,
+  requireLogoutRecoveryRequest,
+  recoverLogoutHandler,
+} from "./logout-recovery.js";
+import {
   LoginSchema,
   RegisterSchema,
   ForgotPasswordSchema,
@@ -95,6 +100,15 @@ export default async function authRoutes(fastify: FastifyInstance) {
     url: "/logout",
     preHandler: [authenticate],
     handler: logoutHandler,
+  });
+
+  // Cookie-authenticated, session-conditional recovery; no cookie mutation.
+  fastify.route({
+    method: "POST",
+    url: "/logout/recover",
+    onRequest: requireLogoutRecoveryRequest,
+    preHandler: [validate(RecoverLogoutSchema)],
+    handler: recoverLogoutHandler,
   });
 
   // POST /api/auth/forgot-password

@@ -108,7 +108,7 @@ test("database SMTP settings take precedence over environment SMTP", async () =>
   const result = await mailer.sendVerificationEmail("person@example.test", TOKEN);
   assert.deepEqual(result, { status: "sent", transport: "database" });
   assert.equal(calls.transports[0].host, "db-smtp.example.test");
-  assert.equal(messages[0].from, "werkyn@example.test");
+  assert.deepEqual(messages[0].from, { name: "", address: "werkyn@example.test" });
   assert.match(messages[0].text, new RegExp(TOKEN));
 });
 

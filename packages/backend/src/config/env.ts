@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SenderAddressSchema } from "@pm/shared";
 import { logger } from "../utils/logger.js";
 
 function wholeNumber(name: string, fallback: number, min: number, max: number) {
@@ -140,7 +141,7 @@ const envSchema = z.object({
   SMTP_SECURE: flag("SMTP_SECURE"),
   SMTP_USER: z.string().default(""),
   SMTP_PASS: z.string().default(""),
-  SMTP_FROM: z.string().default(""),
+  SMTP_FROM: SenderAddressSchema.default(""),
 
   STORAGE_DIR: z.string().min(1, "STORAGE_DIR must not be empty").default("./storage"),
   MAX_FILE_SIZE: wholeNumber("MAX_FILE_SIZE", 10737418240, 1, Number.MAX_SAFE_INTEGER), // 10GB
@@ -206,7 +207,7 @@ export function parseEnvironment(source: NodeJS.ProcessEnv): EnvParseResult {
   // Treat `NAME=` (common in .env files and Compose `${NAME:-}`) as unset so
   // the documented default applies instead of "" failing or becoming 0/false.
   const present = Object.fromEntries(
-    Object.entries(source).filter(([, value]) => value === undefined || value.trim() !== ""),
+    Object.entries(source).filter(([name, value]) => value === undefined || value.trim() !== "" || (name === "SMTP_FROM" && /[\r\n]/.test(value))),
   );
   const parsed = envSchema.safeParse(present);
   if (!parsed.success) {

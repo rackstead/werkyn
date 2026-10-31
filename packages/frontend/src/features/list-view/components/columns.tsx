@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { isHttpUrl } from "@pm/shared";
 import { committedDate } from "@/lib/date-input";
+import { formatDateISO } from "@/features/time/utils";
 import { createColumnHelper } from "@tanstack/react-table";
 import type { Task } from "@/features/tasks/api";
 import {
@@ -135,7 +136,7 @@ export function InlineDueDateCell({
   const [editing, setEditing] = useState(false);
   const isOverdue =
     task.dueDate &&
-    new Date(task.dueDate) < new Date() &&
+    task.dueDate < formatDateISO(new Date()) &&
     !task.status.isCompletion;
 
   if (editing) {
@@ -790,7 +791,7 @@ export function getColumns(options: {
           if (!d)
             return <span className="text-muted-foreground text-xs">-</span>;
           const isOverdue =
-            new Date(d) < new Date() && !row.original.status.isCompletion;
+            d < formatDateISO(new Date()) && !row.original.status.isCompletion;
           return (
             <span
               className={cn(

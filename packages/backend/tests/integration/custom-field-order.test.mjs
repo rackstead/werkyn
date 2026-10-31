@@ -214,6 +214,7 @@ async function orderedRace(f, first, second) {
   }, { timeout: 10_000, maxWait: 5000 });
   holder.catch(failed);
   const pending = [], observed = { firstWaited: false, secondWaited: false };
+  const projectOrderQuery = /FROM "Project".*FOR NO KEY UPDATE/s;
   const waiters = () => control.$queryRaw`
     SELECT pid, query, pg_blocking_pids(pid) AS blockers FROM pg_stat_activity
     WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`;
@@ -232,14 +233,16 @@ async function orderedRace(f, first, second) {
     failsafe = setTimeout(release, 4000);
     pending.push(first().finally(() => firstDone = true));
     observed.firstWaited = await until(async () => {
-      const row = (await waiters()).find((waiter) => waiter.blockers.includes(holderPid));
-      if (row) { firstPid = row.pid; assert.match(row.query, /FROM "Project".*FOR NO KEY UPDATE/s); }
+      // Activity text and live blocker information can straddle statements.
+      // Keep polling until both identify the order-lock wait we need to prove.
+      const row = (await waiters()).find((waiter) => waiter.blockers.includes(holderPid) && projectOrderQuery.test(waiter.query));
+      if (row) { firstPid = row.pid; assert.match(row.query, projectOrderQuery); }
       return Boolean(row);
     }, () => firstDone);
     pending.push(second().finally(() => secondDone = true));
     observed.secondWaited = await until(async () => {
-      const row = (await waiters()).find((waiter) => waiter.pid !== firstPid && waiter.blockers.includes(firstPid));
-      if (row) assert.match(row.query, /FROM "Project".*FOR NO KEY UPDATE/s);
+      const row = (await waiters()).find((waiter) => waiter.pid !== firstPid && waiter.blockers.includes(firstPid) && projectOrderQuery.test(waiter.query));
+      if (row) assert.match(row.query, projectOrderQuery);
       return Boolean(row);
     }, () => secondDone);
   } finally {

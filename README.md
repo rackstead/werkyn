@@ -251,6 +251,11 @@ integrations. Choose 1, 7, 30, 90, or 365 days, or **Never expires**. The defaul
 30 days. Copy the key when it is created; it cannot be displayed again. The list
 shows its prefix, expiration, last use, and revocation status.
 
+Protected HTTP routes require an Authorization header for both access JWTs and
+personal API keys; URL query credentials do not authenticate them. Native PDF
+previews use short-lived, file-scoped grants instead of full access JWTs. See
+[PDF preview authorization](docs/remediation/file-preview-grants.md).
+
 Send the key in the Authorization header:
 
 ```bash

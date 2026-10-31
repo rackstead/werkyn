@@ -1,23 +1,22 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { verifyAccessToken } from "../utils/tokens.js";
-import { AppError, UnauthorizedError } from "../utils/errors.js";
+import { UnauthorizedError } from "../utils/errors.js";
 import { verifyApiKey } from "../modules/api-keys/api-keys.service.js";
-import { describeAuthenticationFailure } from "../utils/authentication-failures.js";
+import {
+  findAuthenticatedUser,
+  failAuthenticationLookup,
+} from "../utils/authenticated-user.js";
 
 export async function authenticate(
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
   const authHeader = request.headers.authorization;
-  const queryToken = (request.query as Record<string, string>)?.token;
-
-  if (!authHeader?.startsWith("Bearer ") && !queryToken) {
+  if (!authHeader?.startsWith("Bearer ")) {
     throw new UnauthorizedError("Missing or invalid authorization header");
   }
 
-  const token = authHeader?.startsWith("Bearer ")
-    ? authHeader.slice(7)
-    : queryToken!;
+  const token = authHeader.slice(7);
   if (typeof token !== "string" || token === "") {
     throw new UnauthorizedError("Invalid or expired token");
   }
@@ -26,11 +25,9 @@ export async function authenticate(
   try {
     let userId: string;
     let sessionId: string | undefined;
+    let accessClaims: FastifyRequest["accessClaims"];
     if (token.startsWith("wk_")) {
-      // Durable credentials must not travel in URLs or access logs.
-      if (!authHeader?.startsWith("Bearer ")) {
-        throw new UnauthorizedError("API keys require an Authorization header");
-      }
+      // Durable credentials, like access JWTs, require the header.
       lookupStage = "api_key";
       const key = await verifyApiKey(request.server.prisma, token);
       userId = key.userId;
@@ -58,58 +55,30 @@ export async function authenticate(
       }
       userId = payload.sub;
       sessionId = payload.sid as string | undefined;
+      accessClaims = {
+        sub: userId,
+        exp: payload.exp,
+        ...(sessionId === undefined ? {} : { sid: sessionId }),
+      };
     }
 
     // One statement checks the account and its owned, unrevoked, unexpired
     // session. Rotation replaces the current token atomically, so the query
     // sees its predecessor or successor, never a gap. No cache delays logout.
     lookupStage = sessionId === undefined ? "account" : "session_account";
-    const user = await request.server.prisma.user.findUnique({
-      where: {
-        id: userId,
-        ...(sessionId === undefined
-          ? {}
-          : {
-              refreshTokenFamilies: {
-                some: {
-                  id: sessionId,
-                  revokedAt: null,
-                  tokens: { some: { expiresAt: { gt: new Date() } } },
-                },
-              },
-            }),
-      },
-      select: {
-        id: true,
-        email: true,
-        displayName: true,
-        avatarUrl: true,
-        emailVerified: true,
-      },
-    });
+    const user = await findAuthenticatedUser(
+      request.server.prisma,
+      userId,
+      sessionId,
+    );
 
     if (!user) {
       throw new UnauthorizedError("Invalid or expired token");
     }
 
     request.user = user;
+    request.accessClaims = accessClaims;
   } catch (error) {
-    if (error instanceof UnauthorizedError) throw error;
-    // Database exceptions can contain queries and credential-related values.
-    // Keep both the response and this operational event independent of them.
-    const failure = describeAuthenticationFailure(error);
-    request.log.error(
-      { authentication: { stage: lookupStage, ...failure } },
-      "Authentication lookup failed",
-    );
-    throw new AppError(
-      failure.statusCode,
-      failure.statusCode === 503
-        ? "Service Unavailable"
-        : "Internal Server Error",
-      failure.statusCode === 503
-        ? "Authentication is temporarily unavailable. Try again in a moment."
-        : "An unexpected error occurred",
-    );
+    failAuthenticationLookup(request, error, lookupStage);
   }
 }

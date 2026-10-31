@@ -1,13 +1,11 @@
-import { useMemo } from "react";
 import type { DriveFile } from "../api";
 import { useFilePreviewUrl, useFileTextContent } from "../api";
 import { getPreviewType, getFileIcon, formatFileSize } from "@/lib/file-icons";
-import { useAuthStore } from "@/stores/auth-store";
 import { Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slideover } from "@/components/ui/slideover";
 import { timeAgo } from "@/lib/time-ago";
-import { apiBase } from "@/lib/api-url";
+import { usePdfPreview } from "../hooks/use-pdf-preview";
 
 export interface FilePreviewSlideoverProps {
   file: DriveFile;
@@ -26,7 +24,11 @@ export function FilePreviewSlideover({
 }: FilePreviewSlideoverProps) {
   const previewType = getPreviewType(file.mimeType);
   const isPdf = previewType === "pdf";
-  const needsBlobUrl = !isPdf && (previewType === "image" || previewType === "video" || previewType === "audio");
+  const needsBlobUrl =
+    !isPdf &&
+    (previewType === "image" ||
+      previewType === "video" ||
+      previewType === "audio");
   const needsText = previewType === "text";
 
   // This component owns blobUrl: the hook revokes it when the file changes or
@@ -41,15 +43,7 @@ export function FilePreviewSlideover({
     needsText ? file.id : null,
   );
 
-  // Direct URL for PDF — lets the browser's native PDF viewer handle it
-  const pdfUrl = useMemo(() => {
-    if (!isPdf) return undefined;
-    const token = useAuthStore.getState().accessToken;
-    const baseUrl = apiBase();
-    const params = new URLSearchParams({ inline: "true" });
-    if (token) params.set("token", token);
-    return `${baseUrl}/workspaces/${workspaceId}/files/${file.id}/download?${params.toString()}`;
-  }, [isPdf, workspaceId, file.id]);
+  const pdf = usePdfPreview(workspaceId, isPdf ? file.id : null);
 
   const Icon = getFileIcon(file.mimeType, false);
 
@@ -73,7 +67,9 @@ export function FilePreviewSlideover({
         <PreviewContent
           previewType={previewType}
           blobUrl={blobUrl}
-          pdfUrl={pdfUrl}
+          pdfUrl={pdf.url}
+          pdfError={pdf.error}
+          retryPdf={pdf.retry}
           textContent={textContent}
           file={file}
           Icon={Icon}
@@ -99,6 +95,8 @@ function PreviewContent({
   previewType,
   blobUrl,
   pdfUrl,
+  pdfError,
+  retryPdf,
   textContent,
   file,
   Icon,
@@ -106,6 +104,8 @@ function PreviewContent({
   previewType: string;
   blobUrl: string | undefined;
   pdfUrl: string | undefined;
+  pdfError: string | null;
+  retryPdf: () => void;
   textContent: string | undefined;
   file: DriveFile;
   Icon: React.ComponentType<{ className?: string }>;
@@ -146,10 +146,22 @@ function PreviewContent({
   }
 
   if (previewType === "pdf") {
+    if (pdfError)
+      return (
+        <div className="flex flex-col items-center gap-3 py-8">
+          <p role="alert" className="text-sm text-muted-foreground">
+            {pdfError}
+          </p>
+          <Button variant="outline" size="sm" onClick={retryPdf}>
+            Retry preview
+          </Button>
+        </div>
+      );
     if (!pdfUrl) return <PreviewLoading />;
     return (
       <iframe
         src={pdfUrl}
+        referrerPolicy="no-referrer"
         title={file.name}
         className="h-[60vh] w-full rounded-md border"
       />

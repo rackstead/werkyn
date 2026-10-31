@@ -6,7 +6,7 @@ interface AccessTokenPayload {
   sub: string;
   email: string;
   // The refresh-token family (sign-in session) the token was issued for.
-  // Realtime sockets are bound to it and end when it is revoked.
+  // HTTP checks it on use; realtime sockets end when it is revoked.
   sid: string;
 }
 

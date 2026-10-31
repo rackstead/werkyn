@@ -11,6 +11,7 @@
 // throttle the run; the server must listen on all loopback addresses.
 
 import http from "node:http";
+import crypto from "node:crypto";
 import { writeFileSync } from "node:fs";
 import jwt from "jsonwebtoken";
 import { PrismaClient } from "@prisma/client";
@@ -27,6 +28,8 @@ const secret = process.env.JWT_SECRET;
 if (!secret) throw new Error("JWT_SECRET must match the server's");
 
 const prisma = new PrismaClient();
+const actorTokens = new Map<string, string>();
+const sessionIds: string[] = [];
 let source = 2;
 
 interface Response {
@@ -193,13 +196,28 @@ async function fixture() {
   };
 }
 
-function token(user: { id: string; email: string }) {
-  return jwt.sign({ sub: user.id, email: user.email, sid: "perf-bench" }, secret!, { expiresIn: "2h" });
+async function token(user: { id: string; email: string }) {
+  const existing = actorTokens.get(user.id);
+  if (existing) return existing;
+  const familyId = crypto.randomUUID();
+  const raw = crypto.randomBytes(32).toString("hex");
+  // The CLI uses synthetic seed actors and already holds the signing secret.
+  // Nested creation commits the real family and current token atomically,
+  // without importing the server's unrelated cookie/configuration bootstrap.
+  await prisma.refreshTokenFamily.create({ data: {
+    id: familyId, userId: user.id,
+    tokens: { create: { token: crypto.createHash("sha256").update(raw).digest("hex"), expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) } },
+  } });
+  sessionIds.push(familyId);
+  const access = jwt.sign({ sub: user.id, email: user.email, sid: familyId }, secret!, { expiresIn: "2h" });
+  actorTokens.set(user.id, access);
+  return access;
 }
 
 async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
-  const m = token(f.member);
-  const a = token(f.admin);
+  // Session setup is outside warmup and the timed request windows.
+  const m = await token(f.member);
+  const a = await token(f.admin);
   const get = (t: string, path: string) => () => request("GET", path, t);
   /** An endpoint that needs a fixture row, or none when the fixture lacks it. */
   const needs = <T>(row: T | undefined, t: string, path: (row: T) => string) =>
@@ -259,7 +277,7 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 async function writeBench(f: Awaited<ReturnType<typeof fixture>>) {
-  const m = token(f.member);
+  const m = await token(f.member);
   const created: string[] = [];
   const results: Result[] = [];
   const target = f.statuses[2];
@@ -320,4 +338,11 @@ main()
     console.error(error);
     process.exitCode = 1;
   })
-  .finally(() => prisma.$disconnect());
+  .finally(async () => {
+    try {
+      // Remove only this invocation's families, including on a failed request.
+      await prisma.refreshTokenFamily.deleteMany({ where: { id: { in: sessionIds } } });
+    } finally {
+      await prisma.$disconnect();
+    }
+  });

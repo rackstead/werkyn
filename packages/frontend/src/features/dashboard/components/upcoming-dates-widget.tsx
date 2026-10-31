@@ -5,6 +5,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { CalendarDays } from "lucide-react";
+import { formatDateISO } from "@/features/time/utils";
 
 interface UpcomingDatesWidgetProps {
   workspaceId: string;
@@ -24,14 +25,14 @@ function formatDueDate(dateStr: string, todayStr: string): string {
 function addDays(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
+  return formatDateISO(d);
 }
 
 export function UpcomingDatesWidget({ workspaceId, onTaskClick }: UpcomingDatesWidgetProps) {
   const { data, isLoading } = useMyTasks(workspaceId);
   const tasks = data?.data ?? [];
 
-  const todayStr = new Date().toISOString().split("T")[0];
+  const todayStr = formatDateISO(new Date());
   const weekEnd = addDays(todayStr, 7);
 
   const upcoming = useMemo(() => {

@@ -4,6 +4,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { AlertTriangle } from "lucide-react";
+import { formatDateISO, parseDateISO } from "@/features/time/utils";
+
+function formatDueDate(value: string): string {
+  return parseDateISO(value)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) ?? value;
+}
 
 const priorityVariant: Record<string, string> = {
   LOW: "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
@@ -21,10 +26,11 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
   const { data, isLoading } = useMyTasks(workspaceId);
   const tasks = data?.data ?? [];
 
-  const todayStr = new Date().toISOString().split("T")[0];
-  const overdueTasks = tasks.filter(
-    (t) => t.dueDate && t.dueDate < todayStr && !t.status.isCompletion,
+  const todayStr = formatDateISO(new Date());
+  const isOverdue = (task: MyTask) => Boolean(
+    task.dueDate && task.dueDate < todayStr && !task.status.isCompletion,
   );
+  const overdueTasks = tasks.filter(isOverdue);
 
   const grouped = tasks.reduce<Record<string, { project: { id: string; name: string; color: string | null }; tasks: MyTask[] }>>(
     (acc, task) => {
@@ -77,7 +83,7 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
                     />
                     <span className="flex-1 min-w-0 truncate text-destructive">{task.title}</span>
                     <span className="text-xs text-destructive shrink-0">
-                      {new Date(task.dueDate!).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                      {formatDueDate(task.dueDate!)}
                     </span>
                   </button>
                 ))}
@@ -112,9 +118,9 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
                     {task.dueDate && (
                       <span className={cn(
                         "text-xs shrink-0",
-                        new Date(task.dueDate) < new Date() ? "text-destructive" : "text-muted-foreground",
+                        isOverdue(task) ? "text-destructive" : "text-muted-foreground",
                       )}>
-                        {new Date(task.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                        {formatDueDate(task.dueDate)}
                       </span>
                     )}
                     <Badge variant="outline" className="text-[10px] px-1.5 py-0 shrink-0">

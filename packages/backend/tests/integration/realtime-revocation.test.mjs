@@ -477,7 +477,13 @@ test("notification list and unread count hide entries for scopes the user can no
   await make("project assignment", "TASK_ASSIGNED", { taskId: f.task.id, projectId: f.project.id });
   await make("due soon", "TASK_DUE_SOON", { taskId: f.task.id, workspaceId: f.workspace.id });
   await make("mention", "CHAT_MENTION", { channelId: f.channel.id, messageId: "m1" });
-  await make("file share", "FILE_SHARED", { fileId: "f1", workspaceId: f.workspace.id });
+  const sharedFile = await app.prisma.file.create({
+    data: { workspaceId: f.workspace.id, name: "Shared fixture", ownerId: f.admin.id, uploadedById: f.admin.id },
+  });
+  await app.prisma.fileShare.create({
+    data: { workspaceId: f.workspace.id, fileId: sharedFile.id, sharedById: f.admin.id, sharedWithId: f.member.id },
+  });
+  await make("file share", "FILE_SHARED", { fileId: sharedFile.id, workspaceId: f.workspace.id });
   const keepProject = await make("other project", "TASK_ASSIGNED", { projectId: otherProject.id });
   const keepPlain = await make("plain", "TASK_ASSIGNED");
 

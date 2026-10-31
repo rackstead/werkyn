@@ -1,7 +1,9 @@
-import type { Notification, NotificationType, Prisma, PrismaClient } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { Notification, NotificationType, PrismaClient } from "@prisma/client";
 import { filterProjectRecipients } from "../../utils/project-access.js";
 import { startPeriodicJob, type PeriodicJob } from "../../schedulers/periodic-job.js";
 import { createNotifications } from "./notifications.service.js";
+import { notificationFileReadableSql } from "../files/file-read-scope.js";
 
 // Durable delivery for notifications sent through notify() (task, comment,
 // template, file-share and due-date reminder notifications), on the same
@@ -115,9 +117,9 @@ export async function enqueueNotifications(
 // Recipients must still be able to read every scope the data names, as the
 // notification list requires: every project it names, including the actual
 // project of a named task (a task that no longer exists notifies no one), and
-// its workspace. Evaluated when the notifications are created, so a delayed
+// its workspace and file. Evaluated when the notifications are created, so a delayed
 // retry never reaches someone who lost access in the meantime.
-async function currentRecipients(db: Db, data: Prisma.JsonValue, userIds: string[]) {
+async function currentRecipients(db: Db, data: Prisma.JsonValue, userIds: string[], type: NotificationType) {
   let recipients = userIds;
   const scope: Prisma.JsonObject = data && typeof data === "object" && !Array.isArray(data) ? data : {};
   const projectIds = new Set<string>();
@@ -151,6 +153,17 @@ async function currentRecipients(db: Db, data: Prisma.JsonValue, userIds: string
     const existing = new Set(users.map((user) => user.id));
     recipients = recipients.filter((id) => existing.has(id));
   }
+  if (recipients.length > 0 && (type === "FILE_SHARED" || scope.fileId != null)) {
+    // Bind only the named file scope, rather than serializing arbitrary
+    // notification data or making one permission request per recipient.
+    const fileScope = Prisma.sql`${JSON.stringify({ fileId: scope.fileId, workspaceId: scope.workspaceId })}::jsonb`;
+    const readers = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT recipient."id" FROM "User" recipient
+      WHERE recipient."id" IN (${Prisma.join(recipients)})
+        AND ${notificationFileReadableSql(fileScope, Prisma.sql`${type}`, Prisma.sql`recipient."id"`)}`;
+    const current = new Set(readers.map((reader) => reader.id));
+    recipients = recipients.filter((id) => current.has(id));
+  }
   return recipients;
 }
 
@@ -168,7 +181,7 @@ async function ensureNotifications(prisma: PrismaClient, id: string): Promise<En
     const row = await tx.notificationDelivery.findUniqueOrThrow({ where: { id } });
     if (row.notifiedAt) return { created: false, notificationIds: row.notificationIds };
 
-    const recipients = await currentRecipients(tx, row.data, row.recipientIds);
+    const recipients = await currentRecipients(tx, row.data, row.recipientIds, row.type);
     const notifications = await createNotifications(
       tx,
       recipients.map((userId) => ({

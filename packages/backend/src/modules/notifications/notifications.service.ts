@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { Notification, PrismaClient, NotificationType } from "@prisma/client";
 import type { NotificationQueryInput, UpdateNotificationPreferenceInput } from "@pm/shared";
+import { notificationFileReadableSql } from "../files/file-read-scope.js";
 
 const TYPE_TO_PREF_KEY: Record<NotificationType, string> = {
   TASK_ASSIGNED: "taskAssigned",
@@ -108,7 +109,7 @@ function projectReadable(projectId: Prisma.Sql, userId: string) {
 // created in. They stay readable only while the recipient can still read
 // every scope named in their data, mirroring the recipient filter applied
 // when they were sent, so a removed member keeps no copy of later or earlier
-// project, channel or workspace content in the list or unread count.
+// project, channel, file or workspace content in the list or unread count.
 function visibleNotification(userId: string) {
   return Prisma.sql`
     (n."data"->>'projectId' IS NULL OR ${projectReadable(Prisma.sql`n."data"->>'projectId'`, userId)})
@@ -127,7 +128,8 @@ function visibleNotification(userId: string) {
     AND (n."data"->>'workspaceId' IS NULL OR EXISTS (
       SELECT 1 FROM "WorkspaceMember" wm
       WHERE wm."workspaceId" = n."data"->>'workspaceId' AND wm."userId" = ${userId}
-    ))`;
+    ))
+    AND ${notificationFileReadableSql(Prisma.sql`n."data"`, Prisma.sql`n."type"`, Prisma.sql`${userId}`)}`;
 }
 
 export async function listNotifications(

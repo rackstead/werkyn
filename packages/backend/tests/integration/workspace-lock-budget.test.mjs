@@ -146,35 +146,85 @@ test("held workspace cancels acquisition on the server and releases the full poo
     // Bound the reproduction even when Prisma does not cancel a blocked
     // statement at its own 10 s interactive-transaction deadline.
     const deadline = setTimeout(release, 12_000);
-    const unrelated = timed(call("POST", `/lock-probe/${other.workspace.id}`));
     const read = timed(call("GET", `/api/workspaces/${other.workspace.id}`, undefined, other.token));
     const write = timed(call("POST", `/api/workspaces/${other.workspace.id}/wiki/spaces`, { name: "Unrelated real caller" }, other.token));
     const observation = sleep(11_000).then(async () => ({ ms: Math.round(performance.now() - start), waiters: (await waiters(pid)).length }));
-    const answers = await Promise.all(queued);
-    const otherAnswer = await unrelated;
-    const [readAnswer, writeAnswer] = await Promise.all([read, write]);
-    const blocked = (await waiters(pid)).length;
-    console.info("workspace lock budget", JSON.stringify({
-      queued: answers.map(({ status, ms }) => ({ status, ms })), other: { status: otherAnswer.status, ms: otherAnswer.ms },
-      otherRead: { status: readAnswer.status, ms: readAnswer.ms }, otherWrite: { status: writeAnswer.status, ms: writeAnswer.ms },
-      remainingWaiters: blocked, observation: await observation,
-    }));
-    clearTimeout(deadline);
-    for (const answer of answers) {
-      assert.equal(answer.status, 409, answer.body);
-      assert.deepEqual(JSON.parse(answer.body), busyBody);
-      assert(answer.ms >= 4000 && answer.ms < 9000, `acquisition took ${answer.ms} ms`);
+    try {
+      const answers = await Promise.all(queued);
+      const [readAnswer, writeAnswer] = await Promise.all([read, write]);
+      const blocked = (await waiters(pid)).length;
+      // Transaction admission has its own 5 s maxWait. Starting this at the
+      // same time as server cancellation races that deadline, with no pool
+      // reservation or fairness guarantee. Check success once admitted; the
+      // separate pool barrier below checks exact admission refusal.
+      const otherAnswer = await timed(call("POST", `/lock-probe/${other.workspace.id}`));
+      const observed = await observation;
+      console.info("workspace lock budget", JSON.stringify({
+        queued: answers.map(({ status, ms }) => ({ status, ms })), admittedOther: { status: otherAnswer.status, ms: otherAnswer.ms },
+        otherRead: { status: readAnswer.status, ms: readAnswer.ms }, otherWrite: { status: writeAnswer.status, ms: writeAnswer.ms },
+        remainingWaiters: blocked, observation: observed,
+      }));
+      for (const answer of answers) {
+        assert.equal(answer.status, 409, answer.body);
+        assert.deepEqual(JSON.parse(answer.body), busyBody);
+        assert(answer.ms >= 4000 && answer.ms < 9000, `acquisition took ${answer.ms} ms`);
+      }
+      assert.equal(blocked, 0, "server still waits after returning busy");
+      assert.equal(observed.waiters, 0, "server still waits at the 11 s observation");
+      await assert.rejects(control.$transaction((tx) => tx.$queryRaw`
+        SELECT id FROM "Workspace" WHERE id = ${hot.workspace.id} FOR NO KEY UPDATE NOWAIT
+      `), (error) => error.code === "P2010" && error.meta.code === "55P03", "control holder released early");
+      assert.equal(otherAnswer.status, 200, otherAnswer.body);
+      assert(otherAnswer.ms < 9000, `unrelated workspace waited ${otherAnswer.ms} ms`);
+      assert.equal(readAnswer.status, 200, readAnswer.body);
+      assert.equal(writeAnswer.status, 201, writeAnswer.body);
+      assert(Math.max(readAnswer.ms, writeAnswer.ms) < 9000, "unrelated authenticated callers waited for the holder");
+      assert.deepEqual(callbacks.slice(before), [other.workspace.id], "a refused callback ran");
+    } finally {
+      clearTimeout(deadline);
     }
-    assert.equal(blocked, 0, "server still waits after returning busy");
-    assert.equal(otherAnswer.status, 200, otherAnswer.body);
-    assert(otherAnswer.ms < 9000, `unrelated workspace waited ${otherAnswer.ms} ms`);
-    assert.equal(readAnswer.status, 200, readAnswer.body);
-    assert.equal(writeAnswer.status, 201, writeAnswer.body);
-    assert(Math.max(readAnswer.ms, writeAnswer.ms) < 9000, "unrelated authenticated callers waited for the holder");
-    assert.deepEqual(callbacks.slice(before), [other.workspace.id], "a refused callback ran");
-    release();
   });
   assert.equal(await app.prisma.wikiSpace.count({ where: { workspaceId: hot.workspace.id } }), 0, "late write after release");
+});
+
+test("pool admission refusal returns workspace busy without a callback or late write, then one retry succeeds", async () => {
+  const f = await fixture(), before = callbacks.length, pids = [];
+  let release, released = false;
+  const finish = new Promise((resolve) => { release = () => { released = true; resolve(); }; });
+  // Hold all five application connections without any PostgreSQL lock wait.
+  // This keeps transaction admission unavailable beyond its existing 5 s
+  // maxWait, independently of the workspace acquisition timeout.
+  const holders = Array.from({ length: 5 }, () => app.prisma.$transaction(async (tx) => {
+    const [{ pid }] = await tx.$queryRaw`SELECT pg_backend_pid()::int AS pid`;
+    pids.push(pid);
+    await finish;
+  }, { timeout: 10_000, maxWait: 5000 }));
+  const settled = Promise.allSettled(holders);
+  const deadline = setTimeout(release, 7500);
+  try {
+    assert(await until(() => pids.length === 5), "pool never filled with barrier transactions");
+    assert.equal(new Set(pids).size, 5);
+    assert.equal((await waiters(-1)).length, 0, "pool barrier unexpectedly waits for a row lock");
+    const start = performance.now();
+    const response = await call("POST", `/lock-probe/${f.workspace.id}`);
+    const ms = Math.round(performance.now() - start);
+    console.info("workspace pool admission budget", JSON.stringify({ status: response.status, ms, connections: pids.length, released }));
+    assert.equal(response.status, 409, response.body);
+    assert.deepEqual(JSON.parse(response.body), busyBody);
+    assert(ms >= 4000 && ms < 9000, `pool admission took ${ms} ms`);
+    assert.equal(released, false, "pool barrier released before admission refusal");
+    assert.equal(callbacks.length, before, "a refused callback ran");
+    assert.equal(await control.wikiSpace.count({ where: { workspaceId: f.workspace.id } }), 0);
+  } finally {
+    clearTimeout(deadline);
+    release();
+    for (const result of await settled) assert.equal(result.status, "fulfilled", result.reason?.message);
+  }
+  assert.equal(await app.prisma.wikiSpace.count({ where: { workspaceId: f.workspace.id } }), 0, "late write after pool release");
+  const retry = await call("POST", `/lock-probe/${f.workspace.id}`);
+  assert.equal(retry.status, 200, retry.body);
+  assert.deepEqual(callbacks.slice(before), [f.workspace.id]);
+  assert.equal(await app.prisma.wikiSpace.count({ where: { workspaceId: f.workspace.id } }), 1, "retry did not write exactly once");
 });
 
 test("a later child-row lock wait is bounded and rolls back earlier writes", async () => {

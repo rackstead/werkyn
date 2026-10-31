@@ -53,6 +53,8 @@ async function open(kind: Kind) {
   }
   const { TaskSlideover: Task } = await import("@/features/tasks/components/lazy-task-slideover");
   const { FilePreviewSlideover: Preview } = await import("@/features/drive/components/lazy-drive-panels");
+  const { IdentityBoundary } = await import("@/components/providers/identity-boundary");
+  const { changeIdentity } = await import("@/lib/identity");
   const Panel: ComponentType<{ onClose: () => void }> = kind === "task"
     ? (({ onClose }) => <Task taskId="task-1" workspaceSlug="acme" onClose={onClose} />)
     : (({ onClose }) => <Preview file={file} workspaceId="w" onClose={onClose} onDownload={vi.fn()} />);
@@ -60,7 +62,8 @@ async function open(kind: Kind) {
     const [visible, setVisible] = useState(false);
     return <><main><button onClick={() => setVisible(true)}>Open {kind}</button><button>Background</button></main>{visible && route && <Panel onClose={() => setVisible(false)} />}</>;
   }
-  const view = render(<Page />);
+  const page = (route = true) => <IdentityBoundary><Page route={route} /></IdentityBoundary>;
+  const view = render(page());
   const opener = screen.getByRole("button", { name: `Open ${kind}` });
   const background = screen.getByRole("button", { name: "Background" });
   opener.focus();
@@ -78,7 +81,11 @@ async function open(kind: Kind) {
     expect(screen.queryByRole("button", { name: "Background" })).toBeNull();
     return loaded;
   };
-  return { opener, background, loading, load, resolve, leave: () => view.rerender(<Page route={false} />) };
+  return {
+    opener, background, loading, load, resolve,
+    leave: () => view.rerender(page(false)),
+    resetIdentity: () => act(async () => { changeIdentity("old", "new"); }),
+  };
 }
 
 async function dismiss(how: Dismissal, loaded = true) {
@@ -126,6 +133,31 @@ describe.each(["task", "preview"] as const)("%s lazy panel handover", (kind) => 
     await dismiss("Close");
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(document.activeElement).toBe(document.body);
+  });
+
+  it("reopens a cached panel without a loading shell and restores focus on Escape", async () => {
+    const { opener, load } = await open(kind);
+    await load();
+    await dismiss("Close");
+    opener.focus();
+    fireEvent.click(opener);
+    const loaded = await screen.findByRole("dialog", { name: kind === "task" ? "Task details" : file.name });
+    expect(screen.queryByRole("dialog", { name: `Loading ${kind}` })).toBeNull();
+    await waitFor(() => expect(loaded.contains(document.activeElement)).toBe(true));
+    await dismiss("Escape");
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("does not reopen or steal new-account focus when a pending chunk resolves after identity reset", async () => {
+    const { opener, resetIdentity, resolve } = await open(kind);
+    await resetIdentity();
+    const nextFocus = screen.getByRole("button", { name: "Background" });
+    nextFocus.focus();
+    await act(resolve);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(opener.isConnected).toBe(false);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(nextFocus);
   });
 });
 

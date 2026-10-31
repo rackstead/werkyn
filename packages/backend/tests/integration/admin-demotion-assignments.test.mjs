@@ -23,7 +23,6 @@ const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { processRecurringTasks } = await import("../../src/schedulers/recurring-tasks.ts");
 const userIds = [], workspaceIds = [], tokens = new Map();
 const actorUrl = new URL(process.env.TEST_DATABASE_URL);
-assert.equal(Number(actorUrl.searchParams.get("connection_limit") ?? 5), 5, "Demotion fixtures use five app connections");
 actorUrl.searchParams.set("connection_limit", "5");
 process.env.DATABASE_URL = actorUrl.toString();
 const controlUrl = new URL(actorUrl);

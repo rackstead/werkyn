@@ -1,6 +1,7 @@
 import fp from "fastify-plugin";
 import helmet from "@fastify/helmet";
 import type { FastifyInstance } from "fastify";
+import { env } from "../config/env.js";
 
 export default fp(async (fastify: FastifyInstance) => {
   await fastify.register(helmet, {
@@ -16,8 +17,7 @@ export default fp(async (fastify: FastifyInstance) => {
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],
-        upgradeInsecureRequests:
-          process.env.COOKIE_SECURE === "true" ? [] : null,
+        upgradeInsecureRequests: env.COOKIE_SECURE ? [] : null,
       },
     },
   });

@@ -24,6 +24,7 @@ const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), "
 const dockerfile = read("Dockerfile");
 const entrypoint = read("docker-entrypoint.sh");
 const compose = parse(read("docker-compose.yml"), { merge: true });
+const workflow = parse(read(".github/workflows/docker-image.yml"));
 
 // Joins continuation lines and drops comments, so each entry is one instruction.
 const instructions = dockerfile
@@ -72,6 +73,25 @@ test("external base images are pinned by digest", () => {
     if (!aliases.has(image)) assert.match(image, /^[^@\s]+:[^@\s]+@sha256:[0-9a-f]{64}$/, image);
     if (alias) aliases.add(alias);
   }
+});
+
+test("the container uses a patch-pinned Node 22 Alpine image matching CI", () => {
+  const base = stages.find((stage) => /\sAS base$/i.test(stage[0]));
+  assert.ok(base, "the shared build and runtime base must exist");
+  const [, image] = base[0].split(/\s+/);
+  const version = image.match(/^node:(22)\.\d+\.\d+-alpine\d+\.\d+@sha256:[0-9a-f]{64}$/);
+  assert.ok(version, `expected a full Node 22 patch, Alpine version and index digest: ${image}`);
+  const setupNode = workflow.jobs.validate.steps.find((step) => step.uses?.startsWith("actions/setup-node@"));
+  assert.equal(String(setupNode?.with?.["node-version"]), version[1]);
+});
+
+test("adm-zip is available to tests and excluded from the production importer", () => {
+  const backend = JSON.parse(read("packages/backend/package.json"));
+  const lock = parse(read("pnpm-lock.yaml")).importers["packages/backend"];
+  assert.equal(backend.dependencies?.["adm-zip"], undefined);
+  assert.equal(lock.dependencies?.["adm-zip"], undefined);
+  assert.equal(typeof backend.devDependencies?.["adm-zip"], "string");
+  assert.equal(lock.devDependencies?.["adm-zip"]?.specifier, backend.devDependencies["adm-zip"]);
 });
 
 test("the entrypoint is valid sh and drops root before migrating or serving", () => {

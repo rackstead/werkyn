@@ -17,6 +17,12 @@ import {
   archiveFilesHandler,
 } from "./files.controller.js";
 import { authenticate } from "../../middleware/authenticate.js";
+import {
+  authenticateFilePreview,
+  createPreviewGrantHandler,
+  previewFileHandler,
+  previewNoStore,
+} from "./file-preview.js";
 import { authorize } from "../../middleware/authorize.js";
 import { validate, validateQuery } from "../../middleware/validate.js";
 import {
@@ -90,6 +96,25 @@ export default async function filesRoutes(fastify: FastifyInstance) {
     url: "/workspaces/:wid/files/:fid",
     preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
     handler: getFileHandler,
+  });
+
+  // Native PDF reads use a distinct, short-lived resource credential.
+  fastify.route({
+    method: "POST",
+    url: "/workspaces/:wid/files/:fid/preview-grant",
+    onRequest: previewNoStore,
+    preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
+    handler: createPreviewGrantHandler,
+  });
+  fastify.route({
+    method: ["GET", "HEAD"],
+    url: "/workspaces/:wid/files/:fid/preview",
+    onRequest: previewNoStore,
+    preHandler: [
+      authenticateFilePreview,
+      authorize("ADMIN", "MEMBER", "VIEWER"),
+    ],
+    handler: previewFileHandler,
   });
 
   // GET /api/workspaces/:wid/files/:fid/download — Stream file content

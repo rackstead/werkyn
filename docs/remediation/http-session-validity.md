@@ -36,8 +36,10 @@ errors receive a safe generic `500`, with bounded diagnostics, rather than a
 retryable availability response. The failure ends no session and no protected
 handler runs, so retrying after operational recovery remains possible.
 
-Header/query selection stays the same: a Bearer header takes precedence over
-the query token, JWT query tokens remain supported, and durable `wk_` API keys
+Protected HTTP routes require a Bearer header. Query access JWTs cannot
+authenticate; a supplied header remains authoritative when a query token is
+present. Native PDF preview uses a separate short-lived file grant; see
+[file-preview-grants.md](file-preview-grants.md). Durable `wk_` API keys also
 require an Authorization header. API keys still have their own per-request
 expiry/revocation checks and survive session logout and password changes or
 resets. Public shares keep their separate unauthenticated grant policy.
@@ -66,7 +68,7 @@ The 15 cases cover valid reads/writes, concurrent rotation/read rounds,
 logout/login/change/reset/reuse revocation, unrelated/newer sessions, denied
 profile and credential side effects, malformed/unknown/foreign families,
 expired and removed current tokens, deleted accounts/families, legacy grace,
-API keys, header/query precedence and public shares. Actual unavailable user,
+API keys, header-only authentication/ignored query credentials and public shares. Actual unavailable user,
 family and API-key relations prove safe schema-fault `500` responses. A real
 connection failure proves operational `503`; injected validation and TypeError
 faults prove safe programming `500`. All refuse protected handler execution,

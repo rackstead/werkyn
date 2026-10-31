@@ -156,11 +156,11 @@ async function resetLink(user) {
   return link[1];
 }
 
-test("current login and refresh tokens authorize header/query reads and writes; refused change and unknown logout keep the session", async () => {
+test("current login and refresh tokens authorize header reads and writes; query credentials are refused; refused change and unknown logout keep the session", async () => {
   const user = await makeUser();
   const session = await login(user);
   assert.equal((await me(session.token)).status, 200);
-  assert.equal((await request("GET", `/api/users/me?token=${session.token}`)).status, 200);
+  assert.equal((await request("GET", `/api/users/me?token=${session.token}`)).status, 401);
   const rotated = await refresh(session);
   assert.equal(rotated.status, 200, rotated.body);
   assert.equal(jwt.decode(rotated.json.data.accessToken).sid, session.sid);
@@ -291,7 +291,7 @@ test("legacy tokens without sid retain only their JWT expiry grace; invalid, exp
   const session = await login(user);
   assert.equal((await request("POST", "/api/auth/logout", session)).status, 204);
   assert.equal((await me(sign(user))).status, 200, "legacy no-sid grace remains explicit");
-  assert.equal((await request("GET", `/api/users/me?token=${sign(user)}`)).status, 200);
+  assert.equal((await request("GET", `/api/users/me?token=${sign(user)}`)).status, 401);
   for (const token of ["invalid", sign(user, {}, { expiresIn: -1 }), sign(user, {}, {}), jwt.sign({ sub: user.id, exp: Math.floor(Date.now() / 1000) + 60 }, "another-secret"), sign(user, { sub: null })]) {
     assert.equal((await me(token)).status, 401);
   }

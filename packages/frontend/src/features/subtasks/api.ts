@@ -94,7 +94,7 @@ export function useReorderSubtasks(tid: string) {
   return useMutation({
     mutationFn: (orderedIds: string[]) =>
       api.post(`tasks/${tid}/subtasks/reorder`, { json: { orderedIds } }).json(),
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.subtasks(tid) });
     },
   });

@@ -77,8 +77,9 @@ export class ProjectBusyError extends AppError {
 
 /**
  * Takes the order lock within ORDER_LOCK_TIMEOUT_MS and caps every later lock
- * wait of the transaction at the same bound (55P03 when exceeded). Waiting for
- * the project row can take two lock waits in a row (first for its place in
+ * wait of the transaction at that bound, preserving each stricter nonzero
+ * caller/role setting independently (55P03 when the lock timeout is exceeded).
+ * Waiting for the project row can take two lock waits in a row (first for its place in
  * the row's queue, then for the holder's transaction), and lock_timeout
  * restarts for each, so this one statement is bounded by a statement_timeout,
  * which is then restored for the rest of the transaction. Either timeout on
@@ -86,12 +87,18 @@ export class ProjectBusyError extends AppError {
  * any later statement keeps its own error.
  */
 async function lockProjectOrderWithinBound(tx: Db, projectId: string) {
-  const bound = `${ORDER_LOCK_TIMEOUT_MS}ms`;
-  const [{ previous }] = await tx.$queryRaw<{ previous: string }[]>`
-    SELECT current_setting('statement_timeout') AS previous
+  // pg_settings reports integer milliseconds, including transaction-local
+  // values. Do not widen a stricter statement or lock budget during acquisition.
+  const settings = await tx.$queryRaw<{ name: string; timeoutMs: number }[]>`
+    SELECT name, setting::integer AS "timeoutMs" FROM pg_settings
+    WHERE name IN ('statement_timeout', 'lock_timeout')
   `;
+  const previousStatement = settings.find((setting) => setting.name === "statement_timeout")!.timeoutMs;
+  const previousLock = settings.find((setting) => setting.name === "lock_timeout")!.timeoutMs;
+  const bounded = (previous: number) => `${Math.min(previous || ORDER_LOCK_TIMEOUT_MS, ORDER_LOCK_TIMEOUT_MS)}ms`;
   await tx.$executeRaw`
-    SELECT set_config('statement_timeout', ${bound}, true), set_config('lock_timeout', ${bound}, true)
+    SELECT set_config('statement_timeout', ${bounded(previousStatement)}, true),
+           set_config('lock_timeout', ${bounded(previousLock)}, true)
   `;
   let project: LockedProject | null;
   try {
@@ -102,7 +109,7 @@ async function lockProjectOrderWithinBound(tx: Db, projectId: string) {
     if (isStatementCanceledError(error) || isLockTimeoutError(error)) throw new ProjectBusyError();
     throw error;
   }
-  await tx.$executeRaw`SELECT set_config('statement_timeout', ${previous}, true)`;
+  await tx.$executeRaw`SELECT set_config('statement_timeout', ${`${previousStatement}ms`}, true)`;
   return project;
 }
 

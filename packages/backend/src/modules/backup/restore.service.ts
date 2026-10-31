@@ -6,7 +6,8 @@ import type { StorageProvider } from "../../services/storage.js";
 import { cleanupBlobsNow } from "../../services/blob-cleanup.js";
 import { AppError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
-import { lockWorkspace } from "../../utils/workspace-lock.js";
+import { lockWorkspace, WorkspaceBusyError } from "../../utils/workspace-lock.js";
+import { isLockTimeoutError } from "../../utils/retryable-database-errors.js";
 import type { BackupArchiveAsset } from "./backup-archive.js";
 import { parseBackupJson } from "./backup-json.js";
 import {
@@ -421,6 +422,9 @@ export async function executeRestore(
     }, RESTORE_TRANSACTION);
   } catch (error) {
     if (storage) await discardStagedAssets(prisma, storage, paths);
+    // lockWorkspace keeps a bounded lock_timeout for later FK/child-row
+    // waits too. Preserve the workspace busy response after the same cleanup.
+    if (isLockTimeoutError(error)) throw new WorkspaceBusyError();
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2028")
       throw new AppError(
         503,

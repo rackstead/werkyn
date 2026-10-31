@@ -69,9 +69,6 @@ importers:
       '@prisma/client':
         specifier: ^6.19.3
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
-      adm-zip:
-        specifier: ^0.6.1
-        version: 0.6.1
       archiver:
         specifier: ^7.0.1
         version: 7.0.1
@@ -130,6 +127,9 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
+      adm-zip:
+        specifier: ^0.6.1
+        version: 0.6.1
       pino-pretty:
         specifier: ^13.0.0
         version: 13.1.3

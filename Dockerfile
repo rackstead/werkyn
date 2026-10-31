@@ -1,12 +1,12 @@
 # Base images are pinned by digest so a rebuild starts from the same bytes.
 # To update one, change the tag and its digest together, for example from
-# `docker buildx imagetools inspect node:20-alpine`.
+# `docker buildx imagetools inspect node:22.23.4-alpine3.24`.
 
 # ── Stage 0: Dex binary source ───────────────────────────────────
 FROM ghcr.io/dexidp/dex:v2.41.1-alpine@sha256:bc7cfce7c17f52864e2bb2a4dc1d2f86a41e3019f6d42e81d92a301fad0c8a1d AS dex-source
 
 # ── Stage 1: base ────────────────────────────────────────────────
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS base
+FROM node:22.23.4-alpine3.24@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS base
 RUN apk add --no-cache libc6-compat openssl
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 ENV PNPM_HOME="/pnpm"

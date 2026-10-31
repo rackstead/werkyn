@@ -176,7 +176,7 @@ werkyn/
 For contributors who want to run outside of Docker:
 
 ### Prerequisites
-- **Node.js** 20.19+ or 22.12+ (`^20.19.0 || >=22.12.0`)
+- **Node.js** 22.12+ (`>=22.12.0`); use the latest patch of a supported LTS release. The container and CI use Node 22.
 - **pnpm** >= 9.0.0
 - **Docker** (for PostgreSQL)
 

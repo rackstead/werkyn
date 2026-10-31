@@ -1,5 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { EditConflictError, NotFoundError } from "../../utils/errors.js";
+import { assertWikiJson } from "./wiki-json.js";
 
 type Tx = Prisma.TransactionClient;
 
@@ -125,6 +126,7 @@ export async function snapshotPage(
     where: { id: pageId },
     select: { title: true, content: true },
   });
+  assertWikiJson(page.content, "content");
   const latest = await tx.wikiPageVersion.aggregate({
     where: { pageId },
     _max: { versionNumber: true },

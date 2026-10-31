@@ -1,6 +1,7 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type { CreateWikiCommentInput, UpdateWikiCommentInput } from "@pm/shared";
 import { NotFoundError, ForbiddenError } from "../../utils/errors.js";
+import { assertWikiJson } from "./wiki-json.js";
 
 const commentInclude = {
   author: { select: { id: true, displayName: true, avatarUrl: true } },
@@ -23,6 +24,8 @@ export async function createComment(
   authorId: string,
   data: CreateWikiCommentInput,
 ) {
+  assertWikiJson(data.selectionStart, "selectionStart");
+  assertWikiJson(data.selectionEnd, "selectionEnd");
   const page = await prisma.wikiPage.findUnique({
     where: { id: pageId },
     select: { id: true, spaceId: true, space: { select: { workspaceId: true } } },

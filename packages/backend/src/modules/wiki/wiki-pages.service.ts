@@ -1,4 +1,4 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import type {
   CreateWikiPageInput,
   UpdateWikiPageInput,
@@ -12,6 +12,7 @@ import {
 } from "../../utils/errors.js";
 import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { assertWikiJson } from "./wiki-json.js";
 import {
   PAGE_WRITE_TRANSACTION,
   assertNotLockedByOther,
@@ -155,6 +156,8 @@ export async function createPage(
   actorId: string,
   data: CreateWikiPageInput,
 ) {
+  const content = data.content;
+  assertWikiJson(content, "content");
   // The workspace graph lock orders the parent check and MAX+1 append with
   // concurrent moves, deletes and other creates.
   return withWorkspaceLock(prisma, workspaceId, async (tx) => {
@@ -182,7 +185,7 @@ export async function createPage(
         spaceId,
         parentId: data.parentId,
         title: data.title,
-        content: data.content ?? undefined,
+        content: content ?? undefined,
         icon: data.icon,
         position,
         createdById: actorId,
@@ -240,6 +243,8 @@ export async function updatePage(
   actorId: string,
   data: UpdateWikiPageInput,
 ) {
+  const content = data.content;
+  assertWikiJson(content, "content");
   return prisma.$transaction(async (tx) => {
     const current = await lockPageRow(tx, pageId);
     await assertNotLockedByOther(tx, pageId, actorId, current);
@@ -251,7 +256,7 @@ export async function updatePage(
       revision: { increment: 1 },
     };
     if (data.title !== undefined) updateData.title = data.title;
-    if (data.content !== undefined) updateData.content = data.content;
+    if (content !== undefined) updateData.content = content === null ? Prisma.JsonNull : content;
     if (data.icon !== undefined) updateData.icon = data.icon;
 
     return tx.wikiPage.update({

@@ -1,5 +1,23 @@
 import { z } from "zod";
 import { QueryBooleanSchema, INT32_MAX, multilineText, singleLineText } from "./common.js";
+import { MAX_JSON_STORAGE_DEPTH, jsonStorageIssue } from "../json-storage.js";
+
+export const MAX_WIKI_CONTENT_DEPTH = MAX_JSON_STORAGE_DEPTH;
+// backup.json adds five containers around page content, and seven around a
+// comment selection. Both must fit the existing whole-file depth cap of 128.
+export const MAX_WIKI_SELECTION_DEPTH = 121;
+
+function wikiJson(maxDepth: number) {
+  // Editor types can contain optional properties before JSON serialization.
+  // Validate the received value without imposing an editor document type.
+  return z.custom<unknown>(() => true).superRefine((value, ctx) => {
+    const message = jsonStorageIssue(value, maxDepth);
+    if (message) ctx.addIssue({ code: "custom", message });
+  });
+}
+
+export const WikiPageContentSchema = wikiJson(MAX_WIKI_CONTENT_DEPTH);
+export const WikiCommentSelectionSchema = wikiJson(MAX_WIKI_SELECTION_DEPTH);
 
 // ─── Wiki Spaces ────────────────────────────────────────
 
@@ -27,14 +45,14 @@ export const CreateWikiPageSchema = z.object({
     .min(1, "Page title is required")
     .max(500, "Page title must be 500 characters or less"),
   parentId: z.string().optional(),
-  content: z.any().optional(),
+  content: WikiPageContentSchema.optional(),
   icon: z.string().optional(),
 });
 export type CreateWikiPageInput = z.infer<typeof CreateWikiPageSchema>;
 
 export const UpdateWikiPageSchema = z.object({
   title: singleLineText().min(1).max(500).optional(),
-  content: z.any().optional(),
+  content: WikiPageContentSchema.optional(),
   icon: z.string().nullable().optional(),
   // The page `revision` this edit is based on. When it is not the stored
   // revision the save is refused with 409 REVISION_CONFLICT. Omitted, the
@@ -73,8 +91,8 @@ export type CreateNamedVersionInput = z.infer<typeof CreateNamedVersionSchema>;
 export const CreateWikiCommentSchema = z.object({
   body: multilineText().min(1).max(10000),
   highlightId: z.string().min(1).max(100),
-  selectionStart: z.any().optional(),
-  selectionEnd: z.any().optional(),
+  selectionStart: WikiCommentSelectionSchema.optional(),
+  selectionEnd: WikiCommentSelectionSchema.optional(),
 });
 export type CreateWikiCommentInput = z.infer<typeof CreateWikiCommentSchema>;
 

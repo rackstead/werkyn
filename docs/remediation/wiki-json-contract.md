@@ -1,0 +1,78 @@
+# Wiki JSON storage contract
+
+Wiki page `content` and comment `selectionStart` / `selectionEnd` previously
+accepted arbitrary values. Content at 124 nested containers reached Prisma
+and returned 500. NUL in a string or member name reached PostgreSQL; an
+unpaired surrogate reached Prisma. A JSON number such as `1e400` parsed as
+Infinity and was silently stored as null. A selection nested 122 levels could
+be saved but made a depth-limited backup impossible.
+
+The shared request schemas and wiki service boundaries now validate those
+fields before writes. A refusal is HTTP 400 with a fixed message and the field
+in `details`; it does not quote JSON values or member names. Refused writes
+leave page rows, revisions, version history, comments and realtime events
+unchanged.
+
+| Field | Maximum object/array depth | Depth in `backup.json` |
+| --- | --- | --- |
+| Page content, including a version snapshot or restore | 123 | 128 |
+| Comment selection start or end | 121 | 128 |
+
+Scalars have depth zero. Each object or array adds one, including empty
+containers; object, array and mixed nesting use the same rule. Prisma stores
+123 levels in a single-row JSON write. The backup envelope adds five levels
+around page content and seven around comment selections, and its existing
+whole-file cap is 128. These limits are separate from the wiki parent-page
+hierarchy and its graph budget.
+
+Accepted values remain format-independent JSON: objects, arrays, strings,
+finite numbers, booleans and null. Normal editor documents need no migration.
+String values and member names must contain neither U+0000 nor an unpaired
+UTF-16 surrogate. Valid surrogate pairs, Unicode normalization forms and other
+characters that JSON storage supports are retained. HTTP's existing request
+body byte limit continues to bound wide inputs; no new item-count limit is
+introduced here.
+
+Omitted fields remain omitted. Creating a page with omitted or null content
+keeps the existing SQL NULL behavior. A PATCH that omits content keeps the
+stored content; explicit null writes JSON null as before. Comment selections
+keep their previous optional/null behavior. This change does not normalize,
+truncate or replace values.
+
+Restoring a version with null content now clears the page to JSON null. Every
+version captures page content, so null represents an empty snapshot. Previously
+restore omitted that field and incorrectly kept newer non-null content. Both
+SQL NULL and JSON null in historical versions restore empty content, while the
+replaced content is recorded as a new version in the existing transaction.
+
+`jsonStorageIssue` walks containers iteratively, checks depth before descending
+and stops on the first problem. It returns the original value through the
+schema without copying its contents. Its explicit stack and cycle detector
+track the active path; JavaScript's object-key enumeration may also buffer
+keys of a wide object. Direct service callers get the same checks, including
+cycles, non-finite numbers and non-JSON values. Repeated noncyclic references
+are accepted. Accessors and `toJSON` methods are never invoked by validation.
+
+Existing rows and historical versions are retained. Reads and comment body
+edits do not revalidate stored JSON. When an actual snapshot would copy
+unsupported legacy content, the operation returns 400 and keeps all rows.
+Restoring unsupported historical content likewise returns 400 before writing
+the replaced page's snapshot. A throttled save that needs no snapshot can
+retain legacy content. Existing edit-lock, revision and tenant checks continue
+to apply. This patch performs no legacy repair.
+
+The bounds ensure compatibility with the backup depth envelope. Aggregate
+backup byte, token and object budgets still apply, so a whole space may need
+to be exported in parts. The backup parser's bounded validation and memory
+budgets are unchanged. Its existing JSON storage check also rejects non-finite
+numbers in page content, selections and activity details, preventing overflow
+numbers in an uploaded JSON file from being silently restored as null.
+Other shared JSON fields, graph limits and the broader
+C07 contract work remain separate.
+
+The shared schema regressions cover exact limits and the next level for
+objects, arrays and mixed containers, member names, Unicode, primitives,
+cycles, wide values and very deep direct input. The integration suite uses
+actual loopback HTTP and PostgreSQL for create, update, comments, named
+snapshots, historical restores and refused-write side effects, alongside
+revision, edit-lock and workspace access checks.

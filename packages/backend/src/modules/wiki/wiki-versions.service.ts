@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import { NotFoundError } from "../../utils/errors.js";
 import {
   PAGE_WRITE_TRANSACTION,
@@ -7,6 +7,7 @@ import {
   snapshotPage,
 } from "./wiki-page-writes.js";
 import { pageWithContentSelect } from "./wiki-pages.service.js";
+import { assertWikiJson } from "./wiki-json.js";
 
 /** Records the page as stored now, numbered after every earlier version. */
 export async function createNamedVersion(
@@ -78,13 +79,14 @@ export async function restoreVersion(
 
     const current = await lockPageRow(tx, version.pageId);
     await assertNotLockedByOther(tx, version.pageId, actorId, current);
+    assertWikiJson(version.content, "content");
     await snapshotPage(tx, version.pageId, actorId);
 
     return tx.wikiPage.update({
       where: { id: version.pageId },
       data: {
         title: version.title,
-        content: version.content ?? undefined,
+        content: version.content === null ? Prisma.JsonNull : version.content,
         lastEditedById: actorId,
         revision: { increment: 1 },
       },

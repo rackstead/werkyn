@@ -2,6 +2,8 @@ import { createRootRoute, Outlet } from "@tanstack/react-router";
 import { Toaster, toast } from "sonner";
 import { IdentityBoundary } from "@/components/providers/identity-boundary";
 import { onIdentityChange } from "@/lib/identity";
+import { isChunkLoadError } from "@/lib/lazy-import";
+import { ChunkLoadErrorNotice } from "@/components/shared/lazy-load";
 
 // Notices about the previous account's work must not stay on screen.
 onIdentityChange(({ previousUserId }) => {
@@ -25,6 +27,7 @@ function RootComponent() {
 }
 
 function RootErrorComponent({ error }: { error: Error }) {
+  if (isChunkLoadError(error)) return <ChunkLoadErrorNotice fullScreen />;
   return (
     <div className="flex min-h-screen items-center justify-center">
       <div className="text-center space-y-3">

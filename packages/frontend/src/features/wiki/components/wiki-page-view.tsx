@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -16,7 +16,7 @@ import {
   useWikiPageBreadcrumbs,
   wikiAutosaveKey,
 } from "../api";
-import { WikiEditor } from "./wiki-editor";
+import { WikiEditor } from "./lazy-wiki-editor";
 import { VersionHistoryPanel } from "./version-history-panel";
 import { WikiCommentsPanel } from "./wiki-comments-panel";
 import { SharePageDialog } from "./share-page-dialog";
@@ -34,6 +34,10 @@ interface WikiPageViewProps {
 
 export function WikiPageView({ pageId, workspaceId, onNavigatePage }: WikiPageViewProps) {
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
+  // Fetch the editor while the page itself is loading.
+  useEffect(() => {
+    void WikiEditor.preload();
+  }, []);
   return (
     <WikiPageSession
       key={`${userId}:${pageId}`}
@@ -424,17 +428,19 @@ function WikiPageSession({
       </div>
 
       {/* Editor */}
-      <WikiEditor
-        key={`${pageId}:${documentVersion}`}
-        initialContent={page.content}
-        // Only unsaved body edits hold back a refreshed body; a pending title does not.
-        hasUnsavedChanges={autosave.draft?.content !== undefined}
-        recoveredContent={autosave.draft?.content}
-        readOnly={readOnly}
-        workspaceId={workspaceId}
-        spaceId={page.spaceId}
-        onChange={handleContentChange}
-      />
+      <Suspense fallback={<Skeleton className="h-40 w-full" />}>
+        <WikiEditor
+          key={`${pageId}:${documentVersion}`}
+          initialContent={page.content}
+          // Only unsaved body edits hold back a refreshed body; a pending title does not.
+          hasUnsavedChanges={autosave.draft?.content !== undefined}
+          recoveredContent={autosave.draft?.content}
+          readOnly={readOnly}
+          workspaceId={workspaceId}
+          spaceId={page.spaceId}
+          onChange={handleContentChange}
+        />
+      </Suspense>
 
       {/* Version History Panel */}
       {showVersions && (

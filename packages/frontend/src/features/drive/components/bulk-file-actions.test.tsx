@@ -58,6 +58,7 @@ vi.mock("@/lib/api-client", () => ({
 
 const toasts = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast: toasts }));
+vi.mock("./file-preview-slideover", () => new Promise(() => {}));
 
 const flush = () => act(() => new Promise((resolve) => setTimeout(resolve, 0)));
 
@@ -404,6 +405,21 @@ describe("drive page bulk trash", () => {
     expect(screen.getByText("2 selected")).toBeTruthy();
     await answerAll("forward", new Set());
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  it("ignores file-list shortcuts while a preview chunk is still loading", async () => {
+    renderPage();
+    await select("File 1.txt");
+    fireEvent.click(await screen.findByText("File 1.txt"));
+    await screen.findByText("Loading preview…");
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    fireEvent.keyDown(document.body, { key: "Backspace" });
+    fireEvent.keyDown(document.body, { key: "a", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "a", metaKey: true });
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByText("1 selected")).toBeTruthy();
+    expect(net.calls).toEqual([]);
   });
 
   it("closes the confirmation when the folder changes mid-batch; the batch still reports", async () => {

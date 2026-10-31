@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { api } from "@/lib/api-client";
 import { apiUrl } from "@/lib/api-url";
-import { identityGeneration } from "@/lib/identity";
+import {
+  getIdentitySnapshot,
+  identityGeneration,
+  identitySignal,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useAuthStore } from "@/stores/auth-store";
 
 interface PreviewGrant {
@@ -10,135 +15,120 @@ interface PreviewGrant {
   sourceExpiresAt: number;
 }
 interface PreviewState {
-  scope: object;
+  scope: string;
   url?: string;
-  expiresAt?: number;
   error: string | null;
   isLoading: boolean;
 }
-const RENEW_EARLY_MS = 30_000;
+const MIN_REMAINING_MS = 30_000;
 const ERROR = "PDF preview could not be loaded. Try again.";
 
-/** Owns only a short-lived URL; PDF bytes stay in the browser's native viewer. */
+/** Keeps one native viewer for each open resource/identity, without buffering bytes. */
 export function usePdfPreview(workspaceId: string, fileId: string | null) {
   const userId = useAuthStore((state) => state.user?.id);
-  const accessToken = useAuthStore((state) => state.accessToken);
-  const scope = useMemo(() => ({}), [workspaceId, fileId, userId, accessToken]);
+  const signedIn = useAuthStore((state) => !!state.accessToken);
+  const { generation } = useSyncExternalStore(
+    subscribeIdentity,
+    getIdentitySnapshot,
+    getIdentitySnapshot,
+  );
+  const enabled = !!fileId && !!userId && signedIn;
+  // A same-user token rotation must not reload an already displayed document.
+  const scope = JSON.stringify([
+    workspaceId,
+    fileId,
+    userId,
+    generation,
+    enabled,
+  ]);
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<PreviewState>();
   const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  const reportFrameError = useCallback(() => {
+    setState((previous) =>
+      previous?.scope === scope
+        ? { scope, error: ERROR, isLoading: false }
+        : previous,
+    );
+  }, [scope]);
 
   useEffect(() => {
-    if (!fileId || !userId || !accessToken) return;
+    if (!enabled || !fileId || !userId) return;
     const controller = new AbortController();
-    const generation = identityGeneration();
+    const identity = identitySignal();
+    const abortIdentity = () => controller.abort();
+    identity.addEventListener("abort", abortIdentity, { once: true });
     let active = true;
-    let pending = false;
-    let grant: PreviewGrant | undefined;
-    let renewal: ReturnType<typeof setTimeout> | undefined;
-    let expiry: ReturnType<typeof setTimeout> | undefined;
     const current = () =>
       active &&
       !controller.signal.aborted &&
       identityGeneration() === generation &&
       useAuthStore.getState().user?.id === userId &&
-      useAuthStore.getState().accessToken === accessToken;
-    const clearTimers = () => {
-      clearTimeout(renewal);
-      clearTimeout(expiry);
-    };
+      !!useAuthStore.getState().accessToken;
     const path = `workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(fileId)}`;
+    const requestGrant = () =>
+      api
+        .post(`${path}/preview-grant`, {
+          signal: controller.signal,
+          context: { expectedUserId: userId },
+        })
+        .json<{ data: PreviewGrant }>();
+    const valid = (data: PreviewGrant) =>
+      data &&
+      typeof data.token === "string" &&
+      data.token !== "" &&
+      Number.isSafeInteger(data.expiresAt) &&
+      Number.isSafeInteger(data.sourceExpiresAt) &&
+      data.sourceExpiresAt >= data.expiresAt;
     setState({ scope, error: null, isLoading: true });
-
-    async function load(previous?: PreviewGrant) {
-      if (!current() || pending) return;
-      pending = true;
+    async function load() {
       try {
-        if (previous && previous.expiresAt === previous.sourceExpiresAt) {
-          // Reuse the shared refresh mutex and identity guards. A token update
-          // starts a new effect; the old renewal must not start a second load.
+        const requestedToken = useAuthStore.getState().accessToken;
+        let { data } = await requestGrant();
+        if (!current()) return;
+        if (!valid(data)) throw new Error("Invalid preview grant");
+        if (
+          data.expiresAt - Date.now() < MIN_REMAINING_MS &&
+          useAuthStore.getState().accessToken === requestedToken
+        ) {
+          // The acquisition was slow or source-bound. Reuse the shared refresh
+          // coordinator once, then require a changed token; never renew in a loop.
           await useAuthStore.getState().refresh();
           if (!current()) return;
-          // A recent-refresh shortcut may leave the same expiring token.
-          // Stop here rather than repeatedly minting its same expiry.
-          throw new Error("Access token was not renewed");
+          if (useAuthStore.getState().accessToken === requestedToken)
+            throw new Error("Access token was not renewed");
         }
-        const { data } = await api
-          .post(`${path}/preview-grant`, {
-            signal: controller.signal,
-          })
-          .json<{ data: PreviewGrant }>();
-        if (!current()) return;
-        if (
-          !data ||
-          typeof data.token !== "string" ||
-          data.token === "" ||
-          !Number.isSafeInteger(data.expiresAt) ||
-          !Number.isSafeInteger(data.sourceExpiresAt) ||
-          data.expiresAt <= Date.now() ||
-          data.sourceExpiresAt < data.expiresAt ||
-          (previous && data.expiresAt <= previous.expiresAt)
-        )
-          throw new Error("Invalid preview expiry");
-        grant = data;
-        clearTimers();
+        // A concurrent ordinary API refresh may already have supplied the token.
+        if (useAuthStore.getState().accessToken !== requestedToken) {
+          ({ data } = await requestGrant());
+          if (!current()) return;
+        }
+        if (!valid(data) || data.expiresAt - Date.now() < MIN_REMAINING_MS)
+          throw new Error("Preview grant expires too soon");
         setState({
           scope,
           url: apiUrl(`${path}/preview`, { token: data.token }),
-          expiresAt: data.expiresAt,
           error: null,
           isLoading: false,
         });
-        renewal = setTimeout(
-          () => {
-            void load(data);
-          },
-          Math.max(0, data.expiresAt - Date.now() - RENEW_EARLY_MS),
-        );
-        expiry = setTimeout(
-          () => {
-            if (!current()) return;
-            setState({ scope, error: null, isLoading: true });
-            void load(data);
-          },
-          Math.max(0, data.expiresAt - Date.now()),
-        );
       } catch {
-        if (current()) {
-          grant = undefined;
-          clearTimers();
-          setState({ scope, error: ERROR, isLoading: false });
-        }
-      } finally {
-        pending = false;
+        if (current()) setState({ scope, error: ERROR, isLoading: false });
       }
     }
-    const resume = () => {
-      if (document.visibilityState !== "visible" || !current() || !grant)
-        return;
-      if (Date.now() >= grant.expiresAt)
-        setState({ scope, error: null, isLoading: true });
-      if (Date.now() >= grant.expiresAt - RENEW_EARLY_MS) void load(grant);
-    };
-    document.addEventListener("visibilitychange", resume);
     void load();
     return () => {
       active = false;
       controller.abort();
-      clearTimers();
-      document.removeEventListener("visibilitychange", resume);
+      identity.removeEventListener("abort", abortIdentity);
     };
-  }, [workspaceId, fileId, userId, accessToken, scope, attempt]);
+  }, [workspaceId, fileId, userId, generation, enabled, scope, attempt]);
 
   const owned = state?.scope === scope ? state : undefined;
-  const enabled = !!fileId && !!userId && !!accessToken;
   return {
-    url:
-      enabled && owned?.expiresAt && owned.expiresAt > Date.now()
-        ? owned.url
-        : undefined,
+    url: enabled ? owned?.url : undefined,
     error: enabled ? (owned?.error ?? null) : null,
     isLoading: enabled && (owned?.isLoading ?? true),
     retry,
+    reportFrameError,
   };
 }

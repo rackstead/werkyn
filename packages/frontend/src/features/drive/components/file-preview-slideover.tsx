@@ -56,10 +56,22 @@ export function FilePreviewSlideover({
       onCloseAutoFocus={onCloseAutoFocus}
       className="max-w-2xl border-l"
       actions={
-        <Button variant="ghost" size="sm" onClick={() => onDownload(file)}>
-          <Download className="h-4 w-4 mr-1" />
-          Download
-        </Button>
+        <>
+          {isPdf && !pdf.error && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={pdf.retry}
+              disabled={pdf.isLoading}
+            >
+              Reload preview
+            </Button>
+          )}
+          <Button variant="ghost" size="sm" onClick={() => onDownload(file)}>
+            <Download className="h-4 w-4 mr-1" />
+            Download
+          </Button>
+        </>
       }
     >
       {/* Content */}
@@ -70,6 +82,7 @@ export function FilePreviewSlideover({
           pdfUrl={pdf.url}
           pdfError={pdf.error}
           retryPdf={pdf.retry}
+          onPdfError={pdf.reportFrameError}
           textContent={textContent}
           file={file}
           Icon={Icon}
@@ -97,6 +110,7 @@ function PreviewContent({
   pdfUrl,
   pdfError,
   retryPdf,
+  onPdfError,
   textContent,
   file,
   Icon,
@@ -106,6 +120,7 @@ function PreviewContent({
   pdfUrl: string | undefined;
   pdfError: string | null;
   retryPdf: () => void;
+  onPdfError: () => void;
   textContent: string | undefined;
   file: DriveFile;
   Icon: React.ComponentType<{ className?: string }>;
@@ -162,6 +177,12 @@ function PreviewContent({
       <iframe
         src={pdfUrl}
         referrerPolicy="no-referrer"
+        ref={(node) => {
+          if (!node) return;
+          // Listen directly: the native iframe error event does not bubble.
+          node.addEventListener("error", onPdfError);
+          return () => node.removeEventListener("error", onPdfError);
+        }}
         title={file.name}
         className="h-[60vh] w-full rounded-md border"
       />

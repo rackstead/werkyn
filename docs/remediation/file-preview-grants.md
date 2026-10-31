@@ -7,6 +7,11 @@ keys retain their independent header-only policy, and public file/wiki shares,
 account links, OIDC callbacks and WebSocket first-message authentication keep
 their separate contracts.
 
+Roll out the matching frontend and backend together. Already-open older tabs
+that put access JWTs in PDF URLs need an application reload, and custom HTTP
+clients using query credentials must migrate to the Authorization header.
+There is no generic query-token compatibility fallback.
+
 The native PDF iframe previously put the full access JWT in its URL. It now
 requests a grant through the authenticated API:
 
@@ -40,25 +45,33 @@ storage/download implementation does not implement byte ranges: requests with
 `Range` still receive its whole-file `200` stream. This change adds no `206`,
 range-resume, storage API or buffering redesign.
 
-The frontend owns each grant in the open preview's component state. File,
-workspace, account or access-token changes abort old requests and discard their
-results; closing the preview removes its timers and listeners. API requests use
-the existing identity guards and bounded authentication replay. The preview
-renews thirty seconds before expiry. When the source access token is the bound,
-it uses the existing shared session-refresh coordinator once and adopts a
-changed token; an unchanged/failed refresh stops with visible retry instead of
-a renewal loop. A delayed renewal unloads expired content, and reopening or
-retrying requests a new grant. The iframe sends no referrer.
+The frontend owns one usable grant URL for the open file, workspace and identity.
+Resource/account changes and closing the preview abort old requests and discard
+late results. An already displayed whole-file200 response stays in the native
+viewer through grant expiry, focus changes and same-user access-token rotation;
+it is not periodically downloaded again or removed by a background renewal.
+Reload preview deliberately requests a new grant, and failed acquisition shows
+Retry preview. The iframe sends no referrer.
 
-Renewal changes the native iframe URL and can reload the PDF or reset its
-position. A custom viewer that preserves reading position and efficient byte
-ranges is separate work. Responses already authorized before a concurrent
-revocation or expiry may finish, and decoded bytes already shown by the browser
-are not remotely erased. A leaked preview URL remains a short-lived read bearer
-for that particular file; proxies should avoid retaining its query values.
-Known application log fields redact it through the existing token policy.
-Historical logs, browser/provider behavior, external collectors, custom API-base
-hosting and broad browser/runtime release validation remain separate gates.
+Before exposing a new URL, the client requires at least thirty seconds of
+remaining grant lifetime. Slow acquisition or a short source token uses the
+existing shared session-refresh coordinator once and requires a changed token;
+a concurrent ordinary API refresh can supply that token instead. One replacement
+grant must then have enough lifetime, or visible retry stops the attempt without
+a loop. Existing identity guards and bounded API authentication replay remain.
+Reported iframe errors show retry. Cross-origin/native-viewer HTTP status cannot
+be inferred reliably, so Reload preview stays available for a blank or failed
+viewer even when its browser does not report an iframe error.
+
+Expiry, session ending and current file authority still refuse every later
+server read; keeping an already received document does not extend the grant.
+Responses authorized before concurrent revocation/expiry may finish, and decoded
+bytes already shown by a browser are not remotely erased. Explicit reload may
+reset reading position. Efficient byte ranges/custom viewers remain separate.
+A leaked preview URL is a short-lived bearer for that one file; proxies should
+avoid retaining its query values. Known application log fields redact it through
+the existing token policy. Historical retention, provider/browser behavior,
+custom API-base hosting and broad runtime release validation remain open.
 
 `file-preview-grants.test.mjs` exercises real TCP HTTP, PostgreSQL and a raw
 WebSocket connection with synthetic local fixtures. It checks generic query
@@ -66,17 +79,20 @@ read/write refusal, separate credential purposes, strict claims, current
 session/file authority, legacy/API-key compatibility, streaming/HEAD, inherited
 Range200 behavior and safe missing-content responses. Authentication unit tests
 compare the shared predicate and safe failure diagnostics. Frontend tests cover
-resource/identity/close cancellation, API bases, expiry/renewal, source-bound
-refresh, no-loop/error/retry behavior and the iframe's no-referrer attribute.
+resource/identity/close cancellation, API bases, stable loaded documents across
+expiry/token rotation, guarded initial acquisition, no-loop/error/retry behavior
+and the iframe's no-referrer attribute.
 
-A local Chromium141/Playwright1.56.1 Vite development harness also exercised
-the actual component/hook/API with real TCP/PostgreSQL. It observed the iframe's
-scoped URL, exact streamed PDF bytes/headers and close cancellation. A genuine
-eight-second source JWT expired while its real refresh was held: the iframe
-unloaded, its expired grant received401, and preview renewal plus an ordinary
-API401 shared exactly one cookie refresh before adopting the new access token.
-An account switch removed the old iframe and the other account's file request
-was refused. No observed URL contained an ordinary access JWT. This is a source
-component/network/lifecycle proof, not the production bundle or full router.
-The cached headless shell reports `pdfViewerEnabled=false`, and its screenshot
-shows the blank native-viewer area; visual PDF rendering is not claimed.
+A local Chromium141/Playwright1.56.1 Vite development harness exercises the
+actual component/hook/API over real TCP/PostgreSQL. The corrected lifecycle
+kept the same iframe URL and request count during same-user token rotation;
+closing aborted held acquisition, and switching accounts removed the old
+iframe. Explicit reload received a genuine eight-second source-bound grant,
+kept that short URL out of the iframe, and shared exactly one real cookie
+refresh with an ordinary API401 before adopting a fresh token. A separate read
+of the expired grant received401. Exact PDF bytes/headers and absence of ordinary
+access JWTs in observed URLs were verified. This is source-component/network
+proof, not production-bundle/full-router or native visual rendering validation:
+the cached headless shell reports `pdfViewerEnabled=false`. Dispatched DOM error
+tests establish listener wiring/cleanup only; cross-origin HTTP error detection
+is not inferred from them.

@@ -14,6 +14,8 @@ const pdf = vi.hoisted(() => ({
   url: undefined as string | undefined,
   error: null as string | null,
   retry: vi.fn(),
+  reportFrameError: vi.fn(),
+  isLoading: false,
 }));
 vi.mock("../hooks/use-pdf-preview", () => ({ usePdfPreview: () => pdf }));
 
@@ -27,6 +29,8 @@ afterEach(() => {
   pdf.url = undefined;
   pdf.error = null;
   pdf.retry.mockClear();
+  pdf.reportFrameError.mockClear();
+  pdf.isLoading = false;
 });
 
 const file = {
@@ -93,7 +97,7 @@ describe("native PDF preview", () => {
   it("embeds the native streaming URL without sending a referrer", () => {
     pdf.url =
       "/api/workspaces/workspace-1/files/file-1/preview?token=scoped-grant";
-    render(
+    const view = render(
       <FilePreviewSlideover
         file={document}
         workspaceId="workspace-1"
@@ -107,6 +111,13 @@ describe("native PDF preview", () => {
     expect(frame.tagName).toBe("IFRAME");
     expect(frame.getAttribute("src")).toBe(pdf.url);
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+    fireEvent.click(screen.getByRole("button", { name: "Reload preview" }));
+    expect(pdf.retry).toHaveBeenCalledTimes(1);
+    fireEvent.error(frame);
+    expect(pdf.reportFrameError).toHaveBeenCalledTimes(1);
+    view.unmount();
+    fireEvent.error(frame);
+    expect(pdf.reportFrameError).toHaveBeenCalledTimes(1);
   });
   it("shows a visible error and a deliberate preview retry", () => {
     pdf.error = "PDF preview could not be loaded. Try again.";

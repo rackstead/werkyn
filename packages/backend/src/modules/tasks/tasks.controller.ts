@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import * as tasksService from "./tasks.service.js";
-import { notify } from "../../utils/notify.js";
+import { deliverNotification } from "../notifications/notification-delivery.js";
 import type {
   CreateTaskInput,
   UpdateTaskInput,
@@ -14,6 +14,54 @@ import type {
   BulkDeleteInput,
   TaskDependencyInput,
 } from "@pm/shared";
+
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+]);
+
+function postCommitDiagnostics(error: unknown) {
+  try {
+    const errorKind = error instanceof TypeError ? "type_error"
+      : error instanceof Error ? "error" : "unknown";
+    const descriptor = typeof error === "object" && error !== null
+      ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
+    const code = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    return {
+      errorKind,
+      ...(typeof code === "string" && NETWORK_ERROR_CODES.has(code) ? { errorCode: code } : {}),
+    };
+  } catch {
+    return { errorKind: "unknown" };
+  }
+}
+
+function afterTaskCommit(
+  request: FastifyRequest,
+  mutation: {
+    operation: "update" | "move" | "assign" | "duplicate";
+    projectId: string;
+    taskId: string;
+    event: "task_updated" | "task_moved" | "task_created";
+    notificationDeliveryIds: string[];
+  },
+) {
+  const { operation, projectId, taskId, event, notificationDeliveryIds } = mutation;
+  try {
+    request.server.broadcast(projectId, event, { taskId });
+  } catch (error) {
+    request.log.error(
+      { stage: "task_broadcast", operation, taskId, ...postCommitDiagnostics(error) },
+      "Could not broadcast committed task change",
+    );
+  }
+  for (const id of notificationDeliveryIds) {
+    void deliverNotification(request.server.prisma, request.server, id, { log: request.server.log })
+      .catch((error) => request.log.error(
+        { stage: "notification_delivery", operation, taskId, notificationDeliveryId: id, ...postCommitDiagnostics(error) },
+        "Committed task notification remains queued for retry",
+      ));
+  }
+}
 
 export async function listTasksHandler(
   request: FastifyRequest,
@@ -64,42 +112,11 @@ export async function updateTaskHandler(
 ) {
   const params = request.params as { tid: string };
   const body = request.body as UpdateTaskInput;
-  const oldTask = body.statusId
-    ? await request.server.prisma.task.findUnique({
-        where: { id: params.tid },
-        select: { statusId: true },
-      })
-    : null;
-  const task = await tasksService.updateTask(
-    request.server.prisma,
-    params.tid,
-    request.user!.id,
-    request.workspaceMember!.role,
-    body,
+  const { result: task, projectId, notificationDeliveryIds } = await tasksService.updateTaskWithNotifications(
+    request.server.prisma, params.tid, request.user!.id,
+    request.workspaceMember!.role, body, request.user!.displayName,
   );
-  request.server.broadcast(task.projectId, "task_updated", { taskId: task.id });
-
-  // Notify assignees on status change
-  if (body.statusId && oldTask && oldTask.statusId !== body.statusId) {
-    const assigneeIds = task.assignees.map((a: { userId: string }) => a.userId);
-    if (assigneeIds.length > 0) {
-      const statusName = task.status?.name || "new status";
-      notify(request.server.prisma, request.server, {
-        recipients: assigneeIds,
-        type: "TASK_STATUS_CHANGED",
-        title: `"${task.title}" moved to ${statusName}`,
-        body: `${request.user!.displayName} changed the status`,
-        data: {
-          taskId: task.id,
-          projectId: task.projectId,
-          actorId: request.user!.id,
-          actorName: request.user!.displayName,
-          taskTitle: task.title,
-        },
-        excludeUserId: request.user!.id,
-      }).catch((err) => request.log.error(err, "Failed to send status change notification"));
-    }
-  }
+  afterTaskCommit(request, { operation: "update", projectId, taskId: task.id, event: "task_updated", notificationDeliveryIds });
   return reply.send({ data: task });
 }
 
@@ -126,39 +143,10 @@ export async function moveTaskHandler(
 ) {
   const params = request.params as { tid: string };
   const body = request.body as MoveTaskInput;
-  const oldTask = await request.server.prisma.task.findUnique({
-    where: { id: params.tid },
-    select: { statusId: true, title: true, assignees: { select: { userId: true } } },
-  });
-  const result = await tasksService.moveTask(
-    request.server.prisma,
-    params.tid,
-    request.user!.id,
-    body,
+  const { result, projectId, notificationDeliveryIds } = await tasksService.moveTaskWithNotifications(
+    request.server.prisma, params.tid, request.user!.id, body, request.user!.displayName,
   );
-  request.server.broadcast(result.projectId, "task_moved", { taskId: params.tid });
-
-  // Notify assignees if status column changed
-  if (oldTask && oldTask.statusId !== body.statusId) {
-    const assigneeIds = oldTask.assignees.map((a) => a.userId);
-    if (assigneeIds.length > 0) {
-      const statusName = result.status?.name || "new status";
-      notify(request.server.prisma, request.server, {
-        recipients: assigneeIds,
-        type: "TASK_STATUS_CHANGED",
-        title: `"${oldTask.title}" moved to ${statusName}`,
-        body: `${request.user!.displayName} changed the status`,
-        data: {
-          taskId: params.tid,
-          projectId: result.projectId,
-          actorId: request.user!.id,
-          actorName: request.user!.displayName,
-          taskTitle: oldTask.title,
-        },
-        excludeUserId: request.user!.id,
-      }).catch((err) => request.log.error(err, "Failed to send move notification"));
-    }
-  }
+  afterTaskCommit(request, { operation: "move", projectId, taskId: params.tid, event: "task_moved", notificationDeliveryIds });
   return reply.send({ data: result });
 }
 
@@ -184,35 +172,11 @@ export async function addAssigneeHandler(
 ) {
   const params = request.params as { tid: string };
   const body = request.body as TaskAssigneeInput;
-  const assignee = await tasksService.addAssignee(
-    request.server.prisma,
-    params.tid,
-    request.user!.id,
-    request.workspaceMember!.role,
-    body,
+  const { result: assignee, projectId, notificationDeliveryIds } = await tasksService.addAssigneeWithNotifications(
+    request.server.prisma, params.tid, request.user!.id,
+    request.workspaceMember!.role, body, request.user!.displayName,
   );
-  const taskForAssignee = await request.server.prisma.task.findUnique({
-    where: { id: params.tid },
-    select: { projectId: true, title: true, project: { select: { name: true } } },
-  });
-  if (taskForAssignee) {
-    request.server.broadcast(taskForAssignee.projectId, "task_updated", { taskId: params.tid });
-    notify(request.server.prisma, request.server, {
-      recipients: [body.userId],
-      type: "TASK_ASSIGNED",
-      title: `You were assigned to "${taskForAssignee.title}"`,
-      body: `${request.user!.displayName} assigned you to this task`,
-      data: {
-        taskId: params.tid,
-        projectId: taskForAssignee.projectId,
-        actorId: request.user!.id,
-        actorName: request.user!.displayName,
-        taskTitle: taskForAssignee.title,
-        projectName: taskForAssignee.project.name,
-      },
-      excludeUserId: request.user!.id,
-    }).catch((err) => request.log.error(err, "Failed to send assignment notification"));
-  }
+  afterTaskCommit(request, { operation: "assign", projectId, taskId: params.tid, event: "task_updated", notificationDeliveryIds });
   return reply.status(201).send({ data: assignee });
 }
 
@@ -324,32 +288,10 @@ export async function duplicateTaskHandler(
   reply: FastifyReply,
 ) {
   const params = request.params as { tid: string };
-  const task = await tasksService.duplicateTask(
-    request.server.prisma,
-    params.tid,
-    request.user!.id,
+  const { result: task, projectId, notificationDeliveryIds } = await tasksService.duplicateTaskWithNotifications(
+    request.server.prisma, params.tid, request.user!.id, request.user!.displayName,
   );
-  request.server.broadcast(task.projectId, "task_created", { taskId: task.id });
-
-  // Notify assignees (fire-and-forget)
-  const assigneeIds = task.assignees.map((a: { userId: string }) => a.userId);
-  if (assigneeIds.length > 0) {
-    notify(request.server.prisma, request.server, {
-      recipients: assigneeIds,
-      type: "TASK_ASSIGNED",
-      title: `You were assigned to "${task.title}"`,
-      body: `${request.user!.displayName} duplicated a task and assigned you`,
-      data: {
-        taskId: task.id,
-        projectId: task.projectId,
-        actorId: request.user!.id,
-        actorName: request.user!.displayName,
-        taskTitle: task.title,
-      },
-      excludeUserId: request.user!.id,
-    }).catch((err) => request.log.error(err, "Failed to send duplicate task notification"));
-  }
-
+  afterTaskCommit(request, { operation: "duplicate", projectId, taskId: task.id, event: "task_created", notificationDeliveryIds });
   return reply.status(201).send({ data: task });
 }
 

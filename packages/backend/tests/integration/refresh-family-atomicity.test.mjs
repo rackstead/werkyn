@@ -177,7 +177,7 @@ async function resetPassword(user) {
   await app.prisma.passwordResetToken.create({
     data: {
       userId: user.id,
-      token,
+      tokenHash: hashToken(token),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     },
   });

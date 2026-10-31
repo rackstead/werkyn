@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { after, before, test } from "node:test";
+import nodemailer from "nodemailer";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error(
@@ -43,6 +44,11 @@ const { PrismaClient } = await import("@prisma/client");
 const { buildApp } = await import("../../src/app.ts");
 const { hashPassword, verifyPassword } =
   await import("../../src/utils/passwords.ts");
+const { hashToken } = await import("../../src/utils/tokens.ts");
+const { resetTransporter } = await import("../../src/utils/mailer.ts");
+const originalTransport = nodemailer.createTransport;
+const mail = [];
+nodemailer.createTransport = () => ({ async sendMail(message) { mail.push(message); return {}; } });
 const authService = await import("../../src/modules/auth/auth.service.ts");
 const { refreshLockLimits } =
   await import("../../src/modules/auth/refresh-sessions.ts");
@@ -57,6 +63,7 @@ let address = 0;
 let holderPid = null;
 
 before(async () => {
+  resetTransporter();
   control = new PrismaClient({
     datasources: { db: { url: controlDatabaseUrl.toString() } },
   });
@@ -72,6 +79,8 @@ after(async () => {
       where: { email: { endsWith: `@${domain}` } },
     });
   } finally {
+    nodemailer.createTransport = originalTransport;
+    resetTransporter();
     const closed = await Promise.allSettled([
       app?.close(),
       control?.$disconnect(),
@@ -112,7 +121,7 @@ async function issueResetToken(user, { expiresInMs = HOUR_MS, usedAt } = {}) {
   await control.passwordResetToken.create({
     data: {
       userId: user.id,
-      token,
+      tokenHash: hashToken(token),
       expiresAt: new Date(Date.now() + expiresInMs),
       usedAt,
     },
@@ -125,7 +134,7 @@ async function issueVerificationToken(user, { expiresInMs = HOUR_MS } = {}) {
   await control.emailVerificationToken.create({
     data: {
       userId: user.id,
-      token,
+      tokenHash: hashToken(token),
       expiresAt: new Date(Date.now() + expiresInMs),
     },
   });
@@ -190,7 +199,7 @@ async function storedPasswordHash(user) {
 }
 
 async function resetTokenRow(token) {
-  return control.passwordResetToken.findUnique({ where: { token } });
+  return control.passwordResetToken.findUnique({ where: { tokenHash: hashToken(token) } });
 }
 
 async function families(user) {
@@ -291,7 +300,7 @@ async function withControlLock(lock, body, { beforeRelease } = {}) {
 function resetTokenRowLock(token) {
   return async (tx) => {
     const rows = await tx.$queryRaw`
-      SELECT id FROM "PasswordResetToken" WHERE token = ${token} FOR UPDATE
+      SELECT id FROM "PasswordResetToken" WHERE "tokenHash" = ${hashToken(token)} FOR UPDATE
     `;
     assert.equal(rows.length, 1);
   };
@@ -300,7 +309,7 @@ function resetTokenRowLock(token) {
 function verificationTokenRowLock(token) {
   return async (tx) => {
     const rows = await tx.$queryRaw`
-      SELECT id FROM "EmailVerificationToken" WHERE token = ${token} FOR UPDATE
+      SELECT id FROM "EmailVerificationToken" WHERE "tokenHash" = ${hashToken(token)} FOR UPDATE
     `;
     assert.equal(rows.length, 1);
   };
@@ -566,9 +575,9 @@ test("a single reset changes the password, uses the token and ends every other s
     payload: { email: user.email },
   });
   assert.equal(requested.statusCode, 200, requested.body);
-  const { token } = await control.passwordResetToken.findFirstOrThrow({
-    where: { userId: user.id, usedAt: null },
-  });
+  const message = mail.findLast((message) => message.to === user.email);
+  const token = /reset-password\/([a-f0-9]{64})/.exec(message.text)?.[1];
+  assert(token, "the reset bearer comes from the outgoing link");
   const chosen = candidatePassword("single");
 
   const response = await reset(token, chosen);
@@ -767,7 +776,7 @@ test("concurrent verifications with one token: exactly one succeeds and the rest
   assert.equal(winner.json().data.user.emailVerified, true);
   assert.equal(await isVerified(user), true);
   assert.equal(
-    await control.emailVerificationToken.count({ where: { token } }),
+    await control.emailVerificationToken.count({ where: { tokenHash: hashToken(token) } }),
     0,
   );
 });
@@ -784,7 +793,7 @@ test("a verification whose token is replaced while it waits changes nothing", as
     {
       // A resend (or another use of the link) removes the token first.
       beforeRelease: (tx) =>
-        tx.emailVerificationToken.deleteMany({ where: { token } }),
+        tx.emailVerificationToken.deleteMany({ where: { tokenHash: hashToken(token) } }),
     },
   );
   assert.equal(response.statusCode, 404, response.body);
@@ -809,7 +818,7 @@ test("a verification whose token expires while it waits for the token is refused
   assert.match(response.json().message, /expired/i);
   assert.equal(await isVerified(user), false);
   assert.equal(
-    await control.emailVerificationToken.count({ where: { token } }),
+    await control.emailVerificationToken.count({ where: { tokenHash: hashToken(token) } }),
     1,
   );
 });
@@ -825,7 +834,7 @@ test("a verification blocked on its token past the lock timeout is a retryable 5
   assert.match(response.json().message, /busy/i);
   assert.equal(await isVerified(user), false);
   assert.equal(
-    await control.emailVerificationToken.count({ where: { token } }),
+    await control.emailVerificationToken.count({ where: { tokenHash: hashToken(token) } }),
     1,
   );
   const retried = await verify(token);

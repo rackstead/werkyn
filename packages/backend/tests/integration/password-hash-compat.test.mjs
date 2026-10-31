@@ -44,6 +44,7 @@ const domain = `hash-${suffix}.example.test`;
 const originalTransport = nodemailer.createTransport;
 const originalTestAccount = nodemailer.createTestAccount;
 let app;
+const mail = [];
 let counter = 0;
 let address = 0;
 
@@ -53,7 +54,8 @@ nodemailer.createTestAccount = async () => {
 nodemailer.createTransport = (options) => {
   assert.equal(options.host, "127.0.0.1");
   return {
-    async sendMail() {
+    async sendMail(message) {
+      mail.push(message);
       return {};
     },
   };
@@ -178,9 +180,9 @@ test("resetting a password replaces a bcrypt 5.1.1 hash", async () => {
     payload: { email: user.email },
   });
   assert.equal(requested.statusCode, 200, requested.body);
-  const { token } = await app.prisma.passwordResetToken.findFirstOrThrow({
-    where: { userId: user.id, usedAt: null },
-  });
+  const message = mail.findLast((message) => message.to === user.email);
+  const token = /reset-password\/([a-f0-9]{64})/.exec(message.text)?.[1];
+  assert(token, "the reset bearer comes from the outgoing link");
   const newPassword = "Werkyn-reset-password-1";
   const reset = await inject("POST", `/api/auth/reset-password/${token}`, {
     payload: { password: newPassword },

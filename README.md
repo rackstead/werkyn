@@ -409,14 +409,17 @@ backfills families for existing sessions, so users stay signed in. See
 A password-reset link works once: when the same link is submitted several
 times at once, one request changes the password and ends the sessions, and the
 others get `410` and change nothing. An email-verification link is likewise
-consumed by exactly one request. See
+consumed by exactly one request. Only SHA-256 digests of these account links
+are stored; outstanding links survive the coordinated upgrade described in
 [docs/remediation/sec-026.md](docs/remediation/sec-026.md).
 
 A password change writes the new password only if the current password it
 verified is still the account's password when the change commits. A change
 whose current password was replaced meanwhile by a password reset or another
 change gets `400 Current password is incorrect` and changes nothing. A
-successful reset also invalidates the account's other unused reset links. See
+successful password change or reset also invalidates the account's earlier
+unused reset links. A skipped deletion that might roll back makes the password
+operation return its retryable busy 503 without changing anything. See
 [docs/remediation/sec-027.md](docs/remediation/sec-027.md).
 
 ## Contributing

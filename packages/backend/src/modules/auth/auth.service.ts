@@ -4,7 +4,11 @@ import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { admitWithInvite } from "../invites/admission.service.js";
 import { logger } from "../../utils/logger.js";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
-import { signAccessToken, generateSecureToken } from "../../utils/tokens.js";
+import {
+  signAccessToken,
+  generateSecureToken,
+  hashToken,
+} from "../../utils/tokens.js";
 import {
   isBusy,
   limitLockWaits,
@@ -140,7 +144,7 @@ export async function register(
     await prisma.emailVerificationToken.create({
       data: {
         userId: user.id,
-        token: verificationToken,
+        tokenHash: hashToken(verificationToken),
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
       },
     });
@@ -408,7 +412,7 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   await prisma.passwordResetToken.create({
     data: {
       userId: user.id,
-      token,
+      tokenHash: hashToken(token),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
     },
   });
@@ -444,7 +448,7 @@ export async function resetPassword(
   newPassword: string,
 ) {
   const resetToken = await prisma.passwordResetToken.findUnique({
-    where: { token },
+    where: { tokenHash: hashToken(token) },
     select: { id: true, userId: true, usedAt: true, expiresAt: true },
   });
   // Refuses unusable tokens before the password is hashed. Requests that pass
@@ -502,6 +506,20 @@ export async function resetPassword(
         FOR UPDATE SKIP LOCKED
       )
     `;
+    // A skipped deletion has not committed and can still roll back. Refuse
+    // rather than leave that pre-existing sibling usable after success.
+    // This read takes no row locks, so deletes never wait for one another.
+    const remaining = await tx.passwordResetToken.findFirst({
+      where: { userId: resetToken.userId, usedAt: null },
+      select: { id: true },
+    });
+    if (remaining) {
+      throw new AppError(
+        503,
+        "Service Unavailable",
+        "This link is busy. Try again in a moment.",
+      );
+    }
     await tx.user.update({
       where: { id: resetToken.userId },
       data: { passwordHash },
@@ -522,7 +540,7 @@ function assertVerificationTokenUsable<T extends { expiresAt: Date }>(
 
 export async function verifyEmail(prisma: PrismaClient, token: string) {
   const verificationToken = await prisma.emailVerificationToken.findUnique({
-    where: { token },
+    where: { tokenHash: hashToken(token) },
     select: { id: true, userId: true, expiresAt: true },
   });
   assertVerificationTokenUsable(verificationToken, new Date());
@@ -607,7 +625,7 @@ export async function resendVerification(
   await prisma.emailVerificationToken.create({
     data: {
       userId: user.id,
-      token,
+      tokenHash: hashToken(token),
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
     },
   });

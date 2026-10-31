@@ -17,7 +17,7 @@ import { MentionsWidget } from "@/features/dashboard/components/mentions-widget"
 import { ActivityFeedWidget } from "@/features/dashboard/components/activity-feed-widget";
 import { CustomizeDashboardDialog } from "@/features/dashboard/components/customize-dashboard-dialog";
 import { DEFAULT_WIDGET_ORDER } from "@/features/dashboard/widget-registry";
-import { TaskSlideover } from "@/features/tasks/components/task-slideover";
+import { TaskSlideover, usePreloadTaskSlideover } from "@/features/tasks";
 import { Button } from "@/components/ui/button";
 import { Plus, Settings } from "lucide-react";
 import { useState } from "react";
@@ -46,6 +46,7 @@ function WorkspaceDashboard() {
   const workspaceId = workspace?.id ?? "";
 
   useWorkspaceRealtime(workspaceId);
+  usePreloadTaskSlideover();
 
   const { data, isLoading } = useDashboard(workspaceId);
   const projects = data?.data ?? [];

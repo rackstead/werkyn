@@ -9,10 +9,11 @@ import { Slideover } from "@/components/ui/slideover";
 import { timeAgo } from "@/lib/time-ago";
 import { apiBase } from "@/lib/api-url";
 
-interface FilePreviewSlideoverProps {
+export interface FilePreviewSlideoverProps {
   file: DriveFile;
   workspaceId: string;
   onClose: () => void;
+  onCloseAutoFocus?: (event: Event) => void;
   onDownload: (file: DriveFile) => void;
 }
 
@@ -20,6 +21,7 @@ export function FilePreviewSlideover({
   file,
   workspaceId,
   onClose,
+  onCloseAutoFocus,
   onDownload,
 }: FilePreviewSlideoverProps) {
   const previewType = getPreviewType(file.mimeType);
@@ -57,6 +59,7 @@ export function FilePreviewSlideover({
       titleClassName="text-sm font-medium truncate mr-4"
       titleTooltip={file.name}
       onClose={onClose}
+      onCloseAutoFocus={onCloseAutoFocus}
       className="max-w-2xl border-l"
       actions={
         <Button variant="ghost" size="sm" onClick={() => onDownload(file)}>

@@ -1,6 +1,6 @@
 import { useMemo, useState, useCallback } from "react";
 import { useSharedWithMe, useDownloadFile, type DriveFile } from "../api";
-import { FilePreviewSlideover } from "./file-preview-slideover";
+import { FilePreviewSlideover } from "./lazy-drive-panels";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { getFileIcon, formatFileSize } from "@/lib/file-icons";
 import { timeAgo } from "@/lib/time-ago";

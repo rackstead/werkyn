@@ -3,12 +3,28 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import path from "node:path";
+import { bundleBudget } from "./scripts/bundle-budget";
+import { manualChunks } from "./scripts/chunking";
 
 export default defineConfig({
-  plugins: [TanStackRouterVite(), react(), tailwindcss()],
+  plugins: [
+    // Each route component is its own chunk, loaded when the route is visited
+    // or a link to it is hovered (see src/lib/router.ts).
+    TanStackRouterVite({ autoCodeSplitting: true }),
+    react(),
+    tailwindcss(),
+    // Fails the build when the initial chunks outgrow their budget.
+    bundleBudget(),
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  build: {
+    rollupOptions: {
+      // One chunk for what every workspace page needs (see scripts/chunking.ts).
+      output: { manualChunks: manualChunks(), onlyExplicitManualChunks: true },
     },
   },
   server: {

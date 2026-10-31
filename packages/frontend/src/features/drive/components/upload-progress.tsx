@@ -18,7 +18,7 @@ function formatSpeed(bytesPerSecond: number): string {
   return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
 }
 
-interface UploadProgressProps {
+export interface UploadProgressProps {
   uploads: UploadItem[];
   onDismiss: () => void;
 }

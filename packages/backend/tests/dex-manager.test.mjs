@@ -211,6 +211,59 @@ test("a DATABASE_URL repeating a TLS parameter stops Dex from starting with a lo
   }
 });
 
+test("invalid sslaccept stops an existing Dex, logs safely without retrying, and recovers after correction", async () => {
+  const { logger, entries } = createLogger();
+  const attempts = [];
+  const manager = new dexModule.DexManager({
+    restartDelayMs: 20,
+    binaryPath: () => {
+      attempts.push(Date.now());
+      return fakeDex;
+    },
+  });
+  const original = { storage: env.DEX_STORAGE_TYPE, url: env.DATABASE_URL };
+  env.DEX_STORAGE_TYPE = "postgres";
+  const base = "postgresql://private-user:private-password@private-db/private-name?sslmode=require";
+  env.DATABASE_URL = `${base}&sslaccept=strict`;
+  try {
+    await manager.start(prisma, logger);
+    await waitFor(() => livePids().length === 1, "Dex did not start with strict verification");
+    for (const value of ["bogus", "", "ACCEPT_INVALID_CERTS", "private-token\nprivate-extra"]) {
+      const attemptsBefore = attempts.length;
+      const errorsBefore = entries.filter((entry) => entry.level === "error").length;
+      env.DATABASE_URL = `${base}&ssl%61ccept=${encodeURIComponent(value)}`;
+      await manager.restart(prisma);
+      await delay(100);
+      assert.equal(manager.isRunning, false);
+      assert.deepEqual(livePids(), []);
+      assert.equal(attempts.length, attemptsBefore, "Dex was spawned or retried");
+      const errors = entries.filter((entry) => entry.level === "error");
+      assert.equal(errors.length, errorsBefore + 1);
+      const error = errors.at(-1);
+      assert.equal(error.args.at(-1), "Failed to generate Dex config");
+      assert.equal(
+        error.args[0].message,
+        "DATABASE_URL sslaccept is not supported for Dex; use strict or accept_invalid_certs (case-sensitive), or omit it",
+      );
+      assert.doesNotMatch(
+        `${error.args[0].stack} ${JSON.stringify(error.args)}`,
+        /private-user|private-password|private-db|private-name|private-token|private-extra/,
+      );
+      assert.equal(entries.filter((entry) => /Restarting Dex in/.test(String(entry.args.at(-1)))).length, 0);
+    }
+
+    env.DATABASE_URL = `${base}&sslaccept=strict`;
+    await manager.restart(prisma);
+    await waitFor(() => livePids().length === 1, "Dex did not recover after sslaccept was corrected");
+    assert.equal(manager.isRunning, true);
+    assert.equal(attempts.length, 2);
+  } finally {
+    env.DEX_STORAGE_TYPE = original.storage;
+    env.DATABASE_URL = original.url;
+    await manager.stop();
+  }
+});
+
 test("start and a settings save racing at boot leave exactly one Dex running", async () => {
   const { logger } = createLogger();
   env.DEX_BINARY_PATH = fakeDex;

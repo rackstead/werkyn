@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { env } from "../config/env.js";
 import { authenticate } from "../middleware/authenticate.js";
 import { ForbiddenError } from "../utils/errors.js";
+import { frontendCacheControl, frontendPathname, isPublicFrontendRequest } from "./frontend-static.js";
 import {
   applyUntrustedContentPolicy,
   isSafeInlineContentType,
@@ -23,6 +24,9 @@ export default fp(async (fastify: FastifyInstance) => {
     "/uploads/*",
   ]);
   fastify.addHook("onSend", async (request, reply, payload) => {
+    if (env.NODE_ENV === "production" && isPublicFrontendRequest(request) && reply.statusCode >= 400) {
+      reply.header("Cache-Control", "no-store");
+    }
     if (uploadRoutes.has(request.routeOptions.url ?? "") && reply.statusCode < 400) {
       // Static metadata is available here; setHeaders runs before MIME metadata
       // and can have its response type overwritten by the static file server.
@@ -99,6 +103,18 @@ export default fp(async (fastify: FastifyInstance) => {
       root: frontendDist,
       prefix: "/",
       decorateReply: false,
+      // Reserved/malformed paths are not frontend files, and the build-asset
+      // namespace is not a document. Reject its directory URL before the
+      // static server's directory fallback; actual files still serve normally.
+      allowedPath: (pathname, _root, request) =>
+        frontendPathname(request) !== undefined && pathname !== "/assets" && pathname !== "/assets/",
+      setHeaders(reply, selectedPath) {
+        // Use the selected file, not just the request URL: a directory whose
+        // name looks like a chunk can still resolve to index.html, including
+        // on conditional responses where entity MIME headers are absent.
+        const relative = path.relative(frontendDist, selectedPath).split(path.sep).join("/");
+        reply.header("Cache-Control", frontendCacheControl(`/${relative}`));
+      },
     });
   }
 });

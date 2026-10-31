@@ -142,7 +142,9 @@ export const logMethodHook = {
     const [first, second] = cleaned;
     if (typeof second !== "string" && first && typeof first === "object") {
       const error = first instanceof Error ? first : (first as { err?: unknown }).err;
-      const ownMessage = !(first instanceof Error) && "msg" in first;
+      // Like pino, treat an undefined msg as absent, even when it is an own
+      // property. Otherwise pino copies the raw error message into msg.
+      const ownMessage = !(first instanceof Error) && (first as { msg?: unknown }).msg !== undefined;
       if (error instanceof Error && !ownMessage) {
         cleaned.splice(1, 0, redactText(error.message));
       }

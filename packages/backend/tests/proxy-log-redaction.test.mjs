@@ -292,6 +292,45 @@ test("structured URL siblings and messages share redaction at every level withou
   assert.doesNotMatch(sink.text(), /c05-[\w-]+-private/);
 });
 
+test("an undefined structured message keeps the error fallback redacted and defined messages selected", () => {
+  const sink = capture();
+  const log = createLogger(sink.stream);
+  const error = new Error(
+    "GET /api/auth/oidc/callback?code=c05-undefined-private&view=keep",
+  );
+  const message = error.message;
+  const stack = error.stack;
+  const context = Object.freeze({
+    err: error,
+    msg: undefined,
+    requestId: "undefined-message-context",
+  });
+  log.error(context);
+  log.error({ err: error, msg: "explicit context" });
+  log.error({ err: error, msg: null });
+  log.error(context, "explicit argument");
+  const records = sink.records();
+  assert.deepEqual(
+    records.map((record) => record.msg),
+    [
+      "GET /api/auth/oidc/callback?code=[REDACTED]&view=keep",
+      "explicit context",
+      null,
+      "explicit argument",
+    ],
+  );
+  assert.equal(records[0].requestId, "undefined-message-context");
+  assert.equal(context.err, error);
+  assert.equal(context.msg, undefined);
+  assert.equal(error.message, message);
+  assert.equal(error.stack, stack);
+  for (const record of records) {
+    assert.equal(record.err.type, "Error");
+    assert.match(record.err.stack, /Error: GET/);
+  }
+  assert.doesNotMatch(sink.text(), /c05-undefined-private/);
+});
+
 test("development pretty transports retain safe context and redact standalone and Fastify URL fields", async () => {
   const script = `
     import Fastify from 'fastify';

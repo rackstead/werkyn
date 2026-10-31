@@ -9,12 +9,15 @@
     "dev": "tsx watch --env-file=.env src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc -p scripts/perf",
     "postinstall": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "perf:seed": "tsx scripts/perf/seed.ts",
+    "perf:bench": "tsx scripts/perf/bench.ts",
+    "perf:statements": "tsx scripts/perf/statements.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

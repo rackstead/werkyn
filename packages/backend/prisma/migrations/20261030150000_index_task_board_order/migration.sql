@@ -1,0 +1,34 @@
+-- Board-order index for the task list.
+--
+-- The task list reads a project's tasks in board order (utils/task-order.ts):
+-- WHERE "projectId" = $1 AND "archived" = $2 ORDER BY "position", "createdAt",
+-- "id" with LIMIT/OFFSET. Without this index every page sorts all of the
+-- project's tasks; with it a page reads only the rows up to its offset and
+-- orders ties of ("position", "createdAt") by "id" in a small incremental
+-- sort (measured in docs/remediation/p02a.md).
+--
+-- "id" is deliberately not a key column. With it, the index becomes a cheap
+-- index-only source of all task IDs of a project, and the planner switched the
+-- notification list's task visibility check from per-row primary key lookups
+-- (under 1 ms) to hashing every readable task (about 12 ms).
+--
+-- Lock impact: CREATE INDEX holds a SHARE lock on "Task" while it builds, so
+-- task inserts, updates and deletes wait (reads do not). The shipped
+-- entrypoint applies migrations before the server starts, so nothing waits
+-- there. The build took about 0.2 s for 100k tasks and grows about linearly
+-- with the table.
+--
+-- CREATE INDEX CONCURRENTLY is not used: Prisma runs a migration script as
+-- one implicit transaction whenever it holds more than one statement, and a
+-- failed concurrent build leaves an invalid index behind that must be dropped
+-- by hand. Operators who apply migrations while an older version keeps
+-- writing can build the index first without blocking writes:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS "Task_projectId_archived_position_createdAt_idx"
+--     ON "Task"("projectId", "archived", "position", "createdAt");
+--
+-- and check that pg_index.indisvalid is true for it (drop and rebuild it if
+-- not). IF NOT EXISTS below then makes this migration a no-op.
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "Task_projectId_archived_position_createdAt_idx" ON "Task"("projectId", "archived", "position", "createdAt");

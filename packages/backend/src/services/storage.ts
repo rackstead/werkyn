@@ -106,16 +106,18 @@ export class LocalStorageProvider implements StorageProvider {
 
     // The file is created before any byte is read. Directories this call
     // creates are removed again if it fails while they are still empty, so a
-    // failed write leaves nothing behind; a concurrent failure may remove a
-    // directory between mkdir and open, which is retried.
+    // failed write leaves nothing behind. Concurrent cleanup may remove an
+    // ancestor during recursive mkdir or between mkdir and open; either
+    // missing-path failure retries the complete directory-and-file attempt.
     let created: string | undefined;
     let handle: FileHandle | undefined;
     try {
       for (let attempt = 1; !handle; attempt++) {
-        // Each made path is an ancestor of dir (or dir); keep the highest.
-        const made = await fs.mkdir(dir, { recursive: true });
-        if (made && (!created || made.length < created.length)) created = made;
         try {
+          // Each made path is an ancestor of dir (or dir); keep the highest
+          // across retries so any later failure cleans up what we created.
+          const made = await fs.mkdir(dir, { recursive: true });
+          if (made && (!created || made.length < created.length)) created = made;
           handle = await fs.open(fullPath, "w");
         } catch (error) {
           if (!isMissingBlobError(error) || attempt >= 3) throw error;

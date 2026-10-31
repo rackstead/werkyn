@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import { mkdtemp, readFile, rm, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -157,6 +158,151 @@ test("a failed write never removes a folder that a concurrent write into it need
       assert.deepEqual(await readdir(path.join(temp, "files", scope)), ["kept.bin"]);
     }
   } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function concurrentDirectoryCleanup(t, operation) {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "werkyn-storage-test-"));
+  const scope = "scope/nested";
+  const dir = path.join(temp, "files", scope);
+  const unrelated = path.join(temp, "unrelated.bin");
+  const mkdir = fs.mkdir;
+  const open = fs.open;
+  const failNow = deferred();
+  const failedOpened = deferred();
+  const failedFinished = deferred();
+  let interrupted = false;
+  let cleanupObserved = false;
+  try {
+    const storage = new LocalStorageProvider(temp);
+    await fs.writeFile(unrelated, "unrelated");
+    if (operation === "mkdir") {
+      let calls = 0;
+      t.mock.method(fs, "mkdir", async (...args) => {
+        if (args[0] === dir && ++calls === 2) {
+          // The failed writer has created these ancestors. Let its cleanup
+          // remove them while this recursive mkdir is in progress.
+          failNow.resolve();
+          await failedFinished.promise;
+          await assert.rejects(access(dir), { code: "ENOENT" });
+          cleanupObserved = interrupted = true;
+          throw Object.assign(new Error("parent removed during mkdir"), { code: "ENOENT" });
+        }
+        return mkdir(...args);
+      });
+    }
+    t.mock.method(fs, "open", async (...args) => {
+      if (args[0] === path.join(dir, "fails.bin")) {
+        const handle = await open(...args);
+        failedOpened.resolve();
+        return handle;
+      }
+      if (operation === "open" && args[0] === path.join(dir, "kept.bin") && !interrupted) {
+        interrupted = true;
+        // mkdir completed, but cleanup removes its ancestors before open.
+        failNow.resolve();
+        await failedFinished.promise;
+        await assert.rejects(access(dir), { code: "ENOENT" });
+        cleanupObserved = true;
+      }
+      return open(...args);
+    });
+    const failed = storage.saveStream("files", scope, "fails", ".bin", new Readable({
+      read() {
+        failNow.promise.then(() => this.destroy(new Error("client went away")));
+      },
+    }));
+    failed.then(failedFinished.resolve, failedFinished.resolve);
+    // The failing writer must own the new directory tree before the second
+    // writer starts; otherwise either mkdir could have created its ancestors.
+    await failedOpened.promise;
+    const bytes = Buffer.from([0, 1, 2, 127, 128, 255]);
+    const kept = storage.saveStream("files", scope, "kept", ".bin", Readable.from([bytes]));
+    const [failure, saved] = await Promise.allSettled([failed, kept]);
+    assert.equal(failure.status, "rejected");
+    assert.equal(cleanupObserved, true, "the other writer actually removed the directory tree");
+    assert.equal(saved.status, "fulfilled", saved.reason?.message);
+    assert.equal(saved.value.size, bytes.length);
+    assert.deepEqual(await readFile(path.join(temp, saved.value.storagePath)), bytes);
+    assert.deepEqual(await fs.readdir(dir), ["kept.bin"]);
+    assert.equal(await readFile(unrelated, "utf8"), "unrelated");
+  } finally {
+    t.mock.restoreAll();
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+test("a writer retries when concurrent cleanup interrupts recursive mkdir", { timeout: 5000 }, async (t) => {
+  await concurrentDirectoryCleanup(t, "mkdir");
+});
+
+test("a writer retries open after concurrent cleanup removes its directories", { timeout: 5000 }, async (t) => {
+  await concurrentDirectoryCleanup(t, "open");
+});
+
+test("directory creation retries are bounded and destroy an unread source on exhaustion", async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "werkyn-storage-test-"));
+  const error = Object.assign(new Error("parent keeps disappearing"), { code: "ENOENT" });
+  let calls = 0;
+  let reads = 0;
+  const source = new Readable({ read() { reads++; } });
+  try {
+    t.mock.method(fs, "mkdir", async () => { calls++; throw error; });
+    await assert.rejects(new LocalStorageProvider(temp).saveStream("files", "scope", "kept", ".bin", source),
+      (actual) => actual === error);
+    assert.equal(calls, 3);
+    assert.equal(reads, 0);
+    assert.equal(source.destroyed, true);
+    assert.deepEqual(await fs.readdir(temp), []);
+  } finally {
+    t.mock.restoreAll();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("permanent directory errors are not retried or hidden", async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "werkyn-storage-test-"));
+  const error = Object.assign(new Error("directory creation denied"), { code: "EACCES" });
+  let calls = 0;
+  const source = new Readable({ read() {} });
+  try {
+    await fs.writeFile(path.join(temp, "unrelated.bin"), "unrelated");
+    t.mock.method(fs, "mkdir", async () => { calls++; throw error; });
+    await assert.rejects(new LocalStorageProvider(temp).saveStream("files", "scope", "kept", ".bin", source),
+      (actual) => actual === error);
+    assert.equal(calls, 1);
+    assert.equal(source.destroyed, true);
+    assert.equal(await readFile(path.join(temp, "unrelated.bin"), "utf8"), "unrelated");
+    assert.deepEqual(await fs.readdir(temp), ["unrelated.bin"]);
+  } finally {
+    t.mock.restoreAll();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("exhausted open retries remove directories made by an earlier attempt", async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "werkyn-storage-test-"));
+  const error = Object.assign(new Error("parent keeps disappearing before open"), { code: "ENOENT" });
+  let calls = 0;
+  const source = new Readable({ read() {} });
+  try {
+    await fs.writeFile(path.join(temp, "unrelated.bin"), "unrelated");
+    t.mock.method(fs, "open", async () => { calls++; throw error; });
+    await assert.rejects(new LocalStorageProvider(temp).saveStream("files", "scope/nested", "kept", ".bin", source),
+      (actual) => actual === error);
+    assert.equal(calls, 3);
+    assert.equal(source.destroyed, true);
+    assert.deepEqual(await fs.readdir(temp), ["unrelated.bin"]);
+    assert.equal(await readFile(path.join(temp, "unrelated.bin"), "utf8"), "unrelated");
+  } finally {
+    t.mock.restoreAll();
     await rm(temp, { recursive: true, force: true });
   }
 });

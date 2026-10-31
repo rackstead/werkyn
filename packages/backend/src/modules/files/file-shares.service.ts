@@ -18,7 +18,30 @@ import {
   fileReadWhere,
   type AccessContext,
 } from "./file-access.js";
-import { notify } from "../../utils/notify.js";
+import {
+  deliverNotification,
+  enqueueNotification,
+} from "../notifications/notification-delivery.js";
+
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+]);
+
+function postCommitDiagnostics(error: unknown) {
+  try {
+    const errorKind = error instanceof TypeError ? "type_error"
+      : error instanceof Error ? "error" : "unknown";
+    const descriptor = typeof error === "object" && error !== null
+      ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
+    const code = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    return {
+      errorKind,
+      ...(typeof code === "string" && NETWORK_ERROR_CODES.has(code) ? { errorCode: code } : {}),
+    };
+  } catch {
+    return { errorKind: "unknown" };
+  }
+}
 
 // ─── Member Shares ──────────────────────────────────────
 
@@ -61,14 +84,16 @@ export async function createFileShares(
 
   if (data.length === 0) return { count: 0 };
 
-  const result = await prisma.fileShare.createMany({
-    data,
-    skipDuplicates: true,
-  });
+  // Internal callers without a broadcaster retain the existing pure write.
+  if (!fastify) {
+    return prisma.fileShare.createMany({ data, skipDuplicates: true });
+  }
 
-  // Send notifications to recipients
-  if (fastify && result.count > 0) {
-    const sharer = await prisma.user.findUnique({
+  const { result, notificationDeliveryId } = await prisma.$transaction(async (tx) => {
+    const result = await tx.fileShare.createMany({ data, skipDuplicates: true });
+    if (result.count === 0) return { result, notificationDeliveryId: null };
+
+    const sharer = await tx.user.findUnique({
       where: { id: sharedById },
       select: { displayName: true },
     });
@@ -77,7 +102,7 @@ export async function createFileShares(
     // Build notification title
     let title: string;
     if (fileIds.length === 1) {
-      const file = await prisma.file.findUnique({
+      const file = await tx.file.findUnique({
         where: { id: fileIds[0] },
         select: { name: true },
       });
@@ -87,15 +112,22 @@ export async function createFileShares(
     }
 
     const recipients = userIds.filter((uid) => uid !== sharedById);
-    if (recipients.length > 0) {
-      notify(prisma, fastify, {
-        recipients,
-        type: "FILE_SHARED",
-        title,
-        data: { fileId: fileIds[0], workspaceId },
-        excludeUserId: sharedById,
-      }).catch(() => {});
-    }
+    const notificationDeliveryId = await enqueueNotification(tx, {
+      recipients,
+      type: "FILE_SHARED",
+      title,
+      data: { fileId: fileIds[0], workspaceId },
+      excludeUserId: sharedById,
+    });
+    return { result, notificationDeliveryId };
+  });
+
+  if (notificationDeliveryId) {
+    void deliverNotification(prisma, fastify, notificationDeliveryId, { log: fastify.log })
+      .catch((error) => fastify.log.error(
+        { stage: "file_share_notification_delivery", workspaceId, notificationDeliveryId, ...postCommitDiagnostics(error) },
+        "Committed file-share notification remains queued for retry",
+      ));
   }
 
   return result;

@@ -55,9 +55,11 @@ the pending statement and observe the dead connection. A separate fixture
 callback kills its own process at the first postcommit broadcast boundary,
 before notification invocation; that does not claim a frame was sent.
 
-This is the task-comment creation subset of the caller-to-outbox gap. Task,
-template and file-share `notify()` callers still need their own transaction
-integration. Comment edit/delete behavior, authorization and revocation
+This is the task-comment creation subset of the caller-to-outbox gap. The
+other current transactional producers are documented in the
+[task](task-notification-outbox.md), [manual-template](template-notification-outbox.md)
+and [member file-share](file-share-notification-outbox.md) guides.
+Comment edit/delete behavior, authorization and revocation
 serialization, file policy, schema, API retry policy and worker timing are
 unchanged. Existing backup/import row restoration does not become a new
 notification producer.

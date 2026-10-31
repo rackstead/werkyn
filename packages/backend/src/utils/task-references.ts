@@ -155,24 +155,33 @@ export async function projectAssigneeIds(db: Db, projectId: string, userIds: rea
 
 /**
  * Clears a user's task and subtask assignments in one project or in every
- * project of a workspace, for a removal that has already deleted the user's
- * membership rows (so no new assignment can start). The rows are locked in
+ * project of a workspace, optionally retaining explicit project memberships.
+ * The caller has already deleted the membership or updated the role, so new
+ * assignments cannot pass the old access check. The rows are locked in
  * task id and subtask id order first (byte order, as JavaScript sorts): bulk
  * updates rewrite assignees task by task and subtask reordering updates
  * subtasks in that same order, so a removal and such a writer queue behind
- * each other instead of deadlocking.
+ * each other instead of deadlocking. Keep this order global across projects:
+ * every TaskAssignee first, then every Subtask, rather than clearing project
+ * by project.
  */
 export async function clearAssignments(
   tx: Db,
   userId: string,
-  scope: { projectId: string } | { workspaceId: string },
+  scope: { projectId: string } | { workspaceId: string; retainedProjectIds?: readonly string[] },
 ) {
+  const retained = "workspaceId" in scope ? scope.retainedProjectIds ?? [] : [];
+  const excludeRetained = retained.length
+    ? Prisma.sql`AND t."projectId" NOT IN (${Prisma.join(retained)})`
+    : Prisma.empty;
   const inScope =
     "projectId" in scope
       ? Prisma.sql`t."projectId" = ${scope.projectId}`
-      : Prisma.sql`t."projectId" IN (SELECT id FROM "Project" WHERE "workspaceId" = ${scope.workspaceId})`;
+      : Prisma.sql`t."projectId" IN (SELECT id FROM "Project" WHERE "workspaceId" = ${scope.workspaceId}) ${excludeRetained}`;
   const task: Prisma.TaskWhereInput =
-    "projectId" in scope ? { projectId: scope.projectId } : { project: { workspaceId: scope.workspaceId } };
+    "projectId" in scope
+      ? { projectId: scope.projectId }
+      : { project: { workspaceId: scope.workspaceId }, ...(retained.length ? { projectId: { notIn: [...retained] } } : {}) };
 
   await tx.$queryRaw`
     SELECT ta.id FROM "TaskAssignee" ta JOIN "Task" t ON t.id = ta."taskId"

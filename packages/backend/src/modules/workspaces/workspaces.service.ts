@@ -185,6 +185,15 @@ export async function updateMemberRole(
             select: { projectId: true },
           })
         : null;
+    if (retainedProjects) {
+      // The role update waits for assignments holding this membership. Clear
+      // every project that lost access in one globally ordered pass, retaining
+      // explicit memberships even when the new workspace role is VIEWER.
+      await clearAssignments(tx, targetUserId, {
+        workspaceId,
+        retainedProjectIds: retainedProjects.map((p) => p.projectId),
+      });
+    }
     return { updated, retainedProjects };
   });
 

@@ -254,6 +254,7 @@ async function refused(method, url, data, field, pageId) {
     response.body,
     /Prisma|recursion|SELECT|INSERT|UPDATE|stack|leaf|secret/,
   );
+  return body;
 }
 
 for (const kind of ["object", "array", "mixed"]) {
@@ -515,6 +516,28 @@ test("unsupported historical restore refuses without changing the page or histor
       .content,
     nested(124),
   );
+});
+
+test("stored legacy content is identified when a due snapshot refuses a metadata edit", async (t) => {
+  const page = await create();
+  const legacy = JSON.stringify(nested(124));
+  await app.prisma
+    .$executeRaw`UPDATE "WikiPage" SET "content" = ${legacy}::jsonb WHERE "id" = ${page.id}`;
+  for (const [field, value] of [
+    ["title", "Renamed"],
+    ["icon", "book"],
+  ]) {
+    await t.test(field, async () => {
+      const body = await refused(
+        "PATCH",
+        `/wiki/pages/${page.id}`,
+        { [field]: value },
+        "content",
+        page.id,
+      );
+      assert.equal(body.message, "Stored page content cannot be versioned");
+    });
+  }
 });
 
 test("body edits and a throttled metadata edit retain legacy JSON they do not write", async () => {

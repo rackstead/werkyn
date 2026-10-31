@@ -55,7 +55,10 @@ are accepted. Accessors and `toJSON` methods are never invoked by validation.
 
 Existing rows and historical versions are retained. Reads and comment body
 edits do not revalidate stored JSON. When an actual snapshot would copy
-unsupported legacy content, the operation returns 400 and keeps all rows.
+unsupported legacy content, the operation returns 400, says "Stored page
+content cannot be versioned" and keeps all rows. This includes a title/icon
+edit when an auto-save snapshot is due; it identifies the stored-content
+problem separately from invalid new input.
 Restoring unsupported historical content likewise returns 400 before writing
 the replaced page's snapshot. A throttled save that needs no snapshot can
 retain legacy content. Existing edit-lock, revision and tenant checks continue

@@ -126,7 +126,7 @@ export async function snapshotPage(
     where: { id: pageId },
     select: { title: true, content: true },
   });
-  assertWikiJson(page.content, "content");
+  assertWikiJson(page.content, "content", "snapshot");
   const latest = await tx.wikiPageVersion.aggregate({
     where: { pageId },
     _max: { versionNumber: true },

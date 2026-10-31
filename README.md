@@ -280,6 +280,11 @@ of expiration.
 
 ### Concurrent edits to wiki pages and task descriptions
 
+Wiki JSON content accepts up to 123 nested objects/arrays; comment selections
+accept up to 121 so they fit the backup envelope. Unsupported JSON gets a 400
+with field details before a write. See the [wiki JSON contract](docs/remediation/wiki-json-contract.md)
+for supported values, null/omitted fields and historical versions.
+
 Wiki pages carry a `revision` and tasks a `descriptionRevision`. Each advances
 with every stored change: a page's title, content or icon (a version restore
 included), or a task's description. To avoid overwriting a change you have not

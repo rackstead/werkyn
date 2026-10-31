@@ -1,5 +1,10 @@
 import { Priority } from "@prisma/client";
-import { CustomFieldTypeEnum, type BackupFile } from "@pm/shared";
+import {
+  CustomFieldTypeEnum,
+  MAX_JSON_STORAGE_DEPTH,
+  hasUnstorableJsonMembers,
+  type BackupFile,
+} from "@pm/shared";
 import { ValidationError } from "../../utils/errors.js";
 import { graphLimits } from "../../utils/graph-limits.js";
 
@@ -15,7 +20,7 @@ type BackupWikiSpace = BackupFile["wikiSpaces"][number];
  * backup.json depth limit (BACKUP_JSON_LIMITS.maxDepth, 128) already keeps
  * wiki content at or under this; the check keeps restore safe on its own.
  */
-export const MAX_RESTORE_JSON_DEPTH = 123;
+export const MAX_RESTORE_JSON_DEPTH = MAX_JSON_STORAGE_DEPTH;
 
 /** Column lengths in characters (`VarChar` in schema.prisma). */
 export const RESTORE_TEXT_LIMITS = Object.freeze({
@@ -72,16 +77,20 @@ function checkText(value: string | null | undefined, what: string, limit?: numbe
 }
 
 /**
- * Every string and member name of a JSON value must be storable, and the
- * value must nest at most MAX_RESTORE_JSON_DEPTH levels. Recursion is bounded
- * by that limit (checked before descending).
+ * Every string and member name must be storable, numbers must be finite,
+ * and a JSON value must nest at most MAX_RESTORE_JSON_DEPTH levels. Recursion
+ * is bounded by that limit (checked before descending).
  */
 export function checkJsonValue(value: unknown, what: string, level = 0): void {
+  if (typeof value === "number" && !Number.isFinite(value))
+    throw invalid(`${what} contains a non-finite number`);
   if (typeof value === "string") {
     if (!isStorableText(value)) throw invalid(`${what} contains a character that cannot be stored`);
     return;
   }
   if (value === null || typeof value !== "object") return;
+  if (hasUnstorableJsonMembers(value))
+    throw invalid(`${what} contains an object member that cannot be stored literally`);
   if (level >= MAX_RESTORE_JSON_DEPTH)
     throw invalid(`${what} is nested more than ${MAX_RESTORE_JSON_DEPTH} levels deep`);
   if (Array.isArray(value)) {
@@ -220,7 +229,7 @@ function checkWikiGraph(backup: BackupFile, seen: Set<string>) {
  * is reported; messages name a position in the file, never its content.
  *
  * Refused: IDs repeated within the scope they resolve in, text that a column
- * cannot hold (too long, U+0000, an unpaired surrogate), JSON nested deeper
+ * cannot hold (too long, U+0000, an unpaired surrogate), non-finite JSON numbers, JSON nested deeper
  * than MAX_RESTORE_JSON_DEPTH, timestamps PostgreSQL cannot store, an unknown
  * priority or custom-field type, dependency cycles and invalid wiki trees.
  * Problems restore can repair without guessing (references outside their

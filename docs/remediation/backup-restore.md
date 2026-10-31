@@ -89,9 +89,15 @@ and never quote its content.
   title 255, comment 10,000, channel description 500, reaction 32, wiki space
   name 100, page title 500, page comment 10,000, highlight id 100).
 - **JSON nested deeper than 123 levels**, or with such a character in a value
-  or member name. This covers page content, activity details and comment
-  selections. 123 is the deepest Prisma stores in one insert. The
+  or member name, or a non-finite number. This covers page content, activity
+  details and comment selections. 123 is the deepest Prisma stores in one insert. The
   `backup.json` depth limit of 128 already keeps page content within it.
+- **Serializer-interpreted object members** in those JSON fields: own
+  `__proto__`, or an own `__prismaRawParameters__` marker equal to `true`.
+  These would be dropped or interpreted instead of stored literally. Preview
+  and restore refuse them at nested positions before effects; supported
+  literal keys and disabled markers are retained. See
+  [wiki-json-contract.md](wiki-json-contract.md).
 - **Timestamps PostgreSQL cannot store** (comments, activity, messages, page
   comments), and an **unknown priority or custom-field type**.
 - **A dependency cycle among the tasks of one project**, including a task
@@ -146,10 +152,10 @@ repaired as described, whatever its version.
 
 ## Not covered
 
-- Saving wiki page content nested more than 123 levels through the wiki API
-  (create or update) still fails with a 500 from Prisma ("recursion limit
-  exceeded"). Nothing is written. It is in the wiki module and the shared
-  page schema, outside this change.
+- Wiki JSON writes now reject unsupported content before storage: page content
+  is limited to 123 object/array levels and comment selections to 121, so both
+  fit the backup depth envelope. See [wiki-json-contract.md](wiki-json-contract.md)
+  for the field contract and historical snapshot/restore behavior.
 - Rewriting asset paths in page content (in preview too, to count the files
   pages use) walks the archive paths as a radix tree at each `assets/` in a
   string, so each occurrence costs at most the longest archive path (1,024

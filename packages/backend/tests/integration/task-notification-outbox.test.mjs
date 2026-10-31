@@ -33,7 +33,7 @@ const fixtures = [], observations = [], broadcasts = [];
 const children = new Map();
 const sockets = new Set(), requestErrors = [];
 let app, control, port;
-let broadcastFailure, throwAfterToast = false;
+let broadcastFailure, deliveryLogFailure, throwAfterToast = false;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(check, label, budget = 3000) {
   const end = Date.now() + budget;
@@ -171,6 +171,11 @@ async function startChild(mode) {
 
 before(async () => {
   app = await buildApp();
+  const deliveryError = app.log.error.bind(app.log);
+  app.log.error = (...args) => {
+    if (deliveryLogFailure && args[1] === "Could not claim notification delivery") throw deliveryLogFailure;
+    deliveryError(...args);
+  };
   const broadcast = app.broadcast.bind(app);
   app.broadcast = (...args) => {
     broadcasts.push(args);
@@ -203,7 +208,8 @@ before(async () => {
       ELSE scoped_project := item->'data'->>'projectId'; END IF;
       SELECT * INTO active FROM tno_hook WHERE "projectId" = scoped_project AND stage = TG_TABLE_NAME;
       IF FOUND THEN
-        IF active.kind = 'fault' THEN PERFORM nextval('tno_faults'); RAISE EXCEPTION 'synthetic task outbox fault';
+        IF active.kind = 'fault' OR (active.kind = 'claim-fault' AND TG_OP = 'UPDATE') THEN
+          PERFORM nextval('tno_faults'); RAISE EXCEPTION 'synthetic task outbox fault';
         ELSIF active.kind = 'barrier' THEN PERFORM pg_advisory_xact_lock(${BARRIER}); END IF;
       END IF;
       RETURN NEW;
@@ -215,6 +221,7 @@ before(async () => {
     await app.prisma.$executeRawUnsafe(`CREATE TRIGGER tno_hook BEFORE INSERT ON "${table}" FOR EACH ROW EXECUTE FUNCTION tno_hook()`);
   }
   await app.prisma.$executeRawUnsafe('CREATE TRIGGER tno_audit AFTER INSERT ON "NotificationDelivery" FOR EACH ROW EXECUTE FUNCTION tno_audit()');
+  await app.prisma.$executeRawUnsafe('CREATE TRIGGER tno_claim_hook BEFORE UPDATE ON "NotificationDelivery" FOR EACH ROW EXECUTE FUNCTION tno_hook()');
 });
 
 after(async () => {
@@ -223,6 +230,7 @@ after(async () => {
   await Promise.allSettled([...children.values()]);
   if (app) {
     await app.prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS tno_audit ON "NotificationDelivery"');
+    await app.prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS tno_claim_hook ON "NotificationDelivery"');
     for (const table of ["NotificationDelivery", "ActivityLog", "Notification"]) await app.prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS tno_hook ON "${table}"`);
     await app.prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS tno_hook()');
     await app.prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS tno_audit()');
@@ -523,3 +531,32 @@ for (const item of diagnosticCases) {
     } finally { broadcastFailure = undefined; }
   });
 }
+
+test("qodo: supplied logger rejection retains committed task context and durable recovery", async () => {
+  const f = await fixture("claim-logger-rejection");
+  const startErrors = requestErrors.length;
+  await hook(f, "claim-fault");
+  // The primitive normally resolves pending after a claim fault. This supplied
+  // logger throws while handling that real fault to exercise the defensive catch.
+  deliveryLogFailure = Object.assign(new TypeError(PRIVATE_DIAGNOSTIC), { code: "EPIPE" });
+  try {
+    assert.equal((await mutate(f, "status")).status, 200);
+    await waitFor(() => requestErrors.slice(startErrors).some(([context]) =>
+      context?.stage === "notification_delivery" && context.taskId === f.task.id), "defensive task delivery diagnostic");
+    const entries = requestErrors.slice(startErrors).filter(([context]) =>
+      context?.stage === "notification_delivery" && context.taskId === f.task.id);
+    assert.equal(entries.length, 1);
+    const [intent] = await app.prisma.notificationDelivery.findMany({ where: scope(f.project.id) });
+    assert.deepEqual(entries[0][0], { stage: "notification_delivery", operation: "update", taskId: f.task.id,
+      notificationDeliveryId: intent.id, errorKind: "type_error", errorCode: "EPIPE" });
+    assert.equal(JSON.stringify(entries).includes(PRIVATE_DIAGNOSTIC), false);
+    assert.equal(JSON.stringify(entries).includes("synthetic task outbox fault"), false);
+    const pending = await state(f);
+    assert.equal(pending.tasks[0].statusId, f.status.Review.id);
+    assert.equal(pending.activity, 1); assert.equal(pending.outbox, 1); assert.equal(pending.notifications, 0); assert.equal(pending.broadcasts, 1);
+    deliveryLogFailure = undefined;
+    await unhook(f);
+    await processDueNotificationDeliveries(app.prisma, app, { log: app.log });
+    assert.equal((await state(f)).outbox, 0); assert.equal((await state(f)).notifications, 1);
+  } finally { deliveryLogFailure = undefined; await unhook(f); }
+});

@@ -6,6 +6,8 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { after, before, test } from "node:test";
 import sharp from "sharp";
+import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
+import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -21,6 +23,7 @@ const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 
 let app, user, workspace, token;
+const extraUsers = [];
 let requests = 0;
 
 before(async () => {
@@ -45,23 +48,24 @@ after(async () => {
       await app.prisma.blobCleanup.deleteMany({ where: { storagePath: { startsWith: `${workspace.id}/` } } });
     }
     if (user) await app.prisma.user.deleteMany({ where: { id: user.id } });
+    await app?.prisma.user.deleteMany({ where: { id: { in: extraUsers } } });
   } finally {
     await app?.close();
     await rm(storageDir, { recursive: true, force: true });
   }
 });
 
-function request(method, url, payload, headers = {}) {
+function request(method, url, payload, headers = {}, auth = token) {
   return app.inject({
     method,
     url,
     payload,
-    headers: { ...headers, authorization: `Bearer ${token}` },
+    headers: { ...headers, ...(auth ? { authorization: `Bearer ${auth}` } : {}) },
     remoteAddress: `10.82.${Math.floor(++requests / 250)}.${(requests % 250) + 1}`,
   });
 }
 
-async function upload(filename, contentType, bytes) {
+async function uploadResponse(filename, contentType, bytes, auth = token) {
   const boundary = `werkyn-thumbnail-${crypto.randomUUID()}`;
   const payload = Buffer.concat([
     Buffer.from(
@@ -70,11 +74,17 @@ async function upload(filename, contentType, bytes) {
     bytes,
     Buffer.from(`\r\n--${boundary}--\r\n`),
   ]);
-  const response = await request("POST", `/api/workspaces/${workspace.id}/files/upload`, payload, {
+  return request("POST", `/api/workspaces/${workspace.id}/files/upload`, payload, {
     "content-type": `multipart/form-data; boundary=${boundary}`,
-  });
+  }, auth);
+}
+
+async function upload(filename, contentType, bytes) {
+  const response = await uploadResponse(filename, contentType, bytes);
   assert.equal(response.statusCode, 201, response.body);
   const file = response.json().data;
+  assert.equal(file.mimeType, contentType);
+  assert.equal(file.size, bytes.length);
   // The original is always stored and served unchanged, thumbnail or not.
   const download = await request("GET", `/api/workspaces/${workspace.id}/files/${file.id}/download`);
   assert.equal(download.statusCode, 200);
@@ -111,7 +121,7 @@ test("raster uploads get a 400-pixel-wide WebP thumbnail without enlargement", a
   }
 });
 
-test("EXIF orientation is kept as metadata, not applied, as before", async () => {
+test("EXIF orientation remains unapplied, as before", async () => {
   const bytes = await solid(1000, 500, "#445566").jpeg().withMetadata({ orientation: 6 }).toBuffer();
   assert.equal((await sharp(bytes).metadata()).orientation, 6);
   const thumb = await thumbnail(await upload("rotated.jpg", "image/jpeg", bytes));
@@ -133,24 +143,55 @@ test("SVG declared as SVG is never rasterized", async () => {
   assert.equal(await thumbnail(file), null);
 });
 
-test("SVG bytes under a raster type are rendered by librsvg without fetching external references", async () => {
-  // The upload route trusts the client's declared type, so SVG content can
-  // reach sharp/librsvg. External references must not be loaded.
-  const marker = path.join(storageDir, "external-marker.png");
-  await solid(10, 10, "#ffffff").png().toFile(marker);
-  const svg = Buffer.from(
-    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="800" height="400">` +
-      `<rect width="800" height="400" fill="#000000"/>` +
-      `<image x="0" y="0" width="800" height="400" xlink:href="file://${marker}"/>` +
-      `<image x="0" y="0" width="800" height="400" href="http://127.0.0.1:9/never.png"/>` +
-      `</svg>`,
-  );
-  const thumb = await thumbnail(await upload("disguised.png", "image/png", svg));
-  assert.deepEqual([thumb.format, thumb.width, thumb.height], ["webp", 400, 200]);
-  const { channels } = await sharp(thumb.bytes).stats();
-  // Still black: neither the local file nor the URL was drawn.
-  assert.ok(channels.slice(0, 3).every((c) => c.max <= 8), JSON.stringify(channels.map((c) => c.max)));
+test("raster entry boundaries preserve originals and exclude unrelated detector/native dispatch", async () => {
+  await withDispatchSpies(async (state) => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>');
+    for (const [name, mime, bytes] of [
+      ["benign-svg.png", "image/png", svg],
+      ["ordinary-text.jpg", "image/jpeg", Buffer.from("A harmless text fixture.")],
+      ["passive-document.png", "image/png", makePdf()],
+      ["declared.svg", "image/svg+xml", svg],
+      ["ordinary.bin", "application/octet-stream", smallPng],
+    ]) {
+      const file = await upload(name, mime, bytes);
+      assert.equal(file.thumbnailPath, null, name);
+      assert.equal(state.detectorCalls, 0, name);
+      assert.equal(state.nativeCalls, 0, name);
+    }
+  });
 });
+
+// Match production's ESM Sharp and core detector class, not the distinct CJS
+// Sharp constructor or the Node detector subclass. Arm both with PNG before
+// interpreting any zero count. Unsupported fixtures never reach native code.
+async function withDispatchSpies(run) {
+  const detector = FileTypeParser.prototype.fromBuffer;
+  const render = sharp.prototype.toBuffer;
+  const state = { detectorCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
+  FileTypeParser.prototype.fromBuffer = async function (...args) {
+    state.detectorCalls++;
+    if (state.detectorMode === "throw") throw new Error("Owned detector failure");
+    if (state.detectorMode === "unknown") return undefined;
+    if (state.detectorMode === "disallowed") return { ext: "svg", mime: "image/svg+xml" };
+    return detector.apply(this, args);
+  };
+  sharp.prototype.toBuffer = function () {
+    state.nativeCalls++;
+    if (state.nativeMode === "throw") return Promise.reject(new Error("Owned transform failure"));
+    return Promise.resolve(smallWebp);
+  };
+  try {
+    const control = await upload("dispatch-control.png", "image/jpeg", smallPng);
+    assert.ok(control.thumbnailPath);
+    assert.equal(state.detectorCalls, 1, "Exact ESM detector spy must be armed");
+    assert.equal(state.nativeCalls, 1, "Exact ESM transform spy must be armed");
+    state.detectorCalls = state.nativeCalls = 0;
+    return await run(state);
+  } finally {
+    FileTypeParser.prototype.fromBuffer = detector;
+    sharp.prototype.toBuffer = render;
+  }
+}
 
 function hugePng(width, height) {
   // A valid 1-bit greyscale PNG; the pixel data deflates to a few kilobytes.
@@ -225,4 +266,212 @@ test("images larger than the thumbnail source limit are stored without being rea
   assert.ok(under.length < THUMBNAIL_SOURCE_MAX_BYTES, `${under.length}`);
   const thumbed = await thumbnail(await upload("under.png", "image/png", under));
   assert.deepEqual([thumbed.width, thumbed.height], [400, 400]);
+});
+
+test("small APNG content retains the PNG family's real thumbnail behavior", async () => {
+  const base = await solid(32, 16, "#228855").png().toBuffer();
+  const control = Buffer.alloc(8);
+  control.writeUInt32BE(1, 0);
+  const frame = Buffer.alloc(26);
+  frame.writeUInt32BE(32, 4);
+  frame.writeUInt32BE(16, 8);
+  frame.writeUInt16BE(1, 20);
+  frame.writeUInt16BE(10, 22);
+  const bytes = Buffer.concat([base.subarray(0, 33), pngChunk("acTL", control), pngChunk("fcTL", frame), base.subarray(33)]);
+  assert.equal((await fileTypeFromBuffer(bytes)).mime, "image/apng");
+  const thumb = await thumbnail(await upload("animation.png", "image/png", bytes));
+  assert.deepEqual([thumb.format, thumb.width, thumb.height], ["webp", 32, 16]);
+});
+
+function pngChunk(type, data) {
+  const body = Buffer.concat([Buffer.from(type), data]);
+  let crc = ~0;
+  for (const byte of body) {
+    crc ^= byte;
+    for (let k = 0; k < 8; k++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  const chunk = Buffer.alloc(body.length + 8);
+  chunk.writeUInt32BE(data.length, 0);
+  body.copy(chunk, 4);
+  chunk.writeUInt32BE((~crc) >>> 0, body.length + 4);
+  return chunk;
+}
+
+test("HEIF brands and both TIFF byte orders retain detector and transform dispatch", async () => {
+  await withDispatchSpies(async (state) => {
+    const cases = [];
+    for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
+      const bytes = Buffer.alloc(24);
+      bytes.writeUInt32BE(24);
+      bytes.write("ftyp" + brand, 4);
+      cases.push([brand, bytes]);
+    }
+    for (const little of [true, false]) for (const version of [42, 43]) {
+      const bytes = Buffer.alloc(16);
+      bytes.write(little ? "II" : "MM");
+      if (little) { bytes.writeUInt16LE(version, 2); bytes.writeUInt32LE(8, 4); }
+      else { bytes.writeUInt16BE(version, 2); bytes.writeUInt32BE(8, 4); }
+      cases.push([`${little ? "little" : "big"}-${version}`, bytes]);
+    }
+    // Container headers exercise dispatch only. The armed transform returns
+    // a known small WebP; these are never presented to a native decoder.
+    for (const [name, bytes] of cases) {
+      state.detectorCalls = state.nativeCalls = 0;
+      const file = await upload(`${name}.bin`, "image/heic", bytes);
+      assert.ok(file.thumbnailPath, name);
+      assert.equal(state.detectorCalls, 1, name);
+      assert.equal(state.nativeCalls, 1, name);
+    }
+  });
+});
+
+test("ordinary ISO envelopes bound detector entry and preserve original uploads", async () => {
+  await withDispatchSpies(async (state) => {
+    const header = (size, length = 24) => {
+      const bytes = Buffer.alloc(length);
+      bytes.writeUInt32BE(size);
+      bytes.write("ftypavif", 4);
+      return bytes;
+    };
+    // Plain header controls only; the armed transform returns a known WebP.
+    for (const size of [16, 20, 24]) {
+      state.detectorCalls = state.nativeCalls = 0;
+      assert.ok((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath);
+      assert.equal(state.detectorCalls, 1);
+      assert.equal(state.nativeCalls, 1);
+    }
+    const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
+    for (const [size, length] of [
+      [0, 24], [1, 24], [8, 24], [12, 24], [15, 24],
+      [28, 24], [16, 12], [THUMBNAIL_SOURCE_MAX_BYTES + 4, 24],
+    ]) {
+      state.detectorCalls = state.nativeCalls = 0;
+      const file = await upload(`omitted-${size}-${length}.avif`, "image/avif", header(size, length));
+      assert.equal(file.thumbnailPath, null);
+      assert.equal(state.detectorCalls, 0);
+      assert.equal(state.nativeCalls, 0);
+    }
+  });
+});
+
+test("detector refusal/failure and transform failure omit only the thumbnail", async () => {
+  await withDispatchSpies(async (state) => {
+    for (const mode of ["unknown", "disallowed", "throw"]) {
+      state.detectorMode = mode;
+      state.detectorCalls = state.nativeCalls = 0;
+      assert.equal((await upload(`${mode}.png`, "image/png", smallPng)).thumbnailPath, null);
+      assert.equal(state.detectorCalls, 1);
+      assert.equal(state.nativeCalls, 0);
+    }
+    state.detectorMode = "real";
+    state.nativeMode = "throw";
+    state.detectorCalls = state.nativeCalls = 0;
+    assert.equal((await upload("transform-failure.png", "image/png", smallPng)).thumbnailPath, null);
+    assert.equal(state.detectorCalls, 1);
+    assert.equal(state.nativeCalls, 1);
+  });
+});
+
+async function actor(role) {
+  const person = await app.prisma.user.create({
+    data: { email: `thumbnail-${crypto.randomUUID()}@example.test`, displayName: "Owned thumbnail actor", emailVerified: true },
+  });
+  extraUsers.push(person.id);
+  if (role) await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: person.id, role } });
+  const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.ts");
+  const session = await startRefreshSession(app.prisma, person.id);
+  return { id: person.id, token: signAccessToken({ sub: person.id, email: person.email, sid: session.familyId }) };
+}
+
+test("refused upload actors stop before storage, detector and native dispatch", async () => {
+  const viewer = await actor("VIEWER"), outsider = await actor();
+  await withDispatchSpies(async (state) => {
+    const save = app.storage.saveStream, read = app.storage.read;
+    let writes = 0, reads = 0;
+    const count = await app.prisma.file.count({ where: { workspaceId: workspace.id } });
+    app.storage.saveStream = function (...args) { writes++; return save.apply(this, args); };
+    app.storage.read = function (...args) { reads++; return read.apply(this, args); };
+    try {
+      for (const [auth, status] of [[null, 401], [viewer.token, 403], [outsider.token, 403]]) {
+        const response = await uploadResponse("refused.png", "image/png", smallPng, auth);
+        assert.equal(response.statusCode, status, response.body);
+      }
+      assert.equal(writes, 0); assert.equal(reads, 0);
+      assert.equal(state.detectorCalls, 0); assert.equal(state.nativeCalls, 0);
+      assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id } }), count);
+    } finally { app.storage.saveStream = save; app.storage.read = read; }
+  });
+});
+
+for (const recognized of [true, false]) test(`membership loss after staging rechecks ${recognized ? "raster" : "omitted-thumbnail"} uploads`, async () => {
+  const member = await actor("MEMBER");
+  const bytes = recognized ? smallPng : Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>');
+  const filename = `revoked-${crypto.randomUUID()}.png`, staged = [];
+  const saveStream = app.storage.saveStream, save = app.storage.save;
+  let enter, release, timer;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const released = new Promise(resolve => { release = resolve; });
+  app.storage.saveStream = async function (...args) {
+    const stored = await saveStream.apply(this, args); staged.push(stored.storagePath); enter(); await released; return stored;
+  };
+  app.storage.save = async function (...args) { const stored = await save.apply(this, args); staged.push(stored); return stored; };
+  let pending;
+  try {
+    pending = uploadResponse(filename, "image/png", bytes, member.token);
+    await Promise.race([entered, pending.then(response => { throw new Error(`Upload ended before staging barrier: ${response.statusCode}`); }), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Owned staging barrier not reached")), 3000); })]);
+    clearTimeout(timer);
+    await app.prisma.workspaceMember.delete({ where: { userId_workspaceId: { userId: member.id, workspaceId: workspace.id } } });
+    release(); const response = await pending;
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(staged.length, recognized ? 2 : 1);
+    assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id, name: filename } }), 0);
+    for (const p of staged) assert.equal(await app.storage.exists(p), false);
+    assert.equal(await app.prisma.blobCleanup.count({ where: { storagePath: { in: staged } } }), 0);
+  } finally {
+    clearTimeout(timer); release();
+    try { await pending; }
+    finally { app.storage.saveStream = saveStream; app.storage.save = save; }
+  }
+});
+
+for (const recognized of [true, false]) test(`failed File insert retains durable cleanup for ${recognized ? "original and thumbnail" : "omitted-thumbnail original"}`, async () => {
+  const suffix = crypto.randomBytes(5).toString("hex"), fault = `thumbnail_fault_${suffix}`;
+  const filename = `${fault}.png`, staged = [];
+  const guard = await upload(`guard-${suffix}.png`, "image/png", smallPng);
+  await app.prisma.blobCleanup.create({ data: { storagePath: guard.storagePath, availableAt: new Date(Date.now() + 3600000) } });
+  const guardQueue = await app.prisma.blobCleanup.findUniqueOrThrow({ where: { storagePath: guard.storagePath } });
+  const saveStream = app.storage.saveStream, save = app.storage.save, remove = app.storage.delete;
+  let installed = false;
+  try {
+    await app.prisma.$executeRawUnsafe(`CREATE FUNCTION ${fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.name='${filename}' THEN RAISE EXCEPTION 'Owned thumbnail insert fault' USING ERRCODE='23514'; END IF; RETURN NEW; END $$`);
+    await app.prisma.$executeRawUnsafe(`CREATE TRIGGER ${fault} BEFORE INSERT ON "File" FOR EACH ROW EXECUTE FUNCTION ${fault}()`); installed = true;
+    app.storage.saveStream = async function (...args) { const r = await saveStream.apply(this, args); staged.push(r.storagePath); return r; };
+    app.storage.save = async function (...args) { const r = await save.apply(this, args); staged.push(r); return r; };
+    app.storage.delete = function (p) {
+      if (staged.includes(p)) return Promise.reject(Object.assign(new Error("Owned thumbnail cleanup outage"), { code: "EIO" }));
+      return remove.call(this, p);
+    };
+    const bytes = recognized ? smallPng : Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>');
+    const response = await uploadResponse(filename, "image/png", bytes);
+    assert.equal(response.statusCode, 500, response.body);
+    assert.equal(staged.length, recognized ? 2 : 1);
+    assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id, name: filename } }), 0);
+    const queued = await app.prisma.blobCleanup.findMany({ where: { storagePath: { in: staged } }, orderBy: { storagePath: "asc" } });
+    assert.deepEqual(queued.map(r => r.storagePath), [...staged].sort());
+    for (const r of queued) { assert.ok(r.attempts >= 1); assert.match(r.lastError, /Owned thumbnail cleanup outage/); assert.equal(await app.storage.exists(r.storagePath), true); }
+  } finally {
+    app.storage.saveStream = saveStream; app.storage.save = save; app.storage.delete = remove;
+    if (installed) await app.prisma.$executeRawUnsafe(`DROP TRIGGER ${fault} ON "File"`);
+    await app.prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${fault}()`);
+  }
+  await app.prisma.blobCleanup.updateMany({ where: { storagePath: { in: staged } }, data: { availableAt: new Date(0) } });
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  const cleaned = await processBlobCleanup(app.prisma, app.storage, { paths: staged });
+  assert.equal(cleaned.deleted, staged.length);
+  assert.equal(await app.prisma.blobCleanup.count({ where: { storagePath: { in: staged } } }), 0);
+  for (const p of staged) assert.equal(await app.storage.exists(p), false);
+  assert.deepEqual(await app.prisma.blobCleanup.findUniqueOrThrow({ where: { storagePath: guard.storagePath } }), guardQueue);
+  assert.deepEqual(await app.storage.read(guard.storagePath), smallPng);
+  assert.ok(await app.prisma.file.findUnique({ where: { id: guard.id } }));
+  await app.prisma.blobCleanup.delete({ where: { storagePath: guard.storagePath } });
 });

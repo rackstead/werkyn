@@ -11,6 +11,7 @@ import { PassThrough } from "node:stream";
 import crypto from "node:crypto";
 import path from "node:path";
 import sharp from "sharp";
+import { fileTypeFromBuffer } from "file-type";
 import archiver from "archiver";
 import { env } from "../../config/env.js";
 import {
@@ -40,6 +41,41 @@ import {
  * into memory (see docs/remediation/p03a.md).
  */
 export const THUMBNAIL_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
+
+const THUMBNAIL_RASTER_TYPES = new Set([
+  "image/jpeg", "image/png", "image/apng", "image/webp", "image/tiff",
+  "image/gif", "image/avif", "image/heif", "image/heif-sequence",
+  "image/heic", "image/heic-sequence",
+]);
+const THUMBNAIL_RASTER_HEADERS = [
+  Buffer.from([0xff, 0xd8, 0xff]),
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from("GIF"),
+  Buffer.from([0x49, 0x49, 0x2a, 0x00]),
+  Buffer.from([0x49, 0x49, 0x2b, 0x00]),
+  Buffer.from([0x4d, 0x4d, 0x00, 0x2a]),
+  Buffer.from([0x4d, 0x4d, 0x00, 0x2b]),
+];
+const THUMBNAIL_HEIF_BRANDS = new Set([
+  "avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx",
+]);
+
+/** Keep unrelated document/archive parsers out of thumbnail detection. */
+function hasThumbnailRasterHeader(buffer: Buffer): boolean {
+  const header = buffer.subarray(0, 12);
+  if (THUMBNAIL_RASTER_HEADERS.some((prefix) =>
+    header.length >= prefix.length && header.subarray(0, prefix.length).equals(prefix),
+  )) return true;
+  if (header.length < 12) return false;
+  const boxSize = header.readUInt32BE(0);
+  return (
+    (header.toString("latin1", 0, 4) === "RIFF" && header.toString("latin1", 8, 12) === "WEBP") ||
+    (header.toString("latin1", 4, 8) === "ftyp" &&
+      THUMBNAIL_HEIF_BRANDS.has(header.toString("latin1", 8, 12)) &&
+      buffer.length >= 16 && boxSize >= 16 &&
+      boxSize <= buffer.length && boxSize <= THUMBNAIL_SOURCE_MAX_BYTES)
+  );
+}
 
 export async function uploadFileStream(
   prisma: PrismaClient,
@@ -75,7 +111,7 @@ export async function uploadFileStream(
     { maxSize: env.MAX_FILE_SIZE },
   );
 
-  // Generate thumbnail for images (non-SVG)
+  // Declared type is a hint; only recognized raster bytes get a thumbnail.
   let thumbnailPath: string | null = null;
   if (
     mimeType.startsWith("image/") &&
@@ -84,17 +120,22 @@ export async function uploadFileStream(
   ) {
     try {
       const originalBuffer = await storage.read(storagePath);
-      const thumbBuffer = await sharp(originalBuffer)
-        .resize(400, undefined, { withoutEnlargement: true })
-        .webp({ quality: 80 })
-        .toBuffer();
-      thumbnailPath = await storage.save(
-        `${workspaceId}/files`,
-        scopeId,
-        `${fileId}_thumb`,
-        ".webp",
-        thumbBuffer,
-      );
+      if (hasThumbnailRasterHeader(originalBuffer)) {
+        const detected = await fileTypeFromBuffer(originalBuffer);
+        if (detected && THUMBNAIL_RASTER_TYPES.has(detected.mime)) {
+          const thumbBuffer = await sharp(originalBuffer)
+            .resize(400, undefined, { withoutEnlargement: true })
+            .webp({ quality: 80 })
+            .toBuffer();
+          thumbnailPath = await storage.save(
+            `${workspaceId}/files`,
+            scopeId,
+            `${fileId}_thumb`,
+            ".webp",
+            thumbBuffer,
+          );
+        }
+      }
     } catch {
       // Non-blocking: continue without thumbnail
     }

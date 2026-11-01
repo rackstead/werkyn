@@ -85,6 +85,7 @@ const hookTables = [
   ["TaskReminderSent", "INSERT"],
   ["Notification", "INSERT"],
   ["NotificationDelivery", "DELETE"],
+  ["NotificationDelivery", "INSERT"],
 ];
 
 async function tableExists(table) {
@@ -749,6 +750,63 @@ test("two concurrent reminder runs send each due-date reminder exactly once", as
     assert.equal(toastsFor((n) => n.data?.taskId === task.id).length, 1, "one realtime push");
   }
   await retireTasks(...tasks);
+});
+
+test("policy: a never-queued one-day reminder is skipped after its day while the on-day control is delivered", { timeout: 15_000 }, async () => {
+  const missed = await assignedTask("policy-never-queued", day(1));
+  const controlTask = await assignedTask("policy-on-day-control", day(2));
+  const counts = async (task) => ({
+    markers: await app.prisma.taskReminderSent.count({ where: { taskId: task.id, userId: users.MEMBER.id } }),
+    queued: await app.prisma.notificationDelivery.count({ where: { data: { path: ["taskId"], equals: task.id } } }),
+    notifications: await reminderCount(task.id),
+  });
+  try {
+    assert.deepEqual(await counts(missed), { markers: 0, queued: 0, notifications: 0 });
+    assert.deepEqual(await counts(controlTask), { markers: 0, queued: 0, notifications: 0 });
+    // No tick on day0. On day1 the default one-day timing matches only day2.
+    await processDueDateReminders(A.prisma, A.fastify, { now: new Date(NOW + DAY_MS) });
+    assert.deepEqual(await counts(missed), { markers: 0, queued: 0, notifications: 0 });
+    assert.deepEqual(await counts(controlTask), { markers: 1, queued: 0, notifications: 1 });
+    assert.equal(toastsFor((n) => n.data?.taskId === missed.id).length, 0);
+    assert.equal(toastsFor((n) => n.data?.taskId === controlTask.id).length, 1);
+    await processDueDateReminders(A.prisma, A.fastify, { now: new Date(NOW + 2 * DAY_MS) });
+    assert.deepEqual(await counts(missed), { markers: 0, queued: 0, notifications: 0 });
+    assert.deepEqual(await counts(controlTask), { markers: 1, queued: 0, notifications: 1 });
+  } finally {
+    await retireTasks(missed, controlTask);
+  }
+});
+
+test("policy: failed reminder outbox enqueue rolls back its marker and same-day retry delivers once", { timeout: 15_000 }, async () => {
+  const task = await assignedTask("policy-marker-outbox-rollback", day(1));
+  const counts = async () => ({
+    markers: await app.prisma.taskReminderSent.count({ where: { taskId: task.id, userId: users.MEMBER.id } }),
+    queued: await app.prisma.notificationDelivery.count({ where: { data: { path: ["taskId"], equals: task.id } } }),
+    notifications: await reminderCount(task.id),
+  });
+  try {
+    const errorsBefore = loggedErrors.length;
+    await setHook("fault", "NotificationDelivery:INSERT");
+    try {
+      await processDueDateReminders(A.prisma, A.fastify, { now: new Date(NOW) });
+      // The marker insert precedes the outbox insert in that same transaction.
+      // Reaching the intended outbox failure must still leave neither row.
+      assert.ok(loggedErrors.slice(errorsBefore).some(([error, message]) =>
+        message === "Due-date reminders: could not record a batch; it will be retried" &&
+        String(error?.message ?? "").includes("injected fault on NotificationDelivery:INSERT")), "the intended outbox INSERT failed");
+      assert.deepEqual(await counts(), { markers: 0, queued: 0, notifications: 0 });
+      assert.equal(toastsFor((n) => n.data?.taskId === task.id).length, 0);
+    } finally {
+      await clearHooks();
+    }
+    await processDueDateReminders(A.prisma, A.fastify, { now: new Date(NOW) });
+    assert.deepEqual(await counts(), { markers: 1, queued: 0, notifications: 1 });
+    await processDueDateReminders(A.prisma, A.fastify, { now: new Date(NOW) });
+    assert.deepEqual(await counts(), { markers: 1, queued: 0, notifications: 1 });
+    assert.equal(toastsFor((n) => n.data?.taskId === task.id).length, 1);
+  } finally {
+    await retireTasks(task);
+  }
 });
 
 test("a reminder whose notification write fails is retried until it is delivered, once", async () => {

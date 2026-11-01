@@ -106,6 +106,7 @@ interface OidcCallbackResult {
   };
   accessToken: string;
   refreshToken: string;
+  familyId: string;
   returnUrl: string | null;
   workspaces: Array<{
     id: string;
@@ -212,6 +213,7 @@ export async function handleOidcCallback(
     user,
     accessToken,
     refreshToken,
+    familyId,
     returnUrl: oidcState.returnUrl,
     workspaces,
   };

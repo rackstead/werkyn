@@ -24,10 +24,28 @@ test(
       storage,
       resetTransporter,
       apiKey,
+      failure,
+      phase = "setup",
       requests = 0;
     const familyIds = new Set();
     const email = "key-policy-" + crypto.randomUUID() + "@example.test";
+    function safeFailure(error, step) {
+      // Preserve the failing step and safe assertion values without credentials.
+      const safe = new Error("Credential policy check failed during " + step);
+      safe.name = error?.code === "ERR_ASSERTION" ? "AssertionError" : "Error";
+      const primitive = (value) =>
+        value === null ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        ["string", "undefined"].includes(value);
+      if (primitive(error?.actual)) safe.actual = error.actual;
+      if (primitive(error?.expected)) safe.expected = error.expected;
+      if (["strictEqual", "ok"].includes(error?.operator))
+        safe.operator = error.operator;
+      return safe;
+    }
     async function request(label, method, pathname, { token, payload } = {}) {
+      phase = label;
       requests++;
       assert.ok(requests <= 12);
       const result = await new Promise((resolve, reject) => {
@@ -84,6 +102,7 @@ test(
       return result;
     }
     async function keySocket() {
+      phase = "valid issued key WebSocket authentication";
       const observed = {
         handshakeStatus: null,
         closeCode: null,
@@ -221,6 +240,7 @@ test(
       app = await buildApp();
       origin = await app.listen({ host: "127.0.0.1", port: 0 });
       assert.equal(app.server.address().address, "127.0.0.1");
+      phase = "create owned user";
       user = await app.prisma.user.create({
         data: {
           email,
@@ -351,28 +371,35 @@ test(
         401,
       );
       assert.equal(requests, 10);
+    } catch (error) {
+      failure = safeFailure(error, phase);
     } finally {
-      socket?.destroy();
       try {
-        if (app && user) {
-          await app.prisma.rotatedRefreshToken.deleteMany({
-            where: { familyId: { in: [...familyIds] } },
-          });
-          await app.prisma.user.deleteMany({ where: { id: user.id } });
-          await app.prisma.loginAttempt.deleteMany({ where: { email } });
-        }
-      } finally {
+        socket?.destroy();
         try {
-          await app?.close();
+          if (app && user) {
+            await app.prisma.rotatedRefreshToken.deleteMany({
+              where: { familyId: { in: [...familyIds] } },
+            });
+            await app.prisma.user.deleteMany({ where: { id: user.id } });
+            await app.prisma.loginAttempt.deleteMany({ where: { email } });
+          }
         } finally {
-          resetTransporter?.();
           try {
-            await smtp?.close();
+            await app?.close();
           } finally {
-            if (storage) await rm(storage, { recursive: true, force: true });
+            resetTransporter?.();
+            try {
+              await smtp?.close();
+            } finally {
+              if (storage) await rm(storage, { recursive: true, force: true });
+            }
           }
         }
+      } catch (error) {
+        failure ??= safeFailure(error, "owned cleanup");
       }
     }
+    if (failure) throw failure;
   },
 );

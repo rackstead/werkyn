@@ -106,6 +106,7 @@ interface OidcCallbackResult {
   };
   accessToken: string;
   refreshToken: string;
+  familyId: string;
   returnUrl: string | null;
   workspaces: Array<{
     id: string;
@@ -126,8 +127,10 @@ export async function handleOidcCallback(
   stateParam: string,
   browserState: string | undefined,
   issuerParam?: string,
+  onStateClaimed?: () => void,
 ): Promise<OidcCallbackResult> {
   const oidcState = await consumeOidcState(prisma, stateParam, browserState);
+  onStateClaimed?.();
   await assertSsoEnabled(prisma, oidcState.connectorId);
 
   const as = await getAuthServer();
@@ -212,6 +215,7 @@ export async function handleOidcCallback(
     user,
     accessToken,
     refreshToken,
+    familyId,
     returnUrl: oidcState.returnUrl,
     workspaces,
   };

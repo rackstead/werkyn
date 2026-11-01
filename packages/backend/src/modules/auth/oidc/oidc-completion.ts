@@ -73,6 +73,7 @@ export function assertOidcAttemptCookieBudget(request: FastifyRequest) {
     names.filter((name) => name === "refresh_token").length > 1
   )
     throw unavailable();
+  return attempts.length;
 }
 export function hasDuplicateAttemptCookie(
   request: FastifyRequest,

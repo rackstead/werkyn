@@ -23,8 +23,10 @@ settings, SameSite=Lax and `/api/auth/oidc` path. Completed proof uses the same
 cookie slot/path, expires after 60 seconds, remains signed/HttpOnly/host-only,
 and uses the configured refresh-cookie SameSite mode and Secure setting.
 Completed proof is never accepted as pending state or as a bearer access token.
-Callback replay cannot clear a completed marker. Error/cancel clears pending
-state as before and does not create success proof.
+Callback replay cannot clear a completed marker. Only a callback that uniquely
+claimed its state can clear pending proof on failure/cancel; a losing callback
+or request missing a code cannot send a delayed deletion over completed proof.
+Rejected pending proof may expire naturally. No failure creates success proof.
 
 Then send `POST /api/auth/oidc/complete-session` with credentials included,
 `Content-Type: application/json`, `X-Werkyn-OIDC-Completion: 1`, and exactly
@@ -72,6 +74,13 @@ duplicate refresh credentials fail closed; they do not select an arbitrary
 subset. Correctly named junk consumes that raw budget. Unrelated cookies are
 not selected or deleted.
 
+Opt-in initiation also reserves its newly issued slot before creating state.
+With five raw candidates it can remove an owned expired completed marker or the
+oldest verified owned live slot; invalid/unowned cookies cannot supply room.
+A full five-unowned jar is rejected before state creation or any cookie mutation.
+Mixed ownership still leaves at most five raw slots after the new cookie is
+issued. The completion POST retains its strict five-slot admission bound.
+
 Legacy initiation without client_attempt retains validated-owned jar accounting:
 signed raw64 bindings and valid pending/completed phases share the five-attempt
 budget. Owned expired completed slots can be removed, then oldest excess owned
@@ -92,9 +101,15 @@ loopback IdP. Two intended failures showed ignored opt-in correlation/cleared
 callback proof and the missing cookie-safe POST. Five controls preserved legacy
 PKCE/state/provider verification, replay and jar behavior. The same seven
 assertions pass after implementation, with backend type checking passing.
-Another 22 proof, credential, expiry and concurrency checks pass, giving 29
+Another 22 proof, credential, expiry and concurrency checks pass. A callback-race
+correction adds five distinct cases: a real concurrent state-claim loser,
+missing-code response ordering, and three uniquely claimed provider failures.
+Those five plus the affected cancellation control pass. A separate independent
+before found two raw-jar headroom failures with five passing controls. Eight new
+headroom cases and the affected legacy control pass after correction, giving 42
 distinct cases promoted into the permanent suite; 26 existing OIDC state/identity
-checks also pass. The expiry-during-await fixture uses a controlled signed short
+checks also pass. The missing-code fixture applies actual HTTP response cookies
+in a chosen jar order; it does not measure transport delay. The expiry-during-await fixture uses a controlled signed short
 remaining deadline and real clock, not an elapsed 60-second claim. Read-fault
 responses use injected delegate failures over actual HTTP. Cookie attributes
 over loopback do not establish deployed HTTPS or browser acceptance under every

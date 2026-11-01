@@ -127,8 +127,10 @@ export async function handleOidcCallback(
   stateParam: string,
   browserState: string | undefined,
   issuerParam?: string,
+  onStateClaimed?: () => void,
 ): Promise<OidcCallbackResult> {
   const oidcState = await consumeOidcState(prisma, stateParam, browserState);
+  onStateClaimed?.();
   await assertSsoEnabled(prisma, oidcState.connectorId);
 
   const as = await getAuthServer();

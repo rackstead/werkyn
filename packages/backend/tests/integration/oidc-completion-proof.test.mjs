@@ -1276,3 +1276,285 @@ for (const sameUser of [true, false])
       await pending;
     }
   });
+
+test("losing concurrent pending callback cannot delete a winner's completed proof", async () => {
+  const a = await start({ attemptId: crypto.randomUUID() });
+  const pendingJar = { ...a.jar };
+  const delegate = app.prisma.oidcState;
+  const original = delegate.findUnique;
+  const exchangesBefore = tokenRequests;
+  let enter,
+    release,
+    paused = false;
+  const entered = new Promise((resolve) => {
+    enter = resolve;
+  });
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  delegate.findUnique = async (...args) => {
+    const row = await original.apply(delegate, args);
+    if (!paused && args[0]?.where?.state === a.state.state) {
+      paused = true;
+      enter();
+      await released;
+    }
+    return row;
+  };
+  let losing;
+  try {
+    losing = callback(a, issue(a), { cookies: pendingJar });
+    let timer;
+    try {
+      await Promise.race([
+        entered,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(new Error("Losing callback did not read pending state")),
+            3_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const winner = await succeeded(a);
+    const marker = a.jar[a.cookie.name];
+    const beforeFamily = await familyState(winner.token.familyId);
+    release();
+    const lost = await losing;
+    failed(lost);
+    applyCookies(a.jar, lost);
+    const completion = await complete({ a });
+    const afterFamily = await familyState(winner.token.familyId);
+    assert.equal(tokenRequests, exchangesBefore + 1);
+    assert.equal(
+      await app.prisma.oidcState.count({ where: { state: a.state.state } }),
+      0,
+    );
+    assert.deepEqual(afterFamily, beforeFamily);
+    assert.deepEqual(
+      lost.setCookie,
+      [],
+      "An unclaimed callback must not delete the winner's marker",
+    );
+    assert.equal(a.jar[a.cookie.name], marker);
+    assert.equal(completion.status, 200, completion.body);
+    noCookie(completion);
+  } finally {
+    release();
+    delegate.findUnique = original;
+    await losing;
+  }
+});
+
+test("missing-code response applied after success cannot delete completed proof", async () => {
+  const a = await start({ attemptId: crypto.randomUUID() });
+  const exchangesBefore = tokenRequests;
+  // Hold the actual HTTP failure response in this fixture's jar applicator.
+  // The successful callback's headers are applied first, then the stale failure.
+  const incomplete = await request(
+    "GET",
+    `/api/auth/oidc/callback?state=${a.state.state}`,
+    {
+      cookies: { ...a.jar },
+    },
+  );
+  failed(incomplete);
+  assert.equal(
+    await app.prisma.oidcState.count({ where: { state: a.state.state } }),
+    1,
+  );
+  const winner = await succeeded(a);
+  const marker = a.jar[a.cookie.name];
+  const beforeFamily = await familyState(winner.token.familyId);
+  applyCookies(a.jar, incomplete);
+  const completion = await complete({ a });
+  assert.equal(tokenRequests, exchangesBefore + 1);
+  assert.deepEqual(await familyState(winner.token.familyId), beforeFamily);
+  assert.deepEqual(
+    incomplete.setCookie,
+    [],
+    "Missing-code response has not claimed state and must not delete proof",
+  );
+  assert.equal(a.jar[a.cookie.name], marker);
+  assert.equal(completion.status, 200, completion.body);
+  noCookie(completion);
+});
+
+for (const [kind, options] of [
+  ["PKCE", { expectedVerifier: "wrong-owned-verifier" }],
+  ["nonce", { claims: { nonce: "wrong-owned-nonce" } }],
+  ["signature", { wrongSignature: true }],
+]) {
+  test(`uniquely claimed opt-in ${kind} failure clears only its pending proof without a session`, async () => {
+    const a = await start({ attemptId: crypto.randomUUID() });
+    const countBefore = await app.prisma.refreshTokenFamily.count();
+    const exchangeBefore = tokenRequests;
+    const unrelated = {
+      name: `unrelated-${crypto.randomUUID()}`,
+      value: "keep",
+    };
+    a.jar[unrelated.name] = unrelated.value;
+    const { claims = {}, ...extra } = options;
+    const rejection = await callback(a, issue(a, claims, extra));
+    failed(rejection);
+    assert.equal(tokenRequests, exchangeBefore + 1);
+    assert.equal(await app.prisma.refreshTokenFamily.count(), countBefore);
+    assert.equal(
+      await app.prisma.oidcState.count({ where: { state: a.state.state } }),
+      0,
+    );
+    assert.equal(a.jar[a.cookie.name], undefined);
+    assert.equal(a.jar[unrelated.name], unrelated.value);
+    assert.equal(rejection.cookies.length, 1);
+    assert.equal(rejection.cookies[0].name, a.cookie.name);
+    assert.equal(rejection.cookies[0].value, "");
+    const completion = await request(
+      "POST",
+      "/api/auth/oidc/complete-session",
+      {
+        cookies: { [a.cookie.name]: a.cookie.value },
+        payload: { attemptId: a.attemptId },
+        headers: trusted,
+      },
+    );
+    assert.equal(completion.status, 409, completion.body);
+    noCookie(completion);
+  });
+}
+
+const headroomRawCount = (jar) =>
+  Object.keys(jar).filter((name) => /^oidc_state_[a-f0-9]{64}$/.test(name))
+    .length;
+const headroomJunk = (count) =>
+  Object.fromEntries(
+    Array.from({ length: count }, () => [
+      `oidc_state_${crypto.randomBytes(32).toString("hex")}`,
+      "owned-fixture-unsigned-junk",
+    ]),
+  );
+const headroomPreserved = (jar, entries) => {
+  for (const [name, value] of Object.entries(entries))
+    assert.equal(jar[name], value, `Unowned cookie must remain: ${name}`);
+};
+
+test("four unowned raw slots leave one opt-in slot and permit completion", async () => {
+  const invalid = headroomJunk(4),
+    jar = { ...invalid };
+  const a = await start({ jar, attemptId: crypto.randomUUID() });
+  assert.equal(headroomRawCount(jar), 5);
+  assert.equal(a.response.cookies.filter((cookie) => !cookie.value).length, 0);
+  headroomPreserved(jar, invalid);
+  await succeeded(a);
+  const response = await complete({ a });
+  assert.equal(response.status, 200, response.body);
+  noCookie(response);
+  headroomPreserved(jar, invalid);
+});
+
+test("five unowned raw slots reject opt-in before state or cookie mutation", async () => {
+  const invalid = headroomJunk(5);
+  const jar = {
+    ...invalid,
+    unrelated_headroom: "keep",
+    oidc_state_bad_name: "keep",
+  };
+  const beforeState = await app.prisma.oidcState.count();
+  const beforeExchanges = tokenRequests;
+  const response = await request(
+    "GET",
+    `/api/auth/oidc/login?connector_id=${connectorId}&client_attempt=${crypto.randomUUID()}`,
+    { cookies: jar },
+  );
+  failed(response);
+  assert.deepEqual(response.setCookie, []);
+  assert.equal(await app.prisma.oidcState.count(), beforeState);
+  assert.equal(tokenRequests, beforeExchanges);
+  applyCookies(jar, response);
+  headroomPreserved(jar, invalid);
+  assert.equal(headroomRawCount(jar), 5);
+  assert.equal(jar.unrelated_headroom, "keep");
+  assert.equal(jar.oidc_state_bad_name, "keep");
+});
+
+for (let ownedCount = 1; ownedCount <= 5; ownedCount++) {
+  test(`opt-in reserves its new slot with ${ownedCount} owned and ${5 - ownedCount} unowned raw cookies`, async () => {
+    const jar = {},
+      owned = [];
+    for (let i = 0; i < ownedCount; i++) {
+      const a = await start({
+        jar,
+        ...(i === 2 ? {} : { attemptId: crypto.randomUUID() }),
+      });
+      if (i === 0) await succeeded(a);
+      owned.push(a.cookie.name);
+    }
+    const invalid = headroomJunk(5 - ownedCount);
+    Object.assign(jar, invalid, {
+      unrelated_headroom: "keep",
+      oidc_state_bad_name: "keep",
+    });
+    assert.equal(headroomRawCount(jar), 5);
+    const beforeState = await app.prisma.oidcState.count();
+    const a = await start({ jar, attemptId: crypto.randomUUID() });
+    assert.equal(headroomRawCount(jar), 5);
+    assert.equal(jar[owned[0]], undefined);
+    for (const name of owned.slice(1)) assert.ok(jar[name]);
+    headroomPreserved(jar, invalid);
+    assert.equal(jar.unrelated_headroom, "keep");
+    assert.equal(jar.oidc_state_bad_name, "keep");
+    assert.equal(await app.prisma.oidcState.count(), beforeState + 1);
+    assert.deepEqual(
+      a.response.cookies
+        .filter((cookie) => !cookie.value)
+        .map((cookie) => cookie.name),
+      [owned[0]],
+    );
+    assert.equal(a.response.cookies.filter((cookie) => cookie.value).length, 1);
+    const winner = await succeeded(a);
+    const beforeFamily = await familyState(winner.token.familyId);
+    const response = await complete({ a });
+    assert.equal(response.status, 200, response.body);
+    noCookie(response);
+    assert.equal(
+      jwt.verify(response.json.data.accessToken, process.env.JWT_SECRET).sid,
+      winner.token.familyId,
+    );
+    assert.deepEqual(await familyState(winner.token.familyId), beforeFamily);
+    assert.equal(headroomRawCount(jar), 5);
+    headroomPreserved(jar, invalid);
+  });
+}
+
+test("owned expired completed slot supplies headroom without deleting a live pending slot", async () => {
+  const jar = {},
+    s = await session({ jar });
+  const pending = await start({ jar, attemptId: crypto.randomUUID() });
+  const now = Date.now();
+  jar[s.a.cookie.name] = signed(s, {
+    issuedAt: now - 61_000,
+    expiresAt: now - 1_000,
+  });
+  const invalid = headroomJunk(3);
+  Object.assign(jar, invalid);
+  assert.equal(headroomRawCount(jar), 5);
+  const pendingValue = jar[pending.cookie.name];
+  const a = await start({ jar, attemptId: crypto.randomUUID() });
+  assert.equal(jar[s.a.cookie.name], undefined);
+  assert.equal(jar[pending.cookie.name], pendingValue);
+  assert.deepEqual(
+    a.response.cookies
+      .filter((cookie) => !cookie.value)
+      .map((cookie) => cookie.name),
+    [s.a.cookie.name],
+  );
+  assert.equal(headroomRawCount(jar), 5);
+  headroomPreserved(jar, invalid);
+  await succeeded(a);
+  const response = await complete({ a });
+  assert.equal(response.status, 200, response.body);
+  noCookie(response);
+  headroomPreserved(jar, invalid);
+});

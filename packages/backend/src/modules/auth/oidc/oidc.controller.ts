@@ -2,7 +2,7 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import * as oidcService from "./oidc.service.js";
 import { env } from "../../../config/env.js";
-import { UnauthorizedError } from "../../../utils/errors.js";
+import { ConflictError, UnauthorizedError } from "../../../utils/errors.js";
 import {
   OIDC_COMPLETION_TTL_MS,
   assertOidcAttemptCookieBudget,
@@ -77,7 +77,32 @@ export async function oidcLoginHandler(
   reply.header("Cache-Control", "no-store");
   try {
     const query = LoginQuery.parse(request.query);
-    if (query.client_attempt) assertOidcAttemptCookieBudget(request);
+    const rawCount = query.client_attempt
+      ? assertOidcAttemptCookieBudget(request)
+      : undefined;
+    const attempts: string[] = [];
+    const expired: string[] = [];
+    const inspectOwnedAttempts = () => {
+      for (const [name, value] of Object.entries(request.cookies)) {
+        const attempt = readBrowserAttempt(request, name, value);
+        if (!attempt) continue;
+        if (attempt.phase === "completed" && attempt.expiresAt <= Date.now())
+          expired.push(name);
+        else attempts.push(name);
+      }
+    };
+    // Reserve the newly issued raw slot before creating opt-in state. Only
+    // verified owned cookies can supply room; junk is never ours to delete.
+    let reserve = 0;
+    if (rawCount !== undefined) {
+      inspectOwnedAttempts();
+      reserve = Math.max(
+        0,
+        rawCount - expired.length + 1 - MAX_OIDC_BROWSER_ATTEMPTS,
+      );
+      if (reserve > attempts.length)
+        throw new ConflictError("Too many OIDC browser attempts");
+    }
     const result = await oidcService.initiateOidcLogin(
       request.server.prisma,
       query.connector_id,
@@ -86,17 +111,12 @@ export async function oidcLoginHandler(
 
     // One cookie per attempt supports parallel tabs. Retain at most the latest
     // five attempts sent by this browser so abandoned logins do not fill its jar.
-    const attempts: string[] = [];
-    for (const [name, value] of Object.entries(request.cookies)) {
-      const attempt = readBrowserAttempt(request, name, value);
-      if (!attempt) continue;
-      if (attempt.phase === "completed" && attempt.expiresAt <= Date.now()) {
-        reply.clearCookie(name, { path: OIDC_STATE_COOKIE_PATH });
-      } else attempts.push(name);
-    }
+    if (rawCount === undefined) inspectOwnedAttempts();
+    for (const name of expired)
+      reply.clearCookie(name, { path: OIDC_STATE_COOKIE_PATH });
     for (const name of attempts.slice(
       0,
-      Math.max(0, attempts.length - MAX_OIDC_BROWSER_ATTEMPTS + 1),
+      Math.max(reserve, attempts.length - MAX_OIDC_BROWSER_ATTEMPTS + 1),
     )) {
       reply.clearCookie(name, { path: OIDC_STATE_COOKIE_PATH });
     }
@@ -136,10 +156,11 @@ export async function oidcCallbackHandler(
     if (attempt?.phase === "completed")
       throw new UnauthorizedError("Invalid or already used OIDC state");
     const binding = attempt?.state;
-    if (attempt?.phase === "pending") pendingCookie = name;
-    else reply.clearCookie(name, { path: OIDC_STATE_COOKIE_PATH });
+    if (attempt?.phase !== "pending")
+      reply.clearCookie(name, { path: OIDC_STATE_COOKIE_PATH });
     if (query.error) {
       await consumeOidcState(request.server.prisma, query.state, binding);
+      if (attempt?.phase === "pending") pendingCookie = name;
       throw new UnauthorizedError("SSO sign-in was not completed");
     }
     if (!query.code)
@@ -150,6 +171,13 @@ export async function oidcCallbackHandler(
       query.state,
       binding,
       query.iss,
+      attempt?.phase === "pending"
+        ? () => {
+            // Only the unique state claimant can safely clear pending proof.
+            // A losing/unfinished callback may arrive after completed proof.
+            pendingCookie = name;
+          }
+        : undefined,
     );
 
     reply.setCookie("refresh_token", result.refreshToken, {

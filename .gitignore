@@ -20,6 +20,9 @@ coverage/
 # Uploads (legacy data directory)
 /uploads/
 
+# Backend runtime storage
+/packages/backend/storage/
+
 # IDE
 .vscode/
 .idea/

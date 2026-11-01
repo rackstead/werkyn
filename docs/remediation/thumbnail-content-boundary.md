@@ -12,9 +12,14 @@ its stored MIME or filename.
 
 Within that cap, thumbnail detection first checks fixed raster-family offsets
 in the first 12 bytes: JPEG, PNG/APNG, GIF, TIFF/BigTIFF in either byte order,
-RIFF/WebP and the AVIF/HEIF brands recognized by the pinned detector. Inputs
-without a candidate raster header skip the general detector, keeping unrelated
-document/archive entry paths out of this upload operation. The existing
+RIFF/WebP and the AVIF/HEIF brands recognized by the pinned detector. ISO
+candidates also require an ordinary 32-bit box size of at least 16 bytes that
+fits the actual buffer and the existing source cap. Size-to-EOF, extended-size,
+short and out-of-buffer forms omit the optional thumbnail while preserving the
+original upload; this does not declare those size forms globally invalid in ISO
+BMFF. Inputs that fail their family header check or required ISO envelope skip
+the general detector, keeping the earlier document/archive entry paths out of this
+upload operation. The existing
 `file-type` detector then must report one of:
 
 - JPEG, PNG, APNG, WebP, TIFF or GIF;

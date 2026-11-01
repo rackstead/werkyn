@@ -67,9 +67,13 @@ function hasThumbnailRasterHeader(buffer: Buffer): boolean {
     header.length >= prefix.length && header.subarray(0, prefix.length).equals(prefix),
   )) return true;
   if (header.length < 12) return false;
+  const boxSize = header.readUInt32BE(0);
   return (
     (header.toString("latin1", 0, 4) === "RIFF" && header.toString("latin1", 8, 12) === "WEBP") ||
-    (header.toString("latin1", 4, 8) === "ftyp" && THUMBNAIL_HEIF_BRANDS.has(header.toString("latin1", 8, 12)))
+    (header.toString("latin1", 4, 8) === "ftyp" &&
+      THUMBNAIL_HEIF_BRANDS.has(header.toString("latin1", 8, 12)) &&
+      buffer.length >= 16 && boxSize >= 16 &&
+      boxSize <= buffer.length && boxSize <= THUMBNAIL_SOURCE_MAX_BYTES)
   );
 }
 

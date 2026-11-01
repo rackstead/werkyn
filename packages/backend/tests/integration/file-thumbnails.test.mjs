@@ -325,6 +325,35 @@ test("HEIF brands and both TIFF byte orders retain detector and transform dispat
   });
 });
 
+test("ordinary ISO envelopes bound detector entry and preserve original uploads", async () => {
+  await withDispatchSpies(async (state) => {
+    const header = (size, length = 24) => {
+      const bytes = Buffer.alloc(length);
+      bytes.writeUInt32BE(size);
+      bytes.write("ftypavif", 4);
+      return bytes;
+    };
+    // Plain header controls only; the armed transform returns a known WebP.
+    for (const size of [16, 20, 24]) {
+      state.detectorCalls = state.nativeCalls = 0;
+      assert.ok((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath);
+      assert.equal(state.detectorCalls, 1);
+      assert.equal(state.nativeCalls, 1);
+    }
+    const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
+    for (const [size, length] of [
+      [0, 24], [1, 24], [8, 24], [12, 24], [15, 24],
+      [28, 24], [16, 12], [THUMBNAIL_SOURCE_MAX_BYTES + 4, 24],
+    ]) {
+      state.detectorCalls = state.nativeCalls = 0;
+      const file = await upload(`omitted-${size}-${length}.avif`, "image/avif", header(size, length));
+      assert.equal(file.thumbnailPath, null);
+      assert.equal(state.detectorCalls, 0);
+      assert.equal(state.nativeCalls, 0);
+    }
+  });
+});
+
 test("detector refusal/failure and transform failure omit only the thumbnail", async () => {
   await withDispatchSpies(async (state) => {
     for (const mode of ["unknown", "disallowed", "throw"]) {

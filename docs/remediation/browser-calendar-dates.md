@@ -18,6 +18,11 @@ Labels parse valid calendar dates locally instead of converting UTC midnight
 to the preceding day west of UTC. A historical invalid date uses its stored
 text as a display fallback; this does not validate or repair legacy rows.
 
+The project List's editable and read-only due-date cells also compare the
+date-only deadline with local today. They retain the literal `YYYY-MM-DD`
+label and show overdue styling only for a noncompleted task due before today.
+Editing and clearing retain the existing date-only mutation payloads.
+
 Both create and edit expiry controls in the file-sharing dialog use local
 today as the date input's minimum. Submission still interprets a selected date
 at local 23:59:59 and serializes that instant to ISO. Clearing still omits expiry
@@ -39,3 +44,9 @@ boundaries, spring/fall DST windows, inclusive endpoints, local labels,
 due-today/overdue consistency, completed/click controls, both input minima and
 unchanged expiry/clearing payloads. These are component-boundary checks, not an
 external-browser or live API test.
+
+`task-table-due-dates.test.tsx` renders the actual List table in both editable
+and read-only modes across the same four process zones at two UTC boundaries.
+Literal labels, past/completed/undated styling, completed-task clicks and exact
+date-change/clear payloads are checked before due-today styling. These checks
+do not change table selection, sorting, filtering or rendering behavior.

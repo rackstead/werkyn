@@ -23,10 +23,13 @@ settings, SameSite=Lax and `/api/auth/oidc` path. Completed proof uses the same
 cookie slot/path, expires after 60 seconds, remains signed/HttpOnly/host-only,
 and uses the configured refresh-cookie SameSite mode and Secure setting.
 Completed proof is never accepted as pending state or as a bearer access token.
-Callback replay cannot clear a completed marker. Only a callback that uniquely
-claimed its state can clear pending proof on failure/cancel; a losing callback
-or request missing a code cannot send a delayed deletion over completed proof.
-Rejected pending proof may expire naturally. No failure creates success proof.
+A callback presenting completed proof rejects replay without deleting its marker.
+For valid opt-in pending proof, only a callback that uniquely claimed its state
+can clear it on failure/cancel; a losing callback or request missing a code sends
+no deletion. Rejected pending proof may expire naturally. The legacy, null,
+invalid or unowned credential path retains its immediate named-cookie clear;
+older responses from that path are outside the marker-preservation guarantee.
+No failure creates success proof.
 
 Then send `POST /api/auth/oidc/complete-session` with credentials included,
 `Content-Type: application/json`, `X-Werkyn-OIDC-Completion: 1`, and exactly
@@ -78,16 +81,19 @@ Opt-in initiation also reserves its newly issued slot before creating state.
 With five raw candidates it can remove an owned expired completed marker or the
 oldest verified owned live slot; invalid/unowned cookies cannot supply room.
 A full five-unowned jar is rejected before state creation or any cookie mutation.
-Mixed ownership still leaves at most five raw slots after the new cookie is
-issued. The completion POST retains its strict five-slot admission bound.
+Mixed ownership leaves at most five raw slots per initiation request after its
+new cookie is issued. The completion POST retains its strict five-slot admission
+bound.
 
 Legacy initiation without client_attempt retains validated-owned jar accounting:
 signed raw64 bindings and valid pending/completed phases share the five-attempt
 budget. Owned expired completed slots can be removed, then oldest excess owned
 slots are pruned before adding a new attempt. Invalid signatures, malformed
 names or state/name mismatches do not count as owned and are not deleted.
-Pending authorization still uses database expiry/claiming. Concurrent delayed
-headers can transiently exceed the jar target; unavailable proof remains unknown.
+Pending authorization still uses database expiry/claiming. For both opt-in and
+legacy flow, concurrent or delayed headers can exceed the jar target; the new
+POST rejects excess raw slots rather than selecting a subset. Unavailable proof
+remains unknown.
 
 Without opt-in, legacy raw64/PKCE/callback/redirect behavior remains. No frontend
 behavior or normal login, refresh, logout, API-key, connector or global CORS

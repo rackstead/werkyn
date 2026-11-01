@@ -257,6 +257,14 @@ export async function listMessages(
   cursor?: string,
   limit = 50,
 ) {
+  if (cursor) {
+    const scopedCursor = await prisma.chatMessage.findFirst({
+      where: { id: cursor, channelId, parentId: null },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: undefined };
+  }
+
   const messages = await prisma.chatMessage.findMany({
     where: {
       channelId,
@@ -272,7 +280,7 @@ export async function listMessages(
         orderBy: { createdAt: "asc" as const },
       },
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
@@ -531,6 +539,14 @@ export async function getThreadReplies(
   cursor?: string,
   limit = 50,
 ) {
+  if (cursor) {
+    const scopedCursor = await prisma.chatMessage.findFirst({
+      where: { id: cursor, parentId },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: undefined };
+  }
+
   const messages = await prisma.chatMessage.findMany({
     where: { parentId },
     omit: chatMessageOmit,
@@ -543,7 +559,7 @@ export async function getThreadReplies(
         orderBy: { createdAt: "asc" },
       },
     },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });

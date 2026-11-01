@@ -960,8 +960,25 @@ export async function searchMessages(
     };
   }
 
+  // Keep cursor eligibility in the same statement as the matching page.
+  const cursorEligibility: Prisma.ChatMessageWhereInput | undefined = cursor
+    ? {
+        channel: {
+          workspace: {
+            chatChannels: {
+              some: {
+                messages: {
+                  some: { AND: [where, { id: cursor }] },
+                },
+              },
+            },
+          },
+        },
+      }
+    : undefined;
+
   const messages = await prisma.chatMessage.findMany({
-    where,
+    where: cursorEligibility ? { AND: [where, cursorEligibility] } : where,
     omit: chatMessageOmit,
     include: {
       user: {
@@ -971,7 +988,7 @@ export async function searchMessages(
         select: { id: true, name: true, type: true },
       },
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });

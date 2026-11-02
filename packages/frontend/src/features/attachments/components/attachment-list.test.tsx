@@ -42,10 +42,19 @@ vi.mock("../api", () => ({
 vi.mock("@/features/drive/components/drive-file-picker", () => ({
   DriveFilePicker: () => null,
 }));
+vi.mock("@/stores/auth-store", () => ({
+  useAuthStore: (select: (value: {
+    user: { id: string };
+    workspaces: { role: "ADMIN"; workspace: { id: string } }[];
+  }) => unknown) => select({
+    user: { id: "actor" },
+    workspaces: [{ role: "ADMIN", workspace: { id: "workspace" } }],
+  }),
+}));
 afterEach(() => cleanup());
 
 it("shows SetNull sources as unavailable, disables unavailable downloads and retains cleanup and readable downloads", () => {
-  render(<AttachmentList workspaceId="workspace" taskId="task" canEdit />);
+  render(<AttachmentList workspaceId="workspace" taskId="task" />);
   expect(screen.getByText("Unavailable file")).toBeTruthy();
   const unavailable = screen.getAllByRole("button", {
     name: "Source file is unavailable",

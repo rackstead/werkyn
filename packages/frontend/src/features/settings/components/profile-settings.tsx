@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import type { UpdateUserInput } from "@pm/shared";
 import { toast } from "sonner";
 import { Loader2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,14 +15,24 @@ import {
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { useParams } from "@tanstack/react-router";
 import { useAuthStore } from "@/stores/auth-store";
+import { identityGeneration } from "@/lib/identity";
 import { useProfile, useUpdateProfile, useChangePassword } from "../api";
 import { useUploadFile } from "@/features/uploads/api";
 
 const TIMEZONE_NONE = "__none__";
 
+type ProfileFields = {
+  displayName: string;
+  jobTitle: string;
+  phone: string;
+  timezone: string;
+};
+
 export function ProfileSettings() {
   const { workspaceSlug } = useParams({ strict: false }) as { workspaceSlug?: string };
   const workspaces = useAuthStore((s) => s.workspaces);
+  const profileUserId = useAuthStore((s) => s.user?.id);
+  const profileGeneration = identityGeneration();
   const workspaceId = workspaceSlug
     ? workspaces.find((w) => w.workspace.slug === workspaceSlug)?.workspace.id
     : undefined;
@@ -32,10 +43,12 @@ export function ProfileSettings() {
   const uploadFile = useUploadFile();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [displayName, setDisplayName] = useState("");
-  const [jobTitle, setJobTitle] = useState("");
-  const [phone, setPhone] = useState("");
-  const [timezone, setTimezone] = useState("");
+  const [profileDraft, setProfileDraft] = useState<{
+    source: NonNullable<typeof profile>;
+    generation: number;
+    initial: ProfileFields;
+    values: ProfileFields;
+  } | null>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -49,13 +62,27 @@ export function ProfileSettings() {
   }, []);
 
   useEffect(() => {
-    if (profile) {
-      setDisplayName(profile.displayName);
-      setJobTitle(profile.jobTitle ?? "");
-      setPhone(profile.phone ?? "");
-      setTimezone(profile.timezone ?? "");
+    if (
+      !profile || profile.id !== profileUserId ||
+      profileGeneration !== identityGeneration() ||
+      profileUserId !== useAuthStore.getState().user?.id
+    ) {
+      setProfileDraft(null);
+      return;
     }
-  }, [profile]);
+    const initial = {
+      displayName: profile.displayName,
+      jobTitle: profile.jobTitle ?? "",
+      phone: profile.phone ?? "",
+      timezone: profile.timezone ?? "",
+    };
+    setProfileDraft({
+      source: profile,
+      generation: profileGeneration,
+      initial,
+      values: initial,
+    });
+  }, [profile, profileUserId, profileGeneration]);
 
   if (isLoading) {
     return (
@@ -65,7 +92,27 @@ export function ProfileSettings() {
     );
   }
 
-  if (!profile) return null;
+  if (!profile || profile.id !== profileUserId) return null;
+
+  const profileReady = profileDraft !== null && profileDraft.source === profile &&
+    profileDraft.generation === profileGeneration;
+  const fields = profileReady ? profileDraft.values : {
+    displayName: profile.displayName,
+    jobTitle: profile.jobTitle ?? "",
+    phone: profile.phone ?? "",
+    timezone: profile.timezone ?? "",
+  };
+
+  function setProfileField(field: keyof ProfileFields, value: string) {
+    setProfileDraft((current) => {
+      if (
+        !current || current.source !== profile ||
+        current.generation !== identityGeneration() ||
+        current.source.id !== useAuthStore.getState().user?.id
+      ) return current;
+      return { ...current, values: { ...current.values, [field]: value } };
+    });
+  }
 
   function handleAvatarUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -97,20 +144,49 @@ export function ProfileSettings() {
 
   function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
-    if (!displayName.trim()) {
-      toast.error("Display name is required");
-      return;
-    }
+    if (
+      !profileDraft || profileDraft.source !== profile ||
+      profileDraft.generation !== identityGeneration() ||
+      profileDraft.source.id !== useAuthStore.getState().user?.id
+    ) return;
 
-    updateProfile.mutate(
-      {
-        displayName: displayName.trim(),
-        jobTitle: jobTitle.trim() || null,
-        phone: phone.trim() || null,
-        timezone: timezone || null,
+    const { values, initial } = profileDraft;
+    const data: UpdateUserInput = {};
+    if (values.displayName !== initial.displayName) {
+      if (!values.displayName.trim()) {
+        toast.error("Display name is required");
+        return;
+      }
+      data.displayName = values.displayName.trim();
+    }
+    if (values.jobTitle !== initial.jobTitle) data.jobTitle = values.jobTitle.trim() || null;
+    if (values.phone !== initial.phone) data.phone = values.phone.trim() || null;
+    if (values.timezone !== initial.timezone) data.timezone = values.timezone || null;
+    if (Object.keys(data).length === 0) return;
+
+    updateProfile.mutate(data, {
+      onSuccess: (updatedUser) => {
+        setProfileDraft((current) => {
+          if (
+            !current || current.source !== profileDraft.source ||
+            current.generation !== profileDraft.generation ||
+            current.generation !== identityGeneration() ||
+            current.source.id !== useAuthStore.getState().user?.id
+          ) return current;
+          // Equal canonical data can retain the same query object on success.
+          return {
+            ...current,
+            initial: {
+              displayName: current.values.displayName === values.displayName ? values.displayName : updatedUser.displayName,
+              jobTitle: current.values.jobTitle === values.jobTitle ? values.jobTitle : updatedUser.jobTitle ?? "",
+              phone: current.values.phone === values.phone ? values.phone : updatedUser.phone ?? "",
+              timezone: current.values.timezone === values.timezone ? values.timezone : updatedUser.timezone ?? "",
+            },
+          };
+        });
+        toast.success("Profile updated");
       },
-      { onSuccess: () => toast.success("Profile updated") },
-    );
+    });
   }
 
   function handleChangePassword(e: React.FormEvent) {
@@ -203,9 +279,10 @@ export function ProfileSettings() {
             <Label htmlFor="displayName">Display Name</Label>
             <Input
               id="displayName"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              required
+              value={fields.displayName}
+              onChange={(e) => setProfileField("displayName", e.target.value)}
+              disabled={!profileReady}
+              required={profileReady && fields.displayName !== profileDraft.initial.displayName}
             />
           </div>
 
@@ -218,8 +295,9 @@ export function ProfileSettings() {
             <Label htmlFor="jobTitle">Job Title</Label>
             <Input
               id="jobTitle"
-              value={jobTitle}
-              onChange={(e) => setJobTitle(e.target.value)}
+              value={fields.jobTitle}
+              onChange={(e) => setProfileField("jobTitle", e.target.value)}
+              disabled={!profileReady}
               placeholder="e.g. Senior Engineer"
             />
           </div>
@@ -228,8 +306,9 @@ export function ProfileSettings() {
             <Label htmlFor="phone">Phone</Label>
             <Input
               id="phone"
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
+              value={fields.phone}
+              onChange={(e) => setProfileField("phone", e.target.value)}
+              disabled={!profileReady}
               placeholder="e.g. +1 (555) 123-4567"
             />
           </div>
@@ -237,8 +316,9 @@ export function ProfileSettings() {
           <div className="space-y-2">
             <Label htmlFor="timezone">Timezone</Label>
             <Select
-              value={timezone || TIMEZONE_NONE}
-              onValueChange={(val) => setTimezone(val === TIMEZONE_NONE ? "" : val)}
+              value={fields.timezone || TIMEZONE_NONE}
+              onValueChange={(val) => setProfileField("timezone", val === TIMEZONE_NONE ? "" : val)}
+              disabled={!profileReady}
             >
               <SelectTrigger>
                 <SelectValue placeholder="Select timezone" />
@@ -254,7 +334,7 @@ export function ProfileSettings() {
             </Select>
           </div>
 
-          <Button type="submit" disabled={updateProfile.isPending}>
+          <Button type="submit" disabled={updateProfile.isPending || !profileReady}>
             {updateProfile.isPending && (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             )}

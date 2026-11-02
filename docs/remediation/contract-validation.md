@@ -102,6 +102,19 @@ the required day, or out-of-range numbers now receive 400 instead of a stored
 value or a 500. Stored values are not migrated: a row that already holds such a
 value keeps it until an edit sends the field again.
 
+## Profile form saves
+
+The profile form sends only fields changed from the loaded draft. Unedited
+values are omitted without trimming or rewriting them. Changed job title and
+phone values keep their existing trim/blank-to-null encoding; timezone None
+sends null. An explicitly changed display name must still be nonblank and pass
+the same server schema. A save with no changed fields sends no PATCH.
+
+As before, a profile refetch resets the form. The draft and its comparison
+baseline reset together, and save waits for the matching account/profile
+snapshot. This does not add a server revision or concurrent-update guarantee.
+Template full-form updates and their list/array semantics are unchanged.
+
 ## Tests
 
 ```sh

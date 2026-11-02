@@ -26,13 +26,15 @@ function RootComponent() {
   );
 }
 
-function RootErrorComponent({ error }: { error: Error }) {
+function RootErrorComponent({ error }: { error: unknown }) {
   if (isChunkLoadError(error)) return <ChunkLoadErrorNotice fullScreen />;
   return (
     <div className="flex min-h-screen items-center justify-center">
       <div className="text-center space-y-3">
         <h1 className="text-2xl font-bold">Something went wrong</h1>
-        <p className="text-sm text-muted-foreground">{error.message}</p>
+        <p className="text-sm text-muted-foreground">
+          {error instanceof Error ? error.message : "An unexpected error occurred"}
+        </p>
       </div>
     </div>
   );

@@ -124,7 +124,6 @@ export function TaskSlideover({
                   <AttachmentList
                     workspaceId={workspaceId}
                     taskId={task.id}
-                    canEdit={canEdit}
                   />
                 )}
 
@@ -214,7 +213,6 @@ export function TaskSlideover({
                 <AttachmentList
                   workspaceId={workspaceId}
                   taskId={task.id}
-                  canEdit={canEdit}
                 />
               )}
 

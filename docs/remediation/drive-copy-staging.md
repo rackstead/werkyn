@@ -18,8 +18,9 @@ cleanup. A claimed row keeps its attempts and error; failure renewal advances it
 lease by at least one stored millisecond. Workers condition retirement and retry
 on the exact attempts/lease they claimed, so an earlier worker cannot remove or
 overwrite renewed work for later bytes. Failure-only cleanup inserts the exact
-planned path if an earlier worker already removed its row. The live-File guard
-protects an ambiguous successful commit. Such an error may leave a queued live path
+planned path if an earlier worker already removed its row. Retry compares the native millisecond lease
+without session-timezone conversion, including transaction-local non-UTC sessions.
+The existing live-File guard protects an ambiguous successful commit. Such an error may leave a queued live path
 with backoff; no zero-enqueue or automatic-success guarantee is claimed. If cleanup
 enqueue itself fails, existing behavior preserves the bytes and logs the known path.
 

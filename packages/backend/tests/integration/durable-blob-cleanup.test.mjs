@@ -396,6 +396,76 @@ test("a crash after the database commit leaves durable cleanup records that conc
   assert.equal((await sweep({ paths })).claimed, 0);
 });
 
+async function nonUtcCleanup(t, deletionFails) {
+  const bytes = Buffer.from("Ordinary non-UTC cleanup notes.\n");
+  const storagePath = await blob(workspace.id, ".txt", bytes);
+  const mode = deletionFails ? "retry" : "retire";
+  const failure = "Ordinary non-UTC cleanup deletion failure";
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  try {
+    await app.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
+      // Use the producer's database clock: Prisma create supplies a UTC wall
+      // timestamp, which may not be due in this transaction-local timezone.
+      await tx.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+        VALUES (${storagePath}, CURRENT_TIMESTAMP - interval '1 second')`;
+      const [seed] = await tx.$queryRaw`
+        SELECT current_setting('TimeZone') AS "timezone", "availableAt",
+          "availableAt" <= CURRENT_TIMESTAMP AS "due",
+          CURRENT_TIMESTAMP::timestamp(3) AS "localNow",
+          CURRENT_TIMESTAMP AS "absoluteNow"
+        FROM "BlobCleanup" WHERE "storagePath" = ${storagePath}`;
+      t.diagnostic(JSON.stringify({ label: "non-utc-cleanup-seed", mode, storagePath, seed }));
+      assert.equal(seed.timezone, "America/Los_Angeles");
+      assert.equal(seed.due, true, "The owned database-clock row must be due before testing the worker");
+      const storage = deletionFails ? {
+        delete: async (actualPath) => {
+          assert.equal(actualPath, storagePath);
+          throw new Error(failure);
+        },
+      } : app.storage;
+      const result = await processBlobCleanup(tx, storage, {
+        paths: [storagePath], limit: 1, log: { warn() {}, error() {} },
+      });
+      const row = await tx.blobCleanup.findUnique({ where: { storagePath } });
+      const [timing] = await tx.$queryRaw`
+        SELECT (EXTRACT(EPOCH FROM ("availableAt" - CURRENT_TIMESTAMP::timestamp(3))) * 1000)::double precision AS "delayMs"
+        FROM "BlobCleanup" WHERE "storagePath" = ${storagePath}`;
+      const presentAfter = await exists(storagePath);
+      const bytesEqual = presentAfter ? Buffer.from(await app.storage.read(storagePath)).equals(bytes) : null;
+      t.diagnostic(JSON.stringify({ label: "non-utc-cleanup-result", mode, result, row,
+        delayMs: timing?.delayMs ?? null, presentAfter, bytesEqual }));
+      if (deletionFails) {
+        assert.deepEqual(result, { claimed: 1, deleted: 0, retained: 0, failed: 1 });
+        assert.equal(row?.attempts, 1); assert.equal(row?.lastError, failure);
+        assert.equal(timing?.delayMs, 60000);
+        assert.equal(presentAfter, true); assert.equal(bytesEqual, true);
+      } else {
+        assert.deepEqual(result, { claimed: 1, deleted: 1, retained: 0, failed: 0 });
+        assert.equal(row, null); assert.equal(presentAfter, false);
+      }
+    });
+  } finally {
+    // The transaction has settled or rolled back before removing this one
+    // recorded path. No other queued work is drained or retimed.
+    await app.prisma.blobCleanup.deleteMany({ where: { storagePath } });
+    await app.storage.delete(storagePath);
+    const remaining = await app.prisma.blobCleanup.count({ where: { storagePath } });
+    const presentAfter = await exists(storagePath);
+    t.diagnostic(JSON.stringify({ label: "non-utc-cleanup-teardown", mode, storagePath, remaining, presentAfter }));
+    assert.equal(remaining, 0); assert.equal(presentAfter, false);
+  }
+}
+
+test("non-UTC cleanup retires a successful owned text deletion", { timeout: 15000 }, async (t) => {
+  await nonUtcCleanup(t, false);
+});
+
+test("non-UTC cleanup records deletion errors and the ordinary retry backoff", { timeout: 15000 }, async (t) => {
+  await nonUtcCleanup(t, true);
+});
+
 test("a stale worker failure preserves a newer cleanup lease and its error state", async () => {
   const storagePath = await blob(workspace.id, ".txt", Buffer.from("ordinary cleanup renewal\n"));
   await app.prisma.blobCleanup.create({ data: { storagePath } });

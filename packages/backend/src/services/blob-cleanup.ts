@@ -99,12 +99,15 @@ export async function processBlobCleanup(
       BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
       MAX_BACKOFF_SECONDS,
     );
+    // Preserve the native TIMESTAMP(3) wall time. Binding a Date here can
+    // compare through timestamptz and shift the claim in a non-UTC session.
+    const leaseTimestamp = availableAt.toISOString();
     await prisma.$executeRaw`
       UPDATE "BlobCleanup"
       SET "lastError" = ${reason.slice(0, 1000)},
         "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
       WHERE "storagePath" = ${storagePath}
-        AND "attempts" = ${attempts} AND "availableAt" = ${availableAt}`;
+        AND "attempts" = ${attempts} AND "availableAt" = ${leaseTimestamp}::text::timestamp(3)`;
   };
 
   const done: typeof claimed = [];

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { stripDisallowedControlCharacters } from "@pm/shared";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useUpdateComment, useDeleteComment, type Comment } from "../api";
@@ -48,7 +49,7 @@ export function CommentItem({
   const canModify = isAdmin || comment.authorId === currentUserId;
 
   const handleSave = () => {
-    const trimmed = editBody.trim();
+    const trimmed = stripDisallowedControlCharacters(editBody).trim();
     if (!trimmed || trimmed === comment.body) {
       setEditing(false);
       setEditBody(comment.body);

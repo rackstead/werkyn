@@ -165,7 +165,7 @@ export function ProfileSettings() {
     if (Object.keys(data).length === 0) return;
 
     updateProfile.mutate(data, {
-      onSuccess: () => {
+      onSuccess: (updatedUser) => {
         setProfileDraft((current) => {
           if (
             !current || current.source !== profileDraft.source ||
@@ -174,7 +174,15 @@ export function ProfileSettings() {
             current.source.id !== useAuthStore.getState().user?.id
           ) return current;
           // Equal canonical data can retain the same query object on success.
-          return { ...current, initial: values };
+          return {
+            ...current,
+            initial: {
+              displayName: current.values.displayName === values.displayName ? values.displayName : updatedUser.displayName,
+              jobTitle: current.values.jobTitle === values.jobTitle ? values.jobTitle : updatedUser.jobTitle ?? "",
+              phone: current.values.phone === values.phone ? values.phone : updatedUser.phone ?? "",
+              timezone: current.values.timezone === values.timezone ? values.timezone : updatedUser.timezone ?? "",
+            },
+          };
         });
         toast.success("Profile updated");
       },

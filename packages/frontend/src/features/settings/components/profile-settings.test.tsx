@@ -296,3 +296,36 @@ it("advances the draft after a canonical-equal success without a second PATCH", 
   expect(queryClient.getMutationCache().getAll()).toHaveLength(mutationCount);
   expect(toast.success).toHaveBeenCalledTimes(1);
 });
+
+it("does not resend a pending edit changed to the saved canonical value", async () => {
+  await start();
+  const loaded = queryClient.getQueryData(queryKeys.me);
+  const ordinaryPatch = transport.patch.getMockImplementation()!;
+  let release!: () => void;
+  const response = new Promise<void>((resolve) => { release = resolve; });
+  transport.patch.mockImplementation((path: string, options: { json: Patch }) => {
+    const pending = ordinaryPatch(path, options);
+    return { json: async () => { const saved = await pending.json(); await response; return saved; } };
+  });
+  change("Job Title", " Engineer ");
+  fireEvent.submit(input("Display Name").closest("form")!);
+  try {
+    await waitFor(() => expect(patches[0]?.status).toBe(200));
+    expect(queryClient.isMutating()).toBe(1); expect(toast.success).not.toHaveBeenCalled();
+    observe("canonical-response-pending");
+    change("Job Title", "Engineer"); observe("canonical-edit-while-pending");
+  } finally {
+    await act(async () => { release(); });
+    await settle();
+  }
+  observations.push({ tag: "pending-canonical-success", sameQueryObject: queryClient.getQueryData(queryKeys.me) === loaded,
+    patchCount: patches.length, mutationCount: queryClient.getMutationCache().getAll().length });
+  expect(queryClient.getQueryData(queryKeys.me)).toBe(loaded);
+  expect(patches.map((p) => p.json)).toEqual([{ jobTitle: "Engineer" }]);
+  expect(input("Job Title").value).toBe("Engineer");
+  const mutationCount = queryClient.getMutationCache().getAll().length;
+  await save();
+  expect(patches).toHaveLength(1);
+  expect(queryClient.getMutationCache().getAll()).toHaveLength(mutationCount);
+  expect(toast.success).toHaveBeenCalledTimes(1);
+});

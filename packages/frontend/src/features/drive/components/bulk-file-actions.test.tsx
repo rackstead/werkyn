@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { DriveFile } from "../api";
 import { useAuthStore } from "@/stores/auth-store";
 import { DriveBulkActions } from "./drive-bulk-actions";
@@ -95,7 +95,7 @@ const driveFile = (i: number) =>
 const filesWord = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
 
 let client: QueryClient;
-let clientWideError: ReturnType<typeof vi.fn>;
+let clientWideError: Mock<(...args: unknown[]) => void>;
 
 function Providers({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
@@ -108,7 +108,7 @@ beforeEach(() => {
   net.maxInFlight = 0;
   net.root = [];
   net.folders = {};
-  clientWideError = vi.fn();
+  clientWideError = vi.fn<(...args: unknown[]) => void>();
   client = new QueryClient({
     defaultOptions: {
       queries: { retry: false },

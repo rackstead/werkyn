@@ -164,7 +164,21 @@ export function ProfileSettings() {
     if (values.timezone !== initial.timezone) data.timezone = values.timezone || null;
     if (Object.keys(data).length === 0) return;
 
-    updateProfile.mutate(data, { onSuccess: () => toast.success("Profile updated") });
+    updateProfile.mutate(data, {
+      onSuccess: () => {
+        setProfileDraft((current) => {
+          if (
+            !current || current.source !== profileDraft.source ||
+            current.generation !== profileDraft.generation ||
+            current.generation !== identityGeneration() ||
+            current.source.id !== useAuthStore.getState().user?.id
+          ) return current;
+          // Equal canonical data can retain the same query object on success.
+          return { ...current, initial: values };
+        });
+        toast.success("Profile updated");
+      },
+    });
   }
 
   function handleChangePassword(e: React.FormEvent) {

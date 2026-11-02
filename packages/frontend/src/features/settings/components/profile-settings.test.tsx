@@ -280,3 +280,19 @@ it("omits an unchanged overlength timezone while saving the phone", async () => 
   await start({ timezone: "t".repeat(51) }); change("Phone", "1111"); await save();
   expect(patches.map((p) => p.json)).toEqual([{ phone: "1111" }]); expect(server.timezone).toBe("t".repeat(51));
 });
+
+it("advances the draft after a canonical-equal success without a second PATCH", async () => {
+  await start();
+  const loaded = queryClient.getQueryData(queryKeys.me);
+  change("Job Title", " Engineer "); await save();
+  observations.push({ tag: "canonical-equal-success", sameQueryObject: queryClient.getQueryData(queryKeys.me) === loaded,
+    patchCount: patches.length, mutationCount: queryClient.getMutationCache().getAll().length });
+  expect(patches.map((p) => p.json)).toEqual([{ jobTitle: "Engineer" }]);
+  expect(patches[0].status).toBe(200); expect(server.jobTitle).toBe("Engineer");
+  expect(queryClient.getQueryData(queryKeys.me)).toBe(loaded);
+  const mutationCount = queryClient.getMutationCache().getAll().length;
+  await save();
+  expect(patches).toHaveLength(1);
+  expect(queryClient.getMutationCache().getAll()).toHaveLength(mutationCount);
+  expect(toast.success).toHaveBeenCalledTimes(1);
+});

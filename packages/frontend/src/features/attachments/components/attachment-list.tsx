@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   useAttachments,
   useDeleteAttachment,
@@ -9,23 +9,32 @@ import { getFileIcon, formatFileSize } from "@/lib/file-icons";
 import { Paperclip, Download, X, Plus, HardDrive, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { DriveFilePicker } from "@/features/drive/components/drive-file-picker";
+import { useAuthStore } from "@/stores/auth-store";
+import { usePermissions } from "@/hooks/use-permissions";
 
 interface AttachmentListProps {
   workspaceId: string;
   taskId: string;
-  canEdit: boolean;
 }
 
 export function AttachmentList({
   workspaceId,
   taskId,
-  canEdit,
 }: AttachmentListProps) {
+  const workspaces = useAuthStore((s) => s.workspaces);
+  const userId = useAuthStore((s) => s.user?.id);
+  const membership = workspaces.find((w) => w.workspace.id === workspaceId);
+  const permissions = usePermissions(membership, userId);
+  const canAttach = !!userId && permissions.canComment;
   const { data, isLoading } = useAttachments(workspaceId, "task", taskId);
   const deleteAttachment = useDeleteAttachment(workspaceId, "task", taskId);
   const linkAttachment = useLinkAttachment(workspaceId, "task", taskId);
   const downloadAttachment = useDownloadAttachment(workspaceId);
   const [showDrivePicker, setShowDrivePicker] = useState(false);
+
+  useEffect(() => {
+    if (!canAttach) setShowDrivePicker(false);
+  }, [canAttach]);
 
   const attachments = data?.data ?? [];
 
@@ -42,8 +51,8 @@ export function AttachmentList({
     });
   };
 
-  // Hide section entirely if no attachments and user can't edit
-  if (!canEdit && attachments.length === 0 && !isLoading) return null;
+  // Attachment links follow discussion policy, independently of task assignment.
+  if (!canAttach && attachments.length === 0 && !isLoading) return null;
 
   return (
     <div>
@@ -60,6 +69,8 @@ export function AttachmentList({
           {attachments.map((att) => {
             const Icon = getFileIcon(att.mimeType, false);
             const unavailable = !att.file || !!att.file.trashedAt;
+            const canRemove =
+              canAttach && (permissions.canDelete || att.uploadedById === userId);
             return (
               <div
                 key={att.id}
@@ -93,7 +104,7 @@ export function AttachmentList({
                 >
                   <Download className="h-3.5 w-3.5" />
                 </button>
-                {canEdit && (
+                {canRemove && (
                   <button
                     onClick={() => handleDelete(att.id)}
                     className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-accent transition-all text-muted-foreground hover:text-destructive"
@@ -108,7 +119,7 @@ export function AttachmentList({
         </div>
       )}
 
-      {canEdit && (
+      {canAttach && (
         <button
           onClick={() => setShowDrivePicker(true)}
           className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -119,11 +130,12 @@ export function AttachmentList({
       )}
 
       <DriveFilePicker
-        open={showDrivePicker}
+        open={canAttach && showDrivePicker}
         onClose={() => setShowDrivePicker(false)}
         workspaceId={workspaceId}
         isPending={linkAttachment.isPending}
         onSelect={(file) => {
+          if (!canAttach) return;
           linkAttachment.mutate(file.id, {
             onSuccess: () => {
               setShowDrivePicker(false);

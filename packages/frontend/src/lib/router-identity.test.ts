@@ -57,11 +57,14 @@ function signIn(id: string, role: WorkspaceMembership["role"]) {
   });
 }
 
-/** Waits for every load, including redirects, to finish. */
+/** Observes settled loads and redirects without triggering another route load. */
 async function settled() {
   for (let round = 0; round < 10; round++) {
     await new Promise((resolve) => setTimeout(resolve, 0));
-    while (router.latestLoadPromise) await router.latestLoadPromise;
+    await vi.waitFor(() => {
+      expect(router.state.isLoading).toBe(false);
+      expect(router.state.status).toBe("idle");
+    });
   }
 }
 

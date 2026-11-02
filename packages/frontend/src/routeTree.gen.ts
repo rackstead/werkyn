@@ -9,43 +9,42 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as LoginRouteImport } from './routes/login'
-import { Route as ForgotPasswordRouteImport } from './routes/forgot-password'
-import { Route as AuthedRouteImport } from './routes/_authed'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as VerifyEmailTokenRouteImport } from './routes/verify-email.$token'
-import { Route as ShareTokenRouteImport } from './routes/share.$token'
-import { Route as ResetPasswordTokenRouteImport } from './routes/reset-password.$token'
-import { Route as InviteTokenRouteImport } from './routes/invite.$token'
-import { Route as AuthedOnboardingRouteImport } from './routes/_authed/onboarding'
+import { Route as AuthedRouteImport } from './routes/_authed'
+import { Route as ForgotPasswordRouteImport } from './routes/forgot-password'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as RegisterRouteImport } from './routes/register'
 import { Route as AuthedWorkspaceSlugRouteImport } from './routes/_authed/$workspaceSlug'
+import { Route as AuthedOnboardingRouteImport } from './routes/_authed/onboarding'
+import { Route as InviteTokenRouteImport } from './routes/invite.$token'
+import { Route as ResetPasswordTokenRouteImport } from './routes/reset-password.$token'
+import { Route as ShareTokenRouteImport } from './routes/share.$token'
+import { Route as VerifyEmailTokenRouteImport } from './routes/verify-email.$token'
 import { Route as AuthedWorkspaceSlugIndexRouteImport } from './routes/_authed/$workspaceSlug/index'
-import { Route as ShareFilesTokenRouteImport } from './routes/share.files.$token'
-import { Route as AuthOidcCompleteRouteImport } from './routes/auth.oidc.complete'
-import { Route as AuthedWorkspaceSlugTimeRouteImport } from './routes/_authed/$workspaceSlug/time'
-import { Route as AuthedWorkspaceSlugSettingsRouteImport } from './routes/_authed/$workspaceSlug/settings'
-import { Route as AuthedWorkspaceSlugKnowledgeRouteImport } from './routes/_authed/$workspaceSlug/knowledge'
-import { Route as AuthedWorkspaceSlugDriveRouteImport } from './routes/_authed/$workspaceSlug/drive'
-import { Route as AuthedWorkspaceSlugChatRouteImport } from './routes/_authed/$workspaceSlug/chat'
 import { Route as AuthedWorkspaceSlugAdminRouteImport } from './routes/_authed/$workspaceSlug/admin'
-import { Route as AuthedWorkspaceSlugTimeIndexRouteImport } from './routes/_authed/$workspaceSlug/time.index'
+import { Route as AuthedWorkspaceSlugChatRouteImport } from './routes/_authed/$workspaceSlug/chat'
+import { Route as AuthedWorkspaceSlugDriveRouteImport } from './routes/_authed/$workspaceSlug/drive'
+import { Route as AuthedWorkspaceSlugKnowledgeRouteImport } from './routes/_authed/$workspaceSlug/knowledge'
+import { Route as AuthedWorkspaceSlugSettingsRouteImport } from './routes/_authed/$workspaceSlug/settings'
+import { Route as AuthedWorkspaceSlugTimeRouteImport } from './routes/_authed/$workspaceSlug/time'
+import { Route as AuthOidcCompleteRouteImport } from './routes/auth.oidc.complete'
+import { Route as ShareFilesTokenRouteImport } from './routes/share.files.$token'
 import { Route as AuthedWorkspaceSlugProjectsIndexRouteImport } from './routes/_authed/$workspaceSlug/projects/index'
-import { Route as AuthedWorkspaceSlugTimeReportsRouteImport } from './routes/_authed/$workspaceSlug/time.reports'
 import { Route as AuthedWorkspaceSlugProjectsProjectIdRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId'
-import { Route as AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/settings'
-import { Route as AuthedWorkspaceSlugProjectsProjectIdListRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/list'
-import { Route as AuthedWorkspaceSlugProjectsProjectIdCalendarRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/calendar'
+import { Route as AuthedWorkspaceSlugTimeIndexRouteImport } from './routes/_authed/$workspaceSlug/time.index'
+import { Route as AuthedWorkspaceSlugTimeReportsRouteImport } from './routes/_authed/$workspaceSlug/time.reports'
 import { Route as AuthedWorkspaceSlugProjectsProjectIdBoardRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/board'
+import { Route as AuthedWorkspaceSlugProjectsProjectIdCalendarRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/calendar'
+import { Route as AuthedWorkspaceSlugProjectsProjectIdListRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/list'
+import { Route as AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport } from './routes/_authed/$workspaceSlug/projects/$projectId/settings'
 
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
+const AuthedRoute = AuthedRouteImport.update({
+  id: '/_authed',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ForgotPasswordRoute = ForgotPasswordRouteImport.update({
@@ -53,23 +52,29 @@ const ForgotPasswordRoute = ForgotPasswordRouteImport.update({
   path: '/forgot-password',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AuthedRoute = AuthedRouteImport.update({
-  id: '/_authed',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
-const VerifyEmailTokenRoute = VerifyEmailTokenRouteImport.update({
-  id: '/verify-email/$token',
-  path: '/verify-email/$token',
-  getParentRoute: () => rootRouteImport,
+const AuthedWorkspaceSlugRoute = AuthedWorkspaceSlugRouteImport.update({
+  id: '/$workspaceSlug',
+  path: '/$workspaceSlug',
+  getParentRoute: () => AuthedRoute,
 } as any)
-const ShareTokenRoute = ShareTokenRouteImport.update({
-  id: '/share/$token',
-  path: '/share/$token',
+const AuthedOnboardingRoute = AuthedOnboardingRouteImport.update({
+  id: '/onboarding',
+  path: '/onboarding',
+  getParentRoute: () => AuthedRoute,
+} as any)
+const InviteTokenRoute = InviteTokenRouteImport.update({
+  id: '/invite/$token',
+  path: '/invite/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ResetPasswordTokenRoute = ResetPasswordTokenRouteImport.update({
@@ -77,20 +82,15 @@ const ResetPasswordTokenRoute = ResetPasswordTokenRouteImport.update({
   path: '/reset-password/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
-const InviteTokenRoute = InviteTokenRouteImport.update({
-  id: '/invite/$token',
-  path: '/invite/$token',
+const ShareTokenRoute = ShareTokenRouteImport.update({
+  id: '/share/$token',
+  path: '/share/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AuthedOnboardingRoute = AuthedOnboardingRouteImport.update({
-  id: '/onboarding',
-  path: '/onboarding',
-  getParentRoute: () => AuthedRoute,
-} as any)
-const AuthedWorkspaceSlugRoute = AuthedWorkspaceSlugRouteImport.update({
-  id: '/$workspaceSlug',
-  path: '/$workspaceSlug',
-  getParentRoute: () => AuthedRoute,
+const VerifyEmailTokenRoute = VerifyEmailTokenRouteImport.update({
+  id: '/verify-email/$token',
+  path: '/verify-email/$token',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const AuthedWorkspaceSlugIndexRoute =
   AuthedWorkspaceSlugIndexRouteImport.update({
@@ -98,25 +98,21 @@ const AuthedWorkspaceSlugIndexRoute =
     path: '/',
     getParentRoute: () => AuthedWorkspaceSlugRoute,
   } as any)
-const ShareFilesTokenRoute = ShareFilesTokenRouteImport.update({
-  id: '/share/files/$token',
-  path: '/share/files/$token',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const AuthOidcCompleteRoute = AuthOidcCompleteRouteImport.update({
-  id: '/auth/oidc/complete',
-  path: '/auth/oidc/complete',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const AuthedWorkspaceSlugTimeRoute = AuthedWorkspaceSlugTimeRouteImport.update({
-  id: '/time',
-  path: '/time',
+const AuthedWorkspaceSlugAdminRoute =
+  AuthedWorkspaceSlugAdminRouteImport.update({
+    id: '/admin',
+    path: '/admin',
+    getParentRoute: () => AuthedWorkspaceSlugRoute,
+  } as any)
+const AuthedWorkspaceSlugChatRoute = AuthedWorkspaceSlugChatRouteImport.update({
+  id: '/chat',
+  path: '/chat',
   getParentRoute: () => AuthedWorkspaceSlugRoute,
 } as any)
-const AuthedWorkspaceSlugSettingsRoute =
-  AuthedWorkspaceSlugSettingsRouteImport.update({
-    id: '/settings',
-    path: '/settings',
+const AuthedWorkspaceSlugDriveRoute =
+  AuthedWorkspaceSlugDriveRouteImport.update({
+    id: '/drive',
+    path: '/drive',
     getParentRoute: () => AuthedWorkspaceSlugRoute,
   } as any)
 const AuthedWorkspaceSlugKnowledgeRoute =
@@ -125,21 +121,37 @@ const AuthedWorkspaceSlugKnowledgeRoute =
     path: '/knowledge',
     getParentRoute: () => AuthedWorkspaceSlugRoute,
   } as any)
-const AuthedWorkspaceSlugDriveRoute =
-  AuthedWorkspaceSlugDriveRouteImport.update({
-    id: '/drive',
-    path: '/drive',
+const AuthedWorkspaceSlugSettingsRoute =
+  AuthedWorkspaceSlugSettingsRouteImport.update({
+    id: '/settings',
+    path: '/settings',
     getParentRoute: () => AuthedWorkspaceSlugRoute,
   } as any)
-const AuthedWorkspaceSlugChatRoute = AuthedWorkspaceSlugChatRouteImport.update({
-  id: '/chat',
-  path: '/chat',
+const AuthedWorkspaceSlugTimeRoute = AuthedWorkspaceSlugTimeRouteImport.update({
+  id: '/time',
+  path: '/time',
   getParentRoute: () => AuthedWorkspaceSlugRoute,
 } as any)
-const AuthedWorkspaceSlugAdminRoute =
-  AuthedWorkspaceSlugAdminRouteImport.update({
-    id: '/admin',
-    path: '/admin',
+const AuthOidcCompleteRoute = AuthOidcCompleteRouteImport.update({
+  id: '/auth/oidc/complete',
+  path: '/auth/oidc/complete',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ShareFilesTokenRoute = ShareFilesTokenRouteImport.update({
+  id: '/share/files/$token',
+  path: '/share/files/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthedWorkspaceSlugProjectsIndexRoute =
+  AuthedWorkspaceSlugProjectsIndexRouteImport.update({
+    id: '/projects/',
+    path: '/projects/',
+    getParentRoute: () => AuthedWorkspaceSlugRoute,
+  } as any)
+const AuthedWorkspaceSlugProjectsProjectIdRoute =
+  AuthedWorkspaceSlugProjectsProjectIdRouteImport.update({
+    id: '/projects/$projectId',
+    path: '/projects/$projectId',
     getParentRoute: () => AuthedWorkspaceSlugRoute,
   } as any)
 const AuthedWorkspaceSlugTimeIndexRoute =
@@ -148,34 +160,16 @@ const AuthedWorkspaceSlugTimeIndexRoute =
     path: '/',
     getParentRoute: () => AuthedWorkspaceSlugTimeRoute,
   } as any)
-const AuthedWorkspaceSlugProjectsIndexRoute =
-  AuthedWorkspaceSlugProjectsIndexRouteImport.update({
-    id: '/projects/',
-    path: '/projects/',
-    getParentRoute: () => AuthedWorkspaceSlugRoute,
-  } as any)
 const AuthedWorkspaceSlugTimeReportsRoute =
   AuthedWorkspaceSlugTimeReportsRouteImport.update({
     id: '/reports',
     path: '/reports',
     getParentRoute: () => AuthedWorkspaceSlugTimeRoute,
   } as any)
-const AuthedWorkspaceSlugProjectsProjectIdRoute =
-  AuthedWorkspaceSlugProjectsProjectIdRouteImport.update({
-    id: '/projects/$projectId',
-    path: '/projects/$projectId',
-    getParentRoute: () => AuthedWorkspaceSlugRoute,
-  } as any)
-const AuthedWorkspaceSlugProjectsProjectIdSettingsRoute =
-  AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport.update({
-    id: '/settings',
-    path: '/settings',
-    getParentRoute: () => AuthedWorkspaceSlugProjectsProjectIdRoute,
-  } as any)
-const AuthedWorkspaceSlugProjectsProjectIdListRoute =
-  AuthedWorkspaceSlugProjectsProjectIdListRouteImport.update({
-    id: '/list',
-    path: '/list',
+const AuthedWorkspaceSlugProjectsProjectIdBoardRoute =
+  AuthedWorkspaceSlugProjectsProjectIdBoardRouteImport.update({
+    id: '/board',
+    path: '/board',
     getParentRoute: () => AuthedWorkspaceSlugProjectsProjectIdRoute,
   } as any)
 const AuthedWorkspaceSlugProjectsProjectIdCalendarRoute =
@@ -184,10 +178,16 @@ const AuthedWorkspaceSlugProjectsProjectIdCalendarRoute =
     path: '/calendar',
     getParentRoute: () => AuthedWorkspaceSlugProjectsProjectIdRoute,
   } as any)
-const AuthedWorkspaceSlugProjectsProjectIdBoardRoute =
-  AuthedWorkspaceSlugProjectsProjectIdBoardRouteImport.update({
-    id: '/board',
-    path: '/board',
+const AuthedWorkspaceSlugProjectsProjectIdListRoute =
+  AuthedWorkspaceSlugProjectsProjectIdListRouteImport.update({
+    id: '/list',
+    path: '/list',
+    getParentRoute: () => AuthedWorkspaceSlugProjectsProjectIdRoute,
+  } as any)
+const AuthedWorkspaceSlugProjectsProjectIdSettingsRoute =
+  AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport.update({
+    id: '/settings',
+    path: '/settings',
     getParentRoute: () => AuthedWorkspaceSlugProjectsProjectIdRoute,
   } as any)
 
@@ -383,25 +383,11 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/forgot-password': {
-      id: '/forgot-password'
-      path: '/forgot-password'
-      fullPath: '/forgot-password'
-      preLoaderRoute: typeof ForgotPasswordRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_authed': {
@@ -411,25 +397,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/forgot-password': {
+      id: '/forgot-password'
+      path: '/forgot-password'
+      fullPath: '/forgot-password'
+      preLoaderRoute: typeof ForgotPasswordRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/verify-email/$token': {
-      id: '/verify-email/$token'
-      path: '/verify-email/$token'
-      fullPath: '/verify-email/$token'
-      preLoaderRoute: typeof VerifyEmailTokenRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/share/$token': {
-      id: '/share/$token'
-      path: '/share/$token'
-      fullPath: '/share/$token'
-      preLoaderRoute: typeof ShareTokenRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_authed/$workspaceSlug': {
+      id: '/_authed/$workspaceSlug'
+      path: '/$workspaceSlug'
+      fullPath: '/$workspaceSlug'
+      preLoaderRoute: typeof AuthedWorkspaceSlugRouteImport
+      parentRoute: typeof AuthedRoute
+    }
+    '/_authed/onboarding': {
+      id: '/_authed/onboarding'
+      path: '/onboarding'
+      fullPath: '/onboarding'
+      preLoaderRoute: typeof AuthedOnboardingRouteImport
+      parentRoute: typeof AuthedRoute
+    }
+    '/invite/$token': {
+      id: '/invite/$token'
+      path: '/invite/$token'
+      fullPath: '/invite/$token'
+      preLoaderRoute: typeof InviteTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reset-password/$token': {
@@ -439,81 +446,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ResetPasswordTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/invite/$token': {
-      id: '/invite/$token'
-      path: '/invite/$token'
-      fullPath: '/invite/$token'
-      preLoaderRoute: typeof InviteTokenRouteImport
+    '/share/$token': {
+      id: '/share/$token'
+      path: '/share/$token'
+      fullPath: '/share/$token'
+      preLoaderRoute: typeof ShareTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/_authed/onboarding': {
-      id: '/_authed/onboarding'
-      path: '/onboarding'
-      fullPath: '/onboarding'
-      preLoaderRoute: typeof AuthedOnboardingRouteImport
-      parentRoute: typeof AuthedRoute
-    }
-    '/_authed/$workspaceSlug': {
-      id: '/_authed/$workspaceSlug'
-      path: '/$workspaceSlug'
-      fullPath: '/$workspaceSlug'
-      preLoaderRoute: typeof AuthedWorkspaceSlugRouteImport
-      parentRoute: typeof AuthedRoute
+    '/verify-email/$token': {
+      id: '/verify-email/$token'
+      path: '/verify-email/$token'
+      fullPath: '/verify-email/$token'
+      preLoaderRoute: typeof VerifyEmailTokenRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_authed/$workspaceSlug/': {
       id: '/_authed/$workspaceSlug/'
       path: '/'
       fullPath: '/$workspaceSlug/'
       preLoaderRoute: typeof AuthedWorkspaceSlugIndexRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugRoute
-    }
-    '/share/files/$token': {
-      id: '/share/files/$token'
-      path: '/share/files/$token'
-      fullPath: '/share/files/$token'
-      preLoaderRoute: typeof ShareFilesTokenRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/auth/oidc/complete': {
-      id: '/auth/oidc/complete'
-      path: '/auth/oidc/complete'
-      fullPath: '/auth/oidc/complete'
-      preLoaderRoute: typeof AuthOidcCompleteRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/_authed/$workspaceSlug/time': {
-      id: '/_authed/$workspaceSlug/time'
-      path: '/time'
-      fullPath: '/$workspaceSlug/time'
-      preLoaderRoute: typeof AuthedWorkspaceSlugTimeRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugRoute
-    }
-    '/_authed/$workspaceSlug/settings': {
-      id: '/_authed/$workspaceSlug/settings'
-      path: '/settings'
-      fullPath: '/$workspaceSlug/settings'
-      preLoaderRoute: typeof AuthedWorkspaceSlugSettingsRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugRoute
-    }
-    '/_authed/$workspaceSlug/knowledge': {
-      id: '/_authed/$workspaceSlug/knowledge'
-      path: '/knowledge'
-      fullPath: '/$workspaceSlug/knowledge'
-      preLoaderRoute: typeof AuthedWorkspaceSlugKnowledgeRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugRoute
-    }
-    '/_authed/$workspaceSlug/drive': {
-      id: '/_authed/$workspaceSlug/drive'
-      path: '/drive'
-      fullPath: '/$workspaceSlug/drive'
-      preLoaderRoute: typeof AuthedWorkspaceSlugDriveRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugRoute
-    }
-    '/_authed/$workspaceSlug/chat': {
-      id: '/_authed/$workspaceSlug/chat'
-      path: '/chat'
-      fullPath: '/$workspaceSlug/chat'
-      preLoaderRoute: typeof AuthedWorkspaceSlugChatRouteImport
       parentRoute: typeof AuthedWorkspaceSlugRoute
     }
     '/_authed/$workspaceSlug/admin': {
@@ -523,12 +474,54 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedWorkspaceSlugAdminRouteImport
       parentRoute: typeof AuthedWorkspaceSlugRoute
     }
-    '/_authed/$workspaceSlug/time/': {
-      id: '/_authed/$workspaceSlug/time/'
-      path: '/'
-      fullPath: '/$workspaceSlug/time/'
-      preLoaderRoute: typeof AuthedWorkspaceSlugTimeIndexRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugTimeRoute
+    '/_authed/$workspaceSlug/chat': {
+      id: '/_authed/$workspaceSlug/chat'
+      path: '/chat'
+      fullPath: '/$workspaceSlug/chat'
+      preLoaderRoute: typeof AuthedWorkspaceSlugChatRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugRoute
+    }
+    '/_authed/$workspaceSlug/drive': {
+      id: '/_authed/$workspaceSlug/drive'
+      path: '/drive'
+      fullPath: '/$workspaceSlug/drive'
+      preLoaderRoute: typeof AuthedWorkspaceSlugDriveRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugRoute
+    }
+    '/_authed/$workspaceSlug/knowledge': {
+      id: '/_authed/$workspaceSlug/knowledge'
+      path: '/knowledge'
+      fullPath: '/$workspaceSlug/knowledge'
+      preLoaderRoute: typeof AuthedWorkspaceSlugKnowledgeRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugRoute
+    }
+    '/_authed/$workspaceSlug/settings': {
+      id: '/_authed/$workspaceSlug/settings'
+      path: '/settings'
+      fullPath: '/$workspaceSlug/settings'
+      preLoaderRoute: typeof AuthedWorkspaceSlugSettingsRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugRoute
+    }
+    '/_authed/$workspaceSlug/time': {
+      id: '/_authed/$workspaceSlug/time'
+      path: '/time'
+      fullPath: '/$workspaceSlug/time'
+      preLoaderRoute: typeof AuthedWorkspaceSlugTimeRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugRoute
+    }
+    '/auth/oidc/complete': {
+      id: '/auth/oidc/complete'
+      path: '/auth/oidc/complete'
+      fullPath: '/auth/oidc/complete'
+      preLoaderRoute: typeof AuthOidcCompleteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/share/files/$token': {
+      id: '/share/files/$token'
+      path: '/share/files/$token'
+      fullPath: '/share/files/$token'
+      preLoaderRoute: typeof ShareFilesTokenRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_authed/$workspaceSlug/projects/': {
       id: '/_authed/$workspaceSlug/projects/'
@@ -537,13 +530,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedWorkspaceSlugProjectsIndexRouteImport
       parentRoute: typeof AuthedWorkspaceSlugRoute
     }
-    '/_authed/$workspaceSlug/time/reports': {
-      id: '/_authed/$workspaceSlug/time/reports'
-      path: '/reports'
-      fullPath: '/$workspaceSlug/time/reports'
-      preLoaderRoute: typeof AuthedWorkspaceSlugTimeReportsRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugTimeRoute
-    }
     '/_authed/$workspaceSlug/projects/$projectId': {
       id: '/_authed/$workspaceSlug/projects/$projectId'
       path: '/projects/$projectId'
@@ -551,18 +537,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRouteImport
       parentRoute: typeof AuthedWorkspaceSlugRoute
     }
-    '/_authed/$workspaceSlug/projects/$projectId/settings': {
-      id: '/_authed/$workspaceSlug/projects/$projectId/settings'
-      path: '/settings'
-      fullPath: '/$workspaceSlug/projects/$projectId/settings'
-      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport
-      parentRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRoute
+    '/_authed/$workspaceSlug/time/': {
+      id: '/_authed/$workspaceSlug/time/'
+      path: '/'
+      fullPath: '/$workspaceSlug/time/'
+      preLoaderRoute: typeof AuthedWorkspaceSlugTimeIndexRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugTimeRoute
     }
-    '/_authed/$workspaceSlug/projects/$projectId/list': {
-      id: '/_authed/$workspaceSlug/projects/$projectId/list'
-      path: '/list'
-      fullPath: '/$workspaceSlug/projects/$projectId/list'
-      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdListRouteImport
+    '/_authed/$workspaceSlug/time/reports': {
+      id: '/_authed/$workspaceSlug/time/reports'
+      path: '/reports'
+      fullPath: '/$workspaceSlug/time/reports'
+      preLoaderRoute: typeof AuthedWorkspaceSlugTimeReportsRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugTimeRoute
+    }
+    '/_authed/$workspaceSlug/projects/$projectId/board': {
+      id: '/_authed/$workspaceSlug/projects/$projectId/board'
+      path: '/board'
+      fullPath: '/$workspaceSlug/projects/$projectId/board'
+      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdBoardRouteImport
       parentRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRoute
     }
     '/_authed/$workspaceSlug/projects/$projectId/calendar': {
@@ -572,11 +565,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdCalendarRouteImport
       parentRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRoute
     }
-    '/_authed/$workspaceSlug/projects/$projectId/board': {
-      id: '/_authed/$workspaceSlug/projects/$projectId/board'
-      path: '/board'
-      fullPath: '/$workspaceSlug/projects/$projectId/board'
-      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdBoardRouteImport
+    '/_authed/$workspaceSlug/projects/$projectId/list': {
+      id: '/_authed/$workspaceSlug/projects/$projectId/list'
+      path: '/list'
+      fullPath: '/$workspaceSlug/projects/$projectId/list'
+      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdListRouteImport
+      parentRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRoute
+    }
+    '/_authed/$workspaceSlug/projects/$projectId/settings': {
+      id: '/_authed/$workspaceSlug/projects/$projectId/settings'
+      path: '/settings'
+      fullPath: '/$workspaceSlug/projects/$projectId/settings'
+      preLoaderRoute: typeof AuthedWorkspaceSlugProjectsProjectIdSettingsRouteImport
       parentRoute: typeof AuthedWorkspaceSlugProjectsProjectIdRoute
     }
   }

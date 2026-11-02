@@ -176,6 +176,19 @@ describe("error screens", () => {
     expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
   });
 
+  it.each([null, undefined, "ordinary failure", { reason: "ordinary failure" }])(
+    "the root error screen safely handles an unknown thrown value %#",
+    (error) => {
+      const RootError = RootRoute.options.errorComponent as (props: {
+        error: unknown;
+      }) => React.ReactNode;
+      render(<>{RootError({ error })}</>);
+      expect(screen.getByText("Something went wrong")).toBeTruthy();
+      expect(screen.getByText("An unexpected error occurred")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+    },
+  );
+
   it("the root error screen offers a reload when a route chunk failed to load", () => {
     const reload = stubReload();
     const RootError = RootRoute.options.errorComponent as (props: {

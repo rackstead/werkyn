@@ -332,11 +332,13 @@ export async function deliverChatMessage(
   }
 }
 
-/** Retries every due, unleased delivery. */
+/** Retries due deliveries, stopping between attempts when the pass is aborted. */
 export async function processDueChatMessageDeliveries(
   prisma: PrismaClient,
-  options: DeliveryOptions & { limit?: number } = {},
+  options: DeliveryOptions & { limit?: number; signal?: AbortSignal } = {},
 ) {
+  const results = { completed: 0, pending: 0, skipped: 0 };
+  if (options.signal?.aborted) return results;
   const now = options.now ?? new Date();
   const due = await prisma.chatMessageDelivery.findMany({
     where: {
@@ -348,8 +350,8 @@ export async function processDueChatMessageDeliveries(
     take: options.limit ?? DEFAULT_BATCH_SIZE,
     select: { messageId: true },
   });
-  const results = { completed: 0, pending: 0, skipped: 0 };
   for (const { messageId } of due) {
+    if (options.signal?.aborted) break;
     results[await deliverChatMessage(prisma, messageId, { ...options, now })] += 1;
   }
   return results;
@@ -357,7 +359,7 @@ export async function processDueChatMessageDeliveries(
 
 export interface ChatMessageDeliveryWorker {
   run(): Promise<void>;
-  /** Stops scheduling passes and waits for the one in progress, if any. */
+  /** Stops scheduling, ends the pass at its next boundary, and waits for it. */
   stop(): Promise<void>;
 }
 
@@ -371,12 +373,12 @@ export function startChatMessageDeliveryWorker(
   options: { intervalMs?: number } = {},
 ): ChatMessageDeliveryWorker {
   const { intervalMs = 30_000 } = options;
-  let stopped = false;
+  const controller = new AbortController();
   let running: Promise<void> | undefined;
 
   const run = () => {
-    if (stopped) return running ?? Promise.resolve();
-    running ??= processDueChatMessageDeliveries(app.prisma, { log: app.log })
+    if (controller.signal.aborted) return running ?? Promise.resolve();
+    running ??= processDueChatMessageDeliveries(app.prisma, { log: app.log, signal: controller.signal })
       .then(() => undefined)
       .catch((err) => app.log.error(err, "Failed to run chat message delivery retries"))
       .finally(() => {
@@ -389,7 +391,7 @@ export function startChatMessageDeliveryWorker(
   return {
     run,
     async stop() {
-      stopped = true;
+      controller.abort();
       clearInterval(interval);
       await running;
     },

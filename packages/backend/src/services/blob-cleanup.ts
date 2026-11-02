@@ -66,7 +66,7 @@ export async function processBlobCleanup(
     ? Prisma.sql`AND "storagePath" = ANY(${options.paths}::text[])`
     : Prisma.empty;
   const claimed = await prisma.$queryRaw<
-    Array<{ storagePath: string; attempts: number }>
+    Array<{ storagePath: string; attempts: number; availableAt: Date }>
   >`
     UPDATE "BlobCleanup"
     SET "attempts" = "attempts" + 1,
@@ -78,7 +78,7 @@ export async function processBlobCleanup(
       LIMIT ${options.limit ?? BATCH_SIZE}
       FOR UPDATE SKIP LOCKED
     )
-    RETURNING "storagePath", "attempts"`;
+    RETURNING "storagePath", "attempts", "availableAt"`;
   result.claimed = claimed.length;
   if (claimed.length === 0) return result;
 
@@ -94,7 +94,7 @@ export async function processBlobCleanup(
     ),
   );
 
-  const retry = async (storagePath: string, attempts: number, reason: string) => {
+  const retry = async (storagePath: string, attempts: number, availableAt: Date, reason: string) => {
     const delay = Math.min(
       BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
       MAX_BACKOFF_SECONDS,
@@ -103,15 +103,17 @@ export async function processBlobCleanup(
       UPDATE "BlobCleanup"
       SET "lastError" = ${reason.slice(0, 1000)},
         "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
-      WHERE "storagePath" = ${storagePath}`;
+      WHERE "storagePath" = ${storagePath}
+        AND "attempts" = ${attempts} AND "availableAt" = ${availableAt}`;
   };
 
-  const done: string[] = [];
+  const done: typeof claimed = [];
   try {
-    for (const { storagePath, attempts } of claimed) {
+    for (const claim of claimed) {
+      const { storagePath, attempts, availableAt } = claim;
       if (live.has(storagePath)) {
         result.retained++;
-        await retry(storagePath, attempts, "Still referenced by a live File");
+        await retry(storagePath, attempts, availableAt, "Still referenced by a live File");
         log.warn(
           { storagePath, attempts },
           "Queued stored blob is still referenced by a live File; kept",
@@ -121,10 +123,10 @@ export async function processBlobCleanup(
       try {
         await storage.delete(storagePath);
         result.deleted++;
-        done.push(storagePath);
+        done.push(claim);
       } catch (error) {
         result.failed++;
-        await retry(storagePath, attempts, errorMessage(error));
+        await retry(storagePath, attempts, availableAt, errorMessage(error));
         log.warn(
           { err: error, storagePath, attempts },
           "Stored blob cleanup failed; it will be retried",
@@ -134,7 +136,11 @@ export async function processBlobCleanup(
   } finally {
     if (done.length > 0)
       await prisma.blobCleanup.deleteMany({
-        where: { storagePath: { in: done } },
+        // A failed writer may renew the queued path after this deletion.
+        // Retire only the exact claim whose storage operation just finished.
+        where: { OR: done.map(({ storagePath, attempts, availableAt }) => ({
+          storagePath, attempts, availableAt,
+        })) },
       });
   }
   return result;

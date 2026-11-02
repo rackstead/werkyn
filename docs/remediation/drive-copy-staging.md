@@ -14,9 +14,11 @@ unexpected returned path is never adopted, queued or deleted: only the proved
 planned path belongs to this operation.
 
 After irreversible failure, with no File retry, an unclaimed stage is made due for
-cleanup. A claimed row keeps its lease/attempts. Failure-only cleanup may enqueue
-the exact planned path again if a worker swept before a late writer opened it;
-skipDuplicates preserves any existing claim. The existing worker's live-File guard
+cleanup. A claimed row keeps its attempts and error; failure renewal advances its
+lease by at least one stored millisecond. Workers condition retirement and retry
+on the exact attempts/lease they claimed, so an earlier worker cannot remove or
+overwrite renewed work for later bytes. Failure-only cleanup inserts the exact
+planned path if an earlier worker already removed its row. The live-File guard
 protects an ambiguous successful commit. Such an error may leave a queued live path
 with backoff; no zero-enqueue or automatic-success guarantee is claimed. If cleanup
 enqueue itself fails, existing behavior preserves the bytes and logs the known path.
@@ -24,7 +26,9 @@ enqueue itself fails, existing behavior preserves the bytes and logs the known p
 Ordinary tiny-text cases cover pre-write intent, exact successful copy, source and
 destination denials, source410, settled write/transaction failures, a return error
 after an actual settled commit, claimed leases, a late writer after a completed
-one-path sweep, unexpected return paths and retained cleanup retry work. They do
+one-path sweep, a worker paused between storage and queue-row deletion, unexpected
+return paths and retained cleanup retry work. They do
 not establish process-crash recovery, sustained draining, universal orphan cleanup
-or native/archive/load behavior. Uploads, thumbnails, restore, the shared worker,
-providers, schema and permissions are unchanged. Broader R26 work stays open.
+or native/archive/load behavior. The shared worker now fences retirement/retry by
+claim identity; upload/thumbnail/restore producers, providers, schema and permissions
+retain their existing contracts. Broader R26 work stays open.

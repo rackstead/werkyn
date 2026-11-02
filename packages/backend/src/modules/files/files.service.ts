@@ -615,22 +615,26 @@ async function discardFailedCopy(
   plannedPath: string,
 ) {
   try {
-    // A claimed row keeps its lease and attempts; an unclaimed failed stage
-    // can be removed now instead of waiting out its original grace.
+    // Renew the claim identity before cleanup. The worker conditions retirement
+    // and retry on attempts + availableAt, so an earlier deletion cannot remove
+    // this later write's durable work. Preserve attempts and extend an existing
+    // lease by at least one stored millisecond; unclaimed stages become due now.
     await prisma.$executeRaw`
-      UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP
-      WHERE "storagePath" = ${plannedPath} AND "attempts" = 0`;
+      INSERT INTO "BlobCleanup" ("storagePath") VALUES (${plannedPath})
+      ON CONFLICT ("storagePath") DO UPDATE SET "availableAt" =
+        CASE WHEN "BlobCleanup"."attempts" = 0 THEN CURRENT_TIMESTAMP
+        ELSE GREATEST("BlobCleanup"."availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+        END`;
   } catch (error) {
     logger.error(
       { err: error, storagePath: plannedPath },
-      "Could not make failed copy cleanup due; preserving its known path",
+      "Could not renew failed copy cleanup; preserving its known path",
     );
+    return;
   }
-  // A sweep may have finished before a late target write. Once this copy
-  // has irreversibly failed, queue that exact planned path for cleanup.
-  // skipDuplicates preserves an existing claim, and the live-File guard
-  // protects an ambiguous successful commit. No File retry follows this.
-  await discardStagedBlobs(prisma, storage, [plannedPath]);
+  // The live-File guard protects an ambiguous successful commit. No File retry
+  // follows this failure-only renewal, including when the old row was absent.
+  await cleanupBlobsNow(prisma, storage, [plannedPath]);
 }
 
 export async function copyFile(

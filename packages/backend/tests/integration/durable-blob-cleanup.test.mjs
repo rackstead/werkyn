@@ -396,6 +396,34 @@ test("a crash after the database commit leaves durable cleanup records that conc
   assert.equal((await sweep({ paths })).claimed, 0);
 });
 
+test("a stale worker failure preserves a newer cleanup lease and its error state", async () => {
+  const storagePath = await blob(workspace.id, ".txt", Buffer.from("ordinary cleanup renewal\n"));
+  await app.prisma.blobCleanup.create({ data: { storagePath } });
+  let renewed;
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  try {
+    const result = await processBlobCleanup(app.prisma, {
+      delete: async (actualPath) => {
+        assert.equal(actualPath, storagePath);
+        await app.prisma.$executeRaw`
+          UPDATE "BlobCleanup" SET "availableAt" = "availableAt" + interval '1 millisecond'
+          WHERE "storagePath" = ${storagePath}`;
+        renewed = await app.prisma.blobCleanup.findUnique({ where: { storagePath } });
+        throw new Error("Earlier cleanup operation failed after renewal");
+      },
+    }, { paths: [storagePath], limit: 1 });
+    assert.equal(result.claimed, 1); assert.equal(result.failed, 1);
+    assert.equal(renewed.attempts, 1); assert.equal(renewed.lastError, null);
+    assert.deepEqual(await app.prisma.blobCleanup.findUnique({ where: { storagePath } }), renewed);
+    assert.equal(await exists(storagePath), true);
+  } finally {
+    await makeDue([storagePath]);
+    await sweep({ paths: [storagePath] });
+  }
+  assert.deepEqual(await queued([storagePath]), []);
+  assert.equal(await exists(storagePath), false);
+});
+
 test("a cleanup record never removes a blob that a live file still references", async () => {
   const live = await makeFile({ thumbnail: true });
   const paths = blobsOf(live);

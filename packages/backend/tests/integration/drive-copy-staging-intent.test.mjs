@@ -158,7 +158,17 @@ before(async () => {
     app.addHook("onResponse", (request, reply, done) => {
       const row = serverRequests.get(request.headers["x-owned-copy-probe"]);
       if (!row) return done();
-      capture("owned-server-response-terminal", { key: row.key, case: row.case, requestId: request.id, status: reply.statusCode }).then(() => {
+      capture("owned-server-response-terminal", { key: row.key, case: row.case, requestId: request.id, status: reply.statusCode }).then(async () => {
+        const c = current;
+        if (c?.releaseQueueDelete && !c.workerReleased) {
+          c.workerReleased = true;
+          await capture(`${c.label}:failure-cleanup-finished-before-worker-row-delete`, {
+            queue: await app.prisma.blobCleanup.findMany({ where: { storagePath: { in: [...c.paths] } } }),
+          });
+          c.releaseQueueDelete();
+          c.sweep = await c.workerPromise;
+          await capture(`${c.label}:held-worker-actually-settled`, { result: c.sweep });
+        }
         row.completed = true; row.resolveTerminal(); done();
       }, done);
     });
@@ -193,9 +203,20 @@ before(async () => {
       name: "Peer private folder", isFolder: true } });
     for (const name of ["saveStream", "openReadStream", "read", "delete", "exists"]) originals[name] = app.storage[name].bind(app.storage);
     originals.executeRaw = app.prisma.$executeRaw.bind(app.prisma); originals.transaction = app.prisma.$transaction.bind(app.prisma);
+    originals.cleanupDeleteMany = app.prisma.blobCleanup.deleteMany.bind(app.prisma.blobCleanup);
+    app.prisma.blobCleanup.deleteMany = (...args) => owned("cleanup-row-delete-wrapper", async () => {
+      const c = current;
+      if (c?.options.holdQueueDelete && !c.workerRowDeleteHeld) {
+        c.workerRowDeleteHeld = true;
+        await capture(`${c.label}:worker-after-storage-delete-before-row-delete`, { args });
+        c.queueDeleteReached();
+        await c.queueDeleteGate;
+      }
+      return originals.cleanupDeleteMany(...args);
+    });
     app.prisma.$executeRaw = (...args) => owned("execute-raw-wrapper", async () => {
       const c = current;
-      if (c && /^\s*INSERT INTO "BlobCleanup"/.test(sqlText(args))) {
+      if (c && /^\s*INSERT INTO "BlobCleanup"/.test(sqlText(args)) && !sqlText(args).includes("ON CONFLICT")) {
         c.intentCalls++; await rememberPlanned(c, args[1]);
         await capture(`${c.label}:intent-insert-called`, { calls: c.intentCalls });
         if (c.options.intentFailure) throw fault("intent insert");
@@ -239,6 +260,17 @@ before(async () => {
       await capture(`${c.label}:before-actual-target-write`, { planned, marker: c.beforeTargetWrite, targetPresent: c.targetPresentBeforeWrite });
       assert.equal(c.targetPresentBeforeWrite, false, "The owned target must be absent before its first write");
       if (c.options.sweepBeforeWrite) await sweepOne(c, planned, false);
+      if (c.options.holdQueueDelete) {
+        c.queueDeleteGate = new Promise(resolve => { c.releaseQueueDelete = resolve; });
+        const reached = new Promise(resolve => { c.queueDeleteReached = resolve; });
+        await makeDue(planned);
+        c.workerPromise = owned("held-one-path-worker", () => processBlobCleanup(app.prisma, app.storage, { paths: [planned], limit: 1 }), c);
+        c.workerPromise.catch(() => {});
+        await bounded(reached, 2000, "worker reached queue-row deletion");
+        c.claimBeforeLateWrite = await queueRow(planned);
+        await capture(`${c.label}:claim-before-late-write`, { row: c.claimBeforeLateWrite });
+        assert.equal(c.claimBeforeLateWrite.attempts, 1);
+      }
       const result = await originals.saveStream(...args);
       c.actualWritesFinished++; c.targetPresentAfterWrite = await originals.exists(planned);
       await capture(`${c.label}:actual-target-write-settled`, { result, targetPresent: c.targetPresentAfterWrite });
@@ -399,7 +431,10 @@ test("copy staging: error after settled commit preserves its live File and bytes
 test("copy staging: an already claimed failed-delete lease is not reset to permit commit", { timeout: 15000 }, async t => {
   await runCase(t, "claimed-lease", { claimAfterWrite: true }, async (c, response, actual) => {
     refused(c, response, actual); assert.equal(c.sweep.claimed, 1); assert.equal(c.sweep.failed, 1);
-    assert.equal(c.rowAfterSweep.attempts, 1); assert.deepEqual(actual.queue, [c.rowAfterSweep]);
+    assert.equal(c.rowAfterSweep.attempts, 1); assert.equal(actual.queue.length, 1);
+    const { availableAt: previousLease, ...previousClaim } = c.rowAfterSweep;
+    const { availableAt: renewedLease, ...renewedClaim } = actual.queue[0];
+    assert.deepEqual(renewedClaim, previousClaim); assert(renewedLease > previousLease);
     assert.equal(Object.values(actual.targetPresent).every(Boolean), true);
     for (const storagePath of c.paths) assert.deepEqual(await originals.read(storagePath), bytes);
   });
@@ -434,6 +469,21 @@ test("copy staging: failed cleanup deletion retains retry work and the original 
   });
 });
 
+test("copy staging: late writer keeps cleanup when an earlier worker finishes its row", { timeout: 15000 }, async t => {
+  await runCase(t, "held-worker-late-writer", { holdQueueDelete: true }, async (c, response, actual) => {
+    refused(c, response, actual);
+    assert.equal(c.workerReleased, true); assert.equal(c.sweep.claimed, 1); assert.equal(c.sweep.deleted, 1);
+    assert.equal(c.actualWritesFinished, 1); assert.equal(actual.queue.length, 1);
+    assert.equal(actual.queue[0].attempts, c.claimBeforeLateWrite.attempts);
+    assert.equal(actual.queue[0].lastError, c.claimBeforeLateWrite.lastError);
+    assert(actual.queue[0].availableAt > c.claimBeforeLateWrite.availableAt);
+    for (const storagePath of c.paths) {
+      assert.equal(actual.targetPresent[storagePath], true);
+      assert.deepEqual(await originals.read(storagePath), bytes);
+    }
+  });
+});
+
 after(async () => {
   const failures = [];
   try { await requireSettled("after-all-cases"); }
@@ -448,6 +498,7 @@ after(async () => {
   for (const name of ["saveStream", "openReadStream", "read", "delete", "exists"]) if (originals[name]) app.storage[name] = originals[name];
   if (originals.executeRaw) app.prisma.$executeRaw = originals.executeRaw;
   if (originals.transaction) app.prisma.$transaction = originals.transaction;
+  if (originals.cleanupDeleteMany) app.prisma.blobCleanup.deleteMany = originals.cleanupDeleteMany;
   try {
     if (app && writesPlanned) {
       await app.prisma.workspace.deleteMany({ where: { id: ids.workspace } });

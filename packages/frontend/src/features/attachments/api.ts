@@ -3,6 +3,9 @@ import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { apiBase } from "@/lib/api-url";
+import type { AttachmentQueryInput } from "@pm/shared";
+
+type AttachmentEntityType = AttachmentQueryInput["entityType"];
 
 export interface Attachment {
   id: string;
@@ -30,7 +33,7 @@ export interface Attachment {
 
 export function useAttachments(
   wid: string,
-  entityType: string,
+  entityType: AttachmentEntityType,
   entityId: string,
 ) {
   return useQuery({
@@ -46,7 +49,7 @@ export function useAttachments(
 
 export function useDeleteAttachment(
   wid: string,
-  entityType: string,
+  entityType: AttachmentEntityType,
   entityId: string,
 ) {
   const qc = useQueryClient();
@@ -65,7 +68,7 @@ export function useDeleteAttachment(
 
 export function useLinkAttachment(
   wid: string,
-  entityType: string,
+  entityType: AttachmentEntityType,
   entityId: string,
 ) {
   const qc = useQueryClient();

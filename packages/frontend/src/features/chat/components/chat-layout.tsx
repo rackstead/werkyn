@@ -11,9 +11,6 @@ import { DmUserPicker } from "./dm-user-picker";
 import { PinnedMessagesPanel } from "./pinned-messages-panel";
 import { BookmarksPanel } from "./bookmarks-panel";
 import { ChannelSearchBar } from "./channel-search-bar";
-import { AttachmentList } from "@/features/attachments/components/attachment-list";
-import { DriveFilePicker } from "@/features/drive/components/drive-file-picker";
-import { useLinkAttachment } from "@/features/attachments/api";
 import { toast } from "sonner";
 import {
   useChannels,
@@ -70,7 +67,6 @@ export function ChatLayout({
   const [showPins, setShowPins] = useState(false);
   const [showBookmarks, setShowBookmarks] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
-  const [attachMessageId, setAttachMessageId] = useState<string | null>(null);
 
   // The thread, side panels and per-message dialogs belong to the channel
   // they were opened in. Close them whenever the workspace or channel changes,
@@ -86,7 +82,6 @@ export function ChatLayout({
     setShowBookmarks(false);
     setShowSearch(false);
     setSettingsOpen(false);
-    setAttachMessageId(null);
   }
 
   // Data queries
@@ -129,7 +124,6 @@ export function ChatLayout({
   const togglePin = useTogglePin(workspaceId, channelId ?? "");
   const toggleBookmark = useToggleBookmark(workspaceId);
   const archiveChannel = useArchiveChannel(workspaceId, channelId ?? "");
-  const linkAttachment = useLinkAttachment(workspaceId, "message", attachMessageId ?? "");
 
   // Member map for mention display
   const memberMap = useMemo(() => {
@@ -274,10 +268,6 @@ export function ChatLayout({
     [toggleBookmark],
   );
 
-  const handleAttach = useCallback((messageId: string) => {
-    setAttachMessageId(messageId);
-  }, []);
-
   return (
     <div className="flex h-full">
       {/* Channel sidebar */}
@@ -354,7 +344,6 @@ export function ChatLayout({
                 onReaction={handleReaction}
                 onPin={isArchived ? undefined : handlePin}
                 onBookmark={handleBookmark}
-                onAttach={isArchived ? undefined : handleAttach}
                 memberMap={memberMap}
               />
             )}
@@ -484,22 +473,6 @@ export function ChatLayout({
         />
       )}
 
-      {/* File attachment picker */}
-      <DriveFilePicker
-        open={!!attachMessageId}
-        onClose={() => setAttachMessageId(null)}
-        workspaceId={workspaceId}
-        isPending={linkAttachment.isPending}
-        onSelect={(file) => {
-          linkAttachment.mutate(file.id, {
-            onSuccess: () => {
-              setAttachMessageId(null);
-              toast.success("File attached");
-            },
-            onError: (err) => toast.error(err.message || "Failed to attach file"),
-          });
-        }}
-      />
     </div>
   );
 }

@@ -41,7 +41,12 @@
       "prosemirror-transform": "1.12.4",
       "vite@6.4.5>rollup": "4.59.0",
       "ajv@8.17.1": "8.18.0",
-      "@tanstack/react-router@1.159.4>srvx": "0.11.13"
+      "@tanstack/react-router@1.159.4>srvx": "0.11.13",
+      "picomatch@2.3.1": "2.3.2",
+      "picomatch@4.0.3": "4.0.7",
+      "browserslist@4.28.1": "4.28.7",
+      "@babel/core@7.29.0": "7.29.6",
+      "fast-copy@4.0.2": "4.1.0"
     }
   }
 }

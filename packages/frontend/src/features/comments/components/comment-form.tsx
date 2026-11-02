@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback } from "react";
+import { stripDisallowedControlCharacters } from "@pm/shared";
 import { useCreateComment } from "../api";
 import { MentionDropdown, type MemberOption } from "./mention-dropdown";
 import { useWorkspaceMembers } from "@/features/workspaces/api";
@@ -49,7 +50,7 @@ export function CommentForm({ taskId }: CommentFormProps) {
   );
 
   const handleSubmit = () => {
-    const storedBody = buildStoredBody(displayBody).trim();
+    const storedBody = stripDisallowedControlCharacters(buildStoredBody(displayBody)).trim();
     if (!storedBody) return;
     createMutation.mutate(
       { body: storedBody },
@@ -174,7 +175,7 @@ export function CommentForm({ taskId }: CommentFormProps) {
         </span>
         <button
           onClick={handleSubmit}
-          disabled={!displayBody.trim() || createMutation.isPending}
+          disabled={!stripDisallowedControlCharacters(displayBody).trim() || createMutation.isPending}
           className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
         >
           {createMutation.isPending ? "Posting..." : "Post"}

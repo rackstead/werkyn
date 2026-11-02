@@ -14,7 +14,9 @@ import sharp from "sharp";
 import { fileTypeFromBuffer } from "file-type";
 import archiver from "archiver";
 import { env } from "../../config/env.js";
+import { logger } from "../../utils/logger.js";
 import {
+  AppError,
   ConflictError,
   ForbiddenError,
   NotFoundError,
@@ -595,6 +597,46 @@ export async function listStarredFiles(
   return starred.map((s) => ({ ...s.file, starred: true }));
 }
 
+// Same grace as restore staging; expiry can refuse a slow copy.
+const STAGED_COPY_GRACE_SECONDS = 60 * 60;
+
+function unavailableCopy() {
+  return new AppError(
+    503,
+    "Service Unavailable",
+    "The copy could not keep its stored file; nothing was copied. Please try again.",
+  );
+}
+
+/** Failure-only cleanup, never a new staging claim followed by a File retry. */
+async function discardFailedCopy(
+  prisma: PrismaClient,
+  storage: StorageProvider,
+  plannedPath: string,
+) {
+  try {
+    // Renew the claim identity before cleanup. The worker conditions retirement
+    // and retry on attempts + availableAt, so an earlier deletion cannot remove
+    // this later write's durable work. Preserve attempts and extend an existing
+    // lease by at least one stored millisecond; unclaimed stages become due now.
+    await prisma.$executeRaw`
+      INSERT INTO "BlobCleanup" ("storagePath") VALUES (${plannedPath})
+      ON CONFLICT ("storagePath") DO UPDATE SET "availableAt" =
+        CASE WHEN "BlobCleanup"."attempts" = 0 THEN CURRENT_TIMESTAMP
+        ELSE GREATEST("BlobCleanup"."availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+        END`;
+  } catch (error) {
+    logger.error(
+      { err: error, storagePath: plannedPath },
+      "Could not renew failed copy cleanup; preserving its known path",
+    );
+    return;
+  }
+  // The live-File guard protects an ambiguous successful commit. No File retry
+  // follows this failure-only renewal, including when the old row was absent.
+  await cleanupBlobsNow(prisma, storage, [plannedPath]);
+}
+
 export async function copyFile(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -630,21 +672,33 @@ export async function copyFile(
   const scopeId = destTeamFolderId
     ? `groupfolders/${destTeamFolderId}`
     : ctx.userId;
-
-  // Copy storage
-  const sourceStream = await storage.openReadStream(source.storagePath);
-  const { storagePath, size } = await storage.saveStream(
-    `${workspaceId}/files`,
-    scopeId,
-    newFileId,
-    ext,
-    sourceStream,
-    { maxSize: env.MAX_FILE_SIZE },
+  // The production LocalStorageProvider uses this same deterministic join.
+  const plannedPath = path.join(
+    `${workspaceId}/files`, scopeId, `${newFileId}${ext}`,
   );
+  let sourceStream: Readable | undefined;
+  let staged = false;
 
-  // Create DB record — clean up on failure. Source read access and the
-  // destination are checked again under the workspace graph lock.
   try {
+    const inserted = await prisma.$executeRaw`
+      INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+      VALUES (${plannedPath}, CURRENT_TIMESTAMP + ${STAGED_COPY_GRACE_SECONDS}::integer * interval '1 second')`;
+    if (inserted !== 1) throw unavailableCopy();
+    staged = true;
+
+    sourceStream = await storage.openReadStream(source.storagePath);
+    const { storagePath, size } = await storage.saveStream(
+      `${workspaceId}/files`,
+      scopeId,
+      newFileId,
+      ext,
+      sourceStream,
+      { maxSize: env.MAX_FILE_SIZE },
+    );
+    // Do not adopt, queue or delete an arbitrary unexpected returned path.
+    if (storagePath !== plannedPath) throw unavailableCopy();
+
+    // Source and destination are rechecked under the existing graph lock.
     return await withWorkspaceLock(prisma, workspaceId, async (tx) => {
       await assertFileAccess(tx, fileId, { ...ctx, workspaceId });
       const current = await resolveFileDestination(
@@ -653,6 +707,11 @@ export async function copyFile(
         input.parentId,
         input.teamFolderId,
       );
+      const claimed = await tx.$queryRaw<Array<{ storagePath: string }>>`
+        DELETE FROM "BlobCleanup"
+        WHERE "storagePath" = ${plannedPath} AND "attempts" = 0
+        RETURNING "storagePath"`;
+      if (claimed.length !== 1) throw unavailableCopy();
       return tx.file.create({
         data: {
           workspaceId,
@@ -667,8 +726,10 @@ export async function copyFile(
       });
     });
   } catch (err) {
-    await discardStagedBlobs(prisma, storage, [storagePath]);
+    if (staged) await discardFailedCopy(prisma, storage, plannedPath);
     throw err;
+  } finally {
+    sourceStream?.destroy();
   }
 }
 

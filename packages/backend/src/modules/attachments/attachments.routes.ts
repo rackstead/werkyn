@@ -5,6 +5,7 @@ import {
   deleteAttachmentHandler,
   linkAttachmentHandler,
 } from "./attachments.controller.js";
+import { applyUntrustedContentPolicy } from "../../utils/untrusted-content.js";
 import { authenticate } from "../../middleware/authenticate.js";
 import { authorize } from "../../middleware/authorize.js";
 import { validate, validateQuery } from "../../middleware/validate.js";
@@ -35,6 +36,10 @@ export default async function attachmentsRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/workspaces/:wid/attachments/:aid/download",
+    onSend: (_request, reply, payload, done) => {
+      applyUntrustedContentPolicy(reply);
+      done(null, payload);
+    },
     preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
     handler: downloadAttachmentHandler,
   });

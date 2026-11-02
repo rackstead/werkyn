@@ -15,12 +15,14 @@ The initial staged-filename failure log is retained; pending removal alone faile
 
 An application fixture verifies permitted Drive/attachment/public/thumbnail bytes,
 then removes only its own physical blobs while retaining valid records. It checks
-500 JSON errors with preserved response security headers, health afterward,
+intentional410 JSON errors for missing content, with preserved response security headers, health afterward,
 denials before storage reads, unchanged rows/events, and an independent successful
 download. Its captured real-handler/native-header guard runs before app creation
 or any missing-stream request; baseline failure remains safely captured.
 
-Missing blobs retain500; B02 durable repair remains separate. Partial streams retain
+The original PR55 missing-blob500 observation is historical: the storage open helper
+now maps missing content to intentional410 before streaming. B02 durable repair remains
+separate. Partial streams retain
 Fastify abort behavior; production error redaction is unchanged. Run:
 
 ```sh

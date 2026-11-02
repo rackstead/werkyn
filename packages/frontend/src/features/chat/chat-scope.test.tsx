@@ -104,11 +104,6 @@ vi.mock("./hooks/use-chat-realtime", () => ({ useChatRealtime: () => {} }));
 vi.mock("./hooks/use-typing-indicator", () => ({
   useTypingIndicator: () => ({ typingUsers: [], handleTyping: () => {} }),
 }));
-vi.mock("@/features/attachments/api", () => ({
-  useLinkAttachment: () => ({ mutate: () => {}, isPending: false }),
-}));
-vi.mock("@/features/drive/components/drive-file-picker", () => ({ DriveFilePicker: () => null }));
-
 beforeEach(() => {
   chat.sends = [];
   chat.threadReads = [];
@@ -153,6 +148,14 @@ async function send(box: HTMLTextAreaElement, text: string) {
 }
 
 describe("chat thread and draft scope", () => {
+  it("keeps supported message actions without offering unsupported file attachments", () => {
+    render(<ChatRoute />);
+    expect(screen.getByText("hello from alpha")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reply in thread" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Save message" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Attach file" })).toBeNull();
+  });
+
   it("sends a thread reply to the parent message's channel", async () => {
     render(<ChatRoute />);
     fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));

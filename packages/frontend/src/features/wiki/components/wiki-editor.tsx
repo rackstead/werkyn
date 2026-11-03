@@ -3,7 +3,7 @@ import "@blocknote/mantine/style.css";
 
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
-import { Component, type ReactNode, useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { Component, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import type { Block } from "@blocknote/core";
 import { useAuthStore } from "@/stores/auth-store";
 import { stripPastedStyleSheets } from "@/lib/pasted-html";
@@ -181,8 +181,9 @@ function WikiEditorInner({
     });
   }, [editor, initialContent, hasUnsavedChanges]);
 
-  // Sync readOnly state
-  useEffect(() => {
+  // Changing the view's editable prop remounts its editor DOM. Keep that view
+  // stable and apply the public editability preference before paint instead.
+  useLayoutEffect(() => {
     editor.isEditable = !readOnly;
   }, [editor, readOnly]);
 
@@ -190,7 +191,6 @@ function WikiEditorInner({
     <div className={`wiki-editor-wrapper${readOnly ? "" : " is-editing"}`}>
       <BlockNoteView
         editor={editor}
-        editable={!readOnly}
         onChange={handleChange}
         theme={isDark ? "dark" : "light"}
       />

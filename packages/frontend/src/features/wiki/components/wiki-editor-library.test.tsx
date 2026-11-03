@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { writeFileSync } from "node:fs";
 import type { Block, BlockNoteEditor } from "@blocknote/core";
@@ -245,5 +246,144 @@ it("known old-constructor-accepted but schema-invalid marks refuse locally witho
   expect(view.container.querySelector(".bn-editor")).toBeNull();
   expect(initial).toEqual(before);
   expect(initial).toEqual(persisted046Document);
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+
+// The old0.46 table control has the same missing end entry after a readonly
+// transition. This characterizes current0.57 integration, not new data loss.
+function terminalTable() {
+  return JSON.parse(JSON.stringify(persisted046Document.filter((block) => block.type === "table")));
+}
+function editabilityFacts(label: string, container: HTMLElement, changes: number) {
+  const element = editable(container);
+  facts.push({
+    test: expect.getState().currentTestName, label,
+    document: JSON.parse(text()), publicEditable: editor().isEditable,
+    contenteditable: element.getAttribute("contenteditable"),
+    tabIndex: element.getAttribute("tabindex"),
+    widgets: container.querySelectorAll(".bn-trailing-block").length,
+    activeElementInside: element.contains(document.activeElement),
+    selectedText: window.getSelection()?.toString(), changes,
+    editorHTML: element.outerHTML,
+  });
+  if (process.env.BLOCKNOTE_COMPAT_FACTS_PATH) {
+    writeFileSync(process.env.BLOCKNOTE_COMPAT_FACTS_PATH, JSON.stringify(facts, null, 2));
+  }
+}
+function EditabilityCommitProbe({ initialContent, readOnly, onChange, onCommit }: {
+  initialContent: unknown;
+  readOnly: boolean;
+  onChange: (blocks: Block[]) => void;
+  onCommit: (element: HTMLDivElement) => void;
+}) {
+  const host = useRef<HTMLDivElement>(null);
+  // The outer layout observation runs after the child commit, before paint.
+  // It observes the public DOM; no editor preference or selection is changed.
+  useLayoutEffect(() => { if (host.current) onCommit(host.current); });
+  return <div ref={host}><WikiEditor initialContent={initialContent} readOnly={readOnly} onChange={onChange} /></div>;
+}
+
+it("real Mantine editability transition exposes terminal table entry without a document edit", async () => {
+  const input = terminalTable();
+  const original = JSON.parse(JSON.stringify(input));
+  const onChange = vi.fn();
+  const commits: Array<{ editable: string | null; widgets: number }> = [];
+  const onCommit = (host: HTMLDivElement) => commits.push({
+    editable: editable(host).getAttribute("contenteditable"),
+    widgets: host.querySelectorAll(".bn-trailing-block").length,
+  });
+  const view = render(<EditabilityCommitProbe initialContent={input} readOnly onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  const instance = editor();
+  const dom = editable(view.container);
+  const snapshot = JSON.parse(text());
+  editabilityFacts("table-readonly-before-transition", view.container, onChange.mock.calls.length);
+  expect(commits[0].editable).toBe("false");
+  expect(instance.isEditable).toBe(false);
+  expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(0);
+  expect(snapshot).toEqual(original);
+  expect(onChange).not.toHaveBeenCalled();
+
+  view.rerender(<EditabilityCommitProbe initialContent={input} readOnly={false} onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  editabilityFacts("table-editable-before-any-document-action", view.container, onChange.mock.calls.length);
+  expect(editable(view.container).getAttribute("contenteditable")).toBe("true");
+  // This is the intended missing-current-integration BEFORE assertion.
+  expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(1);
+  expect(editor()).toBe(instance);
+  expect(editable(view.container)).toBe(dom);
+  expect(JSON.parse(text())).toEqual(snapshot);
+  expect(input).toEqual(original);
+  expect(onChange).not.toHaveBeenCalled();
+
+  view.rerender(<EditabilityCommitProbe initialContent={input} readOnly onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  editabilityFacts("table-readonly-again-before-any-document-action", view.container, onChange.mock.calls.length);
+  expect(commits.at(-1)?.editable).toBe("false");
+  expect(editor().isEditable).toBe(false);
+  expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(0);
+  view.rerender(<EditabilityCommitProbe initialContent={input} readOnly={false} onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  expect(editor()).toBe(instance);
+  expect(editable(view.container)).toBe(dom);
+  expect(JSON.parse(text())).toEqual(snapshot);
+  expect(onChange).not.toHaveBeenCalled();
+  const widget = view.container.querySelector<HTMLElement>(".bn-trailing-block");
+  expect(widget).not.toBeNull();
+  act(() => { fireEvent.mouseDown(widget!); });
+  await settle();
+  editabilityFacts("table-after-explicit-widget-mousedown", view.container, onChange.mock.calls.length);
+  const after = JSON.parse(text());
+  expect(after[0]).toEqual(snapshot[0]);
+  expect(after).toHaveLength(2);
+  expect(after[1]).toMatchObject({ type: "paragraph", content: [], children: [] });
+  expect(after[1].id).toBeTruthy();
+  expect(after[1].id).not.toBe(snapshot[0].id);
+  expect(onChange).toHaveBeenCalled();
+});
+
+it("real Mantine editability readonly control remains locked before paint and emits no edit", async () => {
+  const input = terminalTable();
+  const onChange = vi.fn();
+  const commits: Array<string | null> = [];
+  const onCommit = (host: HTMLDivElement) => commits.push(editable(host).getAttribute("contenteditable"));
+  const view = render(<EditabilityCommitProbe initialContent={input} readOnly onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  const snapshot = JSON.parse(text());
+  const instance = editor();
+  const dom = editable(view.container);
+  view.rerender(<EditabilityCommitProbe initialContent={JSON.parse(JSON.stringify(input))} readOnly onChange={onChange} onCommit={onCommit} />);
+  fireEvent.keyDown(dom, { key: "x" });
+  fireEvent.paste(dom, { clipboardData: { getData: () => "User paste" } });
+  await settle();
+  editabilityFacts("table-readonly-control", view.container, onChange.mock.calls.length);
+  expect(commits.length).toBeGreaterThan(0);
+  expect(commits.every((value) => value === "false")).toBe(true);
+  expect(editor().isEditable).toBe(false);
+  expect(editable(view.container)).toBe(dom);
+  expect(editor()).toBe(instance);
+  expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(0);
+  expect(JSON.parse(text())).toEqual(snapshot);
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+it("real Mantine editability initially editable control has terminal entry without changing content", async () => {
+  const input = terminalTable();
+  const onChange = vi.fn();
+  const view = render(<WikiEditor initialContent={input} readOnly={false} onChange={onChange} />);
+  await settle();
+  const instance = editor();
+  const dom = editable(view.container);
+  const snapshot = JSON.parse(text());
+  editabilityFacts("table-initially-editable-control", view.container, onChange.mock.calls.length);
+  expect(dom.getAttribute("contenteditable")).toBe("true");
+  expect(editor().isEditable).toBe(true);
+  expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(1);
+  view.rerender(<WikiEditor initialContent={JSON.parse(JSON.stringify(input))} readOnly={false} onChange={onChange} />);
+  await settle();
+  expect(editor()).toBe(instance);
+  expect(editable(view.container)).toBe(dom);
+  expect(JSON.parse(text())).toEqual(snapshot);
   expect(onChange).not.toHaveBeenCalled();
 });

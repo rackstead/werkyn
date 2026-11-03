@@ -45,7 +45,8 @@ async function observeSearch(context, producer, options = {}) {
   });
   const queries = [], delivered = [];
   const completion = deferredQuery(), held = deferredQuery();
-  let heldEvent, released = false, closed = false, operation, primaryError;
+  const extra = options.extraCursor ? deferredQuery() : undefined;
+  let heldEvent, released = false, closed = false, operation, primaryError, timer;
   function matches(event) {
     const params = JSON.parse(event.params);
     return messageSelect(event) && event.query.includes("ORDER BY") &&
@@ -59,22 +60,28 @@ async function observeSearch(context, producer, options = {}) {
   observer.$on("query", (event) => {
     assert.equal(closed, false, "Native query event arrived after observer disconnect");
     queries.push(event); // Count every native ChatMessage SELECT, including cursor reads.
+    if (extra && messageSelect(event) && !event.query.includes("ORDER BY") &&
+        JSON.parse(event.params).includes(options.extraCursor)) extra.resolve(event);
     if (options.hold && matches(event) && !heldEvent) {
       heldEvent = event;
       held.resolve(event);
     } else deliver(event);
   });
-  const timer = setTimeout(() => {
-    const error = new QueryObservationTimeout("Search page query not observed within 1000ms");
-    completion.reject(error);
-    held.reject(error);
-  }, 1000);
   if (!options.hold) held.resolve(undefined);
   const release = () => {
     if (heldEvent && !released) { released = true; deliver(heldEvent); }
   };
   // Both event handlers exist before the real producer starts. Preserve its error first.
-  operation = Promise.resolve().then(() => producer(observer));
+  operation = Promise.resolve().then(() => producer(observer)).then((data) => {
+    // Bound missing delivery after successful execution; connection and producer time are separate.
+    timer = setTimeout(() => {
+      const error = new QueryObservationTimeout("Search page query not observed within 1000ms");
+      completion.reject(error);
+      held.reject(error);
+      extra?.reject(error);
+    }, 1000);
+    return data;
+  });
   void operation.catch(() => {});
   try {
     if (options.consume)
@@ -82,6 +89,7 @@ async function observeSearch(context, producer, options = {}) {
         held: held.promise, release, queries, delivered });
     const data = await operation;
     await completion.promise;
+    if (extra) await extra.promise;
     return { data, queries };
   } catch (error) {
     primaryError = error;
@@ -91,7 +99,8 @@ async function observeSearch(context, producer, options = {}) {
     const disposed = new Error("Owned search observation disposed");
     completion.reject(disposed);
     held.reject(disposed);
-    await Promise.allSettled([operation, completion.promise, held.promise]);
+    extra?.reject(disposed);
+    await Promise.allSettled([operation, completion.promise, held.promise, ...(extra ? [extra.promise] : [])]);
     try { await observer.$disconnect(); }
     catch (error) { if (!primaryError) throw error; }
     finally { closed = true; }
@@ -523,7 +532,7 @@ test("fresh search observer settles the exact held event without a prior mode or
       const data = await capture.operation;
       const event = await capture.held;
       assert.equal(capture.delivered.filter(messageSelect).length, 0,
-        "Old immediate consumer can miss the genuinely held native event");
+        "Completion delivery remains held despite native event arrival");
       assert.equal(capture.queries.includes(stale), false, "Prior client cannot contaminate this capture");
       assert.equal(capture.queries.includes(event), true, "The held event is genuinely native");
       capture.release();
@@ -542,7 +551,7 @@ test("search observation retains extra actual cursor SELECTs before and after th
         const data = await searchProducer("channel")(observer);
         if (order === "after") await observer.chatMessage.findUnique({ where: { id: ordinary[30].id } });
         return data;
-      });
+      }, { extraCursor: ordinary[30].id });
     assert.equal(queries.filter(messageSelect).length, 2, `${order}: every message SELECT remains visible`);
     assert.throws(() => assert.equal(queries.filter(messageSelect).length, 1,
       "No separate mutable cursor read"), assert.AssertionError);
@@ -565,4 +574,15 @@ test("search observation rejects absent consumer delivery without stale fallback
       await assert.rejects(capture.completion, QueryObservationTimeout);
       assert.equal(capture.delivered.filter(messageSelect).length, 0);
     } });
+});
+
+
+test("search observation deadline excludes successful producer setup time", async () => {
+  const { data, queries } = await observeSearch({ mode: "channel", cursor: ordinary[30].id },
+    async (observer) => {
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      return searchProducer("channel")(observer);
+    });
+  assert.ok(data.data.length > 0, "Real successful search prerequisite");
+  assert.equal(queries.filter(messageSelect).length, 1);
 });

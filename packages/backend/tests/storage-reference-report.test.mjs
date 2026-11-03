@@ -134,3 +134,12 @@ test("default report and bounded output fallback never expose fixture sentinels 
   const report = run(dense); assert.deepEqual(report.issues, [{ code: "OUTPUT_LIMIT", count: 1 }]);
   assert.deepEqual(report.identities, []); assert.equal(report.coverage, "UNKNOWN_NOT_ZERO"); assert.ok(Buffer.byteLength(JSON.stringify(report)) <= 2048); safe(report);
 });
+
+test("same-row unresolved original and thumbnail stay separate while known-root co-references join", () => {
+  const known = envelope(); known.sources.files = [file("tiny-same", { thumbnailPath: "tiny-same" })];
+  const knownReport = run(known); assert.equal(knownReport.identities.length, 1); assert.equal(knownReport.identities[0].observations.length, 2);
+  const unknown = envelope(); unknown.sources.files = [file("tiny-same", { rootSlot: null, thumbnailPath: "tiny-same" })];
+  const report = run(unknown); safe(report); assert.equal(report.identities.length, 2);
+  assert.equal(new Set(report.identities.map(i => i.rootId)).size, 2);
+  assert.deepEqual(new Set(facts(report).map(o => o.field)), new Set(["storagePath", "thumbnailPath"]));
+});

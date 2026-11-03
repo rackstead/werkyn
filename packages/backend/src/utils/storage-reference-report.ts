@@ -240,7 +240,7 @@ export function buildSyntheticStorageReferenceReport(inputBytes: Uint8Array, per
       for (const field of kind === "files" ? ["storagePath", "thumbnailPath"] : ["storagePath"]) {
         const value = row[field];
         if (typeof value !== "string") { if (value !== null || kind === "cleanupQueue") issue("INVALID_ROW"); continue; }
-        observe(value, root, kind, field, index, index, "stored_path", kind === "files" ? [row.trashed ? "TRASHED" : "NOT_TRASHED", row.isFolder ? "FOLDER_ROW" : "FILE_ROW"] : kind === "attachments" ? [row.fileId === null ? "NULL_OR_LEGACY_UNKNOWN" : "LINKED_CACHE_NOT_AUTHORITY"] : [], queueClass);
+        observe(value, root, kind, field, index, stringOrdinal++, "stored_path", kind === "files" ? [row.trashed ? "TRASHED" : "NOT_TRASHED", row.isFolder ? "FOLDER_ROW" : "FILE_ROW"] : kind === "attachments" ? [row.fileId === null ? "NULL_OR_LEGACY_UNKNOWN" : "LINKED_CACHE_NOT_AUTHORITY"] : [], queueClass);
       }
     }
   }

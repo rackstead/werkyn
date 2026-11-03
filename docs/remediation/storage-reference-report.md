@@ -76,3 +76,7 @@ Live/disposable adapters, bounded retrieval, root/symlink/public-hosting trust
 (R33), owner-selected environment/read-role/repair (R35), producer crash windows,
 worker throughput and final R26 acceptance require their separate work. No live
 inventory or repair instructions are provided here.
+
+Unresolved stored originals and thumbnails receive separate per-string contexts,
+even when both fields contain identical bytes in one File row. Declared known
+roots still let those fields report a positive co-reference to one identity.

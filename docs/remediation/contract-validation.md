@@ -113,7 +113,29 @@ the same server schema. A save with no changed fields sends no PATCH.
 As before, a profile refetch resets the form. The draft and its comparison
 baseline reset together, and save waits for the matching account/profile
 snapshot. This does not add a server revision or concurrent-update guarantee.
-Template full-form updates and their list/array semantics are unchanged.
+
+## Template edit saves
+
+Template EDIT compares each raw field with the snapshot loaded when Edit opens
+and PATCHes only changed fields. Unchanged legacy values are omitted. Names and
+task titles keep trim encoding and must be nonblank when changed. Description
+empty, status None and an empty due offset send null; due offset zero sends 0.
+Assignee and label lists retain their order, and an explicit clear sends [].
+Changed subtasks retain title text/order and omit blank rows as before; unchanged
+subtasks are omitted. Appending blank draft rows alone leaves the raw initial
+subtask list unchanged, including legacy blank or duplicate rows. Explicit
+removal or clearing still uses replacement semantics. No-change and exact-raw
+reverted edits send no PATCH.
+CREATE keeps its existing full payload. Strict validation, description
+sanitization and current project-reference authorization remain server rules.
+
+As before, refetch does not overwrite an open edit snapshot. Cancel closes it;
+reopening loads the current template. Successful saves close that editor,
+including changes made while its request was pending; failures retain the draft.
+An older completion cannot close a newly opened editor, and a stale project or
+identity generation cannot submit its draft. The existing identity boundary and
+request/cache guards remain. This adds no revision/CAS, unseen-update protection,
+raw-entity decoding, stored-row repair or sanitizer/editor policy expansion.
 
 ## Tests
 

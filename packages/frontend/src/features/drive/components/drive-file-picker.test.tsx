@@ -240,3 +240,47 @@ it("resets the real attachment parent's picker when membership loss dismisses it
   expect(attach().disabled).toBe(true);
   expect(state.link).not.toHaveBeenCalled();
 });
+
+function uploadBatch(container: HTMLElement) {
+  const pending: { resolve: (file: DriveFile) => void; abort: ReturnType<typeof vi.fn> }[] = [];
+  state.upload.mockImplementation(() => {
+    let resolve!: (file: DriveFile) => void, reject!: (error: Error) => void;
+    const promise = new Promise<DriveFile>((done, fail) => { resolve = done; reject = fail; });
+    const abort = vi.fn(() => reject(new DOMException("Cancelled", "AbortError")));
+    pending.push({ resolve, abort });
+    return { promise, abort };
+  });
+  fireEvent.change(container.querySelector('input[type="file"]')!, {
+    target: { files: Array.from({ length: 5 }, (_, i) => new File(["ordinary text"], `batch-${i}.txt`)) },
+  });
+  return pending;
+}
+
+it.each(["close", "workspace"] as const)("stops queued batch uploads after %s ends the picker session", async (boundary) => {
+  const picker = mount(), pending = uploadBatch(picker.baseElement);
+  expect(state.upload).toHaveBeenCalledTimes(3);
+  await act(async () => {
+    picker.update(boundary === "close" ? { open: false } : { workspaceId: "beta" });
+    await Promise.resolve();
+  });
+  expect(pending.slice(0, 3).every((item) => item.abort.mock.calls.length === 1)).toBe(true);
+  expect(state.upload).toHaveBeenCalledTimes(3);
+  if (boundary === "close") picker.update({ open: true });
+  expect(attach().disabled).toBe(true);
+  expect(picker.onSelect).not.toHaveBeenCalled();
+});
+
+it("continues queued batch uploads while the picker session stays open", async () => {
+  const picker = mount(), pending = uploadBatch(picker.baseElement);
+  expect(state.upload).toHaveBeenCalledTimes(3);
+  await act(async () => { pending[0].resolve(file("alpha", "batch-0.txt")); await Promise.resolve(); });
+  expect(state.upload).toHaveBeenCalledTimes(4);
+  await act(async () => { pending[1].resolve(file("alpha", "batch-1.txt")); await Promise.resolve(); });
+  expect(state.upload).toHaveBeenCalledTimes(5);
+  await act(async () => {
+    for (let i = 2; i < pending.length; i++) pending[i].resolve(file("alpha", `batch-${i}.txt`));
+    await Promise.resolve();
+  });
+  expect(pending.every((item) => item.abort.mock.calls.length === 0)).toBe(true);
+  expect(attach().disabled).toBe(false);
+});

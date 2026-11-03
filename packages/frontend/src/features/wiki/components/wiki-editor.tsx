@@ -3,7 +3,7 @@ import "@blocknote/mantine/style.css";
 
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { Component, type ReactNode, useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import type { Block } from "@blocknote/core";
 import { useAuthStore } from "@/stores/auth-store";
 import { stripPastedStyleSheets } from "@/lib/pasted-html";
@@ -30,7 +30,53 @@ export interface WikiEditorProps {
   onChange?: (content: Block[]) => void;
 }
 
-export function WikiEditor({
+interface EditorBoundaryProps {
+  documentSignature: string | undefined;
+  children: ReactNode;
+}
+interface EditorBoundaryState {
+  documentSignature: string | undefined;
+  failed: boolean;
+}
+
+class EditorBoundary extends Component<EditorBoundaryProps, EditorBoundaryState> {
+  state: EditorBoundaryState = { documentSignature: this.props.documentSignature, failed: false };
+
+  static getDerivedStateFromProps(props: EditorBoundaryProps, state: EditorBoundaryState) {
+    if (props.documentSignature !== state.documentSignature) {
+      return { documentSignature: props.documentSignature, failed: false };
+    }
+    return null;
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div role="alert" className="rounded-md border p-4 text-sm space-y-2">
+        <p>We couldn’t open this content. It has not been changed.</p>
+        <button type="button" className="underline" onClick={() => this.setState({ failed: false })}>
+          Try again
+        </button>
+      </div>
+    );
+  }
+}
+
+export function WikiEditor(props: WikiEditorProps) {
+  const documentSignature = JSON.stringify(props.recoveredContent ?? props.initialContent);
+  // The signature resets a failed child; it is never a key for a healthy editor.
+  return (
+    <EditorBoundary documentSignature={documentSignature}>
+      <WikiEditorInner {...props} />
+    </EditorBoundary>
+  );
+}
+
+function WikiEditorInner({
   initialContent,
   recoveredContent,
   hasUnsavedChanges = false,

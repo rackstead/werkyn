@@ -389,3 +389,33 @@ it("Qodo an unconfirmed ancestor read stays fenced with retry and actual pending
  expect(screen.queryByText("Check again")).not.toBeNull(); expect(writes).toHaveLength(0);
  expect(latest.draft?.content).toEqual(paragraph("pending during failure"));
 });
+
+it("paused lock acquire is fenced at actual dispatch after terminal availability", async () => {
+ lockOwner = null;
+ const hook = renderHook(({ enabled }) => usePageLock(id, async () => {}, enabled), { initialProps: { enabled: true }, wrapper });
+ await tick(); onlineManager.setOnline(false);
+ let operation!: Promise<unknown>;
+ act(() => { operation = hook.result.current.acquire().catch(() => {}); }); await tick();
+ expect(http.post).not.toHaveBeenCalled(); hook.rerender({ enabled: false });
+ onlineManager.setOnline(true); await tick(); await operation;
+ expect(http.post).not.toHaveBeenCalled(); expect(hook.result.current.isLockedByMe).toBe(false);
+});
+it("paused lock heartbeat is fenced at actual dispatch after terminal availability", async () => {
+ const hook = renderHook(({ enabled }) => usePageLock(id, async () => {}, enabled), { initialProps: { enabled: true }, wrapper });
+ await tick(); http.patch.mockClear(); onlineManager.setOnline(false); await tick(30000);
+ expect(http.patch).not.toHaveBeenCalled(); hook.rerender({ enabled: false });
+ onlineManager.setOnline(true); await tick(); expect(http.patch).not.toHaveBeenCalled();
+});
+it("terminal availability still allows latest owned lease cleanup release", async () => {
+ const hook = renderHook(({ enabled }) => usePageLock(id, async () => {}, enabled), { initialProps: { enabled: true }, wrapper });
+ await tick(); http.delete.mockClear(); hook.rerender({ enabled: false }); hook.unmount(); await tick();
+ expect(http.delete).toHaveBeenCalledTimes(1);
+});
+it("paused old release cannot delete a newly mounted lifetime's recovered lease", async () => {
+ const first = renderHook(() => usePageLock(id, async () => {}), { wrapper }); await tick(); onlineManager.setOnline(false);
+ let operation!: Promise<unknown>;
+ act(() => { operation = first.result.current.release().catch(() => {}); }); await tick(); expect(http.delete).not.toHaveBeenCalled();
+ first.unmount(); const second = renderHook(() => usePageLock(id, async () => {}), { wrapper }); await tick();
+ onlineManager.setOnline(true); await tick(); await operation;
+ expect(http.delete).not.toHaveBeenCalled(); expect(second.result.current.isLockedByMe).toBe(true);
+});

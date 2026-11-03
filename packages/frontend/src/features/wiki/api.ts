@@ -502,12 +502,20 @@ export function useWikiPageLock(pgid: string | undefined) {
 
 // ─── Lock Mutations ─────────────────────────────────────
 
+type WikiLockOperation = { pageId: string; expectedUserId?: string; canDispatch?: () => boolean };
+function assertWikiLockDispatch(canDispatch: WikiLockOperation["canDispatch"]) {
+  if (canDispatch && !canDispatch()) throw new Error("This editor no longer owns the lock operation");
+}
+
 export function useAcquireWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.post(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).json<{ data: WikiPageLock }>(),
-    onSuccess: (_, { pageId }) => {
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.post(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).json<{ data: WikiPageLock }>();
+    },
+    onSuccess: (_, { pageId, canDispatch }) => {
+      if (canDispatch && !canDispatch()) return;
       qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
@@ -516,9 +524,12 @@ export function useAcquireWikiLock() {
 export function useReleaseWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.delete(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).then(() => {}),
-    onSuccess: (_, { pageId }) => {
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.delete(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).then(() => {});
+    },
+    onSuccess: (_, { pageId, canDispatch }) => {
+      if (canDispatch && !canDispatch()) return;
       qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
@@ -526,8 +537,10 @@ export function useReleaseWikiLock() {
 
 export function useHeartbeatWikiLock() {
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.patch(`wiki/pages/${pageId}/lock/heartbeat`, { context: { expectedUserId } }).then(() => {}),
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.patch(`wiki/pages/${pageId}/lock/heartbeat`, { context: { expectedUserId } }).then(() => {});
+    },
   });
 }
 

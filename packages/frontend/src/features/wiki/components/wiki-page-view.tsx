@@ -84,9 +84,9 @@ function WikiPageSession({
   const holdsLock = useRef(false);
   const autosave = useEntityAutosave(wikiAutosaveKey(userId, pageId), save, {
     author: userId,
-    canSave: () => !availabilityGate.current?.canWrite()
-      ? "This page is not available for saving"
-      : holdsLock.current ? null : "Start editing to save these changes",
+    canSave: () => !holdsLock.current
+      ? "Start editing to save these changes"
+      : availabilityGate.current?.canWrite() ? null : "This page is not available for saving",
     retryFailedAutomatically: true,
     revision: pageData?.data?.revision,
     isConflict: isEditConflict,
@@ -119,7 +119,10 @@ function WikiPageSession({
   const readOnly =
     !isLockedByMe || finishing || showVersions || autosave.conflict !== null || availability.readOnly;
 
+  const previousAvailabilityVersion = useRef(availability.documentVersion);
   useEffect(() => {
+    if (previousAvailabilityVersion.current === availability.documentVersion) return;
+    previousAvailabilityVersion.current = availability.documentVersion;
     setDocumentVersion((version) => version + 1);
   }, [availability.documentVersion]);
 

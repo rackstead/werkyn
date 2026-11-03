@@ -264,7 +264,7 @@ export function wikiPageOwnership(client: QueryClient, pageId: string, create = 
 }
 export function markWikiPageAvailability(client: QueryClient, pageId: string, phase: "checking" | "unavailable") {
   const owner = wikiPageOwnership(client, pageId);
-  if (!owner) return;
+  if (!owner || (phase === "checking" && owner.state.phase === "unavailable")) return;
   owner.state.epoch++;
   owner.state.read = undefined;
   owner.state.phase = phase;

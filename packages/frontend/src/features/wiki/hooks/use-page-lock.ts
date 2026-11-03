@@ -181,7 +181,18 @@ export function usePageLock(
       (releasing
         ? releasing
             .catch(() => {})
-            .then(() => acquireLock({ pageId, expectedUserId: userId }))
+            .then(() => {
+              // Availability and this lifetime may retire while the old release settles.
+              if (
+                !isCurrentUser() ||
+                !usable.current ||
+                !mounted.current ||
+                currentLifetime.current !== lifetime ||
+                leaseRef.current !== lease
+              )
+                throw new Error("This editor is no longer available");
+              return acquireLock({ pageId, expectedUserId: userId });
+            })
         : acquireLock({ pageId, expectedUserId: userId }));
     lease.acquisitions.add(operation);
     try {

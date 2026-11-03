@@ -1,8 +1,9 @@
 import { type ReactNode } from "react";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook } from "@testing-library/react";
 import { QueryClientProvider, onlineManager } from "@tanstack/react-query";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { RealtimeProvider } from "@/components/providers/realtime-provider";
+import { usePageLock } from "../hooks/use-page-lock";
 import { useWikiRealtime } from "../hooks/use-wiki-realtime";
 import { useUpdateWikiPage, wikiAutosaveKey } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
@@ -21,6 +22,7 @@ vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn(), dismiss: v
 vi.mock("./wiki-editor", async () => {
   const React = await import("react");
   return { WikiEditor: ({ initialContent, recoveredContent, readOnly, onChange }: any) => {
+    React.useEffect(() => { editorMounts++; }, []);
     const [value, setValue] = React.useState(JSON.stringify(recoveredContent ?? initialContent));
     return <textarea aria-label="Page body" disabled={readOnly} value={value} onChange={(event) => {
       setValue(event.target.value); onChange([{ type: "paragraph", content: event.target.value }]);
@@ -34,6 +36,8 @@ vi.mock("./share-page-dialog", () => ({ SharePageDialog: () => null }));
 const originalAutosave = autosaves.useEntityAutosave;
 let latest: ReturnType<typeof autosaves.useEntityAutosave<any>>;
 let sequence = 0;
+let editorMounts = 0;
+let savePolicy: () => string | null;
 let id: string;
 let pages: Map<string, any>;
 let lockOwner: string | null;
@@ -77,6 +81,7 @@ beforeEach(() => {
   writes.length = 0; gets.length = 0; captured.clear(); readOverride = undefined; patchOverride = undefined;
   useAuthStore.setState({ accessToken: "test-token", user: { id: "author", email: "author@example.test", displayName: "Author" } as any });
   vi.spyOn(autosaves, "useEntityAutosave").mockImplementation((...args: any[]) => {
+    savePolicy = args[2].canSave;
     latest = (originalAutosave as any)(...args); captured.set(args[0], latest); return latest;
   });
   http.get.mockImplementation((url: string) => ({ json: async () => {
@@ -338,4 +343,49 @@ it("a lock acquisition that finishes after deletion cannot re-enable editing or 
   acquisition.resolve({ data: { id: "late-lock", pageId: id, userId: "author" } }); await tick(60_001);
   expect(screen.queryByText(/no longer available/i)).not.toBeNull(); expect(screen.queryByText("Done Editing")).toBeNull();
   expect(http.patch.mock.calls.filter(([url]) => url.endsWith("/heartbeat"))).toHaveLength(0);
+});
+
+it("does not dispatch a queued acquisition after availability retires during release", async () => {
+  const held = deferred<void>();
+  http.delete.mockReturnValue(held.promise);
+  const hook = renderHook(({ enabled }) => usePageLock(id, async () => {}, enabled), {
+    initialProps: { enabled: true }, wrapper,
+  });
+  await tick();
+  let releasing!: Promise<void>;
+  await act(async () => { releasing = hook.result.current.release(); await Promise.resolve(); });
+  expect(http.delete).toHaveBeenCalledTimes(1);
+  let acquired!: Promise<string>;
+  act(() => { acquired = hook.result.current.acquire().then(() => "resolved", () => "rejected"); });
+  expect(http.post).not.toHaveBeenCalled();
+  hook.rerender({ enabled: false });
+  await act(async () => { held.resolve(); await releasing; await acquired; });
+  expect(http.post).not.toHaveBeenCalled();
+  expect(await acquired).toBe("rejected");
+  expect(hook.result.current.isLockedByMe).toBe(false);
+});
+
+it.each(["wiki_page_deleted", "wiki_space_deleted"])("Qodo terminal retained fields survive a later %s", async (event) => {
+ const screen = await open(); fireEvent.change(screen.getByLabelText("Page body"), { target: { value: "kept after delete" } });
+ pages.delete(id); send(id); await tick(); expect(latest.parked?.content).toEqual(paragraph("kept after delete"));
+ const reads = gets.length; send("unrelated", "workspace", event, "unrelated-space"); await tick();
+ expect(screen.queryByText(/no longer available/i)).not.toBeNull();
+ expect(screen.queryByText("Discard")).not.toBeNull(); expect(gets).toHaveLength(reads);
+ expect(latest.parked?.content).toEqual(paragraph("kept after delete")); expect(writes).toHaveLength(0);
+});
+it("Qodo a missing lock retains its specific save refusal", async () => {
+ await open(); lockOwner = null; act(() => queryClient.setQueryData(["wiki-lock", id], { data: null })); await tick();
+ expect(savePolicy()).toBe("Start editing to save these changes"); expect(writes).toHaveLength(0);
+});
+it("Qodo a cached available reopen mounts the editor once", async () => {
+ const first = await open(); first.unmount(); await tick(); const before = editorMounts;
+ render(view(), { wrapper }); await tick(); expect(editorMounts - before).toBe(1);
+});
+it("Qodo an unconfirmed ancestor read stays fenced with retry and actual pending fields", async () => {
+ const screen = await open(); fireEvent.change(screen.getByLabelText("Page body"), { target: { value: "pending during failure" } });
+ readOverride = () => Promise.reject(new TypeError("Ordinary unavailable connection"));
+ send("uncached-possible-ancestor"); await tick(1200);
+ expect(screen.queryByText(/Could not confirm whether this page is available/i)).not.toBeNull();
+ expect(screen.queryByText("Check again")).not.toBeNull(); expect(writes).toHaveLength(0);
+ expect(latest.draft?.content).toEqual(paragraph("pending during failure"));
 });

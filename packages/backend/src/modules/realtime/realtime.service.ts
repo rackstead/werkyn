@@ -13,6 +13,8 @@ interface ConnectionInfo {
   projects: Map<string, string>;
   workspaceIds: Set<string>;
   channels: Map<string, string>;
+  // Only in-flight subscription intentions, never permanent resource tombstones.
+  pendingSubscriptions: Map<string, symbol>;
   // Bumped by every revocation for the user. An authorization read that was in
   // flight when one happened is repeated against the committed state.
   accessVersion: number;
@@ -118,6 +120,7 @@ export async function authenticate(
       projects: new Map(),
       workspaceIds: new Set(),
       channels: new Map(),
+      pendingSubscriptions: new Map(),
       accessVersion: 0,
       expiresAt: payload.exp * 1000,
       authenticatedAt: Date.now(),
@@ -184,25 +187,65 @@ async function authorizeCurrent(
   return null;
 }
 
+type SubscriptionKind = "project" | "workspace" | "channel";
+
+function subscriptionKey(kind: SubscriptionKind, id: string): string {
+  return `${kind}:${id}`;
+}
+
+async function subscribeCurrentIntent(
+  ws: WebSocket,
+  kind: SubscriptionKind,
+  id: string,
+  check: (userId: string) => Promise<string | null>,
+  commit: (conn: ConnectionInfo, workspaceId: string) => void,
+): Promise<boolean> {
+  const conn = connections.get(ws);
+  if (!conn) return false;
+  const key = subscriptionKey(kind, id);
+  const token = Symbol("subscription-intent");
+  conn.pendingSubscriptions.set(key, token);
+  try {
+    const admitted = await authorizeCurrent(ws, check);
+    if (!admitted) return false;
+    if (
+      admitted.conn === conn &&
+      connections.get(ws) === conn &&
+      conn.pendingSubscriptions.get(key) === token
+    ) {
+      // No await between owning the intent and its held-state/presence effects.
+      commit(conn, admitted.workspaceId);
+    }
+    // Preserve the authorized result/ACK even when a later intent made this
+    // request's held-state commit obsolete. This is not a new access denial.
+    return true;
+  } finally {
+    if (conn.pendingSubscriptions.get(key) === token)
+      conn.pendingSubscriptions.delete(key);
+  }
+}
+
 export async function subscribe(
   ws: WebSocket,
   projectId: string,
   prisma: PrismaClient,
 ): Promise<boolean> {
-  const admitted = await authorizeCurrent(
+  return subscribeCurrentIntent(
     ws,
+    "project",
+    projectId,
     async (userId) => (await assertProjectAccess(prisma, projectId, userId)).workspaceId,
+    (conn, workspaceId) => {
+      conn.projects.set(projectId, workspaceId);
+      conn.lastActivity = Date.now();
+    },
   );
-  if (!admitted) return false;
-
-  admitted.conn.projects.set(projectId, admitted.workspaceId);
-  admitted.conn.lastActivity = Date.now();
-  return true;
 }
 
 export function unsubscribe(ws: WebSocket, projectId: string): void {
   const conn = connections.get(ws);
   if (conn) {
+    conn.pendingSubscriptions.delete(subscriptionKey("project", projectId));
     conn.projects.delete(projectId);
     conn.lastActivity = Date.now();
   }
@@ -213,27 +256,29 @@ export async function subscribeWorkspace(
   workspaceId: string,
   prisma: PrismaClient,
 ): Promise<boolean> {
-  const admitted = await authorizeCurrent(ws, async (userId) => {
-    const member = await prisma.workspaceMember.findUnique({
-      where: { userId_workspaceId: { userId, workspaceId } },
-      select: { workspaceId: true },
-    });
-    return member?.workspaceId ?? null;
-  });
-  if (!admitted) return false;
-
-  admitted.conn.workspaceIds.add(workspaceId);
-  admitted.conn.lastActivity = Date.now();
-
-  // Broadcast presence to workspace
-  broadcastToWorkspace(workspaceId, "presence_online", { userId: admitted.conn.userId }, admitted.conn.userId);
-
-  return true;
+  return subscribeCurrentIntent(
+    ws,
+    "workspace",
+    workspaceId,
+    async (userId) => {
+      const member = await prisma.workspaceMember.findUnique({
+        where: { userId_workspaceId: { userId, workspaceId } },
+        select: { workspaceId: true },
+      });
+      return member?.workspaceId ?? null;
+    },
+    (conn) => {
+      conn.workspaceIds.add(workspaceId);
+      conn.lastActivity = Date.now();
+      broadcastToWorkspace(workspaceId, "presence_online", { userId: conn.userId }, conn.userId);
+    },
+  );
 }
 
 export function unsubscribeWorkspace(ws: WebSocket, workspaceId: string): void {
   const conn = connections.get(ws);
   if (conn) {
+    conn.pendingSubscriptions.delete(subscriptionKey("workspace", workspaceId));
     conn.workspaceIds.delete(workspaceId);
     conn.lastActivity = Date.now();
   }
@@ -245,27 +290,32 @@ export async function subscribeChannel(
   prisma: PrismaClient,
 ): Promise<boolean> {
   // A channel membership row only counts while its workspace membership does.
-  const admitted = await authorizeCurrent(ws, async (userId) => {
-    const channel = await prisma.chatChannel.findFirst({
-      where: {
-        id: channelId,
-        members: { some: { userId } },
-        workspace: { members: { some: { userId } } },
-      },
-      select: { workspaceId: true },
-    });
-    return channel?.workspaceId ?? null;
-  });
-  if (!admitted) return false;
-
-  admitted.conn.channels.set(channelId, admitted.workspaceId);
-  admitted.conn.lastActivity = Date.now();
-  return true;
+  return subscribeCurrentIntent(
+    ws,
+    "channel",
+    channelId,
+    async (userId) => {
+      const channel = await prisma.chatChannel.findFirst({
+        where: {
+          id: channelId,
+          members: { some: { userId } },
+          workspace: { members: { some: { userId } } },
+        },
+        select: { workspaceId: true },
+      });
+      return channel?.workspaceId ?? null;
+    },
+    (conn, workspaceId) => {
+      conn.channels.set(channelId, workspaceId);
+      conn.lastActivity = Date.now();
+    },
+  );
 }
 
 export function unsubscribeChannel(ws: WebSocket, channelId: string): void {
   const conn = connections.get(ws);
   if (conn) {
+    conn.pendingSubscriptions.delete(subscriptionKey("channel", channelId));
     conn.channels.delete(channelId);
     conn.lastActivity = Date.now();
   }
@@ -431,6 +481,7 @@ export function cleanup(ws: WebSocket): void {
   if (conn) {
     clearTimeout(conn.expiryTimer);
     connections.delete(ws);
+    conn.pendingSubscriptions.clear();
     const count = userConnectionCounts.get(conn.userId) || 0;
     if (count <= 1) {
       userConnectionCounts.delete(conn.userId);

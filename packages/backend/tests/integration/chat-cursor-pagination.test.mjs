@@ -31,8 +31,81 @@ const observer = new PrismaClient({
   datasourceUrl: observerUrl.toString(),
   log: [{ level: "query", emit: "event" }],
 });
-const queries = [];
-observer.$on("query", (event) => queries.push(event));
+let captureOwner = null;
+const pageQueryShape = (event) =>
+  event.query.startsWith("SELECT ") &&
+  event.query.includes('FROM "public"."ChatMessage"') &&
+  event.query.includes('"content"') && event.query.includes("ORDER BY");
+
+function deferredQuery() {
+  let resolve, reject, settled = false;
+  const promise = new Promise((yes, no) => {
+    resolve = (value) => { if (!settled) { settled = true; yes(value); } };
+    reject = (error) => { if (!settled) { settled = true; no(error); } };
+  });
+  void promise.catch(() => {});
+  return { promise, resolve, reject, settled: () => settled };
+}
+
+function startPageQuery(scope, cursor, run, hold = false) {
+  assert.equal(captureOwner, null, "Settle the prior capture before starting another");
+  const query = deferredQuery(), held = deferredQuery();
+  const delivered = [];
+  let heldEvent, released = false, closed = false;
+  const matches = (event) => pageQueryShape(event) &&
+    JSON.parse(event.params).includes(scope) && JSON.parse(event.params).includes(cursor);
+  const capture = {
+    delivered, query: query.promise, held: held.promise, observed: query.settled,
+    deliver(event) {
+      if (captureOwner !== capture) return;
+      delivered.push(event);
+      if (matches(event)) query.resolve(event);
+    },
+    receive(event) {
+      if (captureOwner !== capture) return;
+      if (hold && matches(event) && !heldEvent) { heldEvent = event; held.resolve(event); }
+      else capture.deliver(event);
+    },
+    release() {
+      if (captureOwner === capture && heldEvent && !released) {
+        released = true;
+        capture.deliver(heldEvent);
+      }
+    },
+    async close() {
+      if (!closed) {
+        closed = true;
+        clearTimeout(timer);
+        if (captureOwner === capture) captureOwner = null;
+        const disposed = new Error("Owned page-query capture disposed");
+        query.reject(disposed); held.reject(disposed);
+      }
+      await Promise.allSettled([capture.operation, query.promise, held.promise]);
+    },
+  };
+  captureOwner = capture;
+  const timer = setTimeout(() => {
+    const error = new Error("Owned page SELECT was not observed within 1000ms");
+    error.name = "PageQueryCaptureTimeout";
+    query.reject(error); held.reject(error);
+  }, 1000);
+  if (!hold) held.resolve(undefined);
+  capture.operation = Promise.resolve().then(run);
+  void capture.operation.catch(() => {});
+  return capture;
+}
+observer.$on("query", (event) => captureOwner?.receive(event));
+
+async function ownPageEvent(scope, cursor, run) {
+  const capture = startPageQuery(scope, cursor, run);
+  try {
+    await capture.operation;
+    return await capture.query;
+  } finally {
+    await capture.close();
+  }
+}
+
 const users = [],
   workspaces = [],
   families = [],
@@ -206,6 +279,7 @@ before(async () => {
 
 after(async () => {
   try {
+    if (captureOwner) await captureOwner.close();
     await observer.$disconnect();
     if (app) {
       await app.prisma.workspace.deleteMany({
@@ -237,19 +311,14 @@ for (const limit of [1, 2, 50, 100]) {
 
 for (const family of ["history", "thread"]) {
   test(`${family} cursor pagination delegates the take bound to PostgreSQL`, async () => {
-    queries.length = 0;
     const cursor = (family === "history" ? history : replies)[55].id;
-    const data =
-      family === "history"
-        ? await chat.listMessages(observer, channels.public.id, cursor, 50)
-        : await chat.getThreadReplies(observer, history[0].id, cursor, 50);
-    const main = queries.find(
-      (event) =>
-        event.query.startsWith("SELECT ") &&
-        event.query.includes('FROM "public"."ChatMessage"') &&
-        event.query.includes('"content"') &&
-        event.query.includes("ORDER BY"),
-    );
+    const scope = family === "history" ? channels.public.id : history[0].id;
+    const capture = startPageQuery(scope, cursor, () => family === "history"
+      ? chat.listMessages(observer, channels.public.id, cursor, 50)
+      : chat.getThreadReplies(observer, history[0].id, cursor, 50));
+    try {
+    const data = await capture.operation;
+    const main = await capture.query;
     assert.ok(main, "Captured the generated page SELECT");
     assert.match(main.query, /LIMIT \$\d+/);
     assert.ok(
@@ -261,6 +330,9 @@ for (const family of ["history", "thread"]) {
     );
     assert.equal(response.statusCode, 200, response.body);
     assert.deepEqual(response.json(), JSON.parse(JSON.stringify(data)));
+    } finally {
+      await capture.close();
+    }
   });
 }
 
@@ -362,5 +434,75 @@ test("defaults, maximum, end, empty and route authorization remain intact", asyn
   for (const limit of ["0", "101", "1.5", "invalid"]) {
     assert.equal((await get(historyPath(undefined, limit))).statusCode, 400);
     assert.equal((await get(threadPath(undefined, limit))).statusCode, 400);
+  }
+});
+
+
+test("page-query capture awaits its actual held event after the service settles", async () => {
+  const cursor = replies[54].id;
+  const capture = startPageQuery(history[0].id, cursor,
+    () => chat.getThreadReplies(observer, history[0].id, cursor, 50), true);
+  try {
+    const data = await capture.operation;
+    const event = await capture.held;
+    assert.equal(capture.delivered.find(pageQueryShape), undefined);
+    assert.equal(capture.observed(), false);
+    capture.release();
+    const main = await capture.query;
+    assert.equal(main, event, "The exact actual event satisfies its own capture");
+    assert.match(main.query, /LIMIT \$\d+/);
+    assert.ok(JSON.parse(main.params).includes(51));
+    assert.equal(data.data.length, 50);
+    assert.equal(data.nextCursor, data.data.at(-1).id);
+  } finally {
+    capture.release();
+    await capture.close();
+  }
+});
+
+test("page-query capture rejects stale-family and different-cursor events", async () => {
+  const staleHistory = await ownPageEvent(channels.public.id, history[55].id,
+    () => chat.listMessages(observer, channels.public.id, history[55].id, 50));
+  const staleThread = await ownPageEvent(history[0].id, replies[55].id,
+    () => chat.getThreadReplies(observer, history[0].id, replies[55].id, 50));
+  assert.ok(staleHistory && staleThread);
+  const cursor = replies[53].id;
+  const capture = startPageQuery(history[0].id, cursor,
+    () => chat.getThreadReplies(observer, history[0].id, cursor, 50), true);
+  try {
+    const data = await capture.operation;
+    const event = await capture.held;
+    capture.deliver(staleHistory);
+    capture.deliver(staleThread);
+    assert.equal(capture.delivered.find(pageQueryShape), staleHistory);
+    assert.equal(capture.observed(), false, "No prior operation may satisfy this waiter");
+    capture.release();
+    const main = await capture.query;
+    assert.equal(main, event);
+    assert.notEqual(main, staleHistory);
+    assert.notEqual(main, staleThread);
+    assert.match(main.query, /LIMIT \$\d+/);
+    assert.ok(JSON.parse(main.params).includes(51));
+    assert.equal(data.data.length, 50);
+  } finally {
+    capture.release();
+    await capture.close();
+  }
+});
+
+test("page-query capture fails boundedly when no owned page SELECT exists", async () => {
+  const staleHistory = await ownPageEvent(channels.public.id, history[55].id,
+    () => chat.listMessages(observer, channels.public.id, history[55].id, 50));
+  const cursor = "cursor-capture-owned-missing";
+  const capture = startPageQuery(history[0].id, cursor,
+    () => chat.getThreadReplies(observer, history[0].id, cursor, 50));
+  try {
+    assert.deepEqual(await capture.operation, { data: [], nextCursor: undefined });
+    assert.equal(capture.delivered.find(pageQueryShape), undefined);
+    capture.deliver(staleHistory);
+    assert.equal(capture.observed(), false);
+    await assert.rejects(capture.query, { name: "PageQueryCaptureTimeout" });
+  } finally {
+    await capture.close();
   }
 });

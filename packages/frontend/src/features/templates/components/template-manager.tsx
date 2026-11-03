@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import type { UpdateTemplateInput } from "@pm/shared";
+import { identityGeneration } from "@/lib/identity";
 import {
   useTemplates,
   useCreateTemplate,
@@ -50,6 +52,35 @@ interface TemplateFormData {
   assigneeIds: string[];
   labelIds: string[];
   subtasks: Array<{ title: string }>;
+}
+
+interface TemplateEdit {
+  id: string;
+  projectId: string;
+  generation: number;
+  initial: TemplateFormData;
+  values: TemplateFormData;
+}
+
+function sameOrderedIds(left: string[], right: string[]) {
+  return left.length === right.length && left.every((id, i) => id === right[i]);
+}
+
+/** Compare the raw edit snapshot before applying the existing encodings. */
+function templateChanges(form: TemplateFormData, initial: TemplateFormData): UpdateTemplateInput {
+  const changes: UpdateTemplateInput = {};
+  if (form.name !== initial.name) changes.name = form.name.trim();
+  if (form.title !== initial.title) changes.title = form.title.trim();
+  if (form.description !== initial.description) changes.description = form.description || null;
+  if (form.priority !== initial.priority) changes.priority = form.priority;
+  if (form.statusId !== initial.statusId) changes.statusId = form.statusId || null;
+  if (form.dueOffset !== initial.dueOffset)
+    changes.dueOffset = form.dueOffset ? parseInt(form.dueOffset, 10) : null;
+  if (!sameOrderedIds(form.assigneeIds, initial.assigneeIds)) changes.assigneeIds = form.assigneeIds;
+  if (!sameOrderedIds(form.labelIds, initial.labelIds)) changes.labelIds = form.labelIds;
+  if (!sameOrderedIds(form.subtasks.map((s) => s.title), initial.subtasks.map((s) => s.title)))
+    changes.subtasks = form.subtasks.filter((s) => s.title.trim());
+  return changes;
 }
 
 const emptyForm: TemplateFormData = {
@@ -330,8 +361,15 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
 
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState<TemplateFormData>(emptyForm);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState<TemplateFormData>(emptyForm);
+  const [edit, setEdit] = useState<TemplateEdit | null>(null);
+  const currentProject = useRef(projectId);
+  currentProject.current = projectId;
+  const currentEdit = useRef(edit);
+  currentEdit.current = edit;
+  const generation = identityGeneration();
+  const editChanges = edit ? templateChanges(edit.values, edit.initial) : {};
+  const invalidChangedTitle = editChanges.title !== undefined && !editChanges.title;
+  const invalidChangedName = editChanges.name !== undefined && !editChanges.name;
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const handleCreate = () => {
@@ -357,22 +395,33 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
     );
   };
 
+  const handleEditChange = (values: TemplateFormData) => {
+    setEdit((current) => {
+      if (
+        !current || current.initial !== edit?.initial ||
+        current.projectId !== currentProject.current ||
+        current.generation !== identityGeneration()
+      ) return current;
+      return { ...current, values };
+    });
+  };
+
   const handleUpdate = () => {
-    if (!editingId || !editForm.name.trim() || !editForm.title.trim()) return;
+    if (
+      !edit || currentEdit.current?.initial !== edit.initial ||
+      edit.projectId !== currentProject.current || edit.generation !== identityGeneration() ||
+      Object.keys(editChanges).length === 0 || invalidChangedName || invalidChangedTitle
+    ) return;
     updateTemplate.mutate(
+      { id: edit.id, ...editChanges },
       {
-        id: editingId,
-        name: editForm.name.trim(),
-        title: editForm.title.trim(),
-        description: editForm.description || null,
-        priority: editForm.priority,
-        statusId: editForm.statusId || null,
-        dueOffset: editForm.dueOffset ? parseInt(editForm.dueOffset, 10) : null,
-        assigneeIds: editForm.assigneeIds,
-        labelIds: editForm.labelIds,
-        subtasks: editForm.subtasks.filter((s) => s.title.trim()),
+        onSuccess: () => {
+          // Keep the existing close-on-success policy, including pending edits.
+          // A completion for an older editor must not close a newly opened one.
+          if (edit.generation !== identityGeneration()) return;
+          setEdit((current) => current?.initial === edit.initial ? null : current);
+        },
       },
-      { onSuccess: () => setEditingId(null) },
     );
   };
 
@@ -386,11 +435,11 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
             key={t.id}
             className="rounded-md border px-3 py-2"
           >
-            {editingId === t.id ? (
+            {edit?.id === t.id && edit.projectId === projectId && edit.generation === generation ? (
               <div className="space-y-3">
                 <TemplateForm
-                  form={editForm}
-                  setForm={setEditForm}
+                  form={edit.values}
+                  setForm={handleEditChange}
                   statuses={statuses}
                   labels={labels}
                   members={members}
@@ -400,8 +449,8 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                     size="sm"
                     onClick={handleUpdate}
                     disabled={
-                      !editForm.name.trim() ||
-                      !editForm.title.trim() ||
+                      Object.keys(editChanges).length === 0 ||
+                      invalidChangedName || invalidChangedTitle ||
                       updateTemplate.isPending
                     }
                   >
@@ -410,7 +459,7 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => setEditingId(null)}
+                    onClick={() => setEdit(null)}
                   >
                     Cancel
                   </Button>
@@ -435,8 +484,12 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                 </span>
                 <button
                   onClick={() => {
-                    setEditingId(t.id);
-                    setEditForm(templateToForm(t));
+                    if (
+                      projectId !== currentProject.current || t.projectId !== projectId ||
+                      generation !== identityGeneration()
+                    ) return;
+                    const initial = templateToForm(t);
+                    setEdit({ id: t.id, projectId, generation, initial, values: initial });
                   }}
                   className="text-muted-foreground hover:text-foreground shrink-0"
                 >

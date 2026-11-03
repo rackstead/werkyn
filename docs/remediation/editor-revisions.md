@@ -72,6 +72,22 @@ pending edits, and the editor's next save builds on its revision when nothing
 else was written in between, so the user's own change is not reported as a
 conflict.
 
+### A page removed in another session
+
+A deletion event makes an open page unavailable without discarding its unsaved
+changes. An ancestor or space deletion first checks the current page, since a
+page may have moved; an unaffected page resumes its live edits after that check.
+New saves and editing-lock activity stop while the page is unavailable.
+
+An already-sent save may still succeed. Its acknowledgment remains valid; only
+its stale cache effects are skipped. Any remaining unsaved fields are set aside
+after it settles and stay in this tab, with a read-only preview and explicit
+Discard. They are never restored or sent automatically on navigation or reopen.
+If the page becomes available again, editing still needs the existing lock and
+restoration remains explicit. This does not preserve a new recovery copy of
+content that was successfully saved before the page was removed, and adds no
+server restore/recreate policy.
+
 ## Validation
 
 ```sh

@@ -21,6 +21,7 @@ import { VersionHistoryPanel } from "./version-history-panel";
 import { WikiCommentsPanel } from "./wiki-comments-panel";
 import { SharePageDialog } from "./share-page-dialog";
 import { usePageLock } from "../hooks/use-page-lock";
+import { useWikiPageAvailability } from "../hooks/use-wiki-page-availability";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import type { Block } from "@blocknote/core";
@@ -53,7 +54,9 @@ function WikiPageSession({
   workspaceId,
   onNavigatePage,
 }: WikiPageViewProps) {
-  const { data: pageData, isLoading } = useWikiPage(pageId);
+  const pageQuery = useWikiPage(pageId);
+  const { data: pageData, isLoading } = pageQuery;
+  const availabilityGate = useRef<{ canWrite: () => boolean } | null>(null);
   const { data: breadcrumbsData } = useWikiPageBreadcrumbs(pageId);
   const { mutateAsync: updatePage } = useUpdateWikiPage();
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
@@ -69,6 +72,7 @@ function WikiPageSession({
         ...(expectedRevision === undefined ? {} : { expectedRevision }),
         pageId,
         expectedUserId: userId,
+        canWrite: () => availabilityGate.current?.canWrite() ?? false,
       });
       return result.data.revision;
     },
@@ -80,15 +84,20 @@ function WikiPageSession({
   const holdsLock = useRef(false);
   const autosave = useEntityAutosave(wikiAutosaveKey(userId, pageId), save, {
     author: userId,
-    canSave: () =>
-      holdsLock.current ? null : "Start editing to save these changes",
+    canSave: () => !availabilityGate.current?.canWrite()
+      ? "This page is not available for saving"
+      : holdsLock.current ? null : "Start editing to save these changes",
     retryFailedAutomatically: true,
-    revision: pageData?.data.revision,
+    revision: pageData?.data?.revision,
     isConflict: isEditConflict,
   });
+  const availability = useWikiPageAvailability({ pageId, workspaceId, userId, pageQuery, autosave,
+    isLocked: () => holdsLock.current });
+  availabilityGate.current = availability;
   const { lock, isLockedByMe, isLockedByOther, acquire, release } = usePageLock(
     pageId,
     autosave.flush,
+    !availability.terminal,
   );
   holdsLock.current = isLockedByMe;
   const queryClient = useQueryClient();
@@ -108,20 +117,24 @@ function WikiPageSession({
   // (or lock) arrives it shows an older one, and edits made there would be
   // refused again and could replace the set-aside draft.
   const readOnly =
-    !isLockedByMe || finishing || showVersions || autosave.conflict !== null;
+    !isLockedByMe || finishing || showVersions || autosave.conflict !== null || availability.readOnly;
+
+  useEffect(() => {
+    setDocumentVersion((version) => version + 1);
+  }, [availability.documentVersion]);
 
   // Losing the lock (or no longer being able to confirm it) sets unsaved
   // changes aside: the page shows the stored document again, and the changes
   // are only sent if the user restores them while holding the lock.
   useEffect(() => {
-    if (isLockedByMe) return;
+    if (isLockedByMe || availability.terminal) return;
     if (autosave.status !== "error" && autosave.status !== "pending") return;
     autosave.park();
     setDocumentVersion((version) => version + 1);
     void queryClient.invalidateQueries({
       queryKey: queryKeys.wikiPage(pageId),
     });
-  }, [isLockedByMe, autosave.status, autosave.park, queryClient, pageId]);
+  }, [isLockedByMe, availability.terminal, autosave.status, autosave.park, queryClient, pageId]);
 
   // A refused save was set aside. Show the stored document again, now and
   // once its newer version is fetched; for a lock conflict, also the lock.
@@ -155,7 +168,7 @@ function WikiPageSession({
 
   const handleContentChange = useCallback(
     (content: Block[]) => {
-      if (readOnly) return;
+      if (readOnly || !availabilityGate.current?.canWrite()) return;
       autosave.schedule({ content: structuredClone(content) });
     },
     [autosave.schedule, readOnly],
@@ -163,7 +176,7 @@ function WikiPageSession({
 
   const handleTitleChange = useCallback(
     (title: string) => {
-      if (readOnly) return;
+      if (readOnly || !availabilityGate.current?.canWrite()) return;
       // An emptied heading keeps the saved title, as before. Returning to the
       // saved title drops an unsent change; one already being saved gets a
       // corrective update instead, so an abandoned value never wins.
@@ -202,9 +215,34 @@ function WikiPageSession({
     void finishEditing().catch(() => {});
   };
 
+  const navigationGuard = router ? <EditorNavigationGuard beforeLeave={leaveEditing}
+    hasUnsavedChanges={autosave.hasUnsavedChanges} /> : null;
+  if (availability.terminal) {
+    const retained = autosave.parked;
+    return <div className="mx-auto max-w-4xl p-8 space-y-4">
+      {navigationGuard}
+      <p role="status">Page no longer available</p>
+      {autosave.hasUnsavedChanges && <p>Finishing an earlier save. Remaining changes will be kept in this tab.</p>}
+      {retained && <section aria-label="Unsaved changes" className="space-y-3">
+        <p>Your unsaved changes are kept in this tab.</p>
+        {retained.title !== undefined && <p>{retained.title}</p>}
+        {retained.icon !== undefined && <p>{retained.icon}</p>}
+        {retained.content !== undefined && <Suspense fallback={<Skeleton className="h-40" />}>
+          <WikiEditor initialContent={retained.content} readOnly />
+        </Suspense>}
+        <Button variant="outline" onClick={autosave.discardParked}>Discard</Button>
+      </section>}
+    </div>;
+  }
+  if (availability.failed) return <div className="mx-auto max-w-4xl p-8 space-y-3">
+    {navigationGuard}<p role="status">Could not confirm whether this page is available.</p>
+    <Button onClick={availability.retryRead}>Check again</Button>
+  </div>;
+
   if (isLoading) {
     return (
       <div className="mx-auto max-w-4xl p-8 space-y-4">
+        {navigationGuard}
         <Skeleton className="h-4 w-48" />
         <Skeleton className="h-10 w-96" />
         <Skeleton className="h-64 w-full" />
@@ -215,19 +253,15 @@ function WikiPageSession({
   if (!page) {
     return (
       <div className="flex items-center justify-center p-12 text-muted-foreground">
-        Page not found
+        {navigationGuard}
+        {availability.readOnly ? "Checking page availability…" : "Page not found"}
       </div>
     );
   }
 
   return (
     <div className="mx-auto max-w-4xl p-8">
-      {router && (
-        <EditorNavigationGuard
-          beforeLeave={leaveEditing}
-          hasUnsavedChanges={autosave.hasUnsavedChanges}
-        />
-      )}
+      {navigationGuard}
       {/* Breadcrumbs (ancestors only, current page shown as h1 below) */}
       {breadcrumbs.length > 1 && (
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-6">
@@ -376,7 +410,7 @@ function WikiPageSession({
         {page.icon && !readOnly ? (
           <EmojiPicker
             value={page.icon}
-            onChange={(emoji) => autosave.schedule({ icon: emoji })}
+            onChange={(emoji) => availabilityGate.current?.canWrite() && autosave.schedule({ icon: emoji })}
           >
             <button
               type="button"
@@ -391,7 +425,7 @@ function WikiPageSession({
           !readOnly && (
             <EmojiPicker
               value={null}
-              onChange={(emoji) => emoji && autosave.schedule({ icon: emoji })}
+              onChange={(emoji) => emoji && availabilityGate.current?.canWrite() && autosave.schedule({ icon: emoji })}
             >
               <button
                 type="button"

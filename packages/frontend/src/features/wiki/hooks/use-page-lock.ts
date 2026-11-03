@@ -37,9 +37,12 @@ function lockIsGone(error: unknown) {
 export function usePageLock(
   pageId: string,
   beforeRelease: () => Promise<void>,
+  enabled = true,
 ) {
   const userId = useAuthStore((s) => s.user?.id);
-  const { data: lockData, refetch } = useWikiPageLock(pageId);
+  const usable = useRef(enabled);
+  usable.current = enabled;
+  const { data: lockData, refetch } = useWikiPageLock(enabled ? pageId : undefined);
   const refetchLock = useRef(refetch);
   refetchLock.current = refetch;
   const { mutateAsync: acquireLock } = useAcquireWikiLock();
@@ -64,7 +67,7 @@ export function usePageLock(
       ? leaseRef.current
       : leases.get(leaseKey);
   const isLockedByMe =
-    lockHeld && (knownLease?.confirmedUntil ?? 0) > Date.now();
+    enabled && lockHeld && (knownLease?.confirmedUntil ?? 0) > Date.now();
   const isLockedByOther = lock !== null && lock.userId !== userId;
   useEffect(() => {
     owned.current = lockHeld;
@@ -97,7 +100,7 @@ export function usePageLock(
   const startHeartbeat = useCallback(() => {
     stopHeartbeat();
     const renew = () => {
-      if (!isCurrentUser()) {
+      if (!isCurrentUser() || !usable.current) {
         stopHeartbeat();
         return;
       }
@@ -105,13 +108,14 @@ export function usePageLock(
       const started = Date.now();
       void heartbeat({ pageId, expectedUserId: userId }).then(
         () => {
+          if (!usable.current) return;
           confirmOwnership(started + LOCK_MS);
           toast.dismiss(notice);
         },
         (error) => {
           // The account changed while it was pending: nothing to report to the
           // next account, and the lock is not known to be gone.
-          if (isIdentityChangedError(error) || !isCurrentUser()) return;
+          if (isIdentityChangedError(error) || !isCurrentUser() || !usable.current) return;
           // Keep renewing after a transient failure; ownership then lapses on
           // its own once the server's lock could have expired. A definite
           // answer that the lock is gone makes the editor read-only now.
@@ -163,6 +167,7 @@ export function usePageLock(
 
   const acquire = useCallback(async () => {
     if (!isCurrentUser()) throw new Error("Sign in to edit this page");
+    if (!usable.current) throw new Error("This page is no longer available");
     const lease = leaseRef.current;
     const lifetime = currentLifetime.current;
     if (!lease || lease.key !== leaseKey)
@@ -187,6 +192,7 @@ export function usePageLock(
       // release. An old acquisition must not release a newly recovered lock.
       if (
         !isCurrentUser() ||
+        !usable.current ||
         !mounted.current ||
         currentLifetime.current !== lifetime
       )
@@ -205,7 +211,7 @@ export function usePageLock(
     const lifetime = currentLifetime.current;
     if (lease) await Promise.allSettled([...lease.acquisitions]);
     await beforeRelease();
-    if (!lease || (!owned.current && !lease.owned) || !isCurrentUser()) return;
+    if (!lease || (!owned.current && !lease.owned) || !isCurrentUser() || !usable.current) return;
     // If this editor closed (or a newer lifetime of the page replaced it) while
     // saving, the latest lifetime's cleanup owns the release.
     if (
@@ -246,7 +252,7 @@ export function usePageLock(
         .then(async () => {
           await Promise.allSettled([...lease.acquisitions]);
           if (lease.latest !== lifetime || lease.active.size) return;
-          if (lease.owned && isCurrentUser()) await performRelease(lease);
+          if (lease.owned && isCurrentUser() && usable.current) await performRelease(lease);
           if (
             lease.latest === lifetime &&
             !lease.active.size &&

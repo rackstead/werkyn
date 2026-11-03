@@ -118,7 +118,11 @@ beforeEach(() => {
     },
   });
   vi.spyOn(wiki, "useWikiPage").mockImplementation(
-    (id) => ({ data: { data: page(id!) }, isLoading: false }) as any,
+    (id) => {
+      const ownership = wiki.wikiPageOwnership(client, id!, true)!;
+      ownership.state.phase = "available";
+      return { data: { data: page(id!) }, isLoading: false, availability: "available", ownership } as any;
+    },
   );
   vi.spyOn(wiki, "useWikiPageBreadcrumbs").mockReturnValue({
     data: { data: [] },

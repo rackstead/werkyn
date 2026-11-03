@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { CancelledError, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
@@ -234,13 +234,89 @@ export function useWikiPageTree(sid: string, parentId?: string) {
   });
 }
 
+export type WikiAvailability = "unknown" | "available" | "checking" | "unavailable" | "failed";
+interface WikiPageCache { data: WikiPage | null; stamp?: symbol; transition?: number }
+interface PageOwnership {
+  epoch: number;
+  phase: WikiAvailability;
+  read?: symbol;
+  stamp?: symbol;
+  needsResume: boolean;
+  retire?: () => void;
+}
+// Metadata follows this exact cache entry. A removed entry cannot lend its
+// ownership to a replacement with the same key; no permanent ID map is kept.
+const pageOwners = new WeakMap<object, PageOwnership>();
+export function wikiPageOwnership(client: QueryClient, pageId: string, create = false) {
+  const key = queryKeys.wikiPage(pageId);
+  let query = client.getQueryCache().find({ queryKey: key, exact: true });
+  if (!query && create) {
+    client.setQueryData<WikiPageCache>(key, { data: null });
+    query = client.getQueryCache().find({ queryKey: key, exact: true });
+  }
+  if (!query) return undefined;
+  let state = pageOwners.get(query);
+  if (!state) {
+    state = { epoch: 0, phase: "unknown", needsResume: false };
+    pageOwners.set(query, state);
+  }
+  return { query, state };
+}
+export function markWikiPageAvailability(client: QueryClient, pageId: string, phase: "checking" | "unavailable") {
+  const owner = wikiPageOwnership(client, pageId);
+  if (!owner || (phase === "checking" && owner.state.phase === "unavailable")) return;
+  owner.state.epoch++;
+  owner.state.read = undefined;
+  owner.state.phase = phase;
+  owner.state.needsResume = phase === "checking";
+  if (phase === "unavailable") {
+    owner.state.retire?.();
+    void client.cancelQueries({ queryKey: ["wiki-lock", pageId], exact: true }, { revert: false }).catch(() => {});
+    client.setQueryData(["wiki-lock", pageId], { data: null });
+  }
+  void client.cancelQueries({ queryKey: queryKeys.wikiPage(pageId), exact: true }, { revert: false }).catch(() => {});
+  client.setQueryData<WikiPageCache>(queryKeys.wikiPage(pageId), (previous) => ({
+    data: phase === "unavailable" ? null : previous?.data ?? null,
+    stamp: owner.state.stamp,
+    transition: owner.state.epoch,
+  }));
+}
 export function useWikiPage(pgid: string | undefined) {
-  return useQuery({
+  const client = useQueryClient();
+  const result = useQuery({
     queryKey: queryKeys.wikiPage(pgid!),
-    queryFn: () =>
-      api.get(`wiki/pages/${pgid}`).json<{ data: WikiPage }>(),
+    queryFn: async ({ signal }) => {
+      const owner = wikiPageOwnership(client, pgid!, true)!;
+      const epoch = owner.state.epoch;
+      const token = Symbol("wiki-page-read");
+      owner.state.read = token;
+      const current = () => !signal.aborted &&
+        client.getQueryCache().find({ queryKey: queryKeys.wikiPage(pgid!), exact: true }) === owner.query &&
+        owner.state.epoch === epoch && owner.state.read === token;
+      try {
+        const response = await api.get(`wiki/pages/${pgid}`, { signal }).json<{ data: WikiPage }>();
+        if (!current()) throw new CancelledError({ silent: true });
+        if (owner.state.phase !== "available") owner.state.epoch++;
+        owner.state.phase = "available";
+        owner.state.stamp = token;
+        return { ...response, stamp: token } as WikiPageCache;
+      } catch (error) {
+        if (!current()) throw new CancelledError({ silent: true });
+        if ((error as { statusCode?: number } | null)?.statusCode === 404) {
+          markWikiPageAvailability(client, pgid!, "unavailable");
+        } else if (owner.state.phase !== "available") owner.state.phase = "failed";
+        throw error;
+      }
+    },
     enabled: !!pgid,
+    refetchOnMount: (query) => pageOwners.get(query)?.phase === "available" ? true : "always",
   });
+  const owner = pgid ? wikiPageOwnership(client, pgid) : undefined;
+  const phase = owner?.state.phase ?? "unknown";
+  const data = phase === "unavailable" ? { data: null } :
+    result.data?.stamp === owner?.state.stamp ? result.data : undefined;
+  return { ...result, data, availability: phase, ownership: owner,
+    isLoading: result.isLoading || phase === "unknown" };
 }
 
 export function useWikiPageBreadcrumbs(pgid: string | undefined) {
@@ -283,27 +359,38 @@ export function useCreateWikiPage(sid: string) {
 export function useUpdateWikiPage() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId, ...data }: UpdateWikiPageInput & { pageId: string; expectedUserId?: string }) => {
-      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) {
-        throw new Error("Sign in as the author to save these changes");
-      }
-      return api
-        .patch(`wiki/pages/${pageId}`, { json: data, ...(expectedUserId ? { context: { expectedUserId } } : {}) })
-        .json<{ data: WikiPage }>();
+    onMutate: ({ pageId }: UpdateWikiPageInput & { pageId: string; expectedUserId?: string; canWrite?: () => boolean }) => {
+      // Capture before dispatch, including tree-item writers. Success may not
+      // manufacture a new entry after this one was removed or collected.
+      const owner = wikiPageOwnership(qc, pageId, true)!;
+      return { ...owner, epoch: owner.state.epoch };
     },
-    onSuccess: async (result, { pageId, expectedUserId, ...data }) => {
-      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
-      // PATCH returns the full page. Prevent an older GET from replacing it.
-      await qc.cancelQueries({ queryKey: queryKeys.wikiPage(pageId) });
-      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId) return;
-      qc.setQueryData(queryKeys.wikiPage(pageId), result);
-      // A content save is already in the cache; a new title or icon also
-      // shows in the page tree and breadcrumbs.
-      if ("title" in data || "icon" in data)
-        qc.invalidateQueries({ queryKey: ["wiki-pages"] });
+    mutationFn: ({ pageId, expectedUserId, canWrite, ...data }: UpdateWikiPageInput & { pageId: string; expectedUserId?: string; canWrite?: () => boolean }) => {
+      if (expectedUserId && useAuthStore.getState().user?.id !== expectedUserId)
+        throw new Error("Sign in as the author to save these changes");
+      if (canWrite && !canWrite()) throw new Error("This page is no longer available for saving");
+      return api.patch(`wiki/pages/${pageId}`, { json: data,
+        ...(expectedUserId ? { context: { expectedUserId } } : {}) }).json<{ data: WikiPage }>();
+    },
+    onSuccess: async (result, { pageId, expectedUserId, canWrite, ...data }, owner) => {
+      const current = () => !!owner &&
+        (!expectedUserId || useAuthStore.getState().user?.id === expectedUserId) &&
+        (!canWrite || canWrite()) &&
+        qc.getQueryCache().find({ queryKey: queryKeys.wikiPage(pageId), exact: true }) === owner.query &&
+        owner.state.epoch === owner.epoch;
+      // Cache work is best effort after an ACK. Neither a stale lease nor a
+      // cache cancellation failure may turn committed bytes into a failed save.
+      try {
+        if (!current()) return;
+        await qc.cancelQueries({ queryKey: queryKeys.wikiPage(pageId), exact: true });
+        if (!current()) return;
+        if (owner!.state.phase === "available")
+          qc.setQueryData<WikiPageCache>(queryKeys.wikiPage(pageId), { ...result, stamp: owner!.state.stamp });
+        if (!current()) return;
+        if ("title" in data || "icon" in data) void qc.invalidateQueries({ queryKey: ["wiki-pages"] }).catch(() => {});
+      } catch { /* The HTTP response remains acknowledged. */ }
     },
     onError: (error, { expectedUserId }) => {
-      // Editor autosaves report failures through their own retry notice.
       if (expectedUserId) return;
       toast.error(error.message || "Something went wrong");
     },
@@ -415,12 +502,20 @@ export function useWikiPageLock(pgid: string | undefined) {
 
 // ─── Lock Mutations ─────────────────────────────────────
 
+type WikiLockOperation = { pageId: string; expectedUserId?: string; canDispatch?: () => boolean };
+function assertWikiLockDispatch(canDispatch: WikiLockOperation["canDispatch"]) {
+  if (canDispatch && !canDispatch()) throw new Error("This editor no longer owns the lock operation");
+}
+
 export function useAcquireWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.post(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).json<{ data: WikiPageLock }>(),
-    onSuccess: (_, { pageId }) => {
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.post(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).json<{ data: WikiPageLock }>();
+    },
+    onSuccess: (_, { pageId, canDispatch }) => {
+      if (canDispatch && !canDispatch()) return;
       qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
@@ -429,9 +524,12 @@ export function useAcquireWikiLock() {
 export function useReleaseWikiLock() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.delete(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).then(() => {}),
-    onSuccess: (_, { pageId }) => {
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.delete(`wiki/pages/${pageId}/lock`, { context: { expectedUserId } }).then(() => {});
+    },
+    onSuccess: (_, { pageId, canDispatch }) => {
+      if (canDispatch && !canDispatch()) return;
       qc.invalidateQueries({ queryKey: ["wiki-lock", pageId] });
     },
   });
@@ -439,8 +537,10 @@ export function useReleaseWikiLock() {
 
 export function useHeartbeatWikiLock() {
   return useMutation({
-    mutationFn: ({ pageId, expectedUserId }: { pageId: string; expectedUserId?: string }) =>
-      api.patch(`wiki/pages/${pageId}/lock/heartbeat`, { context: { expectedUserId } }).then(() => {}),
+    mutationFn: ({ pageId, expectedUserId, canDispatch }: WikiLockOperation) => {
+      assertWikiLockDispatch(canDispatch);
+      return api.patch(`wiki/pages/${pageId}/lock/heartbeat`, { context: { expectedUserId } }).then(() => {});
+    },
   });
 }
 

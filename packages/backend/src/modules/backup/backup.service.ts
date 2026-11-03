@@ -7,7 +7,7 @@ import {
   type BackupFile,
 } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { once } from "node:events";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -156,7 +156,7 @@ type PageEntry = BackupFile["wikiSpaces"][number]["pages"][number];
  * soon as restore could no longer read it.
  */
 class ExportArchive {
-  private readonly archive = archiver("zip", { zlib: { level: 6 } });
+  private readonly archive = new ZipArchive({ zlib: { level: 6 } });
   private readonly output: WriteStream;
   private readonly written: Promise<void>;
   /** Why the archive failed or was stopped; every later wait fails with it. */

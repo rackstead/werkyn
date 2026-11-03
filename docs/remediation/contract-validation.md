@@ -137,6 +137,16 @@ identity generation cannot submit its draft. The existing identity boundary and
 request/cache guards remain. This adds no revision/CAS, unseen-update protection,
 raw-entity decoding, stored-row repair or sanitizer/editor policy expansion.
 
+Template description submissions use the existing multiline control-character
+helper: vertical tab and form feed become newlines, and other forbidden controls
+are removed. Tabs, Unicode, permitted newlines and whitespace remain. Descriptions
+are not trimmed or HTML/entity-decoded; the server sanitizer is unchanged. Edit
+compares the raw snapshot first, so unchanged legacy values are still omitted.
+A changed description that normalizes to empty sends null; CREATE keeps its full
+payload and omits an empty normalized description. Create/update errors show the
+first field validation detail, then the server error message, with the existing
+operation fallback when neither is available. Failed forms keep their drafts.
+
 ## Tests
 
 ```sh

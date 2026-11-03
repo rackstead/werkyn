@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import type { UpdateTemplateInput } from "@pm/shared";
+import { stripDisallowedControlCharacters, type UpdateTemplateInput } from "@pm/shared";
 import { identityGeneration } from "@/lib/identity";
 import {
   useTemplates,
@@ -71,7 +71,8 @@ function templateChanges(form: TemplateFormData, initial: TemplateFormData): Upd
   const changes: UpdateTemplateInput = {};
   if (form.name !== initial.name) changes.name = form.name.trim();
   if (form.title !== initial.title) changes.title = form.title.trim();
-  if (form.description !== initial.description) changes.description = form.description || null;
+  if (form.description !== initial.description)
+    changes.description = stripDisallowedControlCharacters(form.description) || null;
   if (form.priority !== initial.priority) changes.priority = form.priority;
   if (form.statusId !== initial.statusId) changes.statusId = form.statusId || null;
   if (form.dueOffset !== initial.dueOffset)
@@ -381,7 +382,7 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
       {
         name: form.name.trim(),
         title: form.title.trim(),
-        description: form.description || undefined,
+        description: stripDisallowedControlCharacters(form.description) || undefined,
         priority: form.priority,
         statusId: form.statusId || undefined,
         dueOffset: form.dueOffset ? parseInt(form.dueOffset, 10) : undefined,

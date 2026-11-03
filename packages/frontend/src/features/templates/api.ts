@@ -1,9 +1,34 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api-client";
+import { api, mapApiErrorToForm } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { toast } from "sonner";
 import type { CreateTemplateInput, UpdateTemplateInput, InstantiateTemplateInput } from "@pm/shared";
+
+const TEMPLATE_FIELD_LABELS: Record<string, string> = {
+  name: "Template name",
+  title: "Task title",
+  description: "Description",
+  priority: "Priority",
+  statusId: "Status",
+  dueOffset: "Due offset (days)",
+  assigneeIds: "Assignees",
+  labelIds: "Labels",
+  subtasks: "Subtasks",
+};
+
+function templateErrorMessage(error: unknown, fallback: string): string {
+  const fields = mapApiErrorToForm(error);
+  for (const [field, message] of Object.entries(fields ?? {})) {
+    if (typeof message !== "string" || !message.trim()) continue;
+    const subtask = /^subtasks\.(\d+)\.title$/.exec(field);
+    const label = subtask
+      ? `Subtask ${Number(subtask[1]) + 1}`
+      : TEMPLATE_FIELD_LABELS[field.split(".")[0]];
+    return label ? `${label}: ${message}` : message;
+  }
+  return error instanceof Error && error.message.trim() ? error.message : fallback;
+}
 
 export interface TaskTemplate {
   id: string;
@@ -40,8 +65,8 @@ export function useCreateTemplate(pid: string) {
       queryClient.invalidateQueries({ queryKey: queryKeys.templates(pid) });
       toast.success("Template created");
     },
-    onError: () => {
-      toast.error("Failed to create template");
+    onError: (error) => {
+      toast.error(templateErrorMessage(error, "Failed to create template"));
     },
   });
 }
@@ -56,8 +81,8 @@ export function useUpdateTemplate(pid: string) {
       queryClient.invalidateQueries({ queryKey: queryKeys.templates(pid) });
       toast.success("Template updated");
     },
-    onError: () => {
-      toast.error("Failed to update template");
+    onError: (error) => {
+      toast.error(templateErrorMessage(error, "Failed to update template"));
     },
   });
 }

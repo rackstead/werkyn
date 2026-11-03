@@ -1,9 +1,24 @@
 import { useInfiniteQuery, useMutation } from "@tanstack/react-query";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 import { toast } from "sonner";
 import type { CreateCommentInput, UpdateCommentInput } from "@pm/shared";
+
+function commentErrorMessage(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiError) || error.statusCode !== 400 || !Array.isArray(error.details)) {
+    return fallback;
+  }
+  for (const detail of error.details) {
+    if (!detail || typeof detail !== "object" || Array.isArray(detail)) continue;
+    if (!Object.prototype.hasOwnProperty.call(detail, "field") ||
+        !Object.prototype.hasOwnProperty.call(detail, "message")) continue;
+    if (detail.field === "body" && typeof detail.message === "string" && detail.message.trim()) {
+      return `Comment: ${detail.message.trim()}`;
+    }
+  }
+  return fallback;
+}
 
 export interface Comment {
   id: string;
@@ -44,8 +59,8 @@ export function useCreateComment(tid: string) {
       queryClient.invalidateQueries({ queryKey: queryKeys.comments(tid) });
       queryClient.invalidateQueries({ queryKey: queryKeys.activity(tid) });
     },
-    onError: () => {
-      toast.error("Failed to post comment");
+    onError: (error) => {
+      toast.error(commentErrorMessage(error, "Failed to post comment"));
     },
   });
 }
@@ -57,8 +72,8 @@ export function useUpdateComment(tid: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.comments(tid) });
     },
-    onError: () => {
-      toast.error("Failed to update comment");
+    onError: (error) => {
+      toast.error(commentErrorMessage(error, "Failed to update comment"));
     },
   });
 }

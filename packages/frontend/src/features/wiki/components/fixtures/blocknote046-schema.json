@@ -1,0 +1,326 @@
+{
+  "blocks": {
+    "audio": {
+      "type": "audio",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "name": {
+          "default": ""
+        },
+        "url": {
+          "default": ""
+        },
+        "caption": {
+          "default": ""
+        },
+        "showPreview": {
+          "default": true
+        }
+      },
+      "content": "none"
+    },
+    "bulletListItem": {
+      "type": "bulletListItem",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        }
+      },
+      "content": "inline"
+    },
+    "checkListItem": {
+      "type": "checkListItem",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        },
+        "checked": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "content": "inline"
+    },
+    "codeBlock": {
+      "type": "codeBlock",
+      "propSchema": {
+        "language": {
+          "default": "text"
+        }
+      },
+      "content": "inline"
+    },
+    "divider": {
+      "type": "divider",
+      "propSchema": {},
+      "content": "none"
+    },
+    "file": {
+      "type": "file",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "name": {
+          "default": ""
+        },
+        "url": {
+          "default": ""
+        },
+        "caption": {
+          "default": ""
+        }
+      },
+      "content": "none"
+    },
+    "heading": {
+      "type": "heading",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        },
+        "level": {
+          "default": 1,
+          "values": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        "isToggleable": {
+          "default": false,
+          "optional": true
+        }
+      },
+      "content": "inline"
+    },
+    "image": {
+      "type": "image",
+      "propSchema": {
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        },
+        "backgroundColor": {
+          "default": "default"
+        },
+        "name": {
+          "default": ""
+        },
+        "url": {
+          "default": ""
+        },
+        "caption": {
+          "default": ""
+        },
+        "showPreview": {
+          "default": true
+        },
+        "previewWidth": {
+          "type": "number"
+        }
+      },
+      "content": "none"
+    },
+    "numberedListItem": {
+      "type": "numberedListItem",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        },
+        "start": {
+          "type": "number"
+        }
+      },
+      "content": "inline"
+    },
+    "paragraph": {
+      "type": "paragraph",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        }
+      },
+      "content": "inline"
+    },
+    "quote": {
+      "type": "quote",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        }
+      },
+      "content": "inline"
+    },
+    "table": {
+      "type": "table",
+      "content": "table",
+      "propSchema": {
+        "textColor": {
+          "default": "default"
+        }
+      }
+    },
+    "toggleListItem": {
+      "type": "toggleListItem",
+      "propSchema": {
+        "backgroundColor": {
+          "default": "default"
+        },
+        "textColor": {
+          "default": "default"
+        },
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        }
+      },
+      "content": "inline"
+    },
+    "video": {
+      "type": "video",
+      "propSchema": {
+        "textAlignment": {
+          "default": "left",
+          "values": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        },
+        "backgroundColor": {
+          "default": "default"
+        },
+        "name": {
+          "default": ""
+        },
+        "url": {
+          "default": ""
+        },
+        "caption": {
+          "default": ""
+        },
+        "showPreview": {
+          "default": true
+        },
+        "previewWidth": {
+          "type": "number"
+        }
+      },
+      "content": "none"
+    }
+  },
+  "inline": {
+    "text": "text",
+    "link": "link"
+  },
+  "styles": {
+    "bold": {
+      "type": "bold",
+      "propSchema": "boolean"
+    },
+    "italic": {
+      "type": "italic",
+      "propSchema": "boolean"
+    },
+    "underline": {
+      "type": "underline",
+      "propSchema": "boolean"
+    },
+    "strike": {
+      "type": "strike",
+      "propSchema": "boolean"
+    },
+    "code": {
+      "type": "code",
+      "propSchema": "boolean"
+    },
+    "textColor": {
+      "type": "textColor",
+      "propSchema": "string"
+    },
+    "backgroundColor": {
+      "type": "backgroundColor",
+      "propSchema": "string"
+    }
+  }
+}

@@ -129,9 +129,20 @@ vi.mock("@blocknote/react", async () => {
   return {
     useCreateBlockNote: (options: { initialContent?: unknown[] }) => {
       const [editor] = React.useState(() => {
+        let isEditable = true;
+        const editabilityListeners = new Set<() => void>();
         const editor = {
           document: options.initialContent ?? [{ type: "paragraph" }],
-          isEditable: true,
+          get isEditable() { return isEditable; },
+          set isEditable(value: boolean) {
+            if (value === isEditable) return;
+            isEditable = value;
+            for (const listener of editabilityListeners) listener();
+          },
+          subscribeEditability(listener: () => void) {
+            editabilityListeners.add(listener);
+            return () => { editabilityListeners.delete(listener); };
+          },
           notify: () => {},
           replaceBlocks(_old: unknown, next: unknown[]) {
             editor.document = next;
@@ -152,11 +163,20 @@ vi.mock("@blocknote/mantine", async () => {
       editable,
       onChange,
     }: {
-      editor: { document: Paragraph[]; notify: () => void };
-      editable: boolean;
+      editor: {
+        document: Paragraph[];
+        notify: () => void;
+        isEditable: boolean;
+        subscribeEditability: (listener: () => void) => () => void;
+      };
+      editable?: boolean;
       onChange: () => void;
     }) => {
       const [, rerender] = React.useReducer((n: number) => n + 1, 0);
+      const isEditable = React.useSyncExternalStore(
+        editor.subscribeEditability,
+        () => editor.isEditable,
+      );
       editor.notify = () => {
         onChange();
         rerender();
@@ -164,7 +184,7 @@ vi.mock("@blocknote/mantine", async () => {
       return (
         <textarea
           aria-label="Page body"
-          disabled={!editable}
+          disabled={editable === false || !isEditable}
           value={editor.document.map((block) => block.content ?? "").join("\n")}
           onChange={(event) => {
             editor.document = [

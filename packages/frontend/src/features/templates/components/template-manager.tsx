@@ -78,8 +78,11 @@ function templateChanges(form: TemplateFormData, initial: TemplateFormData): Upd
     changes.dueOffset = form.dueOffset ? parseInt(form.dueOffset, 10) : null;
   if (!sameOrderedIds(form.assigneeIds, initial.assigneeIds)) changes.assigneeIds = form.assigneeIds;
   if (!sameOrderedIds(form.labelIds, initial.labelIds)) changes.labelIds = form.labelIds;
-  if (!sameOrderedIds(form.subtasks.map((s) => s.title), initial.subtasks.map((s) => s.title)))
-    changes.subtasks = form.subtasks.filter((s) => s.title.trim());
+  // The UI appends new rows. Blank drafts must not rewrite raw legacy rows.
+  const unchangedSubtasks = form.subtasks.length >= initial.subtasks.length &&
+    initial.subtasks.every((subtask, i) => form.subtasks[i].title === subtask.title) &&
+    form.subtasks.slice(initial.subtasks.length).every((subtask) => !subtask.title.trim());
+  if (!unchangedSubtasks) changes.subtasks = form.subtasks.filter((s) => s.title.trim());
   return changes;
 }
 

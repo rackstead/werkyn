@@ -122,7 +122,10 @@ task titles keep trim encoding and must be nonblank when changed. Description
 empty, status None and an empty due offset send null; due offset zero sends 0.
 Assignee and label lists retain their order, and an explicit clear sends [].
 Changed subtasks retain title text/order and omit blank rows as before; unchanged
-subtasks are omitted. No-change and exact-raw reverted edits send no PATCH.
+subtasks are omitted. Appending blank draft rows alone leaves the raw initial
+subtask list unchanged, including legacy blank or duplicate rows. Explicit
+removal or clearing still uses replacement semantics. No-change and exact-raw
+reverted edits send no PATCH.
 CREATE keeps its existing full payload. Strict validation, description
 sanitization and current project-reference authorization remain server rules.
 

@@ -234,6 +234,25 @@ test("rejects a changed invalid subtask and permits a corrected retry", async ()
   expect(writes()[1].data).toEqual({ subtasks: [{ title: "Corrected child" }, { title: "Second" }] });
   expect(writes()[1].status).toBe(200);
 });
+test("omits unchanged legacy subtasks when adding a blank row during an unrelated edit", async () => {
+  await mount({ subtasks: [{ title: "S".repeat(256) }] }); await open(); addSubtask(); change(titleInput(), "Revised title"); await save();
+  expect(writes()[0].data).toEqual({ title: "Revised title" }); expect(writes()[0].status).toBe(200);
+  expect(rows()[0].subtasks).toEqual([{ title: "S".repeat(256) }]);
+});
+test("does not PATCH when only a blank subtask row is added", async () => {
+  await mount({ subtasks: [{ title: "S".repeat(256) }] }); await open(); addSubtask(); await save();
+  expect(writes()).toHaveLength(0); expect(maybeName()?.value).toBe("Template A");
+});
+test("preserves raw legacy blank and duplicate subtasks when only appending a blank draft", async () => {
+  const legacy = [{ title: "" }, { title: " " }, { title: "S".repeat(256) }, { title: "" }];
+  await mount({ subtasks: legacy }); await open(); addSubtask(); change(titleInput(), "Revised title"); await save();
+  expect(writes()[0].data).toEqual({ title: "Revised title" }); expect(writes()[0].status).toBe(200);
+  expect(rows()[0].subtasks).toEqual(legacy);
+});
+test("explicitly clears legacy blank subtasks with an empty replacement", async () => {
+  await mount({ subtasks: [{ title: "" }, { title: " " }] }); await open(); removeSubtask(1); removeSubtask(0); await save();
+  expect(writes()[0].data).toEqual({ subtasks: [] }); expect(writes()[0].status).toBe(200); expect(rows()[0].subtasks).toEqual([]);
+});
 test("does not PATCH a no-op or exact raw scalar list and subtask reverts", async () => {
   await mount(); await open(); change(titleInput(), "Temporary"); change(titleInput(), "Review the plan");
   await toggle("Assign", "Morgan Reed"); await toggle("Assign", "Morgan Reed"); addSubtask(); removeSubtask(2);

@@ -12,6 +12,7 @@ import {
   WikiPageTreeQuerySchema,
   WikiPageVersionQuerySchema,
   CreateNamedVersionSchema,
+  RestoreWikiPageVersionSchema,
   CreateWikiCommentSchema,
   UpdateWikiCommentSchema,
   WikiCommentQuerySchema,
@@ -224,6 +225,7 @@ export default async function wikiRoutes(fastify: FastifyInstance) {
     preHandler: [
       authenticate,
       authorize("ADMIN", "MEMBER"),
+      validate(RestoreWikiPageVersionSchema),
     ],
     handler: restoreVersionHandler,
   });

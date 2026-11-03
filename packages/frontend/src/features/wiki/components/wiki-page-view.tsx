@@ -15,6 +15,7 @@ import {
   useUpdateWikiPage,
   useWikiPageBreadcrumbs,
   wikiAutosaveKey,
+  type WikiPage,
 } from "../api";
 import { WikiEditor } from "./lazy-wiki-editor";
 import { VersionHistoryPanel } from "./version-history-panel";
@@ -106,6 +107,7 @@ function WikiPageSession({
   const router = useRouter({ warn: false });
   const [finishing, setFinishing] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState<number | null>(null);
   const [showComments, setShowComments] = useState(false);
   const [showShare, setShowShare] = useState(false);
 
@@ -395,6 +397,16 @@ function WikiPageSession({
               void autosave
                 .flush()
                 .then(() => {
+                  // mutateAsync awaits its cache ACK; the click's captured
+                  // render can still contain the pre-save revision.
+                  const acknowledged = queryClient.getQueryData<{ data: WikiPage | null }>(
+                    queryKeys.wikiPage(pageId),
+                  )?.data?.revision;
+                  if (typeof acknowledged !== "number" || !Number.isInteger(acknowledged) || acknowledged < 0 || acknowledged > 2147483647) {
+                    toast.error("The saved page is not available. Reload it before opening History.");
+                    return;
+                  }
+                  setHistoryRevision(acknowledged);
                   setShowVersions(true);
                   setShowComments(false);
                 })
@@ -480,9 +492,10 @@ function WikiPageSession({
       </Suspense>
 
       {/* Version History Panel */}
-      {showVersions && (
+      {showVersions && historyRevision !== null && (
         <VersionHistoryPanel
           pageId={pageId}
+          expectedRevision={historyRevision}
           onClose={() => setShowVersions(false)}
         />
       )}

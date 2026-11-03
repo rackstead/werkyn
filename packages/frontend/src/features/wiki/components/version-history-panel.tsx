@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, Clock, Save, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { isEditConflict } from "@/lib/edit-conflict";
 import {
   useWikiPageVersions,
   useCreateNamedVersion,
@@ -11,14 +12,18 @@ import {
 
 interface VersionHistoryPanelProps {
   pageId: string;
+  expectedRevision: number;
   onClose: () => void;
 }
 
-export function VersionHistoryPanel({ pageId, onClose }: VersionHistoryPanelProps) {
+export function VersionHistoryPanel({ pageId, expectedRevision, onClose }: VersionHistoryPanelProps) {
   const { data: versionsData, isLoading } = useWikiPageVersions(pageId);
   const createVersion = useCreateNamedVersion(pageId);
   const restoreVersion = useRestoreVersion(pageId);
   const [newVersionName, setNewVersionName] = useState("");
+  // Cache/realtime updates cannot advance this panel session's chosen base.
+  const [baseRevision] = useState(expectedRevision);
+  const [staleVersionId, setStaleVersionId] = useState<string | null>(null);
 
   const versions = versionsData?.data ?? [];
 
@@ -31,7 +36,13 @@ export function VersionHistoryPanel({ pageId, onClose }: VersionHistoryPanelProp
   };
 
   const handleRestore = (vid: string) => {
-    restoreVersion.mutate(vid, { onSuccess: () => onClose() });
+    if (staleVersionId || restoreVersion.isPending) return;
+    restoreVersion.mutate({ versionId: vid, expectedRevision: baseRevision }, {
+      onSuccess: () => onClose(),
+      onError: (error) => {
+        if (isEditConflict(error) && error.code === "REVISION_CONFLICT") setStaleVersionId(vid);
+      },
+    });
   };
 
   return (
@@ -48,6 +59,13 @@ export function VersionHistoryPanel({ pageId, onClose }: VersionHistoryPanelProp
       </div>
 
       {/* Create named version */}
+      {staleVersionId && (
+        <p role="alert" className="border-b px-4 py-3 text-sm text-destructive">
+          The page changed. This version was not restored. Close History, review
+          the updated page, then reopen History to choose a version again.
+        </p>
+      )}
+
       <div className="border-b px-4 py-3 space-y-2">
         <p className="text-xs text-muted-foreground">Save a named version</p>
         <div className="flex gap-2">
@@ -90,7 +108,7 @@ export function VersionHistoryPanel({ pageId, onClose }: VersionHistoryPanelProp
                 key={version.id}
                 version={version}
                 onRestore={() => handleRestore(version.id)}
-                isRestoring={restoreVersion.isPending}
+                isRestoring={restoreVersion.isPending || staleVersionId !== null}
               />
             ))}
           </div>

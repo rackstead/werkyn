@@ -8,6 +8,7 @@ import { WikiEditor } from "./lazy-wiki-editor";
 import { wikiAutosaveKey } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
 import { PendingEditsError } from "@/lib/autosave-queue";
+import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 
 const { http, notices } = vi.hoisted(() => ({
@@ -121,6 +122,8 @@ beforeEach(() => {
     (id) => {
       const ownership = wiki.wikiPageOwnership(client, id!, true)!;
       ownership.state.phase = "available";
+      if (client.getQueryData<{data: unknown}>(queryKeys.wikiPage(id!))?.data === null)
+        client.setQueryData(queryKeys.wikiPage(id!), {data: page(id!)});
       return { data: { data: page(id!) }, isLoading: false, availability: "available", ownership } as any;
     },
   );
@@ -935,6 +938,7 @@ describe("server revisions and edit conflicts", () => {
   // What a refetch of the page delivers to the open view.
   function refetched(id: string, stored: Stored, screen: { rerender: (ui: ReactNode) => void }) {
     pages.set(id, { ...page(id), ...structuredClone(stored) });
+    client.setQueryData(queryKeys.wikiPage(id), {data: page(id)});
     screen.rerender(view(id));
   }
   function body(screen: { getByLabelText: (label: string) => HTMLElement }) {

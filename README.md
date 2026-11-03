@@ -313,9 +313,18 @@ in the same way; the field is ignored when `description` is absent, and other
 task fields never change `descriptionRevision`. When the stored revision is
 different, nothing is written and the response is `409` with
 `"code":"REVISION_CONFLICT"` and `"current":{"revision":8,"updatedAt":"..."}`.
-Read the item again and decide what to send. Requests without the field behave
+Read the item again and decide what to send. PATCH requests without the field behave
 as before: the edit replaces whatever is stored (last writer wins) and still
 advances the revision.
+
+Historical wiki restores require a revision: send
+`{"expectedRevision":7}` to `POST /api/wiki/versions/:vid/restore`, using the
+current page revision you reviewed. Missing or invalid revisions return 400;
+a stale revision returns the same 409 conflict without changing the page or
+adding a version. The History panel flushes pending saves before opening and
+keeps that acknowledged revision fixed. On conflict, close History, review the
+refreshed page, and reopen History to deliberately choose a version again.
+See [historical restore revisions](docs/remediation/wiki-history-restore.md).
 
 While a user holds a wiki page's edit lock (taken by **Start Editing**; it
 lapses two minutes after its last renewal), a save or version restore by anyone

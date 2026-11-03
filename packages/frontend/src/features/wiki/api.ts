@@ -3,6 +3,7 @@ import { api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
+import { isEditConflict } from "@/lib/edit-conflict";
 import type {
   CreateWikiSpaceInput,
   UpdateWikiSpaceInput,
@@ -10,6 +11,7 @@ import type {
   UpdateWikiPageInput,
   MoveWikiPageInput,
   CreateNamedVersionInput,
+  RestoreWikiPageVersionInput,
   CreateWikiCommentInput,
   UpdateWikiCommentInput,
   CreateWikiShareInput,
@@ -472,9 +474,9 @@ export function useCreateNamedVersion(pgid: string) {
 export function useRestoreVersion(pgid: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (vid: string) =>
+    mutationFn: ({ versionId, ...data }: RestoreWikiPageVersionInput & { versionId: string }) =>
       api
-        .post(`wiki/versions/${vid}/restore`)
+        .post(`wiki/versions/${versionId}/restore`, { json: data })
         .json<{ data: WikiPage }>(),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.wikiPage(pgid) });
@@ -482,6 +484,10 @@ export function useRestoreVersion(pgid: string) {
       toast.success("Version restored");
     },
     onError: (error) => {
+      if (isEditConflict(error) && error.code === "REVISION_CONFLICT") {
+        // Refresh for review without rebasing the open panel or resending.
+        void qc.invalidateQueries({ queryKey: queryKeys.wikiPage(pgid), exact: true }).catch(() => {});
+      }
       // For example, another user holds the page's edit lock.
       toast.error(error.message || "Failed to restore version");
     },

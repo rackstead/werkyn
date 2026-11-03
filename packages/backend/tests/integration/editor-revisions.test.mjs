@@ -379,7 +379,7 @@ test("a restore is a new revision that an in-flight older save cannot overwrite"
   // Restored from one tab while another tab's save based on revision 1 is
   // still on its way.
   const restored = status(
-    await req("ALICE", "POST", `/api/wiki/versions/${named.data.id}/restore`),
+    await req("ALICE", "POST", `/api/wiki/versions/${named.data.id}/restore`, { expectedRevision: 1 }),
     200,
   );
   assert.equal(restored.data.revision, 2);
@@ -407,12 +407,12 @@ test("a restore is a new revision that an in-flight older save cannot overwrite"
     ],
   );
 
-  // Racing a restore with a save based on the replaced revision: whichever
-  // the database orders first, the restore is stored and nothing is lost.
+  // A restore and save based on one revision cannot both overwrite. The row
+  // lock orders them; only the first can commit against that base.
   for (const restoreFirst of [true, false]) {
     const current = (await stored(page.id)).revision;
     const restore = () =>
-      req("ALICE", "POST", `/api/wiki/versions/${named.data.id}/restore`);
+      req("ALICE", "POST", `/api/wiki/versions/${named.data.id}/restore`, { expectedRevision: current });
     const edit = () =>
       save("ALICE", page.id, { content: doc(`edit ${restoreFirst}`), expectedRevision: current });
     const [first, second] = await race(
@@ -423,23 +423,28 @@ test("a restore is a new revision that an in-flight older save cannot overwrite"
     const [restoreResponse, saveResponse] = restoreFirst
       ? [first, second]
       : [second, first];
-    status(restoreResponse, 200);
-    if (restoreFirst) conflict(saveResponse, "REVISION_CONFLICT", current + 1);
-    else status(saveResponse, 200);
+    if (restoreFirst) {
+      status(restoreResponse, 200);
+      conflict(saveResponse, "REVISION_CONFLICT", current + 1);
+    } else {
+      status(saveResponse, 200);
+      conflict(restoreResponse, "REVISION_CONFLICT", current + 1);
+    }
     const now = await stored(page.id);
-    assert.deepEqual(now.content, doc("v1"));
-    assert.equal(now.revision, current + (restoreFirst ? 1 : 2));
-    if (!restoreFirst) {
+    assert.deepEqual(now.content, doc(restoreFirst ? "v1" : "edit false"));
+    assert.equal(now.revision, current + 1);
+    if (restoreFirst) {
       const kept = await app.prisma.wikiPageVersion.findFirst({
         where: { pageId: page.id },
         orderBy: { versionNumber: "desc" },
       });
-      assert.deepEqual(kept.content, doc("edit false"));
+      // A winning restore snapshots exactly what it replaces.
+      assert.deepEqual(kept.content, doc("v1"));
     }
   }
 });
 
-test("another user's edit lock refuses saves and restores, with or without a revision", async () => {
+test("another user's edit lock refuses optional saves and revision-checked restores", async () => {
   const page = await newPage();
   status(await acquire("ALICE", page.id), 200);
   const version = status(
@@ -458,7 +463,7 @@ test("another user's edit lock refuses saves and restores, with or without a rev
   // An API client that sends no revision is refused the same way.
   conflict(await save("BOB", page.id, { title: "API" }), "EDIT_LOCKED", 0);
   conflict(
-    await req("BOB", "POST", `/api/wiki/versions/${version.data.id}/restore`),
+    await req("BOB", "POST", `/api/wiki/versions/${version.data.id}/restore`, { expectedRevision: 0 }),
     "EDIT_LOCKED",
     0,
   );

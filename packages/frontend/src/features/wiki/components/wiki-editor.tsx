@@ -95,6 +95,7 @@ function WikiEditorInner({
 
   const editor = useCreateBlockNote({
     selectAllBehavior: "document",
+    domAttributes: { editor: { tabindex: "0" } },
     initialContent:
       Array.isArray(initialDocument) && initialDocument.length > 0
         ? (initialDocument as Block[])

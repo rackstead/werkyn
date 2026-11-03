@@ -387,3 +387,41 @@ it("real Mantine editability initially editable control has terminal entry witho
   expect(JSON.parse(text())).toEqual(snapshot);
   expect(onChange).not.toHaveBeenCalled();
 });
+
+
+it("real Mantine preserves readonly tabindex through editability transitions", async () => {
+  const input = terminalTable();
+  const onChange = vi.fn();
+  const commits: Array<{ editable: string | null; tabIndex: string | null }> = [];
+  const onCommit = (host: HTMLDivElement) => commits.push({
+    editable: editable(host).getAttribute("contenteditable"),
+    tabIndex: editable(host).getAttribute("tabindex"),
+  });
+  const view = render(<EditabilityCommitProbe initialContent={input} readOnly onChange={onChange} onCommit={onCommit} />);
+  await settle();
+  const instance = editor();
+  const dom = editable(view.container);
+  const snapshot = JSON.parse(text());
+  editabilityFacts("tabindex-initial-readonly-before-assertion", view.container, onChange.mock.calls.length);
+  expect(dom.getAttribute("contenteditable")).toBe("false");
+  expect(instance.isEditable).toBe(false);
+  // The established494 readonly DOM had tabindex0, preserved as an exact key.
+  expect(dom.getAttribute("tabindex")).toBe("0");
+  expect(commits.at(-1)?.tabIndex).toBe("0");
+  expect(JSON.parse(text())).toEqual(snapshot);
+  expect(onChange).not.toHaveBeenCalled();
+  for (const readOnly of [false, true, false, true]) {
+    view.rerender(<EditabilityCommitProbe initialContent={input} readOnly={readOnly} onChange={onChange} onCommit={onCommit} />);
+    await settle();
+    editabilityFacts("tabindex-after-readonly-" + readOnly, view.container, onChange.mock.calls.length);
+    expect(editor()).toBe(instance);
+    expect(editable(view.container)).toBe(dom);
+    expect(dom.getAttribute("contenteditable")).toBe(String(!readOnly));
+    expect(editor().isEditable).toBe(!readOnly);
+    expect(dom.getAttribute("tabindex")).toBe("0");
+    expect(commits.at(-1)?.tabIndex).toBe("0");
+    expect(view.container.querySelectorAll(".bn-trailing-block")).toHaveLength(readOnly ? 0 : 1);
+    expect(JSON.parse(text())).toEqual(snapshot);
+    expect(onChange).not.toHaveBeenCalled();
+  }
+});

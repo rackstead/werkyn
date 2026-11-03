@@ -418,7 +418,7 @@ for (const kind of ["object", "array", "mixed"]) {
     ).data;
     assert.equal(saved.revision, 1);
     const restored = result(
-      await request("POST", `/wiki/versions/${version.id}/restore`),
+      await request("POST", `/wiki/versions/${version.id}/restore`, { expectedRevision: (await app.prisma.wikiPage.findUniqueOrThrow({ where: { id: version.pageId } })).revision }),
       200,
     ).data;
     assert.equal(restored.revision, 2);
@@ -648,7 +648,7 @@ test("unsupported historical restore refuses without changing the page or histor
   await refused(
     "POST",
     `/wiki/versions/${version.id}/restore`,
-    undefined,
+    { expectedRevision: ordinary.revision },
     "content",
     ordinary.id,
   );
@@ -743,7 +743,7 @@ for (const kind of ["SQL", "JSON"])
     );
     const before = await state(page.id);
     const restored = result(
-      await request("POST", `/wiki/versions/${version.id}/restore`),
+      await request("POST", `/wiki/versions/${version.id}/restore`, { expectedRevision: (await app.prisma.wikiPage.findUniqueOrThrow({ where: { id: version.pageId } })).revision }),
       200,
     ).data;
     if (process.env.WIKI_JSON_OBSERVE)
@@ -780,7 +780,7 @@ for (const kind of ["SQL", "JSON"])
     );
     const locked = await state(page.id);
     assert.equal(
-      result(await request("POST", `/wiki/versions/${version.id}/restore`), 409)
+      result(await request("POST", `/wiki/versions/${version.id}/restore`, { expectedRevision: (await app.prisma.wikiPage.findUniqueOrThrow({ where: { id: version.pageId } })).revision }), 409)
         .code,
       "EDIT_LOCKED",
     );
@@ -1108,7 +1108,7 @@ test("literal members: unsupported legacy snapshots and historical restores refu
       refused(
         "POST",
         `/wiki/versions/${version.id}/restore`,
-        undefined,
+        { expectedRevision: ordinary.revision },
         "content",
         ordinary.id,
       ),
@@ -1183,7 +1183,7 @@ test("literal members: supported controls round trip through services, HTTP, ver
       });
       assert.deepEqual(
         result(
-          await request("POST", `/wiki/versions/${version.id}/restore`),
+          await request("POST", `/wiki/versions/${version.id}/restore`, { expectedRevision: (await app.prisma.wikiPage.findUniqueOrThrow({ where: { id: version.pageId } })).revision }),
           200,
         ).data.content,
         value,

@@ -15,6 +15,7 @@ import {
   useUpdateWikiPage,
   useWikiPageBreadcrumbs,
   wikiAutosaveKey,
+  type WikiPage,
 } from "../api";
 import { WikiEditor } from "./lazy-wiki-editor";
 import { VersionHistoryPanel } from "./version-history-panel";
@@ -106,6 +107,7 @@ function WikiPageSession({
   const router = useRouter({ warn: false });
   const [finishing, setFinishing] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState<number | null>(null);
   const [showComments, setShowComments] = useState(false);
   const [showShare, setShowShare] = useState(false);
 
@@ -385,16 +387,45 @@ function WikiPageSession({
           <Button
             size="sm"
             variant="ghost"
-            disabled={finishing}
+            disabled={finishing || (!showVersions && pageQuery.isFetching)}
             onClick={() => {
               if (showVersions) {
                 setShowVersions(false);
                 return;
               }
+              if (queryClient.getQueryState(queryKeys.wikiPage(pageId))?.fetchStatus === "fetching") return;
               setFinishing(true);
               void autosave
                 .flush()
-                .then(() => {
+                .then(async () => {
+                  if (useAuthStore.getState().user?.id !== userId) return;
+                  // Cache reconciliation after a save ACK is best effort.
+                  // Confirm the displayed base with a fresh read before using it.
+                  const displayed = queryClient.getQueryData<{ data: WikiPage | null }>(
+                    queryKeys.wikiPage(pageId),
+                  )?.data?.revision;
+                  if (typeof displayed !== "number" || !Number.isInteger(displayed) || displayed < 0 || displayed > 2147483647) {
+                    toast.error("The saved page is not available. Reload it before opening History.");
+                    return;
+                  }
+                  let refreshed: Awaited<ReturnType<typeof pageQuery.refetch>>;
+                  try {
+                    refreshed = await pageQuery.refetch({ cancelRefetch: true, throwOnError: true });
+                  } catch {
+                    if (useAuthStore.getState().user?.id === userId)
+                      toast.error("The page could not be refreshed. History stayed closed; try again after checking the page.");
+                    return;
+                  }
+                  if (useAuthStore.getState().user?.id !== userId) return;
+                  const confirmed = refreshed.data?.data?.revision;
+                  if (confirmed !== displayed) {
+                    // Dirty-to-clean editor sync can defer a replacement for
+                    // one render. Show this freshly read document for review.
+                    setDocumentVersion((version) => version + 1);
+                    toast.error("The page was refreshed. Review the updated page, then open History again.");
+                    return;
+                  }
+                  setHistoryRevision(confirmed);
                   setShowVersions(true);
                   setShowComments(false);
                 })
@@ -480,9 +511,10 @@ function WikiPageSession({
       </Suspense>
 
       {/* Version History Panel */}
-      {showVersions && (
+      {showVersions && historyRevision !== null && (
         <VersionHistoryPanel
           pageId={pageId}
+          expectedRevision={historyRevision}
           onClose={() => setShowVersions(false)}
         />
       )}

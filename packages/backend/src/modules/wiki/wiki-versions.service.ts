@@ -3,6 +3,7 @@ import { NotFoundError } from "../../utils/errors.js";
 import {
   PAGE_WRITE_TRANSACTION,
   assertNotLockedByOther,
+  assertRevision,
   lockPageRow,
   snapshotPage,
 } from "./wiki-page-writes.js";
@@ -59,9 +60,9 @@ export async function getVersion(prisma: PrismaClient, versionId: string) {
 }
 
 /**
- * Replaces the page title and content with a version's as a new revision, so
- * a save based on the replaced revision is refused instead of undoing the
- * restore. Another user's edit lock refuses it like a save. The replaced
+ * Replaces the page title and content only on the caller's expected revision.
+ * Saves and restores sharing one base cannot both overwrite. Another user's
+ * edit lock refuses it like a save. The replaced
  * content is always recorded as a version first, however recent the last
  * auto-save version is.
  */
@@ -69,6 +70,7 @@ export async function restoreVersion(
   prisma: PrismaClient,
   versionId: string,
   actorId: string,
+  expectedRevision: number,
 ) {
   return prisma.$transaction(async (tx) => {
     const version = await tx.wikiPageVersion.findUnique({
@@ -79,6 +81,7 @@ export async function restoreVersion(
 
     const current = await lockPageRow(tx, version.pageId);
     await assertNotLockedByOther(tx, version.pageId, actorId, current);
+    assertRevision(expectedRevision, current);
     assertWikiJson(version.content, "content");
     await snapshotPage(tx, version.pageId, actorId);
 

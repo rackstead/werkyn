@@ -39,7 +39,14 @@ interface FolderStackEntry {
   teamFolderId?: string;
 }
 
-export function DriveFilePicker({
+export function DriveFilePicker(props: DriveFilePickerProps) {
+  // Parent-controlled dismissal ends the session too. Unmounting releases
+  // pending uploads and mutation callbacks along with the local picker state.
+  if (!props.open) return null;
+  return <DriveFilePickerSession key={props.workspaceId} {...props} />;
+}
+
+function DriveFilePickerSession({
   open,
   onClose,
   onSelect,

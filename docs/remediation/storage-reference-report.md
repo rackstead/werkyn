@@ -24,8 +24,10 @@ an empty array means an empty synthetic sample, not proof of absence. Rows use:
 | wikiPages / wikiVersions | contentJson (serialized JSON string) |
 | cleanupQueue | rootSlot, storagePath, attempts, availableAt, createdAt |
 
-Paths/URLs may be null except the queue path. A null rootSlot remains unresolved;
-it never joins a global unknown root. Root declarations have unique slots0–7,
+Paths/URLs may be null except the queue path. An empty supplied reference string
+contributes a fixed EMPTY_REFERENCE unknown diagnostic, including queue paths;
+ordinary nullable reference fields remain null. A null rootSlot remains unresolved
+and never joins a global unknown root. Root declarations have unique slots0–7,
 kind CONFIGURED_STORAGE / AVATAR_STORAGE / LEGACY_UPLOAD, and bindings with an
 exact HTTP(S) origin or null for relative URLs plus an exact routePrefix ending
 in `/`. No physical root is read. Overlapping bindings are ambiguous.

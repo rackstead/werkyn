@@ -140,7 +140,8 @@ export function buildSyntheticStorageReferenceReport(inputBytes: Uint8Array, per
     return true;
   };
   const observe = (value: string, root: Root | undefined, kind: Kind, field: string, row: number, position: number, mode: Mode, flags: string[] = [], queueClass?: string) => {
-    if (stopped || !tokenValid(value) || !value) return;
+    if (stopped || !tokenValid(value)) return;
+    if (!value) { issue("EMPTY_REFERENCE"); return; }
     if (references >= STORAGE_REFERENCE_LIMITS.referenceObservations) { issue("REFERENCE_LIMIT"); stopped = true; return; }
     references++;
     if (mode === "stored_path" && unsafe(value)) { issue("UNSAFE_STORED_PATH"); flags = [...flags, "UNSAFE_STORED_PATH"]; }
@@ -158,7 +159,8 @@ export function buildSyntheticStorageReferenceReport(inputBytes: Uint8Array, per
   };
   const uri = (value: string, kind: Kind, field: string, row: number) => {
     const position = stringOrdinal++;
-    if (!tokenValid(value) || !value || stopped) return;
+    if (stopped || !tokenValid(value)) return;
+    if (!value) { issue("EMPTY_REFERENCE"); return; }
     const matches: { root: Root; tail: string }[] = [];
     for (const root of roots.values()) for (const binding of root.bindings) {
       const prefix = (binding.origin ?? "") + binding.routePrefix;

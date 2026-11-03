@@ -17,6 +17,20 @@ const safe = report => {
   assert.equal(report.scope, "DECLARED_SYNTHETIC_ONLY"); assert.ok(Buffer.byteLength(JSON.stringify(report)) <= L.outputUtf8Bytes);
 };
 
+test("empty supplied reference strings are unknown while null references remain ordinary", () => {
+  const data = envelope();
+  data.sources.files = [file("", { thumbnailPath: "" }), file(null)];
+  data.sources.attachments = [{ rootSlot: 0, storagePath: "", fileId: null }, { rootSlot: 0, storagePath: null, fileId: null }];
+  data.sources.avatars = [{ avatarUrl: "" }, { avatarUrl: null }];
+  data.sources.wikiPages = [{ contentJson: JSON.stringify("") }];
+  data.sources.cleanupQueue = [{ rootSlot: 0, storagePath: "", attempts: 0, availableAt: data.snapshotNativeTimestamp3, createdAt: data.snapshotNativeTimestamp3 }];
+  const report = run(data); safe(report);
+  assert.deepEqual(report.identities, []); assert.equal(report.coverage.files.processedRows, 2);
+  assert.equal(report.coverage.cleanupQueue.processedRows, 1);
+  assert.equal(report.issues.find(i => i.code === "EMPTY_REFERENCE")?.count, 6);
+  assert.deepEqual(report.issues.map(i => i.code), ["EMPTY_REFERENCE"]);
+});
+
 test("all positive source facts coexist with queue observations without inferring absence", () => {
   const data = envelope();
   data.sources.files = [file("photo", { thumbnailPath: "photo", trashed: true, isFolder: true }), file("photo")];

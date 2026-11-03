@@ -19,8 +19,11 @@ revision once. The controller broadcasts the committed full page afterward.
 Concurrent saves and restores based on one revision have one winner.
 
 History waits for the current user's pending saves to finish before opening.
-It captures the page revision from the acknowledged query cache, keeping it
-fixed for that panel session even when a remote update refreshes the page.
+It confirms the acknowledged query-cache revision with a fresh page read.
+If the read reveals a different revision, History stays closed and displays
+that document for review before a new explicit opening attempt. History also
+cannot reopen while a conflict refresh is pending. The confirmed revision
+stays fixed for the panel session even when a remote update refreshes the page.
 After a stale restore, the panel stays open and retains the failed target;
 the page refreshes for review. Further restores are disabled until the user
 closes History, reviews the refreshed page and reopens History to choose

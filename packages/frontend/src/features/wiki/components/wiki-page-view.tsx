@@ -387,26 +387,45 @@ function WikiPageSession({
           <Button
             size="sm"
             variant="ghost"
-            disabled={finishing}
+            disabled={finishing || (!showVersions && pageQuery.isFetching)}
             onClick={() => {
               if (showVersions) {
                 setShowVersions(false);
                 return;
               }
+              if (queryClient.getQueryState(queryKeys.wikiPage(pageId))?.fetchStatus === "fetching") return;
               setFinishing(true);
               void autosave
                 .flush()
-                .then(() => {
-                  // mutateAsync awaits its cache ACK; the click's captured
-                  // render can still contain the pre-save revision.
-                  const acknowledged = queryClient.getQueryData<{ data: WikiPage | null }>(
+                .then(async () => {
+                  if (useAuthStore.getState().user?.id !== userId) return;
+                  // Cache reconciliation after a save ACK is best effort.
+                  // Confirm the displayed base with a fresh read before using it.
+                  const displayed = queryClient.getQueryData<{ data: WikiPage | null }>(
                     queryKeys.wikiPage(pageId),
                   )?.data?.revision;
-                  if (typeof acknowledged !== "number" || !Number.isInteger(acknowledged) || acknowledged < 0 || acknowledged > 2147483647) {
+                  if (typeof displayed !== "number" || !Number.isInteger(displayed) || displayed < 0 || displayed > 2147483647) {
                     toast.error("The saved page is not available. Reload it before opening History.");
                     return;
                   }
-                  setHistoryRevision(acknowledged);
+                  let refreshed: Awaited<ReturnType<typeof pageQuery.refetch>>;
+                  try {
+                    refreshed = await pageQuery.refetch({ cancelRefetch: true, throwOnError: true });
+                  } catch {
+                    if (useAuthStore.getState().user?.id === userId)
+                      toast.error("The page could not be refreshed. History stayed closed; try again after checking the page.");
+                    return;
+                  }
+                  if (useAuthStore.getState().user?.id !== userId) return;
+                  const confirmed = refreshed.data?.data?.revision;
+                  if (confirmed !== displayed) {
+                    // Dirty-to-clean editor sync can defer a replacement for
+                    // one render. Show this freshly read document for review.
+                    setDocumentVersion((version) => version + 1);
+                    toast.error("The page was refreshed. Review the updated page, then open History again.");
+                    return;
+                  }
+                  setHistoryRevision(confirmed);
                   setShowVersions(true);
                   setShowComments(false);
                 })

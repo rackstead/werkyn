@@ -187,3 +187,54 @@ it("historical restore: failed pending save cannot open History or restore",asyn
  expect(screen.queryByText("Version History")).toBeNull();expect(restores()).toHaveLength(0);
  expect((screen.getByLabelText("History body carrier") as HTMLTextAreaElement).value).toContain("Unsaved ordinary draft");
 });
+
+// Fresh-read and deliberately reviewed retry regressions.
+function holdPageReads() {
+  const original = http.get.getMockImplementation()!;
+  const response = deferredResponse();
+  http.get.mockImplementation((path: string, ...args: any[]) => path === `wiki/pages/${id}`
+    ? {json: () => { getPageCount++; return response.promise; }}
+    : original(path, ...args));
+  return {response, restoreReads: () => http.get.mockImplementation(original)};
+}
+it("historical restore: closing History during conflict refresh cannot reopen on the rejected base",async()=>{
+ const screen=await mount();await open(screen);
+ const held=holdPageReads();Object.assign(stored,{title:"Review held eight",content:doc("Remote eight"),revision:8});
+ nextRestore=()=>Promise.reject(conflict());
+ fireEvent.click(screen.getAllByTitle("Restore this version")[0]);
+ await waitFor(()=>expect(getPageCount).toBe(2));
+ await waitFor(()=>expect(notices.error).toHaveBeenCalledTimes(1));
+ fireEvent.click(screen.getByText("History"));expect(screen.queryByText("Version History")).toBeNull();
+ fireEvent.click(screen.getByText("History"));await settle();
+ console.info("History held-refresh observation",{cachedRevision:(client.getQueryData(queryKeys.wikiPage(id)) as any)?.data?.revision,panelOpen:!!screen.queryByText("Version History"),toast:notices.error.mock.calls[0]?.[0]});
+ expect(screen.queryByText("Version History")).toBeNull();
+ expect((screen.getByText("History").closest("button") as HTMLButtonElement).disabled).toBe(true);
+ expect(restores()).toHaveLength(1);
+ await act(async()=>{held.response.resolve({data:structuredClone(stored)});});held.restoreReads();
+ await waitFor(()=>expect(screen.getByRole("heading",{name:"Review held eight"})).toBeTruthy());
+ expect(screen.queryByText("Version History")).toBeNull();
+ await waitFor(()=>expect((screen.getByText("History").closest("button") as HTMLButtonElement).disabled).toBe(false));
+ nextRestore=undefined;await open(screen);fireEvent.click(screen.getAllByTitle("Restore this version")[1]);
+ await waitFor(()=>expect(restores()).toHaveLength(2));
+ expect(restores()[1]).toEqual({path:"wiki/versions/version-two/restore",json:{expectedRevision:8}});
+ expect(notices.error.mock.calls[0][0]).toMatch(/History.*review|review.*History/i);
+});
+it("historical restore: skipped save cache ACK requires fresh displayed content before History opens",async()=>{
+ const patch=deferredResponse();nextPatch=()=>patch.promise;
+ const screen=await mount();const held=holdPageReads();
+ fireEvent.change(screen.getByLabelText("History body carrier"),{target:{value:"Own seven"}});
+ fireEvent.click(screen.getByText("History"));await waitFor(()=>expect(requestLog.filter(x=>x.path===`wiki/pages/${id}`)).toHaveLength(1));
+ const cancel=vi.spyOn(client,"cancelQueries").mockRejectedValueOnce(new Error("Owned cache cancellation unavailable"));
+ Object.assign(stored,{title:"Review own seven",content:doc("Own seven"),revision:7});
+ await act(async()=>{patch.resolve({data:structuredClone(stored)});});await settle();
+ expect(cancel).toHaveBeenCalledTimes(1);
+ console.info("History skipped-ACK observation",{serverAcknowledgedRevision:7,cachedRevision:(client.getQueryData(queryKeys.wikiPage(id)) as any)?.data?.revision,panelOpen:!!screen.queryByText("Version History")});
+ expect(screen.queryByText("Version History")).toBeNull();
+ await waitFor(()=>expect(getPageCount).toBe(2));expect(restores()).toHaveLength(0);
+ await act(async()=>{held.response.resolve({data:structuredClone(stored)});});held.restoreReads();
+ await waitFor(()=>expect(screen.getByRole("heading",{name:"Review own seven"})).toBeTruthy());
+ expect(screen.queryByText("Version History")).toBeNull();
+ await waitFor(()=>expect((screen.getByText("History").closest("button") as HTMLButtonElement).disabled).toBe(false));
+ await open(screen);fireEvent.click(screen.getAllByTitle("Restore this version")[0]);await waitFor(()=>expect(restores()).toHaveLength(1));
+ expect(restores()[0]).toEqual({path:"wiki/versions/version-one/restore",json:{expectedRevision:7}});
+});

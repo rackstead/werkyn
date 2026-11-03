@@ -487,6 +487,8 @@ export function useRestoreVersion(pgid: string) {
       if (isEditConflict(error) && error.code === "REVISION_CONFLICT") {
         // Refresh for review without rebasing the open panel or resending.
         void qc.invalidateQueries({ queryKey: queryKeys.wikiPage(pgid), exact: true }).catch(() => {});
+        toast.error("The page changed. Close History, review the updated page, then reopen History to restore a version.");
+        return;
       }
       // For example, another user holds the page's edit lock.
       toast.error(error.message || "Failed to restore version");

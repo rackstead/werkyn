@@ -124,7 +124,9 @@ beforeEach(() => {
       ownership.state.phase = "available";
       if (client.getQueryData<{data: unknown}>(queryKeys.wikiPage(id!))?.data === null)
         client.setQueryData(queryKeys.wikiPage(id!), {data: page(id!)});
-      return { data: { data: page(id!) }, isLoading: false, availability: "available", ownership } as any;
+      return { data: { data: page(id!) }, isLoading: false, availability: "available", ownership,
+        refetch: async () => ({ data: client.getQueryData(queryKeys.wikiPage(id!)) }),
+      } as any;
     },
   );
   vi.spyOn(wiki, "useWikiPageBreadcrumbs").mockReturnValue({

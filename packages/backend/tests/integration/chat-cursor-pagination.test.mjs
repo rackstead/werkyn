@@ -31,7 +31,6 @@ const observer = new PrismaClient({
   datasourceUrl: observerUrl.toString(),
   log: [{ level: "query", emit: "event" }],
 });
-const capturedPages = {};
 let captureOwner = null;
 const pageQueryShape = (event) =>
   event.query.startsWith("SELECT ") &&
@@ -96,6 +95,17 @@ function startPageQuery(scope, cursor, run, hold = false) {
   return capture;
 }
 observer.$on("query", (event) => captureOwner?.receive(event));
+
+async function ownPageEvent(scope, cursor, run) {
+  const capture = startPageQuery(scope, cursor, run);
+  try {
+    await capture.operation;
+    return await capture.query;
+  } finally {
+    await capture.close();
+  }
+}
+
 const users = [],
   workspaces = [],
   families = [],
@@ -309,7 +319,6 @@ for (const family of ["history", "thread"]) {
     try {
     const data = await capture.operation;
     const main = await capture.query;
-    capturedPages[family] = main;
     assert.ok(main, "Captured the generated page SELECT");
     assert.match(main.query, /LIMIT \$\d+/);
     assert.ok(
@@ -452,22 +461,26 @@ test("page-query capture awaits its actual held event after the service settles"
 });
 
 test("page-query capture rejects stale-family and different-cursor events", async () => {
-  assert.ok(capturedPages.history && capturedPages.thread);
+  const staleHistory = await ownPageEvent(channels.public.id, history[55].id,
+    () => chat.listMessages(observer, channels.public.id, history[55].id, 50));
+  const staleThread = await ownPageEvent(history[0].id, replies[55].id,
+    () => chat.getThreadReplies(observer, history[0].id, replies[55].id, 50));
+  assert.ok(staleHistory && staleThread);
   const cursor = replies[53].id;
   const capture = startPageQuery(history[0].id, cursor,
     () => chat.getThreadReplies(observer, history[0].id, cursor, 50), true);
   try {
     const data = await capture.operation;
     const event = await capture.held;
-    capture.deliver(capturedPages.history);
-    capture.deliver(capturedPages.thread);
-    assert.equal(capture.delivered.find(pageQueryShape), capturedPages.history);
+    capture.deliver(staleHistory);
+    capture.deliver(staleThread);
+    assert.equal(capture.delivered.find(pageQueryShape), staleHistory);
     assert.equal(capture.observed(), false, "No prior operation may satisfy this waiter");
     capture.release();
     const main = await capture.query;
     assert.equal(main, event);
-    assert.notEqual(main, capturedPages.history);
-    assert.notEqual(main, capturedPages.thread);
+    assert.notEqual(main, staleHistory);
+    assert.notEqual(main, staleThread);
     assert.match(main.query, /LIMIT \$\d+/);
     assert.ok(JSON.parse(main.params).includes(51));
     assert.equal(data.data.length, 50);
@@ -478,13 +491,15 @@ test("page-query capture rejects stale-family and different-cursor events", asyn
 });
 
 test("page-query capture fails boundedly when no owned page SELECT exists", async () => {
+  const staleHistory = await ownPageEvent(channels.public.id, history[55].id,
+    () => chat.listMessages(observer, channels.public.id, history[55].id, 50));
   const cursor = "cursor-capture-owned-missing";
   const capture = startPageQuery(history[0].id, cursor,
     () => chat.getThreadReplies(observer, history[0].id, cursor, 50));
   try {
     assert.deepEqual(await capture.operation, { data: [], nextCursor: undefined });
     assert.equal(capture.delivered.find(pageQueryShape), undefined);
-    capture.deliver(capturedPages.history);
+    capture.deliver(staleHistory);
     assert.equal(capture.observed(), false);
     await assert.rejects(capture.query, { name: "PageQueryCaptureTimeout" });
   } finally {

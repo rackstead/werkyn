@@ -12,7 +12,8 @@ import { queryKeys } from "@/lib/query-keys";
 import { FakeWebSocket } from "@/test/fake-websocket";
 import { useAuthStore } from "@/stores/auth-store";
 import * as autosaves from "@/hooks/use-entity-autosave";
-import { ApiError } from "@/lib/api-error";
+import { identityGeneration } from "@/lib/identity";
+import { ApiError, IdentityChangedError } from "@/lib/api-error";
 import { WikiPageView } from "./wiki-page-view";
 import { WikiEditor } from "./lazy-wiki-editor";
 
@@ -418,4 +419,23 @@ it("paused old release cannot delete a newly mounted lifetime's recovered lease"
  first.unmount(); const second = renderHook(() => usePageLock(id, async () => {}), { wrapper }); await tick();
  onlineManager.setOnline(true); await tick(); await operation;
  expect(http.delete).not.toHaveBeenCalled(); expect(second.result.current.isLockedByMe).toBe(true);
+});
+
+it.each(["other-account", "author"])("a paused acquisition keeps the identity-generation protocol for %s", async (nextId) => {
+ lockOwner = null; const hook = renderHook(() => usePageLock(id, async () => {}), { wrapper }); await tick();
+ onlineManager.setOnline(false); let outcome: unknown;
+ let operation!: Promise<unknown>;
+ act(() => { operation = hook.result.current.acquire().catch((error) => { outcome = error; }); }); await tick();
+ expect(queryClient.getMutationCache().getAll().filter((mutation) => mutation.state.isPaused)).toHaveLength(1);
+ const generation = identityGeneration();
+ act(() => {
+   // Elect the application's real online continuation before changing identity;
+   // its mutationFn still runs in a microtask under IdentityScopedMutationCache.
+   onlineManager.setOnline(true);
+   useAuthStore.setState({ user: null });
+   useAuthStore.setState({ user: { id: nextId, email: "next@example.test", displayName: "Next" } as any });
+ });
+ expect(identityGeneration()).toBe(generation + 2);
+ await tick(); await operation;
+ expect(http.post).not.toHaveBeenCalled(); expect(outcome).toBeInstanceOf(IdentityChangedError);
 });

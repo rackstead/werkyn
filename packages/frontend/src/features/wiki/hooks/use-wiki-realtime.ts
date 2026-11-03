@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useRealtimeClient } from "@/components/providers/realtime-provider";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
+import { markWikiPageAvailability, type WikiPage } from "../api";
 import {
   readId,
   readRecord,
@@ -29,6 +30,20 @@ function invalidate(queryKey: readonly unknown[], exact = false) {
 // Every page tree list of a space, whatever parent it was loaded for.
 function invalidateSpacePages(spaceId: string | undefined) {
   if (spaceId) invalidate(["wiki-pages", { sid: spaceId }]);
+}
+
+// Only existing exact detail entries participate. No workspace enumeration or
+// server subscription is added; inactive entries wait for their next mount.
+function invalidateDeletedPages(spaceId: string | undefined, deletedId?: string) {
+  if (!spaceId && !deletedId) return;
+  for (const query of queryClient.getQueryCache().getAll()) {
+    const key = query.queryKey;
+    if (key.length !== 2 || key[0] !== "wiki-pages" || typeof key[1] !== "string") continue;
+    const page = (query.state.data as { data?: WikiPage | null } | undefined)?.data;
+    if (key[1] !== deletedId && page?.spaceId !== spaceId && !(query.isActive() && !page?.spaceId)) continue;
+    markWikiPageAvailability(queryClient, key[1], key[1] === deletedId ? "unavailable" : "checking");
+    invalidate(queryKeys.wikiPageBreadcrumbs(key[1]), true);
+  }
 }
 
 // What page lists show for a page: trees (sidebar, space view, dashboard
@@ -101,6 +116,7 @@ export function useWikiRealtime(workspaceId: string | undefined) {
           const spaceId = readId(data, "spaceId");
           if (spaceId) invalidate(queryKeys.wikiSpace(spaceId));
           invalidateSpacePages(spaceId);
+          invalidateDeletedPages(spaceId);
           break;
         }
         case "wiki_page_created":
@@ -120,7 +136,10 @@ export function useWikiRealtime(workspaceId: string | undefined) {
           break;
         }
         case "wiki_page_deleted":
-          invalidateSpacePages(readId(data, "spaceId"));
+          if (readId(data, "pageId") && readId(data, "spaceId")) {
+            invalidateSpacePages(readId(data, "spaceId"));
+            invalidateDeletedPages(readId(data, "spaceId"), readId(data, "pageId"));
+          }
           break;
         case "wiki_page_moved":
           // A move changes the trees of both spaces and the breadcrumbs of

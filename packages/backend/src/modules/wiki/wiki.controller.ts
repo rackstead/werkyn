@@ -8,6 +8,7 @@ import type {
   WikiPageTreeQueryInput,
   WikiPageVersionQueryInput,
   CreateNamedVersionInput,
+  RestoreWikiPageVersionInput,
   CreateWikiCommentInput,
   UpdateWikiCommentInput,
   WikiCommentQueryInput,
@@ -303,11 +304,13 @@ export async function restoreVersionHandler(
   reply: FastifyReply,
 ) {
   const { vid } = request.params as { vid: string };
+  const { expectedRevision } = request.body as RestoreWikiPageVersionInput;
 
   const page = await versionsService.restoreVersion(
     request.server.prisma,
     vid,
     request.user!.id,
+    expectedRevision,
   );
 
   request.server.broadcastToWorkspace(

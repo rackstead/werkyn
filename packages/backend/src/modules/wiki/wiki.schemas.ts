@@ -7,6 +7,7 @@ export {
   WikiPageTreeQuerySchema,
   WikiPageVersionQuerySchema,
   CreateNamedVersionSchema,
+  RestoreWikiPageVersionSchema,
   CreateWikiCommentSchema,
   UpdateWikiCommentSchema,
   WikiCommentQuerySchema,

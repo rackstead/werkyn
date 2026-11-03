@@ -86,6 +86,11 @@ export const CreateNamedVersionSchema = z.object({
 });
 export type CreateNamedVersionInput = z.infer<typeof CreateNamedVersionSchema>;
 
+export const RestoreWikiPageVersionSchema = z.object({
+  expectedRevision: z.number().int().min(0).max(INT32_MAX),
+});
+export type RestoreWikiPageVersionInput = z.infer<typeof RestoreWikiPageVersionSchema>;
+
 // ─── Wiki Page Comments ─────────────────────────────────
 
 export const CreateWikiCommentSchema = z.object({

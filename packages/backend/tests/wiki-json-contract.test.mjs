@@ -149,7 +149,7 @@ test("historical restore validates the chosen value before snapshotting or chang
     },
   };
   const prisma = { $transaction: async (callback) => callback(tx) };
-  await assert.rejects(restoreVersion(prisma, "v", "u"), invalid("content"));
+  await assert.rejects(restoreVersion(prisma, "v", "u", 3), invalid("content"));
 });
 
 test("backup JSON numeric validation accepts finite primitives and refuses overflow at any position", () => {

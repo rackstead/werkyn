@@ -27,12 +27,80 @@ const { signAccessToken } = await import("../../src/utils/tokens.js");
 const { PrismaClient } = await import("@prisma/client");
 const observerUrl = new URL(process.env.TEST_DATABASE_URL);
 observerUrl.searchParams.set("connection_limit", "1");
-const observer = new PrismaClient({
-  datasourceUrl: observerUrl.toString(),
-  log: [{ level: "query", emit: "event" }],
-});
-const queries = [];
-observer.$on("query", (event) => queries.push(event));
+// Completion ownership does not filter the SQL counted by the page assertions.
+const messageSelect = (event) =>
+  event.query.startsWith("SELECT ") &&
+  event.query.includes('FROM "public"."ChatMessage"');
+function deferredQuery() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  void promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+class QueryObservationTimeout extends Error {}
+async function observeSearch(context, producer, options = {}) {
+  const observer = new PrismaClient({
+    datasourceUrl: observerUrl.toString(),
+    log: [{ level: "query", emit: "event" }],
+  });
+  const queries = [], delivered = [];
+  const completion = deferredQuery(), held = deferredQuery();
+  let heldEvent, released = false, closed = false, operation, primaryError;
+  function matches(event) {
+    const params = JSON.parse(event.params);
+    return messageSelect(event) && event.query.includes("ORDER BY") &&
+      params.includes(context.cursor) && params.includes("%needle%") &&
+      params.includes(context.mode === "channel" ? channels.public.id : workspaces[0].id);
+  }
+  function deliver(event) {
+    delivered.push(event);
+    if (matches(event)) completion.resolve(event);
+  }
+  observer.$on("query", (event) => {
+    assert.equal(closed, false, "Native query event arrived after observer disconnect");
+    queries.push(event); // Count every native ChatMessage SELECT, including cursor reads.
+    if (options.hold && matches(event) && !heldEvent) {
+      heldEvent = event;
+      held.resolve(event);
+    } else deliver(event);
+  });
+  const timer = setTimeout(() => {
+    const error = new QueryObservationTimeout("Search page query not observed within 1000ms");
+    completion.reject(error);
+    held.reject(error);
+  }, 1000);
+  if (!options.hold) held.resolve(undefined);
+  const release = () => {
+    if (heldEvent && !released) { released = true; deliver(heldEvent); }
+  };
+  // Both event handlers exist before the real producer starts. Preserve its error first.
+  operation = Promise.resolve().then(() => producer(observer));
+  void operation.catch(() => {});
+  try {
+    if (options.consume)
+      return await options.consume({ operation, completion: completion.promise,
+        held: held.promise, release, queries, delivered });
+    const data = await operation;
+    await completion.promise;
+    return { data, queries };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    const disposed = new Error("Owned search observation disposed");
+    completion.reject(disposed);
+    held.reject(disposed);
+    await Promise.allSettled([operation, completion.promise, held.promise]);
+    try { await observer.$disconnect(); }
+    catch (error) { if (!primaryError) throw error; }
+    finally { closed = true; }
+  }
+}
+function searchProducer(mode, cursor = ordinary[30].id, channelId) {
+  return (observer) => searchMessages(observer, workspaces[0].id, users[0].id,
+    "needle", channelId ?? (mode === "channel" ? channels.public.id : undefined), cursor, 20);
+}
 const users = [],
   workspaces = [],
   families = [],
@@ -101,7 +169,6 @@ async function walk(mode, limit) {
 before(async () => {
   app = await buildApp();
   await app.ready();
-  await observer.$connect();
   const suffix = crypto.randomUUID().slice(0, 12);
   for (let i = 0; i < 2; i++) {
     const user = await app.prisma.user.create({
@@ -223,7 +290,6 @@ before(async () => {
 
 after(async () => {
   try {
-    await observer.$disconnect();
     if (app) {
       await app.prisma.workspace.deleteMany({
         where: { id: { in: workspaces.map((w) => w.id) } },
@@ -248,15 +314,8 @@ for (const mode of ["global", "channel"])
 
 for (const mode of ["global", "channel"])
   test(`${mode} service emits a bounded page in one message SELECT with HTTP parity`, async () => {
-    queries.length = 0;
-    const data = await searchMessages(
-      observer,
-      workspaces[0].id,
-      users[0].id,
-      "needle",
-      mode === "channel" ? channels.public.id : undefined,
-      ordinary[30].id,
-      20,
+    const { data, queries } = await observeSearch(
+      { mode, cursor: ordinary[30].id }, searchProducer(mode),
     );
     const selects = queries.filter(
       (event) =>
@@ -451,4 +510,59 @@ test("ordinary edits, soft deletion and membership changes keep cursor eligibili
   );
   assert.equal(restored.statusCode, 200, restored.body);
   assert.deepEqual(restored.json(), before.json());
+});
+
+
+test("fresh search observer settles the exact held event without a prior mode or cursor", async () => {
+  const prior = await observeSearch({ mode: "global", cursor: ordinary[31].id },
+    searchProducer("global", ordinary[31].id));
+  const stale = prior.queries.find(messageSelect);
+  assert.ok(stale, "Own prior native event prerequisite");
+  const { queries } = await observeSearch({ mode: "channel", cursor: ordinary[30].id },
+    searchProducer("channel"), { hold: true, consume: async (capture) => {
+      const data = await capture.operation;
+      const event = await capture.held;
+      assert.equal(capture.delivered.filter(messageSelect).length, 0,
+        "Old immediate consumer can miss the genuinely held native event");
+      assert.equal(capture.queries.includes(stale), false, "Prior client cannot contaminate this capture");
+      assert.equal(capture.queries.includes(event), true, "The held event is genuinely native");
+      capture.release();
+      assert.equal(await capture.completion, event, "Release the identical owned event");
+      return { data, queries: capture.queries };
+    } });
+  assert.equal(queries.filter(messageSelect).length, 1);
+  assert.ok(JSON.parse(queries.find(messageSelect).params).includes(21));
+});
+
+test("search observation retains extra actual cursor SELECTs before and after the page", async () => {
+  for (const order of ["before", "after"]) {
+    const { queries } = await observeSearch({ mode: "channel", cursor: ordinary[30].id },
+      async (observer) => {
+        if (order === "before") await observer.chatMessage.findUnique({ where: { id: ordinary[30].id } });
+        const data = await searchProducer("channel")(observer);
+        if (order === "after") await observer.chatMessage.findUnique({ where: { id: ordinary[30].id } });
+        return data;
+      });
+    assert.equal(queries.filter(messageSelect).length, 2, `${order}: every message SELECT remains visible`);
+    assert.throws(() => assert.equal(queries.filter(messageSelect).length, 1,
+      "No separate mutable cursor read"), assert.AssertionError);
+  }
+});
+
+test("search observation preserves the real producer error before missing completion", async () => {
+  await assert.rejects(observeSearch({ mode: "channel", cursor: ordinary[30].id },
+    searchProducer("channel", ordinary[30].id, "owned-nonexistent-search-channel")),
+    (error) => error.name === "NotFoundError" && error.message === "Channel not found");
+});
+
+test("search observation rejects absent consumer delivery without stale fallback", async () => {
+  await observeSearch({ mode: "channel", cursor: ordinary[30].id }, searchProducer("channel"),
+    { hold: true, consume: async (capture) => {
+      const data = await capture.operation;
+      const event = await capture.held;
+      assert.ok(data.data.length > 0, "Real successful producer prerequisite");
+      assert.equal(capture.queries.includes(event), true);
+      await assert.rejects(capture.completion, QueryObservationTimeout);
+      assert.equal(capture.delivered.filter(messageSelect).length, 0);
+    } });
 });

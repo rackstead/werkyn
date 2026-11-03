@@ -268,7 +268,9 @@ before(async () => {
     await app.prisma.file.create({ data: { id: ids.peerFolder, workspaceId: ids.workspace, ownerId: ids.peer, uploadedById: ids.peer,
       name: "Peer private folder", isFolder: true } });
     for (const name of ["saveStream", "openReadStream", "read", "delete", "exists"]) originals[name] = app.storage[name].bind(app.storage);
-    originals.executeRaw = app.prisma.$executeRaw.bind(app.prisma); originals.queryRaw = app.prisma.$queryRaw.bind(app.prisma); originals.transaction = app.prisma.$transaction.bind(app.prisma);
+    // Preserve native controls separately so the witness can measure wrapper receivers.
+    originals.executeRawNative = app.prisma.$executeRaw; originals.queryRawNative = app.prisma.$queryRaw;
+    originals.executeRaw = app.prisma.$executeRaw; originals.queryRaw = app.prisma.$queryRaw; originals.transaction = app.prisma.$transaction.bind(app.prisma);
     originals.cleanupDeleteMany = app.prisma.blobCleanup.deleteMany.bind(app.prisma.blobCleanup);
     app.prisma.blobCleanup.deleteMany = (...args) => owned("cleanup-row-delete-wrapper", async () => {
       const c = current;
@@ -280,7 +282,11 @@ before(async () => {
       }
       return originals.cleanupDeleteMany(...args);
     });
-    app.prisma.$executeRaw = (...args) => owned("execute-raw-wrapper", async () => {
+    // Interactive clients inherit these wrappers. Native raw methods use this
+    // to create their transaction-specific Prisma promise; never bind root.
+    app.prisma.$executeRaw = function (...args) {
+      const receiver = this;
+      return owned("execute-raw-wrapper", async () => {
       const c = current;
       if (c && /^\s*INSERT INTO "BlobCleanup"/.test(sqlText(args)) && !sqlText(args).includes("ON CONFLICT")) {
         c.intentCalls++; await rememberPlanned(c, args[1]);
@@ -288,28 +294,34 @@ before(async () => {
         if (c.options.intentFailure) throw fault("intent insert");
       }
       if (c?.options.precisionClock && isFailureProducer(args)) {
+        assert.equal(receiver, app.prisma, "Fixed failure clock only wraps root-client SQL");
         assert.equal(c.paths.size, 1); const planned = [...c.paths][0]; assert.equal(args[1], planned);
         c.precisionBeforeRow = await queueRow(planned);
         const changed = freezeFailureProducer(args, planned, precisionDefaultsVerified);
         c.precisionPath = planned; c.precisionDefaultInjected = changed.defaultInjected;
         c.precisionProducerSQL = changed.originalSQL; c.precisionProducerTransformedSQL = changed.transformedSQL;
         await capture(`${c.label}:precision-producer-before-dispatch`, { planned, beforeRow: c.precisionBeforeRow, originalSQL: changed.originalSQL, transformedSQL: changed.transformedSQL, defaultInjected: changed.defaultInjected });
-        const result = await originals.executeRaw(...changed.args);
+        const result = await originals.executeRaw.apply(receiver, changed.args);
         c.precisionAfterRow = await queueRow(planned); c.precisionEnabled = true;
         await capture(`${c.label}:precision-producer-after`, { row: c.precisionAfterRow }); return result;
       }
-      return originals.executeRaw(...args);
+      return originals.executeRaw.apply(receiver, args);
     });
-    app.prisma.$queryRaw = (...args) => owned("query-raw-wrapper", async () => {
+    };
+    app.prisma.$queryRaw = function (...args) {
+      const receiver = this;
+      return owned("query-raw-wrapper", async () => {
       const c = current;
       if (c?.precisionEnabled && isOwnedWorkerClaim(args, c.precisionPath)) {
+        assert.equal(receiver, app.prisma, "Fixed worker clock only wraps root-client SQL");
         const changed = freezeWorkerClaim(args, c.precisionPath);
-        const result = await originals.queryRaw(...changed.args);
+        const result = await originals.queryRaw.apply(receiver, changed.args);
         (c.precisionClaims ??= []).push({ originalSQL: changed.originalSQL, transformedSQL: changed.transformedSQL, result });
         await capture(`${c.label}:precision-worker-actual-claim`, c.precisionClaims.at(-1)); return result;
       }
-      return originals.queryRaw(...args);
+      return originals.queryRaw.apply(receiver, args);
     });
+    };
     app.prisma.$transaction = (...args) => owned("real-transaction-wrapper", () => {
       const c = current;
       if (!c || typeof args[0] !== "function") return originals.transaction(...args);
@@ -569,6 +581,29 @@ test("copy staging: late writer keeps cleanup when an earlier worker finishes it
       assert.deepEqual(await originals.read(storagePath), bytes);
     }
   });
+});
+
+test("copy transaction receiver: inherited raw methods use the actual interactive client", { timeout: 15000 }, async t => {
+  const actual = await app.prisma.$transaction(async tx => {
+    const nativeQuery = originals.queryRawNative.bind(tx), nativeExecute = originals.executeRawNative.bind(tx);
+    const [expected] = await nativeQuery`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid`;
+    await nativeExecute`SET LOCAL werkyn_copy_test.receiver = 'native-control'`;
+    const [control] = await nativeQuery`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid, current_setting('werkyn_copy_test.receiver', true) AS marker`;
+    const [observed] = await tx.$queryRaw`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid`;
+    await tx.$executeRaw`SET LOCAL werkyn_copy_test.receiver = 'wrapped-control'`;
+    const [after] = await nativeQuery`SELECT current_setting('werkyn_copy_test.receiver', true) AS marker`;
+    return { expected, control, observed, wrappedExecuteStayedLocal: after.marker === 'wrapped-control' };
+  });
+  await requireSettled("transaction-receiver-witness-settled");
+  await capture("transaction-receiver-witness-before-assert", actual);
+  assert.equal(actual.control.xid, actual.expected.xid); assert.equal(actual.control.pid, actual.expected.pid);
+  assert.equal(actual.control.marker, "native-control");
+  // Intended BEFORE failure: both reads must use the same actual transaction,
+  // not an outer pooled client's autocommit query. The custom GUC is LOCAL and
+  // has no policy, timezone, timestamp or application-data effect.
+  assert.deepEqual(actual.observed, actual.expected);
+  assert.equal(actual.wrappedExecuteStayedLocal, true);
+  t.diagnostic(safeJSON({ receiverWitnessPassed: true }));
 });
 
 test("copy precision component: native millisecond boundary and claimed fence controls", { timeout: 15000 }, async t => {

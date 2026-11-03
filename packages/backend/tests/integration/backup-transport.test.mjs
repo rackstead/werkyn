@@ -11,7 +11,7 @@ import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { after, before, test } from "node:test";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { craftZip, crc32, DEFLATED } from "../fixtures/crafted-zip.mjs";
 
 if (!process.env.TEST_DATABASE_URL)
@@ -503,7 +503,7 @@ test("a large upload is staged and restored without holding it in memory", { tim
   const names = ["one.bin", "two.bin", "three.bin"].map((name) => `assets/${name}`);
   const label = `Large ${suffix}`;
   const zipFile = path.join(root, "large.zip");
-  const archive = archiver("zip", { zlib: { level: 1 } });
+  const archive = new ZipArchive({ zlib: { level: 1 } });
   const written = pipeline(archive, createWriteStream(zipFile));
   archive.append(backupJson(label, names), { name: "backup.json" });
   // archiver reads one entry's stream at a time, so the streams wait their turn.

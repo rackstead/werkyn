@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import sharp from "sharp";
 import { fileTypeFromBuffer } from "file-type";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { env } from "../../config/env.js";
 import { logger } from "../../utils/logger.js";
 import {
@@ -910,7 +910,7 @@ export async function archiveFiles(
       : "files.zip";
 
   const passthrough = new PassThrough();
-  const archive = archiver("zip", { zlib: { level: 6 } });
+  const archive = new ZipArchive({ zlib: { level: 6 } });
 
   archive.on("error", (err) => passthrough.destroy(err));
   archive.pipe(passthrough);

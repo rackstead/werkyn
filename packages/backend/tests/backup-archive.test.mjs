@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { Readable } from "node:stream";
 import zlib from "node:zlib";
 import { after, test } from "node:test";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import {
   craftZip,
   crc32,
@@ -63,7 +63,7 @@ async function assertRefused(zip, reason, { overBudget = false, limits } = {}) {
 /** Build a ZIP with archiver exactly as backup.service.ts packages an export. */
 function archiverZip(entries) {
   return new Promise((resolve, reject) => {
-    const archive = archiver("zip", { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
     const chunks = [];
     archive.on("data", (chunk) => chunks.push(chunk));
     archive.on("end", () => resolve(Buffer.concat(chunks)));

@@ -6,6 +6,7 @@ import { queryClient } from "@/lib/query-client";
 import { clearFileContentCache, useFilePreviewUrl, useThumbnailUrl, type DriveFile } from "./api";
 import { FileCard } from "./components/file-card";
 import { FilePreviewSlideover } from "./components/file-preview-slideover";
+import { Slideover } from "@/components/ui/slideover";
 
 // jsdom has no object URL registry; this one records every URL's lifetime.
 const registry = {
@@ -49,8 +50,17 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 });
-afterEach(() => {
-  cleanup();
+// Radix restores focus on its zero-delay close turn; settle it before fixture globals change.
+async function cleanupRenderedPreviews() {
+  await act(async () => {
+    cleanup();
+    if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+    else await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+afterEach(async () => {
+  await cleanupRenderedPreviews();
   client.clear();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -297,5 +307,65 @@ describe("cached file contents", () => {
     queryClient.setQueryData(["file-preview", { wid: "w", fileId: "x" }], new Blob(["x"]));
     clearFileContentCache();
     expect(cached(queryClient, "file-preview")).toBe(0);
+  });
+});
+
+
+describe("preview fixture teardown", () => {
+  it("returns only after the real close callback restores focus and releases its URL", async () => {
+    const opener = document.createElement("button");
+    opener.textContent = "owned preview opener";
+    document.body.append(opener);
+    opener.focus();
+    const onClosed = vi.fn();
+    try {
+      render(
+        <Slideover title="Owned preview" onClose={vi.fn()} onCloseAutoFocus={onClosed}>
+          <Thumbnail fileId="owned-real" />
+        </Slideover>,
+        { wrapper: Providers },
+      );
+      liveSrc(await screen.findByRole("img", { name: "thumbnail owned-real" }));
+      await cleanupRenderedPreviews();
+      expect(onClosed).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(opener);
+      expectBackToBaseline();
+    } finally {
+      // An intentional old-helper assertion failure must still settle its owed close.
+      await act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+      opener.remove();
+    }
+  });
+
+  it("settles the pending fake-timer close while retaining fake mode and future timers", async () => {
+    const opener = document.createElement("button");
+    opener.textContent = "owned fake preview opener";
+    document.body.append(opener);
+    opener.focus();
+    const onClosed = vi.fn();
+    const future = vi.fn();
+    let sentinel: number | undefined;
+    try {
+      render(
+        <Slideover title="Owned fake preview" onClose={vi.fn()} onCloseAutoFocus={onClosed}>
+          <Thumbnail fileId="owned-fake" />
+        </Slideover>,
+        { wrapper: Providers },
+      );
+      liveSrc(await screen.findByRole("img", { name: "thumbnail owned-fake" }));
+      vi.useFakeTimers();
+      sentinel = setTimeout(future, 1_000);
+      await cleanupRenderedPreviews();
+      expect(onClosed).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(opener);
+      expectBackToBaseline();
+      expect(vi.isFakeTimers()).toBe(true);
+      expect(future).not.toHaveBeenCalled();
+    } finally {
+      if (sentinel !== undefined) clearTimeout(sentinel);
+      if (vi.isFakeTimers()) await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      else await act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+      opener.remove();
+    }
   });
 });

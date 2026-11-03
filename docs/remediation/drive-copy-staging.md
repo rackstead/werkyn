@@ -33,3 +33,10 @@ not establish process-crash recovery, sustained draining, universal orphan clean
 or native/archive/load behavior. The shared worker now fences retirement/retry by
 claim identity; upload/thumbnail/restore producers, providers, schema and permissions
 retain their existing contracts. Broader R26 work stays open.
+
+
+Failure cleanup due-now precision
+
+`BlobCleanup.availableAt` uses native `TIMESTAMP(3)`. PostgreSQL rounds extra fractional digits on assignment, so an unrounded due-now value can become a stored millisecond later than a very fast following claim. Failure cleanup explicitly truncates only a newly inserted or unclaimed failure row's due-now value to native milliseconds before storage. The worker eligibility comparison remains unchanged. Claimed rows retain the existing `GREATEST(previous lease + 1 millisecond, CURRENT_TIMESTAMP)` renewal, attempts, errors and native tuple fences; staging grace and backoff are unchanged.
+
+The regressions compare fixed producer `.125600` and later consumer `.125900` instants through native SQL and the real copy/failure-cleanup/worker path with tiny owned files. Their test-only SQL clock adapter records original and transformed templates and verifies the schema default before substituting a delegated default timestamp. UTC and non-UTC component controls cover rounding, later/equal boundaries and the claimed lease fence. These are controlled precision witnesses, not a reconstruction of any prior CI failure's unrecorded fractional query times.

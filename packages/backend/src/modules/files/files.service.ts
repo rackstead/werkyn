@@ -619,10 +619,14 @@ async function discardFailedCopy(
     // and retry on attempts + availableAt, so an earlier deletion cannot remove
     // this later write's durable work. Preserve attempts and extend an existing
     // lease by at least one stored millisecond; unclaimed stages become due now.
+    // Floor only that due-now value in the native timestamp domain so storage
+    // cannot round it ahead of the following worker claim.
     await prisma.$executeRaw`
-      INSERT INTO "BlobCleanup" ("storagePath") VALUES (${plannedPath})
+      INSERT INTO "BlobCleanup" ("storagePath", "availableAt") VALUES (
+        ${plannedPath}, date_trunc('milliseconds', CURRENT_TIMESTAMP::timestamp))
       ON CONFLICT ("storagePath") DO UPDATE SET "availableAt" =
-        CASE WHEN "BlobCleanup"."attempts" = 0 THEN CURRENT_TIMESTAMP
+        CASE WHEN "BlobCleanup"."attempts" = 0
+          THEN date_trunc('milliseconds', CURRENT_TIMESTAMP::timestamp)
         ELSE GREATEST("BlobCleanup"."availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
         END`;
   } catch (error) {

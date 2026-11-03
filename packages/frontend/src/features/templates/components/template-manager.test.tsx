@@ -16,15 +16,16 @@ const transport = vi.hoisted(() => {
   vi.stubGlobal("BroadcastChannel", class { addEventListener() {} removeEventListener() {} postMessage() {} close() {} });
   return { get: vi.fn(), patch: vi.fn(), post: vi.fn(), delete: vi.fn() };
 });
-vi.mock("@/lib/api-client", () => ({ api: transport }));
+vi.mock("@/lib/api-client", async (importOriginal) => ({ ...await importOriginal<typeof import("@/lib/api-client")>(), api: transport }));
 vi.mock("@/lib/router", () => ({ router: { invalidate: vi.fn() } }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 type Person = NonNullable<ReturnType<typeof useAuthStore.getState>["user"]>;
 type Call = { actor: string; generation: number; method: string; path: string; data?: Record<string, unknown>;
-  objectKeys?: string[]; status?: number; delivered: boolean; release?: () => void };
+  objectKeys?: string[]; status?: number; details?: Array<{ field: string; message: string }>; delivered: boolean; release?: () => void };
 let database: Map<string, Map<string, TaskTemplate[]>>, calls: Call[], notes: unknown[], unexpected: string[];
 let holdNext = false, failNext = false;
+let ordinaryFailure: unknown = null;
 const observations: unknown[] = [];
 const originalScroll = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
 const copy = <T,>(value: T): T => structuredClone(value);
@@ -117,7 +118,7 @@ beforeEach(() => {
     ["a", new Map([["p", [template("template-a", "Template A"), template("template-b", "Template B")]], ["q", [template("template-q", "Project Q", "q")]]])],
     ["b", new Map([["p", [template("template-b-owner", "Other account")]], ["q", [template("template-b-q", "Other Q", "q")]]])],
   ]);
-  calls = []; notes = []; unexpected = []; holdNext = false; failNext = false;
+  calls = []; notes = []; unexpected = []; holdNext = false; failNext = false; ordinaryFailure = null;
   vi.mocked(toast.success).mockClear(); vi.mocked(toast.error).mockClear();
   for (const mock of Object.values(transport)) mock.mockReset();
   vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
@@ -137,15 +138,16 @@ beforeEach(() => {
   function write(method: "PATCH" | "POST", path: string, options: { json: Record<string, unknown> }) {
     const call: Call = { actor: actor(), generation: identityGeneration(), method, path,
       data: JSON.parse(JSON.stringify(options.json)), objectKeys: Object.keys(options.json).sort(), delivered: false }; calls.push(call);
-    const delayed = holdNext, refused = failNext; holdNext = false; failNext = false;
+    const delayed = holdNext, refused = failNext, refusal = ordinaryFailure; holdNext = false; failNext = false; ordinaryFailure = null;
     return { json: async () => {
       const match = /^projects\/(p|q)\/templates(?:\/(template-[a-z-]+))?$/.exec(path);
       if (!match || !database.has(call.actor) || method === "PATCH" && !match[2]) { unexpected.push(`${method} ${path}`); throw new Error("Unexpected template write"); }
       const project = match[1], id = match[2];
       const parsed = method === "PATCH" ? UpdateTemplateSchema.safeParse(call.data) : CreateTemplateSchema.safeParse(call.data);
-      if (!parsed.success) { call.status = 400; call.delivered = true; throw new ApiError(400, "Bad Request", "Validation failed"); }
+      if (!parsed.success) { call.status = 400; call.delivered = true; call.details = parsed.error.issues.map((issue) => ({ field: issue.path.join("."), message: issue.message })); throw new ApiError(400, "Bad Request", "Validation failed", call.details); }
       const deliver = () => {
         call.delivered = true;
+        if (refusal !== null) { call.status = 503; throw refusal; }
         if (refused) { call.status = 503; throw new ApiError(503, "Service Unavailable", "Owned save unavailable"); }
         if (method === "PATCH") {
           const target = rows(call.actor, project).find((value) => value.id === id);
@@ -264,7 +266,7 @@ test("blocks explicitly blank required name and title without a request", async 
 });
 test("retains strict changed-invalid errors draft and cache", async () => {
   await mount(); await open(); change(dueInput(), "5001"); await save();
-  expect(writes()[0].status).toBe(400); expect(dueInput().value).toBe("5001"); expect(rows()[0].dueOffset).toBe(3); expect(toast.error).toHaveBeenCalledWith("Failed to update template");
+  expect(writes()[0].status).toBe(400); expect(dueInput().value).toBe("5001"); expect(rows()[0].dueOffset).toBe(3); expect(toast.error).toHaveBeenCalledWith("Due offset (days): " + writes()[0].details![0].message);
 });
 test("keeps the open draft on refetch and reloads it after Cancel and reopen", async () => {
   await mount(); await open(); change(nameInput(), "Local draft"); Object.assign(rows()[0], { name: "Server name", title: "Server title" });
@@ -313,4 +315,65 @@ test("keeps CREATE full payload and its successful and Cancel reset policies", a
   fireEvent.click(screen.getByRole("button", { name: "New template" })); expect(nameInput().value).toBe(""); expect(titleInput().value).toBe(""); expect(dueInput().value).toBe("");
   change(nameInput(), "Discarded create draft"); cancel(); fireEvent.click(screen.getByRole("button", { name: "New template" })); note("create-cancel-reopen");
   expect(nameInput().value).toBe(""); expect(descriptionInput().value).toBe(""); expect(writes()).toHaveLength(1);
+});
+
+
+function createFields(description: string, name = "Text contract template") {
+  fireEvent.click(screen.getByRole("button", { name: "New template" }));
+  change(nameInput(), name); change(titleInput(), "Text contract task"); change(descriptionInput(), description);
+}
+async function createSave() { fireEvent.click(screen.getByRole("button", { name: "Create template" })); await quiet(); note("text-create-settled"); }
+
+test("text contract: create normalizes only forbidden description controls", async () => {
+  await mount(); createFields("First\tΩ\u000BSecond\u000CThird\u0000 end"); await createSave();
+  expect(writes()[0].data?.description).toBe("First\tΩ\nSecond\nThird end"); expect(writes()[0].status).toBe(201);
+  expect(writes()[0].data).toMatchObject({ name: "Text contract template", title: "Text contract task", assigneeIds: [], labelIds: [], subtasks: [] });
+});
+test("text contract: edit normalizes a changed description with sparse payload", async () => {
+  await mount({ name: "N".repeat(256) }); await open(); change(descriptionInput(), "Changed\u0001 text\u000Bline\tΩ"); await save();
+  expect(writes()[0].data).toEqual({ description: "Changed text\nline\tΩ" }); expect(writes()[0].status).toBe(200); expect(rows()[0].name).toHaveLength(256);
+});
+test("text contract: controls-only create description keeps optional omission", async () => {
+  await mount(); createFields("\u0000\u0001"); await createSave(); expect(writes()[0].data).not.toHaveProperty("description"); expect(writes()[0].status).toBe(201);
+});
+test("text contract: changed controls-only description sends explicit null", async () => {
+  await mount(); await open(); change(descriptionInput(), "\u0000\u0001"); await save(); expect(writes()[0].data).toEqual({ description: null }); expect(writes()[0].status).toBe(200);
+});
+test("text contract: unrelated edit omits unchanged legacy-invalid description", async () => {
+  const legacy = "Legacy\u0000 &amp; <b>text</b>"; await mount({ description: legacy }); await open(); change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" }); expect(writes()[0].status).toBe(200); expect(rows()[0].description).toBe(legacy);
+});
+test("text contract: allowed markup entities tabs Unicode and newlines stay verbatim", async () => {
+  const allowed = "<p>Résumé &amp; &lt;copy&gt;\tΩ\nnext line</p>"; await mount(); createFields(allowed); await createSave();
+  expect(writes()[0].data?.description).toBe(allowed); expect(writes()[0].status).toBe(201); await open(); change(descriptionInput(), allowed); await save();
+  expect(writes()[1].data).toEqual({ description: allowed }); expect(writes()[1].status).toBe(200);
+});
+test("text contract: raw change normalizing to initial value remains an explicit save", async () => {
+  await mount({ description: "Same value" }); await open(); change(descriptionInput(), "Same value\u0000"); await save();
+  expect(writes()[0].data).toEqual({ description: "Same value" }); expect(writes()[0].status).toBe(200); expect(maybeName()).toBeNull();
+});
+test("text contract: exact raw description revert remains a no-op", async () => {
+  const legacy = "Keep\u0000 raw"; await mount({ description: legacy }); await open(); change(descriptionInput(), "Temporary"); change(descriptionInput(), legacy); await save();
+  expect(writes()).toHaveLength(0); expect(descriptionInput().value).toBe(legacy);
+});
+test("text contract: create reports a strict field error once and retains draft", async () => {
+  await mount(); const invalid = "N".repeat(256); createFields("Valid notes", invalid); await createSave();
+  expect(writes()[0].status).toBe(400); expect(nameInput().value).toBe(invalid); expect(toast.error).toHaveBeenCalledExactlyOnceWith("Template name: " + writes()[0].details![0].message);
+});
+test("text contract: update reports a strict field error once without changing cache", async () => {
+  await mount(); await open(); change(dueInput(), "5001"); await save(); expect(writes()[0].status).toBe(400); expect(dueInput().value).toBe("5001"); expect(rows()[0].dueOffset).toBe(3);
+  expect(toast.error).toHaveBeenCalledExactlyOnceWith("Due offset (days): " + writes()[0].details![0].message);
+});
+test("text contract: meaningful server message is used without field details", async () => {
+  await mount(); await open(); failNext = true; change(descriptionInput(), "Retry notes"); await save(); expect(writes()[0].status).toBe(503); expect(descriptionInput().value).toBe("Retry notes");
+  expect(toast.error).toHaveBeenCalledExactlyOnceWith("Owned save unavailable");
+});
+test("text contract: unknown error keeps operation fallback and draft", async () => {
+  await mount(); await open(); ordinaryFailure = {}; change(descriptionInput(), "Unsent notes"); await save(); expect(writes()[0].status).toBe(503); expect(descriptionInput().value).toBe("Unsent notes");
+  expect(toast.error).toHaveBeenCalledExactlyOnceWith("Failed to update template");
+});
+
+test("text contract: whitespace-only descriptions are not trimmed", async () => {
+  const whitespace = " \t\n "; await mount(); createFields(whitespace); await createSave(); expect(writes()[0].data?.description).toBe(whitespace); expect(writes()[0].status).toBe(201);
+  await open(); change(descriptionInput(), whitespace); await save(); expect(writes()[1].data).toEqual({ description: whitespace }); expect(writes()[1].status).toBe(200);
 });

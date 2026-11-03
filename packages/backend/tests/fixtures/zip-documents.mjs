@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import AdmZip from "adm-zip";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 
 // Small, harmless ZIP-based documents for content detection tests. Each format can
 // be written with sizes in its local headers (AdmZip) or with trailing data
@@ -98,7 +98,7 @@ export function zipWithLocalSizes(entries) {
 }
 
 export async function zipWithDataDescriptors(entries) {
-  const archive = archiver("zip", { zlib: { level: 9 } });
+  const archive = new ZipArchive({ zlib: { level: 9 } });
   const output = new PassThrough();
   const chunks = [];
   output.on("data", (chunk) => chunks.push(chunk));

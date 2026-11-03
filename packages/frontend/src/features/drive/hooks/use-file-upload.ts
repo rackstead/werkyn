@@ -145,6 +145,7 @@ export function useFileUpload({
         const MAX_CONCURRENT = 3;
         let nextIndex = 0;
         const runNext = async (): Promise<void> => {
+          if (!mountedRef.current) return;
           const i = nextIndex++;
           if (i >= fileList.length) return;
           if (!sameAccount()) {

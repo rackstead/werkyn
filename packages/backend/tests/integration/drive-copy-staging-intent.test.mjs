@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+let precisionDefaultsVerified = false;
 import crypto from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -124,6 +125,63 @@ async function sweepOne(c, storagePath, failDelete) {
     await capture(`${c.label}:settled-one-path-worker`, { actual, row: c.rowAfterSweep });
   } finally { c.workerMode = false; c.workerDeleteFailure = false; }
 }
+// Only these fixed synthetic clocks are substituted for exact owned fixture SQL.
+// This proves the native precision boundary, not any observed CI fractional timing.
+const PRODUCER = "TIMESTAMPTZ '2026-11-03 07:26:39.125600+00'";
+const CONSUMER = "TIMESTAMPTZ '2026-11-03 07:26:39.125900+00'";
+function isFailureProducer(args) {
+  return /^\s*INSERT INTO "BlobCleanup"/.test(sqlText(args)) && /ON CONFLICT \("storagePath"\) DO UPDATE SET "availableAt"/.test(sqlText(args));
+}
+function withStrings(args, strings) {
+  assert.equal(strings.length, args[0].length);
+  Object.defineProperty(strings, 'raw', { value: [...strings] });
+  return [strings, ...args.slice(1)];
+}
+function freezeFailureProducer(args, ownedPath, verifiedDefault) {
+  assert.equal(verifiedDefault, true, 'Native schema/type/default precondition required');
+  assert.ok(isFailureProducer(args)); assert.equal(args.length, 2); assert.equal(args[1], ownedPath);
+  assert.ok(Array.isArray(args[0].raw));
+  const originalSQL = sqlText(args), strings = [...args[0]];
+  const prefix = strings[0].match(/INSERT INTO "BlobCleanup" \(([^)]*)\) VALUES \(\s*$/);
+  assert.ok(prefix, 'Exact failure INSERT header required');
+  const defaultInjected = prefix[1].trim() === '"storagePath"';
+  if (defaultInjected) {
+    // The original delegates to DEFAULT CURRENT_TIMESTAMP. Freeze only that
+    // verified default evaluation; preserve path binding/conflict expression.
+    strings[0] = strings[0].replace('(\"storagePath\")', '(\"storagePath\", \"availableAt\")');
+    assert.match(strings[1], /^\s*\)/);
+    strings[1] = strings[1].replace(/^(\s*)\)/, `$1, ${PRODUCER})`);
+  } else {
+    assert.equal(prefix[1].replace(/\s/g, ''), '"storagePath","availableAt"');
+  }
+  const count = strings.join('?').match(/CURRENT_TIMESTAMP/g)?.length || 0;
+  assert.ok(count >= 2 && count <= 3, 'Only expected due-now plus claimed-lease clocks');
+  for (let i = 0; i < strings.length; i++) strings[i] = strings[i].replaceAll('CURRENT_TIMESTAMP', PRODUCER);
+  const output = withStrings(args, strings);
+  return { args: output, originalSQL, transformedSQL: sqlText(output), defaultInjected };
+}
+function bindingStrings(value, depth = 0) {
+  assert.ok(depth <= 8, 'Bounded fixture binding walk');
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) { assert.ok(value.length <= 8); return value.flatMap(v => bindingStrings(v, depth + 1)); }
+  if (value && typeof value === 'object' && Array.isArray(value.values)) return bindingStrings(value.values, depth + 1);
+  assert.ok(value == null || typeof value === 'number'); return [];
+}
+function isOwnedWorkerClaim(args, ownedPath) {
+  const text = sqlText(args);
+  if (!/^\s*UPDATE "BlobCleanup"/.test(text) || !/RETURNING "storagePath", "attempts", "availableAt"/.test(text)) return false;
+  const paths = args.slice(1).flatMap(v => bindingStrings(v));
+  return paths.length === 1 && paths[0] === ownedPath;
+}
+function freezeWorkerClaim(args, ownedPath) {
+  assert.ok(isOwnedWorkerClaim(args, ownedPath));
+  const originalSQL = sqlText(args), strings = [...args[0]];
+  assert.equal(strings.join('?').match(/CURRENT_TIMESTAMP/g)?.length, 2);
+  for (let i = 0; i < strings.length; i++) strings[i] = strings[i].replaceAll('CURRENT_TIMESTAMP', CONSUMER);
+  const output = withStrings(args, strings);
+  return { args: output, originalSQL, transformedSQL: sqlText(output) };
+}
+
 function sqlText(args) {
   return Array.isArray(args[0]) ? args[0].join("?") : "";
 }
@@ -177,6 +235,14 @@ before(async () => {
     await capture("database-identity-before-assert", identity);
     assert.equal(identity.length, 1); assert.equal(identity[0].database, testDatabase);
     assert.equal(identity[0].role, decodeURIComponent(testURL.username)); assert.equal(identity[0].owner, identity[0].role);
+    const precisionSchema = await app.prisma.$queryRaw`SELECT column_name, data_type, datetime_precision, column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='BlobCleanup' AND column_name IN ('availableAt','createdAt') ORDER BY column_name`;
+    await capture("precision-schema-default-before-assert", precisionSchema);
+    assert.equal(precisionSchema.length, 2);
+    for (const row of precisionSchema) {
+      assert.equal(row.data_type, "timestamp without time zone"); assert.equal(row.datetime_precision, 3);
+      assert.equal(row.column_default, "CURRENT_TIMESTAMP");
+    }
+    precisionDefaultsVerified = true;
     const collisions = {
       users: await app.prisma.user.count({ where: { id: { in: [ids.actor, ids.peer] } } }),
       workspace: await app.prisma.workspace.count({ where: { id: ids.workspace } }),
@@ -202,7 +268,9 @@ before(async () => {
     await app.prisma.file.create({ data: { id: ids.peerFolder, workspaceId: ids.workspace, ownerId: ids.peer, uploadedById: ids.peer,
       name: "Peer private folder", isFolder: true } });
     for (const name of ["saveStream", "openReadStream", "read", "delete", "exists"]) originals[name] = app.storage[name].bind(app.storage);
-    originals.executeRaw = app.prisma.$executeRaw.bind(app.prisma); originals.transaction = app.prisma.$transaction.bind(app.prisma);
+    // Preserve native controls separately so the witness can measure wrapper receivers.
+    originals.executeRawNative = app.prisma.$executeRaw; originals.queryRawNative = app.prisma.$queryRaw;
+    originals.executeRaw = app.prisma.$executeRaw; originals.queryRaw = app.prisma.$queryRaw; originals.transaction = app.prisma.$transaction.bind(app.prisma);
     originals.cleanupDeleteMany = app.prisma.blobCleanup.deleteMany.bind(app.prisma.blobCleanup);
     app.prisma.blobCleanup.deleteMany = (...args) => owned("cleanup-row-delete-wrapper", async () => {
       const c = current;
@@ -214,15 +282,46 @@ before(async () => {
       }
       return originals.cleanupDeleteMany(...args);
     });
-    app.prisma.$executeRaw = (...args) => owned("execute-raw-wrapper", async () => {
+    // Interactive clients inherit these wrappers. Native raw methods use this
+    // to create their transaction-specific Prisma promise; never bind root.
+    app.prisma.$executeRaw = function (...args) {
+      const receiver = this;
+      return owned("execute-raw-wrapper", async () => {
       const c = current;
       if (c && /^\s*INSERT INTO "BlobCleanup"/.test(sqlText(args)) && !sqlText(args).includes("ON CONFLICT")) {
         c.intentCalls++; await rememberPlanned(c, args[1]);
         await capture(`${c.label}:intent-insert-called`, { calls: c.intentCalls });
         if (c.options.intentFailure) throw fault("intent insert");
       }
-      return originals.executeRaw(...args);
+      if (c?.options.precisionClock && isFailureProducer(args)) {
+        assert.equal(receiver, app.prisma, "Fixed failure clock only wraps root-client SQL");
+        assert.equal(c.paths.size, 1); const planned = [...c.paths][0]; assert.equal(args[1], planned);
+        c.precisionBeforeRow = await queueRow(planned);
+        const changed = freezeFailureProducer(args, planned, precisionDefaultsVerified);
+        c.precisionPath = planned; c.precisionDefaultInjected = changed.defaultInjected;
+        c.precisionProducerSQL = changed.originalSQL; c.precisionProducerTransformedSQL = changed.transformedSQL;
+        await capture(`${c.label}:precision-producer-before-dispatch`, { planned, beforeRow: c.precisionBeforeRow, originalSQL: changed.originalSQL, transformedSQL: changed.transformedSQL, defaultInjected: changed.defaultInjected });
+        const result = await originals.executeRaw.apply(receiver, changed.args);
+        c.precisionAfterRow = await queueRow(planned); c.precisionEnabled = true;
+        await capture(`${c.label}:precision-producer-after`, { row: c.precisionAfterRow }); return result;
+      }
+      return originals.executeRaw.apply(receiver, args);
     });
+    };
+    app.prisma.$queryRaw = function (...args) {
+      const receiver = this;
+      return owned("query-raw-wrapper", async () => {
+      const c = current;
+      if (c?.precisionEnabled && isOwnedWorkerClaim(args, c.precisionPath)) {
+        assert.equal(receiver, app.prisma, "Fixed worker clock only wraps root-client SQL");
+        const changed = freezeWorkerClaim(args, c.precisionPath);
+        const result = await originals.queryRaw.apply(receiver, changed.args);
+        (c.precisionClaims ??= []).push({ originalSQL: changed.originalSQL, transformedSQL: changed.transformedSQL, result });
+        await capture(`${c.label}:precision-worker-actual-claim`, c.precisionClaims.at(-1)); return result;
+      }
+      return originals.queryRaw.apply(receiver, args);
+    });
+    };
     app.prisma.$transaction = (...args) => owned("real-transaction-wrapper", () => {
       const c = current;
       if (!c || typeof args[0] !== "function") return originals.transaction(...args);
@@ -484,6 +583,69 @@ test("copy staging: late writer keeps cleanup when an earlier worker finishes it
   });
 });
 
+test("copy transaction receiver: inherited raw methods use the actual interactive client", { timeout: 15000 }, async t => {
+  const actual = await app.prisma.$transaction(async tx => {
+    const nativeQuery = originals.queryRawNative.bind(tx), nativeExecute = originals.executeRawNative.bind(tx);
+    const [expected] = await nativeQuery`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid`;
+    await nativeExecute`SET LOCAL werkyn_copy_test.receiver = 'native-control'`;
+    const [control] = await nativeQuery`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid, current_setting('werkyn_copy_test.receiver', true) AS marker`;
+    const [observed] = await tx.$queryRaw`SELECT txid_current()::text AS xid, pg_backend_pid()::text AS pid`;
+    await tx.$executeRaw`SET LOCAL werkyn_copy_test.receiver = 'wrapped-control'`;
+    const [after] = await nativeQuery`SELECT current_setting('werkyn_copy_test.receiver', true) AS marker`;
+    return { expected, control, observed, wrappedExecuteStayedLocal: after.marker === 'wrapped-control' };
+  });
+  await requireSettled("transaction-receiver-witness-settled");
+  await capture("transaction-receiver-witness-before-assert", actual);
+  assert.equal(actual.control.xid, actual.expected.xid); assert.equal(actual.control.pid, actual.expected.pid);
+  assert.equal(actual.control.marker, "native-control");
+  // Intended BEFORE failure: both reads must use the same actual transaction,
+  // not an outer pooled client's autocommit query. The custom GUC is LOCAL and
+  // has no policy, timezone, timestamp or application-data effect.
+  assert.deepEqual(actual.observed, actual.expected);
+  assert.equal(actual.wrappedExecuteStayedLocal, true);
+  t.diagnostic(safeJSON({ receiverWitnessPassed: true }));
+});
+
+test("copy precision component: native millisecond boundary and claimed fence controls", { timeout: 15000 }, async t => {
+  assert.equal(precisionDefaultsVerified, true);
+  for (const zone of ["UTC", "Asia/Kolkata"]) {
+    const rows = await app.prisma.$transaction(async tx => {
+      if (zone === "UTC") await tx.$executeRaw`SET LOCAL TIME ZONE 'UTC'`;
+      else await tx.$executeRaw`SET LOCAL TIME ZONE 'Asia/Kolkata'`;
+      return tx.$queryRaw`WITH clocks AS (SELECT TIMESTAMPTZ '2026-11-03 07:26:39.125600+00' AS p, TIMESTAMPTZ '2026-11-03 07:26:39.125900+00' AS c, TIMESTAMPTZ '2026-11-03 07:26:39.126100+00' AS d)
+        SELECT (p::timestamp(3) <= c) AS "oldDue", (p::timestamp(3) <= d) AS "laterDue",
+        (date_trunc('milliseconds', p::timestamp) <= c) AS "floorDue",
+        (TIMESTAMPTZ '2026-11-03 07:26:39.125100+00'::timestamp(3) <= TIMESTAMPTZ '2026-11-03 07:26:39.125400+00') AS "lowerDue",
+        (TIMESTAMPTZ '2026-11-03 07:26:39.125000+00'::timestamp(3) <= TIMESTAMPTZ '2026-11-03 07:26:39.125000+00') AS "equalDue",
+        to_char(p::timestamp(3), 'SS.US') AS "rounded", to_char(date_trunc('milliseconds',p::timestamp), 'SS.US') AS "floored",
+        (GREATEST(TIMESTAMP '2030-01-01 00:00:00.000' + interval '1 millisecond', p::timestamp)::timestamp(3) = TIMESTAMP '2030-01-01 00:00:00.001') AS "claimedAdvanced",
+        (TIMESTAMP '2030-01-01 00:00:00.001' <> TIMESTAMP '2030-01-01 00:00:00.000') AS "oldTupleMismatch"
+        FROM clocks`;
+    });
+    await capture("precision-component-before-assert", { zone, rows });
+    assert.deepEqual(rows, [{ oldDue: false, laterDue: true, floorDue: true, lowerDue: true, equalDue: true, rounded: "39.126000", floored: "39.125000", claimedAdvanced: true, oldTupleMismatch: true }]);
+    t.diagnostic(safeJSON({ zone, precisionComponentPassed: true }));
+  }
+});
+for (const [label, options, expectMissing] of [
+  ["fixed-default-insert", { sweepBeforeWrite: true, precisionClock: true }, true],
+  ["fixed-unclaimed-renewal", { unexpectedReturn: true, precisionClock: true }, false],
+]) {
+  test(`copy precision producer: ${label} is due before the next fractional millisecond`, { timeout: 15000 }, async t => {
+    await runCase(t, label, options, async (c, response, actual) => {
+      refused(c, response, actual); assert.equal(c.actualWritesFinished, 1);
+      assert.equal(c.precisionAfterRow.attempts, 0);
+      assert.equal(c.precisionBeforeRow === null, expectMissing);
+      if (!expectMissing) assert.equal(c.precisionBeforeRow.attempts, 0);
+      assert.equal(c.precisionClaims.length, 1);
+      // The intended BEFORE failure is a real claim result0 under the fixed,
+      // later consumer clock. Full state/SQL/default qualification is captured first.
+      assert.equal(c.precisionClaims[0].result.length, 1);
+      assert.deepEqual(actual.queue, []); assert.equal(Object.values(actual.targetPresent).every(v => !v), true);
+    });
+  });
+}
+
 after(async () => {
   const failures = [];
   try { await requireSettled("after-all-cases"); }
@@ -497,6 +659,7 @@ after(async () => {
   // Every actual request/wrapper/stream settled before restoring instance hooks.
   for (const name of ["saveStream", "openReadStream", "read", "delete", "exists"]) if (originals[name]) app.storage[name] = originals[name];
   if (originals.executeRaw) app.prisma.$executeRaw = originals.executeRaw;
+  if (originals.queryRaw) app.prisma.$queryRaw = originals.queryRaw;
   if (originals.transaction) app.prisma.$transaction = originals.transaction;
   if (originals.cleanupDeleteMany) app.prisma.blobCleanup.deleteMany = originals.cleanupDeleteMany;
   try {

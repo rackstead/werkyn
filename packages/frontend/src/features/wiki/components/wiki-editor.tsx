@@ -94,6 +94,7 @@ function WikiEditorInner({
   const wasDirty = useRef(hasUnsavedChanges);
 
   const editor = useCreateBlockNote({
+    selectAllBehavior: "document",
     initialContent:
       Array.isArray(initialDocument) && initialDocument.length > 0
         ? (initialDocument as Block[])

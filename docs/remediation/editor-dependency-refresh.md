@@ -8,6 +8,8 @@ The editor retains supported stored block IDs, text, properties and nesting. The
 
 The current library renders unused trailing input as a decoration. Clicking it creates a real paragraph. An old editor-generated extra blank paragraph is therefore no longer added automatically to serialized content; an explicit saved blank block remains data.
 
+The editor explicitly uses the supported `selectAllBehavior: "document"` option to retain whole-document selection on the first Ctrl+A or Cmd+A. The upgraded library's default selects the current block first; an independent native check measured that difference before this option was added.
+
 Backend storage accepts bounded JSON, while the editor has a document schema. The old constructor accepted a combined code/formatting span that its own complete schema check rejected. The current constructor rejects that span. The unchanged negative fixture records that distinction; it is not evidence that no such content was persisted.
 
 In a dated pre-containment application check on main150 with the new dependency graph, the known-invalid document removed History and left the route body in an error state after navigation. Initial and idle loads produced no automatic content PATCH; raw page, version and exported backup JSON remained exact. The recovered-case input was deliberately supplied through existing public draft hooks and remained recoverable after retry. This establishes a containment failure, not an ordinary producer of that combined-mark input or a data-loss finding.

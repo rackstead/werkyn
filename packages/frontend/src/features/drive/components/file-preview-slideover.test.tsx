@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -24,8 +25,12 @@ vi.mock("../api", () => ({
   useFileTextContent: () => ({ data: "quarterly numbers" }),
 }));
 
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  // Radix restores focus on its close turn; keep this jsdom owner alive for it.
+  await act(async () => {
+    cleanup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
   pdf.url = undefined;
   pdf.error = null;
   pdf.retry.mockClear();

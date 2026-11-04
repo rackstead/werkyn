@@ -11,7 +11,7 @@ type Status = "cap_reached_lease_active" | "cap_reached_unscheduled" |
   "cap_reached_lease_expired" | "cap_reached_scheduled_unleased";
 const STATUSES: readonly string[] = ["cap_reached_lease_active", "cap_reached_unscheduled",
   "cap_reached_lease_expired", "cap_reached_scheduled_unleased"];
-type Failure = "invalid_options" | "query_failed" | "oversized_id" | "output_limit";
+type Failure = "invalid_options" | "query_failed" | "oversized_id" | "output_limit" | "output_failed";
 export class DeliveryReportError extends Error {
   constructor(readonly code: Failure) { super(code); }
 }
@@ -113,10 +113,19 @@ async function main() {
   let prisma: PrismaClient | undefined;
   let report: Awaited<ReturnType<typeof findExhaustedDeliveries>> | undefined;
   let failure: Failure | undefined;
+  // Only the standalone process installs these listeners. Stream errors must
+  // not escape as raw exceptions, including an error emitted after a callback.
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
+  const write = async (stream: NodeJS.WriteStream, text: string) => {
+    if (stream.destroyed) return false;
+    try { return await new Promise<boolean>((resolve) => stream.write(text, (error) => resolve(!error))); }
+    catch { return false; }
+  };
   // This timer belongs only to this standalone, read-only CLI, never an importer.
   const deadline = setTimeout(() => {
-    process.stderr.write('{"error":"deadline_exceeded"}\n');
-    process.exit(1);
+    try { process.stderr.write('{"error":"deadline_exceeded"}\n'); }
+    finally { process.exit(1); }
   }, 15_000);
   try {
     const options = parseDeliveryReportArgs(process.argv.slice(2));
@@ -133,14 +142,17 @@ async function main() {
   } finally {
     try { await prisma?.$disconnect(); }
     catch { failure ??= "query_failed"; }
-    finally { clearTimeout(deadline); }
   }
-  if (failure || !report) {
-    process.stderr.write(JSON.stringify({ error: failure ?? "query_failed" }) + "\n");
-    process.exitCode = 1;
-  } else {
-    process.stdout.write(JSON.stringify(report) + "\n");
-    process.exitCode = report.rows.length ? 2 : 0;
-  }
+  try {
+    if (failure || !report) {
+      await write(process.stderr, JSON.stringify({ error: failure ?? "query_failed" }) + "\n");
+      process.exitCode = 1;
+    } else if (await write(process.stdout, JSON.stringify(report) + "\n")) {
+      process.exitCode = report.rows.length ? 2 : 0;
+    } else {
+      await write(process.stderr, '{"error":"output_failed"}\n');
+      process.exitCode = 1;
+    }
+  } finally { clearTimeout(deadline); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void main();

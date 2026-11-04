@@ -39,7 +39,9 @@ one UTC observation instant rounded down to milliseconds, matching the stored
 timestamp precision. SQL statement time is limited to 2 seconds; transaction
 wait and duration are bounded to 1 and 4 seconds. The standalone CLI bounds
 connection/pool waiting and has a 15-second failure deadline, including
-disconnect. A deadline is an error, never a completed report.
+disconnect and actual stdout/stderr write settlement. A blocked output consumer
+can therefore cause a fixed failure exit with incomplete output; it is never a
+completed report. Consumers must check exit status and parse the complete JSON.
 
 Rows use the same explicit `C` collation for ordering and the ID keyset. The
 query fetches at most the requested limit plus one lookahead. SQL checks ID
@@ -75,3 +77,5 @@ The integration test checks actual worker-cap equality, observed states,
 unchanged stored rows, deterministic pagination, selected/lookahead oversized
 IDs, maximum escaped-ID output, malformed options, standalone JSON/exit codes,
 and PostgreSQL rejecting an attempted write in the report transaction.
+The POSIX/Linux FIFO case checks the standalone deadline with an actual blocked
+consumer, alongside the ordinary CLI completion controls.

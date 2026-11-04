@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { before, after, test } from "node:test";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { mkdtemp, rm } from "node:fs/promises";
+import { openSync, closeSync, readSync, constants, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
 process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -154,6 +158,24 @@ for (const kind of ["chat", "notification"]) {
     assert.equal(bad.code, 1); assert.equal(bad.stdout, "");
     assert.deepEqual(JSON.parse(bad.stderr), { error: "invalid_options" });
     assert.equal(bad.stderr.includes("secret-invalid-kind"), false);
+    // A genuinely closed consumer must get a fixed failure, not an unhandled
+    // stream exception. Keep the original ordinary-completion assertions above.
+    const closed = spawn(process.execPath, ["--import", "tsx", script, `--kind=${kind}`, `--after=${prefix}T-`], {
+      cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let closedError = "", expired = false, force;
+    closed.stderr.on("data", (chunk) => { closedError = (closedError + chunk.toString()).slice(0, 2048); });
+    const closedResult = new Promise((resolve, reject) => {
+      closed.once("error", reject);
+      closed.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    closed.stdout.destroy();
+    const timeout = setTimeout(() => { expired = true; closed.kill("SIGTERM"); force = setTimeout(() => closed.kill("SIGKILL"), 3000); }, 10_000);
+    try {
+      const result = await closedResult;
+      assert.equal(expired, false); assert.deepEqual(result, { code: 1, signal: null });
+      assert.equal(closedError, '{"error":"output_failed"}\n');
+    } finally { clearTimeout(timeout); clearTimeout(force); }
     await delegate(kind).deleteMany({ where: scope(kind, [id]) });
   });
 }
@@ -167,4 +189,56 @@ test("options refuse malformed values before any database operation", async () =
   for (const args of [null, [null], [], ["--kind=all"], ["--kind=chat", "--limit=01"], ["--kind=chat", "--limit=1.2"], ["--kind=chat", "--limit=101"], ["--kind=chat", "--kind=notification"], ["--kind=chat", "--json"], ["--kind=chat", "--after=" + "x".repeat(257)]])
     assert.throws(() => parse(args), (error) => error.code === "invalid_options");
   assert.deepEqual(parse(["--kind=notification", "--limit=100", "--after="]), { kind: "notification", limit: 100, after: "" });
+});
+
+test("standalone CLI bounds a blocked output consumer", async () => {
+  const selected = [];
+  const directory = await mkdtemp(path.join(tmpdir(), "delivery-report-fifo-"));
+  const fifo = path.join(directory, "output");
+  let descriptor, child, timer, killTimer, completion;
+  let timedOut = false, stderr = "";
+  let started;
+  try {
+    for (let i = 0; i < 100; i++) selected.push(await create("notification", `U-${String(i).padStart(3, "0")}-` + "\u0001".repeat(180)));
+    // POSIX/Linux integration fixture: an actual FIFO with a reader kept open
+    // but not drained. No private Node handle or production stream replacement.
+    await exec("mkfifo", [fifo], { timeout: 2000 });
+    descriptor = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+    const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
+    started = performance.now();
+    child = spawn(process.execPath, ["--import", "tsx", script, "--kind=notification", "--limit=100", `--after=${prefix}U-`], {
+      cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, stdio: ["ignore", descriptor, "pipe"],
+    });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(0, 2048); });
+    completion = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    timer = setTimeout(() => {
+      timedOut = true; child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 3000);
+    }, 17_000);
+    const outcome = await completion;
+    clearTimeout(timer); clearTimeout(killTimer);
+    const buffer = Buffer.alloc(4096);
+    let bytes = 0;
+    try { bytes = readSync(descriptor, buffer, 0, buffer.length, null); }
+    catch (error) { if (error.code !== "EAGAIN") throw error; }
+    const beginsAsReport = buffer.subarray(0, bytes).toString().startsWith('{"version":1,"readOnly":true,"kind":"notification"');
+    const facts = { pid: child.pid, timedOut, ...outcome, elapsedMs: performance.now() - started, stderr, prefixBytes: bytes, beginsAsReport, fullOutputNotDrained: true };
+    if (process.env.DELIVERY_REPORT_OUTPUT_FACTS) writeFileSync(process.env.DELIVERY_REPORT_OUTPUT_FACTS, JSON.stringify(facts, null, 2) + "\n");
+    assert.equal(timedOut, false); assert.equal(outcome.signal, null); assert.equal(outcome.code, 1);
+    assert.equal(stderr, '{"error":"deadline_exceeded"}\n'); assert.equal(beginsAsReport, true);
+    assert(facts.elapsedMs >= 14_000 && facts.elapsedMs < 17_000);
+  } finally {
+    clearTimeout(timer); clearTimeout(killTimer);
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      const force = setTimeout(() => child.kill("SIGKILL"), 3000);
+      try { await completion?.catch(() => {}); } finally { clearTimeout(force); }
+    }
+    if (descriptor !== undefined) closeSync(descriptor);
+    await rm(directory, { recursive: true, force: true });
+    await db.notificationDelivery.deleteMany({ where: { id: { in: selected } } });
+  }
 });

@@ -2,9 +2,10 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import type { TimeReportQuery } from "@pm/shared";
 import * as userRatesService from "./user-rates.service.js";
 import { timeEntryProjectWhere } from "./time-entries.service.js";
-import { currencyFractionDigits, reportMoneyNumber, roundedCostUnits } from "./report-money.js";
+import { currencyFractionDigits, reportMoneyDecimal, reportMoneyNumber, roundedCostUnits } from "./report-money.js";
 import {
   csvDecimal,
+  csvExactDecimal,
   csvIsoDate,
   encodeCsv,
   type CsvCell,
@@ -294,7 +295,7 @@ export async function exportReportCSV(
       entry.billable ? "Yes" : "No",
       entry.rate === null ? null : csvDecimal(entry.rate),
       entry.currency,
-      entry.cost === null ? null : csvDecimal(entry.cost, entry.costFractionDigits ?? 2),
+      entry.cost === null ? null : csvExactDecimal(reportMoneyDecimal(entry.cost, entry.costFractionDigits ?? 2)),
       entry.description,
     ]),
   );

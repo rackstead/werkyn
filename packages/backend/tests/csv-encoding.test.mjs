@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { csvDecimal, csvIsoDate, encodeCsv, encodeCsvCell } from "../src/utils/csv.ts";
+import { csvDecimal, csvExactDecimal, csvIsoDate, encodeCsv, encodeCsvCell } from "../src/utils/csv.ts";
 import { parseCsv, values } from "./fixtures/rfc4180.mjs";
 import { READINGS, cellsUnder, formulaLike } from "./fixtures/spreadsheet-readings.mjs";
 
@@ -144,4 +144,17 @@ test("ISO dates are bare; anything else in a date column is encoded as text", ()
 test("records must match the header width", () => {
   assert.throws(() => encodeCsv(header, [["only one"]]), RangeError);
   assert.equal(encodeCsv(header, []), `${BOM}"Text","Number"\r\n`);
+});
+
+test("exact decimal cells retain the validated amount as bare numeric text", () => {
+  const amounts = ["9007199254740.940", "-9007199254740.940", "0.0000", "2"];
+  const records = roundTrip(amounts.map((amount) => ["cost", csvExactDecimal(amount)]));
+  assert.deepEqual(values(records).slice(1).map(([, amount]) => amount), amounts);
+  assert(records.slice(1).every(([, amount]) => amount.quoted === false));
+});
+
+test("the exact decimal factory cannot admit separators or nonnumeric expressions", () => {
+  for (const value of ["", "NaN", "Infinity", "1e3", "+1", "01", "1.", "-", " 1", "1 ", "1,2", "1;2", "1\n", "1\r\n", "1\t", "=1", "-1+2", "9".repeat(129)]) {
+    assert.throws(() => csvExactDecimal(value), TypeError, JSON.stringify(value));
+  }
 });

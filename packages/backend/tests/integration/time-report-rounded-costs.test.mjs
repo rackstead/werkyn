@@ -190,3 +190,24 @@ for (const currency of ["ZZZ", "1$X"]) {
     assert.equal(saved.rates[0].currency, currency); assert.equal(saved.rates[0].rate, 1.005);
   });
 }
+
+test("a large representable KWD cost has exactly the same decimal value in CSV", async () => {
+  const actor = "LARGE-KWD";
+  users[actor] = await app.prisma.user.create({ data: {
+    email: `rounded-large-${crypto.randomUUID()}@example.test`, displayName: actor, emailVerified: true,
+  } });
+  tokens[actor] = signAccessToken({ sub: users[actor].id, email: users[actor].email });
+  await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: users[actor].id, role: "MEMBER" } });
+  await app.prisma.projectMember.create({ data: { projectId: project.id, userId: users[actor].id } });
+  await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: users[actor].id,
+    rate: 9007199254740.94, currency: "KWD", effectiveFrom: "2026-01-01" } });
+  await entry(actor, actor, 1);
+  const beforeRows = await stored([actor]);
+  const report = await read([actor]); const exported = await csv([actor]);
+  const afterRows = await stored([actor]);
+  record("large-kwd-csv-decimal", { report, exported, unchanged: JSON.stringify(beforeRows) === JSON.stringify(afterRows) });
+  assert.deepEqual(afterRows, beforeRows);
+  assert.equal(rows(report)[0].cost, 9007199254740.94);
+  assert.equal(rows(report)[0].costFractionDigits, 3);
+  assert.equal(exported[0][8], "9007199254740.940");
+});

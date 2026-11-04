@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { currencyFractionDigits, reportMoneyNumber, roundedCostUnits } from "../src/modules/time/report-money.js";
+import { currencyFractionDigits, reportMoneyDecimal, reportMoneyNumber, roundedCostUnits } from "../src/modules/time/report-money.js";
 
 test("decimal multiplication rounds each USD row before summing", () => {
   const units = roundedCostUnits(0.1, 33.33, 2);
@@ -72,4 +72,14 @@ test("nonfinite inputs and invalid precision never become blank money", () => {
 
 test("the policy uses decimal currency units rather than a cash increment", () => {
   assert.equal(roundedCostUnits(1, 1.025, currencyFractionDigits("CHF")), 103n);
+});
+
+test("decimal export text pads the API spelling without rounding its binary value", () => {
+  assert.equal(reportMoneyDecimal(9007199254740.94, 3), "9007199254740.940");
+  assert.equal(reportMoneyDecimal(90071992547409.9, 2), "90071992547409.90");
+  assert.equal(reportMoneyDecimal(-9007199254740.94, 3), "-9007199254740.940");
+  assert.equal(reportMoneyDecimal(2, 0), "2");
+  assert.equal(reportMoneyDecimal(-0, 4), "0.0000");
+  assert.equal(reportMoneyDecimal(1e-3, 4), "0.0010");
+  assert.throws(() => reportMoneyDecimal(1.2345, 3), { statusCode: 400 });
 });

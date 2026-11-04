@@ -151,3 +151,15 @@ it("uses the same server precision in summary, group and expanded entry costs", 
   fireEvent.click(screen.getByText("Rounded work"));
   expect(screen.getAllByText(/1\.235$/)).toHaveLength(3);
 });
+
+it("large accepted KWD formatting preserves the API decimal spelling", () => {
+  const text = formatEntryCost(9007199254740.94, "KWD", 3);
+  console.log("COST_FORMAT_FACTS", JSON.stringify({ kind: "large-kwd", text }));
+  expect(text).toMatch(/9,007,199,254,740\.940$/);
+});
+
+it("large accepted legacy currency formatting preserves the API decimal spelling", () => {
+  const text = formatEntryCost(90071992547409.9, "1$X", 2);
+  console.log("COST_FORMAT_FACTS", JSON.stringify({ kind: "large-invalid-code", text }));
+  expect(text).toBe("90071992547409.90 1$X");
+});

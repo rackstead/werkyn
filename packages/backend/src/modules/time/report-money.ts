@@ -89,3 +89,24 @@ export function reportMoneyNumber(units: bigint, fractionDigits: number): number
   if (restored !== units) throw new ValidationError(RANGE_MESSAGE);
   return value;
 }
+
+/** Pad the validated API decimal spelling; never reround its binary value. */
+export function reportMoneyDecimal(value: number, fractionDigits: number): string {
+  checkDigits(fractionDigits);
+  const spelled = decimal(value);
+  const exponent = spelled.exponent + fractionDigits;
+  let units: bigint;
+  if (exponent >= 0) {
+    units = spelled.coefficient * power(exponent);
+  } else {
+    const divisor = power(-exponent);
+    if (spelled.coefficient % divisor !== 0n) throw new ValidationError(RANGE_MESSAGE);
+    units = spelled.coefficient / divisor;
+  }
+  reportMoneyNumber(units, fractionDigits);
+  const magnitude = (units < 0n ? -units : units).toString().padStart(fractionDigits + 1, "0");
+  const fixed = fractionDigits === 0
+    ? magnitude
+    : `${magnitude.slice(0, -fractionDigits)}.${magnitude.slice(-fractionDigits)}`;
+  return (units < 0n ? "-" : "") + fixed;
+}

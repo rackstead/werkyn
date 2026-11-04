@@ -12,7 +12,13 @@ export function formatMoney(amount: number, currency: string, fractionDigits?: n
       }),
     }).format(amount);
   } catch {
-    return `${amount.toFixed(fractionDigits ?? 2)} ${currency}`;
+    const digits = fractionDigits ?? 2;
+    const decimal = new Intl.NumberFormat("en-US", {
+      useGrouping: false,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(amount === 0 ? 0 : amount);
+    return `${decimal} ${currency}`;
   }
 }
 

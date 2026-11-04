@@ -13,6 +13,8 @@ legacy codes retain the existing two-digit fallback; this does not validate or
 repair currency codes. This is currency decimal precision, not cash-increment
 rounding. CSV Rate and Hours keep their existing display precision; cost is
 calculated from the stored inputs, not those displayed cells.
+CSV cost text pads the validated API decimal spelling without rounding the
+underlying binary Number again, including large accepted amounts.
 
 Reports keep currencies separate, missing billable rates unpriced and flagged,
 nonbillable costs zero, and zero-rate buckets present. Existing numeric API

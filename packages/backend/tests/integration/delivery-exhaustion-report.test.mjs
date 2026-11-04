@@ -359,9 +359,15 @@ test("a writer terminated after its output acknowledgement cannot return success
     // owned child when normal finalization requests its graceful disconnect.
     writeFileSync(observer, `import{createRequire,syncBuiltinESMExports}from'node:module';import{writeFileSync}from'node:fs';const cp=createRequire(import.meta.url)('node:child_process');const original=cp.spawn;cp.spawn=function(...args){const c=Reflect.apply(original,this,args);if(args[0]===process.execPath&&args[2]?.stdio?.[3]==='ipc'){const disconnect=c.disconnect;const observation={pid:c.pid,signal:'SIGTERM'};c.once('exit',(code,signal)=>{observation.actualExit={code,signal};writeFileSync(${JSON.stringify(marker)},JSON.stringify(observation));});c.disconnect=function(...rest){writeFileSync(${JSON.stringify(marker)},JSON.stringify(observation));c.kill('SIGTERM');return Reflect.apply(disconnect,this,rest);};}return c;};syncBuiltinESMExports();`);
     const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
+    // A random fixture prefix is not an upper bound for retained failed-run rows.
+    // Read at most one bounded key; preserve all stored data and the empty-page oracle.
+    const [greatest] = await db.$queryRaw`SELECT CASE WHEN octet_length(id) <= 256 THEN id ELSE NULL END AS id
+      FROM "NotificationDelivery" ORDER BY id COLLATE "C" DESC LIMIT 1`;
+    assert(greatest === undefined || (typeof greatest.id === "string" && Buffer.byteLength(greatest.id, "utf8") <= 256));
+    const after = greatest?.id ?? prefix;
     let outcome;
     try {
-      outcome = { ...(await exec(process.execPath, ["--import", observer, "--import", "tsx", script, "--kind=notification", `--after=${prefix}W-`], {
+      outcome = { ...(await exec(process.execPath, ["--import", observer, "--import", "tsx", script, "--kind=notification", `--after=${after}`], {
         cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, timeout: 10_000, maxBuffer: 512 * 1024,
       })), code: 0, signal: null };
     } catch (error) { outcome = { stdout: error.stdout, stderr: error.stderr, code: error.code, signal: error.signal }; }

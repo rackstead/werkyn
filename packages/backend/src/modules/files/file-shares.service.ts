@@ -6,7 +6,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { StorageProvider } from "../../services/storage.js";
 import type { FastifyInstance } from "fastify";
 import crypto from "crypto";
-import bcrypt from "bcrypt";
+import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
   NotFoundError,
   ForbiddenError,
@@ -312,7 +312,7 @@ export async function createFileShareLink(
   }
 
   const token = crypto.randomBytes(6).toString("base64url");
-  const passwordHash = password ? await bcrypt.hash(password, 10) : undefined;
+  const passwordHash = password ? await hashPassword(password) : undefined;
 
   const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
 
@@ -416,7 +416,7 @@ export async function updateFileShareLink(
   }
   if (data.password !== undefined) {
     updateData.passwordHash = data.password
-      ? await bcrypt.hash(data.password, 10)
+      ? await hashPassword(data.password)
       : null;
   }
 
@@ -530,7 +530,7 @@ export async function validateShareLinkAccess(
 
   if (!link.passwordHash) return link;
 
-  const valid = await bcrypt.compare(password, link.passwordHash);
+  const valid = await verifyPassword(password, link.passwordHash);
   if (!valid) throw new ForbiddenError("Invalid password");
   const current = await prisma.fileShareLink.findUnique({
     where: { id: link.id, updatedAt: link.updatedAt, enabled: true },

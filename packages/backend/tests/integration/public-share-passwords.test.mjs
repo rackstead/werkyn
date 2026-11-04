@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
+import { verifyPassword } from "../../src/utils/passwords.ts";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error(
@@ -764,9 +765,9 @@ for (const kind of ["wiki", "files"]) {
     );
     assert.equal(current.enabled, false);
     const winner = revisions[0] > revisions[1] ? 0 : 1;
-    assert(await bcrypt.compare(writes[winner].password, current.passwordHash));
+    assert(await verifyPassword(writes[winner].password, current.passwordHash));
     assert.equal(
-      await bcrypt.compare(writes[1 - winner].password, current.passwordHash),
+      await verifyPassword(writes[1 - winner].password, current.passwordHash),
       false,
     );
     if (kind === "files")

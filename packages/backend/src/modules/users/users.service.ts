@@ -96,7 +96,7 @@ export async function changePassword(
   const passwordHash = await hashPassword(data.newPassword);
 
   // The current password was verified against the hash read above, outside
-  // the transaction, so that bcrypt does not run while the row is held. The
+  // the transaction, so that password hashing does not run while the row is held. The
   // transaction locks the user row (FOR NO KEY UPDATE, as password login and
   // reset do, before the families) and writes only if the hash is still the
   // one that was verified. A reset or another change that committed in

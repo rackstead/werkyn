@@ -42,6 +42,8 @@ export interface UserRate {
 export interface CurrencyAmount {
   currency: string;
   amount: number;
+  /** Report server's precision; use it instead of browser currency defaults. */
+  fractionDigits: number;
 }
 
 /**
@@ -78,6 +80,7 @@ export interface TimeReportGroup extends TimeReportCostTotals {
     currency: string | null;
     /** null when the entry is billable but has no rate. */
     cost: number | null;
+    costFractionDigits: number | null;
   }>;
 }
 

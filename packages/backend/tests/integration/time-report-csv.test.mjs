@@ -166,7 +166,7 @@ test("filters, grouping and the admin-only boundary are unchanged", async () => 
   }
 });
 
-test("an overflowing cost exports as an empty cell instead of failing the download", async () => {
+test("an unrepresentable cost refuses export without changing its stored rate or hours", async () => {
   const suffix = crypto.randomUUID().slice(0, 12);
   users.HUGE = await app.prisma.user.create({ data: { email: `time-csv-huge-${suffix}@example.test`, displayName: "Huge", emailVerified: true } });
   tokens.HUGE = signAccessToken({ sub: users.HUGE.id, email: users.HUGE.email });
@@ -182,7 +182,10 @@ test("an overflowing cost exports as an empty cell instead of failing the downlo
   const entry = await req("HUGE", "POST", `/api/workspaces/${workspace.id}/time/entries`, { date: "2026-05-01", hours: 24, billable: true });
   assert.equal(entry.statusCode, 201, entry.body);
   const response = await req("ADMIN", "GET", `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-05-01&endDate=2026-05-31`);
-  assert.equal(response.statusCode, 200, response.body);
-  const [, row] = values(parseCsv(response.body.slice(BOM.length)));
-  assert.deepEqual(row, ["2026-05-01", "Huge", "", "", "24.00", "Yes", "1e+308", "USD", "", ""]);
+  assert.equal(response.statusCode, 400, response.body);
+  assert.equal(response.json().message, "Report cost exceeds the supported monetary precision");
+  const storedRate = await app.prisma.userRate.findFirst({ where: { workspaceId: workspace.id, userId: users.HUGE.id } });
+  const storedEntry = await app.prisma.timeEntry.findFirst({ where: { workspaceId: workspace.id, userId: users.HUGE.id } });
+  assert.equal(storedRate.rate, 1e308);
+  assert.equal(storedEntry.hours, 24);
 });

@@ -2,8 +2,10 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import type { TimeReportQuery } from "@pm/shared";
 import * as userRatesService from "./user-rates.service.js";
 import { timeEntryProjectWhere } from "./time-entries.service.js";
+import { currencyFractionDigits, reportMoneyDecimal, reportMoneyNumber, roundedCostUnits } from "./report-money.js";
 import {
   csvDecimal,
+  csvExactDecimal,
   csvIsoDate,
   encodeCsv,
   type CsvCell,
@@ -12,6 +14,7 @@ import {
 export interface CurrencyAmount {
   currency: string;
   amount: number;
+  fractionDigits: number;
 }
 
 /**
@@ -42,8 +45,10 @@ interface ReportEntry {
   /** Rate in effect on the entry's own date, or null when the member had none. */
   rate: number | null;
   currency: string | null;
-  /** hours x rate for billable entries, 0 for non-billable ones, null when billable but unrated. */
+  /** Currency-rounded hours x rate, 0 when non-billable, null when billable but unrated. */
   cost: number | null;
+  /** Server precision used for cost; null when no currency applies. */
+  costFractionDigits: number | null;
 }
 
 interface ReportGroup extends CostTotals {
@@ -56,24 +61,29 @@ interface ReportGroup extends CostTotals {
 }
 
 class CostAccumulator {
-  private readonly amounts = new Map<string, number>();
+  private readonly amounts = new Map<string, { units: bigint; fractionDigits: number }>();
   private unratedBillableHours = 0;
 
-  add(entry: ReportEntry) {
+  add(entry: ReportEntry, units: bigint | null) {
     if (!entry.billable) return;
-    if (entry.cost === null || entry.currency === null) {
+    if (units === null || entry.currency === null || entry.costFractionDigits === null) {
       this.unratedBillableHours += entry.hours;
       return;
     }
-    this.amounts.set(
-      entry.currency,
-      (this.amounts.get(entry.currency) ?? 0) + entry.cost,
-    );
+    const previous = this.amounts.get(entry.currency);
+    this.amounts.set(entry.currency, {
+      units: (previous?.units ?? 0n) + units,
+      fractionDigits: entry.costFractionDigits,
+    });
   }
 
   totals(): CostTotals {
     const costByCurrency = [...this.amounts]
-      .map(([currency, amount]) => ({ currency, amount }))
+      .map(([currency, { units, fractionDigits }]) => ({
+        currency,
+        amount: reportMoneyNumber(units, fractionDigits),
+        fractionDigits,
+      }))
       .sort((a, b) =>
         a.currency < b.currency ? -1 : a.currency > b.currency ? 1 : 0,
       );
@@ -156,6 +166,7 @@ export async function generateReport(
     { group: Omit<ReportGroup, keyof CostTotals>; costs: CostAccumulator }
   >();
   const summaryCosts = new CostAccumulator();
+  const precisions = new Map<string, number>();
   const summary = { totalHours: 0, billableHours: 0, nonBillableHours: 0 };
 
   for (const entry of entries) {
@@ -202,6 +213,16 @@ export async function generateReport(
       inEffect && inEffect.rate !== null
         ? { rate: inEffect.rate, currency: inEffect.currency }
         : null;
+    // Legacy lower-case codes retain one bucket; resolve its precision once.
+    const currency = applied?.currency.toUpperCase() ?? null;
+    let costFractionDigits: number | null = null;
+    if (currency !== null) {
+      costFractionDigits = precisions.get(currency) ?? currencyFractionDigits(currency);
+      precisions.set(currency, costFractionDigits);
+    }
+    const units = entry.billable && applied && costFractionDigits !== null
+      ? roundedCostUnits(entry.hours, applied.rate, costFractionDigits)
+      : null;
     const reportEntry: ReportEntry = {
       id: entry.id,
       date: entry.date,
@@ -212,9 +233,9 @@ export async function generateReport(
       projectName: entry.project?.name ?? null,
       taskTitle: entry.task?.title ?? null,
       rate: applied?.rate ?? null,
-      // Legacy rows may store a lower-case code; one currency is one bucket.
-      currency: applied?.currency.toUpperCase() ?? null,
-      cost: !entry.billable ? 0 : applied ? entry.hours * applied.rate : null,
+      currency,
+      cost: !entry.billable ? 0 : units !== null ? reportMoneyNumber(units, costFractionDigits!) : null,
+      costFractionDigits,
     };
 
     for (const totals of [group, summary]) {
@@ -225,8 +246,8 @@ export async function generateReport(
         totals.nonBillableHours += entry.hours;
       }
     }
-    costs.add(reportEntry);
-    summaryCosts.add(reportEntry);
+    costs.add(reportEntry, units);
+    summaryCosts.add(reportEntry, units);
     group.entries.push(reportEntry);
   }
 
@@ -274,7 +295,7 @@ export async function exportReportCSV(
       entry.billable ? "Yes" : "No",
       entry.rate === null ? null : csvDecimal(entry.rate),
       entry.currency,
-      entry.cost === null ? null : csvDecimal(entry.cost),
+      entry.cost === null ? null : csvExactDecimal(reportMoneyDecimal(entry.cost, entry.costFractionDigits ?? 2)),
       entry.description,
     ]),
   );

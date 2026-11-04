@@ -135,7 +135,7 @@ async function storedHash(id) {
     .passwordHash;
 }
 
-test("accounts whose hashes were written by bcrypt 5.1.1 still sign in", async () => {
+test("bounded legacy hashes sign in; long legacy candidates need reset", async () => {
   for (const name of [
     "account password at the application cost (12)",
     "$2a$ prefix at cost 12",
@@ -146,13 +146,14 @@ test("accounts whose hashes were written by bcrypt 5.1.1 still sign in", async (
     const { password, hash } = fixture(name);
     const user = await makeUser(hash);
     await assertRejected(user.email, wrong(password));
-    await assertSignsIn(user.email, password);
+    if (Buffer.byteLength(password, "utf8") <= 72) await assertSignsIn(user.email, password);
+    else await assertRejected(user.email, password);
     // Signing in never rewrites the stored hash.
     assert.equal(await storedHash(user.id), hash, name);
   }
 });
 
-test("changing a password verifies the old hash and stores a $2b$12$ hash", async () => {
+test("changing a password verifies the old hash and stores an Argon2id hash", async () => {
   const old = fixture("$2a$ prefix at cost 12");
   const user = await makeUser(old.hash);
   const path = `/api/users/${user.id}/password`;
@@ -168,7 +169,7 @@ test("changing a password verifies the old hash and stores a $2b$12$ hash", asyn
     payload: { currentPassword: old.password, newPassword },
   });
   assert.equal(changed.statusCode, 200, changed.body);
-  assert.match(await storedHash(user.id), /^\$2b\$12\$[./A-Za-z0-9]{53}$/);
+  assert.match(await storedHash(user.id), /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/);
   await assertSignsIn(user.email, newPassword);
   await assertRejected(user.email, old.password);
 });
@@ -188,12 +189,12 @@ test("resetting a password replaces a bcrypt 5.1.1 hash", async () => {
     payload: { password: newPassword },
   });
   assert.equal(reset.statusCode, 200, reset.body);
-  assert.match(await storedHash(user.id), /^\$2b\$12\$[./A-Za-z0-9]{53}$/);
+  assert.match(await storedHash(user.id), /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/);
   await assertSignsIn(user.email, newPassword);
   await assertRejected(user.email, old.password);
 });
 
-test("registration stores a $2b$12$ hash that signs in", async () => {
+test("registration stores an Argon2id hash that signs in", async () => {
   const email = `registered-${++counter}@${domain}`;
   const password = "Werkyn-registered-password-1";
   const registered = await inject("POST", "/api/auth/register", {
@@ -202,7 +203,7 @@ test("registration stores a $2b$12$ hash that signs in", async () => {
   assert.equal(registered.statusCode, 201, registered.body);
   const user = await app.prisma.user.findUniqueOrThrow({ where: { email } });
   assert.equal(user.isInstanceAdmin, false);
-  assert.match(user.passwordHash, /^\$2b\$12\$[./A-Za-z0-9]{53}$/);
+  assert.match(user.passwordHash, /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/);
   await assertSignsIn(email, password);
   await assertRejected(email, wrong(password));
 });

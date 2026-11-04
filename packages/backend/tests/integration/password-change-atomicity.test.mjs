@@ -231,8 +231,7 @@ async function lockWaiterCount() {
   return row.total;
 }
 
-async function waitForLockWaiters(expected) {
-  const deadline = performance.now() + 5000;
+async function waitForLockWaiters(expected, deadline = performance.now() + 5000) {
   let observed = 0;
   while (performance.now() < deadline) {
     observed = await lockWaiterCount();
@@ -558,10 +557,14 @@ test("concurrent changes from one current password: exactly one succeeds and the
     candidatePassword(`change-${i}`),
   );
   const responses = await withControlLock(userRowLock(user), async (start) => {
-    for (const candidate of candidates)
-      start(() => changePassword(user, session.access, password, candidate));
+    const deadline = performance.now() + 5000;
+    for (let i = 0; i < candidates.length; i++) {
+      start(() => changePassword(user, session.access, password, candidates[i]));
+      // The preceding native jobs settled before this request reached SQL;
+      // keep all four real lock waiters, under one original arrival budget.
+      await waitForLockWaiters(i + 1, deadline);
+    }
     // Every request has verified the old password before any can write.
-    await waitForLockWaiters(CONCURRENT);
   });
 
   const statuses = responses.map((r) => r.statusCode);
@@ -846,7 +849,7 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
     const allowed = {
       change: [200, 400, 503],
       reset: [200, 404, 410, 503],
-      login: [200, 401, 423],
+      login: [200, 401, 423, 503],
       refresh: [200, 401, 409],
     };
     for (const outcome of outcomes) {
@@ -861,13 +864,18 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
         );
       if (outcome.kind === "change" && outcome.status === 400)
         assert.deepEqual(JSON.parse(outcome.body), INCORRECT);
-      if (outcome.status === 503)
-        assert.equal(
-          JSON.parse(outcome.body).message,
-          outcome.kind === "change"
+      if (outcome.status === 503) {
+        const body = JSON.parse(outcome.body);
+        if (body.message === "Password checks are temporarily unavailable. Try again.") {
+          assert(["change", "reset", "login"].includes(outcome.kind));
+          assert.deepEqual(body, { statusCode: 503, error: "Service Unavailable", message: "Password checks are temporarily unavailable. Try again." });
+        } else {
+          assert(["change", "reset"].includes(outcome.kind));
+          assert.equal(body.message, outcome.kind === "change"
             ? "This account is busy. Try again in a moment."
-            : "This link is busy. Try again in a moment.",
-        );
+            : "This link is busy. Try again in a moment.");
+        }
+      }
     }
     const mix = {};
     for (const { kind, status } of outcomes)

@@ -33,7 +33,7 @@ test("the recorded fixtures cover the stored hash shapes", () => {
 });
 
 for (const fixture of recorded.fixtures) {
-  test(`bcrypt 5.1.1 hash still verifies identically: ${fixture.name}`, async () => {
+  test(`raw bcrypt5 fixture and bounded application legacy handling: ${fixture.name}`, async () => {
     assert(
       fixture.hash.startsWith(
         `${fixture.prefix}${String(fixture.rounds).padStart(2, "0")}$`,
@@ -46,34 +46,28 @@ for (const fixture of recorded.fixtures) {
       fixture.rehashWithStoredSalt,
     );
     assert.equal(fixture.rehashWithStoredSalt, fixture.hash);
-    const results = await Promise.all(
-      fixture.compare.map(async ({ label, candidate }) => ({
-        label,
-        candidate,
-        matches: await verifyPassword(candidate, fixture.hash),
-      })),
-    );
-    assert.deepEqual(results, fixture.compare);
+    // Application legacy verification deliberately refuses candidates over72
+    // bytes. Keep recorded raw-library outcomes immutable and test them below.
+    const results = [];
+    for (const { label, candidate } of fixture.compare) {
+      results.push({ label, candidate, matches: await verifyPassword(candidate, fixture.hash) });
+    }
+    assert.deepEqual(results, fixture.compare.map((row) => ({
+      ...row, matches: Buffer.byteLength(row.candidate, "utf8") <= 72 && row.matches,
+    })));
     assert.equal(
       await bcrypt.compare(fixture.password, fixture.hash),
       true,
-      "share-link validation calls bcrypt.compare directly",
+      "raw bcrypt library compatibility remains distinct from bounded application policy",
     );
   });
 }
 
-test("new hashes keep the $2b$ format and the account and share costs", async () => {
-  const account = await hashPassword("Werkyn-new-account-password");
-  assert.match(account, /^\$2b\$12\$[./A-Za-z0-9]{53}$/);
-  assert.equal(
-    await verifyPassword("Werkyn-new-account-password", account),
-    true,
-  );
-  assert.equal(
-    await verifyPassword("Werkyn-new-account-passwore", account),
-    false,
-  );
-  const share = await bcrypt.hash("Werkyn-new-share-password", 10);
-  assert.match(share, /^\$2b\$10\$[./A-Za-z0-9]{53}$/);
-  assert.equal(await bcrypt.compare("Werkyn-new-share-password", share), true);
+test("new account and share helpers use explicit Argon2id parameters", async () => {
+  for (const password of ["Werkyn-new-account-password", "Werkyn-new-share-password"]) {
+    const hash = await hashPassword(password);
+    assert.match(hash, /^\$argon2id\$v=19\$m=19456,t=2,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/);
+    assert.equal(await verifyPassword(password, hash), true);
+    assert.equal(await verifyPassword(password + "!", hash), false);
+  }
 });

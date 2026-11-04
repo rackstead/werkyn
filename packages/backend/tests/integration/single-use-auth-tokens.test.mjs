@@ -235,8 +235,7 @@ async function lockWaiterCount() {
   return row.total;
 }
 
-async function waitForLockWaiters(expected) {
-  const deadline = performance.now() + 5000;
+async function waitForLockWaiters(expected, deadline = performance.now() + 5000) {
   let observed = 0;
   while (performance.now() < deadline) {
     observed = await lockWaiterCount();
@@ -399,9 +398,13 @@ test("concurrent resets with one token: exactly one succeeds, its password stays
   const responses = await withControlLock(
     resetTokenRowLock(token),
     async (start) => {
-      for (const candidate of candidates) start(() => reset(token, candidate));
-      // Every request has read the token as unused before any can use it.
-      await waitForLockWaiters(CONCURRENT);
+      const deadline = performance.now() + 5000;
+      for (let i = 0; i < candidates.length; i++) {
+        start(() => reset(token, candidates[i]));
+        await waitForLockWaiters(i + 1, deadline);
+      }
+      // All four requests read the unused token and now wait in PostgreSQL;
+      // admission/hash work settled under one original arrival budget.
     },
   );
 
@@ -485,13 +488,20 @@ test("an unsynchronized burst of resets with one token lets exactly one through"
       candidates.map((candidate) => reset(token, candidate)),
     );
     const statuses = responses.map((r) => r.statusCode);
-    assert.deepEqual(
-      [...statuses].sort(),
-      [200, 410, 410, 410, 410, 410],
-      describe(...responses),
-    );
+    assert.equal(statuses.filter((status) => status === 200).length, 1, describe(...responses));
+    for (const response of responses.filter((response) => response.statusCode !== 200)) {
+      if (response.statusCode === 503)
+        assert.deepEqual(response.json(), { statusCode: 503, error: "Service Unavailable", message: "Password checks are temporarily unavailable. Try again." });
+      else {
+        assert.equal(response.statusCode, 410, describe(response));
+        assert.match(response.json().message, /already been used/i);
+      }
+    }
     const winner = candidates[statuses.indexOf(200)];
-    assert(await verifyPassword(winner, await storedPasswordHash(user)));
+    const stored = await storedPasswordHash(user);
+    assert(await verifyPassword(winner, stored));
+    for (const other of candidates.filter((candidate) => candidate !== winner))
+      assert.equal(await verifyPassword(other, stored), false);
   }
 });
 
@@ -659,13 +669,20 @@ test("concurrent resets with different tokens of one account: exactly one succee
       tokens.map((token, i) => reset(token, candidates[i])),
     );
     const statuses = responses.map((r) => r.statusCode);
-    assert.deepEqual(
-      [...statuses].sort(),
-      [200, ...Array(CONCURRENT - 1).fill(404)],
-      describe(...responses),
-    );
+    assert.equal(statuses.filter((status) => status === 200).length, 1, describe(...responses));
+    for (const response of responses.filter((response) => response.statusCode !== 200)) {
+      if (response.statusCode === 503)
+        assert.deepEqual(response.json(), { statusCode: 503, error: "Service Unavailable", message: "Password checks are temporarily unavailable. Try again." });
+      else {
+        assert.equal(response.statusCode, 404, describe(response));
+        assert.match(response.json().message, /invalid reset token/i);
+      }
+    }
     const winner = candidates[statuses.indexOf(200)];
-    assert(await verifyPassword(winner, await storedPasswordHash(user)));
+    const stored = await storedPasswordHash(user);
+    assert(await verifyPassword(winner, stored));
+    for (const other of candidates.filter((candidate) => candidate !== winner))
+      assert.equal(await verifyPassword(other, stored), false);
     assert.equal(
       await control.passwordResetToken.count({
         where: { userId: user.id, usedAt: null },

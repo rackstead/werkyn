@@ -357,7 +357,7 @@ test("a writer terminated after its output acknowledgement cannot return success
   try {
     // Actual bytes and acknowledgement flow unchanged; terminate the actual
     // owned child when normal finalization requests its graceful disconnect.
-    writeFileSync(observer, `import{createRequire,syncBuiltinESMExports}from'node:module';import{writeFileSync}from'node:fs';const cp=createRequire(import.meta.url)('node:child_process');const original=cp.spawn;cp.spawn=function(...args){const c=Reflect.apply(original,this,args);if(args[0]===process.execPath&&args[2]?.stdio?.[3]==='ipc'){c.disconnect=function(){writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:c.pid,signal:'SIGTERM'}));return c.kill('SIGTERM');};}return c;};syncBuiltinESMExports();`);
+    writeFileSync(observer, `import{createRequire,syncBuiltinESMExports}from'node:module';import{writeFileSync}from'node:fs';const cp=createRequire(import.meta.url)('node:child_process');const original=cp.spawn;cp.spawn=function(...args){const c=Reflect.apply(original,this,args);if(args[0]===process.execPath&&args[2]?.stdio?.[3]==='ipc'){const disconnect=c.disconnect;const observation={pid:c.pid,signal:'SIGTERM'};c.once('exit',(code,signal)=>{observation.actualExit={code,signal};writeFileSync(${JSON.stringify(marker)},JSON.stringify(observation));});c.disconnect=function(...rest){writeFileSync(${JSON.stringify(marker)},JSON.stringify(observation));c.kill('SIGTERM');return Reflect.apply(disconnect,this,rest);};}return c;};syncBuiltinESMExports();`);
     const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
     let outcome;
     try {
@@ -371,6 +371,7 @@ test("a writer terminated after its output acknowledgement cannot return success
     if (process.env.DELIVERY_REPORT_CHILD_STATUS_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CHILD_STATUS_FACTS, JSON.stringify(facts, null, 2) + "\n");
     assert.equal(facts.completeReport, true); assert.equal(facts.rows, 0);
     assert.equal(termination.signal, "SIGTERM"); assert.equal(typeof termination.pid, "number");
+    assert.deepEqual(termination.actualExit, { code: null, signal: "SIGTERM" });
     assert.equal(outcome.signal, null); assert.equal(outcome.stderr, "");
     assert.equal(outcome.code, 1, "An abnormal output-child close must not leave a successful CLI status");
   } finally { await rm(directory, { recursive: true, force: true }); }

@@ -179,8 +179,8 @@ it("a non-editor late ACK cannot recreate cache after retirement, GC and remount
   const screen = await open(), response = deferred<any>();
   patchOverride = (pageId) => pageId === id ? response.promise : undefined;
   let revision: number | undefined;
-  const operation = writeAlongsideAutosave(wikiAutosaveKey("author", id), async () => {
-    const result = await outside.mutateAsync({ pageId: id, title: "outside rename" });
+  const operation = writeAlongsideAutosave(wikiAutosaveKey("author", id), async (expectedRevision) => {
+    const result = await outside.mutateAsync({ pageId: id, title: "outside rename", expectedRevision: expectedRevision! });
     revision = result.data.revision; return revision;
   });
   await tick(); pages.delete(id); send(id); await tick();

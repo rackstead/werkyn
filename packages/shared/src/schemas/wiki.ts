@@ -50,14 +50,16 @@ export const CreateWikiPageSchema = z.object({
 });
 export type CreateWikiPageInput = z.infer<typeof CreateWikiPageSchema>;
 
+export const WikiPageRevisionSchema = z.number().int().min(0).max(INT32_MAX);
+
 export const UpdateWikiPageSchema = z.object({
   title: singleLineText().min(1).max(500).optional(),
   content: WikiPageContentSchema.optional(),
   icon: z.string().nullable().optional(),
   // The page `revision` this edit is based on. When it is not the stored
-  // revision the save is refused with 409 REVISION_CONFLICT. Omitted, the
-  // save applies to whatever is stored (last writer wins).
-  expectedRevision: z.number().int().min(0).max(INT32_MAX).optional(),
+  // revision the save is refused with 409 REVISION_CONFLICT. Required for
+  // every edit, including title and icon changes.
+  expectedRevision: WikiPageRevisionSchema,
 });
 export type UpdateWikiPageInput = z.infer<typeof UpdateWikiPageSchema>;
 

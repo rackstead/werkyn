@@ -75,13 +75,12 @@ function TaskDescriptionEditor({
       if (useAuthStore.getState().user?.id !== userId) {
         throw new Error("Sign in as the author to save these changes");
       }
+      if (expectedDescriptionRevision === undefined) throw new Error("Reload this task before saving: its description revision is unavailable");
       // The server refuses (409) a description based on an older revision
       // instead of replacing the newer one.
       const result = await updateTask({
         description: savableDescription(patch.description),
-        ...(expectedDescriptionRevision === undefined
-          ? {}
-          : { expectedDescriptionRevision }),
+        expectedDescriptionRevision,
         id: taskId,
         expectedUserId: userId,
       });
@@ -101,6 +100,7 @@ function TaskDescriptionEditor({
       isConflict: isEditConflict,
     },
   );
+  const revisionAvailable = descriptionRevision !== undefined;
   const appliedSource = useRef(description);
   const wasDirty = useRef(autosave.hasUnsavedChanges);
 
@@ -114,7 +114,7 @@ function TaskDescriptionEditor({
         ? autosave.draft.description
         : description) ?? "",
     ),
-    editable: canEdit,
+    editable: canEdit && revisionAvailable,
     editorProps: {
       transformPastedHTML: pastedHtml,
       transformPastedText: pastedText,
@@ -136,9 +136,9 @@ function TaskDescriptionEditor({
   const conflicted = autosave.conflict !== null;
   useEffect(() => {
     if (editor) {
-      editor.setEditable(canEdit && !conflicted, false);
+      editor.setEditable(canEdit && revisionAvailable && !conflicted, false);
     }
-  }, [editor, canEdit, conflicted]);
+  }, [editor, canEdit, revisionAvailable, conflicted]);
 
   useEffect(() => {
     if (!editor) return;

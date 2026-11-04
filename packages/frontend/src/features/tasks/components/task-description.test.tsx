@@ -71,6 +71,7 @@ beforeEach(() => {
           id: path.split("/").pop(),
           projectId: "project",
           ...options.json,
+          descriptionRevision: Number(options.json.expectedDescriptionRevision) + 1,
         },
       }),
     }),
@@ -88,7 +89,7 @@ it("real Tiptap editor remounts for another task and flushes pending text to the
   const a = `task-a-${++suffix}`,
     b = `task-b-${suffix}`;
   const screen = render(
-    <TaskDescription taskId={a} description="<p>Original A</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={a} description="<p>Original A</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -97,14 +98,14 @@ it("real Tiptap editor remounts for another task and flushes pending text to the
     original.commands.setContent("<p>Unsaved A</p>");
   });
   screen.rerender(
-    <TaskDescription taskId={b} description="<p>Original B</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={b} description="<p>Original B</p>" canEdit />,
   );
   await tick(10);
   expect(currentEditor()).not.toBe(original);
   expect(currentEditor().getHTML()).toBe("<p>Original B</p>");
   expect(http.patch).toHaveBeenCalledTimes(1);
   expect(http.patch).toHaveBeenCalledWith(`tasks/${a}`, {
-    json: { description: "<p>Unsaved A</p>" },
+    json: { description: "<p>Unsaved A</p>", expectedDescriptionRevision: 0 },
     context: { expectedUserId: "task-editor-user" },
   });
 });
@@ -112,12 +113,12 @@ it("real Tiptap editor remounts for another task and flushes pending text to the
 it("real Tiptap syncs idle remote updates without an update loop and protects dirty local text", async () => {
   const id = `task-sync-${++suffix}`;
   const screen = render(
-    <TaskDescription taskId={id} description="<p>Initial</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Initial</p>" canEdit />,
     { wrapper },
   );
   await tick();
   screen.rerender(
-    <TaskDescription taskId={id} description="<p>Remote update</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Remote update</p>" canEdit />,
   );
   await tick();
   expect(currentEditor().getHTML()).toBe("<p>Remote update</p>");
@@ -126,7 +127,7 @@ it("real Tiptap syncs idle remote updates without an update loop and protects di
     currentEditor().commands.setContent("<p>Local draft</p>");
   });
   screen.rerender(
-    <TaskDescription
+    <TaskDescription descriptionRevision={0}
       taskId={id}
       description="<p>Another remote update</p>"
       canEdit
@@ -136,7 +137,7 @@ it("real Tiptap syncs idle remote updates without an update loop and protects di
   expect(currentEditor().getHTML()).toBe("<p>Local draft</p>");
   await tick(801);
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
-    json: { description: "<p>Local draft</p>" },
+    json: { description: "<p>Local draft</p>", expectedDescriptionRevision: 0 },
     context: { expectedUserId: "task-editor-user" },
   });
   expect(currentEditor().getHTML()).toBe("<p>Local draft</p>");
@@ -145,7 +146,7 @@ it("real Tiptap syncs idle remote updates without an update loop and protects di
 it("a refetch of the just-saved description keeps the caret in place", async () => {
   const id = `task-caret-${++suffix}`;
   const screen = render(
-    <TaskDescription taskId={id} description="<p>Hello</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Hello</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -158,7 +159,7 @@ it("a refetch of the just-saved description keeps the caret in place", async () 
   expect(http.patch).toHaveBeenCalledTimes(1);
   // The detail GET invalidated by the save returns the text that was saved.
   screen.rerender(
-    <TaskDescription
+    <TaskDescription descriptionRevision={0}
       taskId={id}
       description="<p>Hello world again</p>"
       canEdit
@@ -174,7 +175,7 @@ it("a refetch of the just-saved description keeps the caret in place", async () 
 it("does not persist a prior identity's pending task description under a new identity", async () => {
   const id = `task-identity-${++suffix}`;
   const screen = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -207,7 +208,7 @@ it("does not persist a prior identity's pending task description under a new ide
   await tick();
   expect(currentEditor().getHTML()).toBe("<p>Alice draft</p>");
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
-    json: { description: "<p>Alice draft</p>" },
+    json: { description: "<p>Alice draft</p>", expectedDescriptionRevision: 0 },
     context: { expectedUserId: "task-editor-user" },
   });
 });
@@ -220,7 +221,7 @@ it("a failing autosave shows only its retry notice, not a generic error per atte
     },
   }));
   const screen = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -251,7 +252,7 @@ it("R1c: a failed description draft is offered on reopen, not shown or replayed 
       : patch(path, options),
   );
   const first = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -265,7 +266,7 @@ it("R1c: a failed description draft is offered on reopen, not shown or replayed 
   offline = false;
   // Someone else has since saved a newer description.
   const reopened = render(
-    <TaskDescription taskId={id} description="<p>Bob newer</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Bob newer</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -292,7 +293,7 @@ it("a failed description is only resent when the user retries it", async () => {
       : patch(path, options),
   );
   const screen = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -321,7 +322,7 @@ it("idle sync shows a newer description while a set-aside draft stays offered an
       : patch(path, options),
   );
   const first = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
@@ -332,12 +333,12 @@ it("idle sync shows a newer description while a set-aside draft stays offered an
   await tick();
   offline = false;
   const reopened = render(
-    <TaskDescription taskId={id} description="<p>Server</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Server</p>" canEdit />,
     { wrapper },
   );
   await tick();
   reopened.rerender(
-    <TaskDescription taskId={id} description="<p>Newer</p>" canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Newer</p>" canEdit />,
   );
   await tick(801);
   expect(currentEditor().getHTML()).toBe("<p>Newer</p>");
@@ -359,7 +360,7 @@ const LEGACY_DESCRIPTION =
 
 it("a reader's view of a legacy description shows its text but none of its active markup", async () => {
   const screen = render(
-    <TaskDescription
+    <TaskDescription descriptionRevision={0}
       taskId={`task-legacy-${++suffix}`}
       description={LEGACY_DESCRIPTION}
       canEdit={false}
@@ -381,7 +382,7 @@ it("a reader's view of a legacy description shows its text but none of its activ
 it("an editor opened on a legacy description loads only its text and formatting", async () => {
   const id = `task-legacy-edit-${++suffix}`;
   const screen = render(
-    <TaskDescription taskId={id} description={LEGACY_DESCRIPTION} canEdit />,
+    <TaskDescription descriptionRevision={0} taskId={id} description={LEGACY_DESCRIPTION} canEdit />,
     { wrapper },
   );
   await tick();
@@ -424,7 +425,7 @@ function captureClipboardDocuments() {
 
 it("pasted style sheets never reach the document prosemirror-view inlines styles from", async () => {
   const id = `task-paste-style-${++suffix}`;
-  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+  render(<TaskDescription descriptionRevision={0} taskId={id} description="<p></p>" canEdit />, {
     wrapper,
   });
   await tick();
@@ -446,14 +447,14 @@ it("pasted style sheets never reach the document prosemirror-view inlines styles
   }
   await tick(801);
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
-    json: { description: "<p>Pasted text</p>" },
+    json: { description: "<p>Pasted text</p>", expectedDescriptionRevision: 0 },
     context: { expectedUserId: "task-editor-user" },
   });
 });
 
 it("a paste with style- and link- custom elements keeps their text, not their tags", async () => {
   const id = `task-paste-custom-${++suffix}`;
-  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+  render(<TaskDescription descriptionRevision={0} taskId={id} description="<p></p>" canEdit />, {
     wrapper,
   });
   await tick();
@@ -468,6 +469,7 @@ it("a paste with style- and link- custom elements keeps their text, not their ta
   await tick(801);
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
     json: {
+      expectedDescriptionRevision: 0,
       description:
         "<p>See the docs and a chip, plus <code>&lt;style&gt;x&lt;/style&gt;</code> here</p>",
     },
@@ -477,7 +479,7 @@ it("a paste with style- and link- custom elements keeps their text, not their ta
 
 it("an ordinary rich-text paste is stored as before", async () => {
   const id = `task-paste-plain-${++suffix}`;
-  render(<TaskDescription taskId={id} description="<p></p>" canEdit />, {
+  render(<TaskDescription descriptionRevision={0} taskId={id} description="<p></p>" canEdit />, {
     wrapper,
   });
   await tick();
@@ -495,6 +497,7 @@ it("an ordinary rich-text paste is stored as before", async () => {
   await tick(801);
   expect(http.patch).toHaveBeenCalledWith(`tasks/${id}`, {
     json: {
+      expectedDescriptionRevision: 0,
       description:
         "<h2>Heading</h2>" +
         '<p><strong>Bold</strong>, <em>italic</em>, <s>struck</s> and <a target="_blank" rel="noopener noreferrer nofollow" href="https://example.com/a?b=1&amp;c=2">a link</a></p>' +
@@ -512,12 +515,12 @@ function sentDescriptions() {
   );
 }
 function serverAccepts(description: string) {
-  return UpdateTaskSchema.safeParse({ description }).success;
+  return UpdateTaskSchema.safeParse({ description, expectedDescriptionRevision: 0 }).success;
 }
 
 it("real Tiptap: a plain-text paste with Word and PDF breaks saves a description the server accepts", async () => {
   const id = `task-paste-${++suffix}`;
-  render(<TaskDescription taskId={id} description="" canEdit />, { wrapper });
+  render(<TaskDescription descriptionRevision={0} taskId={id} description="" canEdit />, { wrapper });
   await tick();
   act(() => {
     // Ctrl+Shift+V of Word text with a manual line break (VT) and a page break (FF).
@@ -540,7 +543,7 @@ it("real Tiptap: a legacy description with control characters saves after the ne
   const id = `task-legacy-${++suffix}`;
   const legacy = "<p>legacy\u000bvt esc\u001b[0m end</p>";
   expect(serverAccepts(legacy)).toBe(false);
-  const screen = render(<TaskDescription taskId={id} description={legacy} canEdit />, {
+  const screen = render(<TaskDescription descriptionRevision={0} taskId={id} description={legacy} canEdit />, {
     wrapper,
   });
   await tick();

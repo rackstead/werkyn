@@ -20,9 +20,11 @@ makes a pending description edit conflict. Both start at 0 for existing rows
 `PATCH /api/tasks/:tid` accepts `expectedDescriptionRevision` (with
 `description`). A value other than the stored revision is refused with 409,
 `code: "REVISION_CONFLICT"` and `current: { revision, updatedAt }`, and nothing
-is written (for tasks, not even the activity entry). Omitting the field keeps
-the previous last-writer-wins behaviour, so existing API clients keep working;
-the README documents both for API key users.
+is written (for tasks, not even the activity entry). Wiki edits require a valid
+revision for title, content and icon writes. Description edits require a valid
+revision even when clearing to null or an empty string; task metadata-only
+updates remain independent. Missing or invalid required revisions return 400.
+Direct service callers obey the same contract.
 
 ## Locks and atomicity
 
@@ -68,9 +70,22 @@ document arrives it shows an older one, and an edit made there would be
 refused again and replace the set-aside draft. Restoring the
 draft is an explicit replacement of the version then shown; discarding drops it.
 A rename or icon change from the page tree first stores the open editor's
-pending edits, and the editor's next save builds on its revision when nothing
+pending edits and uses that own acknowledged base (or the displayed tree
+revision without an editor), never an automatically fetched latest revision.
+The editor's next save builds on its revision when nothing
 else was written in between, so the user's own change is not reported as a
 conflict.
+
+A rename keeps the revision shown when its input opened, even if a remote
+update rerenders the tree. Only a contiguous sequence of acknowledged local
+writes may advance that captured base; a refetch cannot silently rebase it.
+Outside writes serialize per author/page and resolve the current editor queue
+when each operation starts. Failed writes do not advance the local ACK chain.
+Successful ACKs update existing matching-base tree/detail cache entries, without
+downgrading a newer entry or assigning a revision to unrelated stale metadata.
+A task description remains read-only until its first revision is available;
+existing unsaved drafts are not discarded or silently based on a new revision.
+
 
 ### A page removed in another session
 
@@ -106,8 +121,8 @@ task descriptions. In each case exactly one write is stored and the others get
 
 ## Remaining
 
-- Restoring a version does not take an expected revision; it always keeps the
-  replaced content as a version.
+- Historical restores already require the reviewed current revision and always
+  keep replaced content as a version; see `wiki-history-restore.md`.
 - A save whose response is lost after the server stored it is retried with the
   old revision and reported as a conflict; the stored page then shows the
   user's own text.

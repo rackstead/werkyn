@@ -25,6 +25,8 @@ export const CreateTaskSchema = z.object({
 });
 export type CreateTaskInput = z.infer<typeof CreateTaskSchema>;
 
+export const TaskDescriptionRevisionSchema = z.number().int().min(0).max(INT32_MAX);
+
 export const UpdateTaskSchema = z.object({
   title: singleLineText().min(1).max(255).optional(),
   description: multilineText().nullable().optional(),
@@ -35,9 +37,13 @@ export const UpdateTaskSchema = z.object({
   reminder: ReminderEnum.nullable().optional(),
   // The `descriptionRevision` a new description is based on. When it is not
   // the stored revision the update is refused with 409 REVISION_CONFLICT.
-  // Ignored without `description`; omitted, the description is replaced
-  // whatever is stored (last writer wins).
-  expectedDescriptionRevision: z.number().int().min(0).max(INT32_MAX).optional(),
+  // Required whenever `description` is supplied, including a null clear.
+  // Metadata-only changes do not require a description revision.
+  expectedDescriptionRevision: TaskDescriptionRevisionSchema.optional(),
+}).superRefine((data, ctx) => {
+  if (data.description !== undefined && data.expectedDescriptionRevision === undefined) {
+    ctx.addIssue({ code: "custom", path: ["expectedDescriptionRevision"], message: "Description revision is required" });
+  }
 });
 export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
 

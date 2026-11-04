@@ -40,6 +40,7 @@ export interface WikiSpace {
 
 export interface WikiPageTreeItem {
   id: string;
+  revision: number;
   spaceId: string;
   parentId: string | null;
   title: string;
@@ -358,6 +359,28 @@ export function useCreateWikiPage(sid: string) {
   });
 }
 
+/** A local ACK may advance only a tree row still based on that same revision. */
+function acknowledgeWikiTree(qc: ReturnType<typeof useQueryClient>, page: WikiPage, expectedRevision: number) {
+  if (page.revision !== expectedRevision + 1) return;
+  qc.setQueriesData<{ data: WikiPageTreeItem[] }>({
+    queryKey: ["wiki-pages"],
+    predicate: (query) => {
+      const scope = query.queryKey[1];
+      return typeof scope === "object" && scope !== null && (scope as { tree?: unknown }).tree === true;
+    },
+  }, (existing) => {
+    if (!Array.isArray(existing?.data)) return existing;
+    let changed = false;
+    const data = existing.data.map((row) => {
+      if (row.id !== page.id || row.revision !== expectedRevision) return row;
+      changed = true;
+      return { ...row, revision: page.revision!, title: page.title, icon: page.icon,
+        updatedAt: page.updatedAt, lastEditedById: page.lastEditedById, lastEditedBy: page.lastEditedBy };
+    });
+    return changed ? { ...existing, data } : existing;
+  });
+}
+
 export function useUpdateWikiPage() {
   const qc = useQueryClient();
   return useMutation({
@@ -386,9 +409,11 @@ export function useUpdateWikiPage() {
         if (!current()) return;
         await qc.cancelQueries({ queryKey: queryKeys.wikiPage(pageId), exact: true });
         if (!current()) return;
-        if (owner!.state.phase === "available")
+        const detail = qc.getQueryData<WikiPageCache>(queryKeys.wikiPage(pageId));
+        if (owner!.state.phase === "available" && detail?.data?.revision === data.expectedRevision)
           qc.setQueryData<WikiPageCache>(queryKeys.wikiPage(pageId), { ...result, stamp: owner!.state.stamp });
         if (!current()) return;
+        acknowledgeWikiTree(qc, result.data, data.expectedRevision);
         if ("title" in data || "icon" in data) void qc.invalidateQueries({ queryKey: ["wiki-pages"] }).catch(() => {});
       } catch { /* The HTTP response remains acknowledged. */ }
     },
@@ -478,7 +503,10 @@ export function useRestoreVersion(pgid: string) {
       api
         .post(`wiki/versions/${versionId}/restore`, { json: data })
         .json<{ data: WikiPage }>(),
-    onSuccess: () => {
+    onMutate: () => ({ actorId: useAuthStore.getState().user?.id }),
+    onSuccess: (result, { expectedRevision }, owner) => {
+      if (owner?.actorId === useAuthStore.getState().user?.id)
+        acknowledgeWikiTree(qc, result.data, expectedRevision);
       qc.invalidateQueries({ queryKey: queryKeys.wikiPage(pgid) });
       qc.invalidateQueries({ queryKey: ["wiki-versions", pgid] });
       toast.success("Version restored");

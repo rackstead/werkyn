@@ -313,9 +313,12 @@ in the same way; the field is ignored when `description` is absent, and other
 task fields never change `descriptionRevision`. When the stored revision is
 different, nothing is written and the response is `409` with
 `"code":"REVISION_CONFLICT"` and `"current":{"revision":8,"updatedAt":"..."}`.
-Read the item again and decide what to send. PATCH requests without the field behave
-as before: the edit replaces whatever is stored (last writer wins) and still
-advances the revision.
+Read the item again and decide what to send. Every wiki PATCH requires a valid
+`expectedRevision`; task PATCH requires `expectedDescriptionRevision` when
+`description` is supplied, including a null or empty clear. Missing or invalid
+required revisions return 400. Task updates that omit `description` still need
+no description revision. Bundled editors retain unsaved drafts when their base
+is unavailable rather than guessing the latest server revision.
 
 Historical wiki restores require a revision: send
 `{"expectedRevision":7}` to `POST /api/wiki/versions/:vid/restore`, using the
@@ -329,7 +332,7 @@ See [historical restore revisions](docs/remediation/wiki-history-restore.md).
 While a user holds a wiki page's edit lock (taken by **Start Editing**; it
 lapses two minutes after its last renewal), a save or version restore by anyone
 else is refused with `409`, `"code":"EDIT_LOCKED"` and `current.lockedBy`,
-whether or not it carries a revision. A page nobody is editing accepts writes
+after a valid revision is provided. A page nobody is editing accepts writes
 without a lock.
 
 ### Testing API keys

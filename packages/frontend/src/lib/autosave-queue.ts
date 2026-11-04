@@ -69,6 +69,16 @@ export class AutosaveBlockedError extends Error {
   }
 }
 
+/** A bounded run of revisions proved by this client's contiguous +1 ACKs. */
+export interface OwnRevisionSpan { from: number; to: number }
+export function advanceOwnRevision(span: OwnRevisionSpan | undefined, base: number | undefined) {
+  return span && base !== undefined && base >= span.from && base <= span.to ? span.to : base;
+}
+export function recordOwnRevision(span: OwnRevisionSpan | undefined, base: number | undefined, revision: number | undefined): OwnRevisionSpan | undefined {
+  if (base === undefined || revision === undefined || !Number.isSafeInteger(base) || !Number.isSafeInteger(revision) || revision !== base + 1) return undefined;
+  return { from: span?.to === base ? span.from : base, to: revision };
+}
+
 /** Serializes one entity's patches; newer fields replace older queued fields. */
 export class AutosaveQueue<T extends object> {
   private pending: T | undefined;
@@ -81,6 +91,7 @@ export class AutosaveQueue<T extends object> {
   // editor showed when it had nothing unsaved, then each save's own result.
   private baseRevision: number | undefined;
   private observedRevision: number | undefined;
+  private ownRevisionSpan: OwnRevisionSpan | undefined;
   private observedWhileDirty = false;
   private running: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -127,6 +138,7 @@ export class AutosaveQueue<T extends object> {
     }
     if (revision === this.observedRevision) return;
     this.observedRevision = revision;
+    if (revision !== this.baseRevision) this.ownRevisionSpan = undefined;
     this.baseRevision = revision;
   };
 
@@ -137,6 +149,7 @@ export class AutosaveQueue<T extends object> {
   adoptRevision = (revision: number | undefined) => {
     if (revision === undefined || this.snapshot.hasUnsavedChanges) return;
     this.observedWhileDirty = false;
+    this.ownRevisionSpan = undefined;
     this.observedRevision = revision;
     this.baseRevision = revision;
   };
@@ -150,6 +163,7 @@ export class AutosaveQueue<T extends object> {
   acknowledgeRevision = (revision: number | undefined) => {
     if (revision === undefined || this.baseRevision === undefined) return;
     if (this.inFlight || revision !== this.baseRevision + 1) return;
+    this.ownRevisionSpan = recordOwnRevision(this.ownRevisionSpan, this.baseRevision, revision);
     this.baseRevision = revision;
     this.observedRevision = revision;
   };
@@ -160,13 +174,17 @@ export class AutosaveQueue<T extends object> {
    * they cannot be, the outside write is not made. Saves of edits made
    * meanwhile wait for it and are then based on its revision.
    */
-  writeAlongside = async (write: () => Promise<number | undefined>) => {
+  writeAlongside = async (write: (baseRevision?: number) => Promise<number | undefined>, capturedBase?: number) => {
     try {
       await this.flush();
     } catch {
       throw new PendingEditsError();
     }
-    const outside = write().then((revision) => this.acknowledgeRevision(revision));
+    // A supplied base belongs to the user's captured edit. Independent query
+    // observations may not rebase it; only this queue's contiguous own ACKs may.
+    const base = capturedBase === undefined ? this.baseRevision :
+      this.ownRevisionSpan?.to === this.baseRevision ? advanceOwnRevision(this.ownRevisionSpan, capturedBase) : capturedBase;
+    const outside = write(base).then((revision) => this.acknowledgeRevision(revision));
     // Flushes requested meanwhile wait for this, then for the edits made
     // meanwhile, which are saved on the acknowledged revision.
     const held: Promise<void> = outside
@@ -339,8 +357,12 @@ export class AutosaveQueue<T extends object> {
           this.publish("saving", this.snapshot.draft);
           this.inFlight = patch;
           try {
-            const revision = await this.save(patch, this.baseRevision);
-            if (typeof revision === "number") this.baseRevision = revision;
+            const base = this.baseRevision;
+            const revision = await this.save(patch, base);
+            if (typeof revision === "number") {
+              this.ownRevisionSpan = recordOwnRevision(this.ownRevisionSpan, base, revision);
+              this.baseRevision = revision;
+            }
           } catch (cause) {
             this.inFlight = undefined;
             this.pending = Object.assign({}, patch, this.pending) as T;

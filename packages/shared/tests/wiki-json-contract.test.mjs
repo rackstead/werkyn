@@ -18,7 +18,7 @@ function nested(levels, kind = "object", leaf = "leaf") {
 
 const inputs = [
   ["create content", CreateWikiPageSchema, { title: "Page" }, "content", 123],
-  ["update content", UpdateWikiPageSchema, {}, "content", 123],
+  ["update content", UpdateWikiPageSchema, { expectedRevision: 0 }, "content", 123],
   [
     "selectionStart",
     CreateWikiCommentSchema,

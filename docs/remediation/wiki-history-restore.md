@@ -30,8 +30,10 @@ closes History, reviews the refreshed page and reopens History to choose
 again. Another intervening change is refused again. No conflict revision is
 automatically adopted for a retry.
 
-Ordinary wiki PATCH requests still allow an omitted revision. The separate
-parked-draft **Restore changes** action and version-label policy are unchanged.
+Ordinary wiki PATCH requests require `expectedRevision` for title, content and
+icon writes; see [the current editor revision contract](editor-revisions.md).
+The separate parked-draft **Restore changes** action and version-label policy
+are unchanged.
 This change has no migration or new lock ordering.
 
 Regression coverage uses actual Fastify request injection and PostgreSQL row

@@ -1,4 +1,8 @@
 import { cn } from "@/lib/utils";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { identityGeneration, subscribeIdentity } from "@/lib/identity";
+import { isRetiredUploadedMediaUrl, isUploadedMediaUrl } from "@/lib/uploaded-media";
+import { acquireAvatarMedia } from "@/lib/avatar-media";
 
 interface UserAvatarProps {
   displayName: string;
@@ -36,11 +40,29 @@ function getColor(name: string): string {
 }
 
 export function UserAvatar({ displayName, avatarUrl, size = "md", className }: UserAvatarProps) {
-  if (avatarUrl) {
+  const generation = useSyncExternalStore(subscribeIdentity, identityGeneration);
+  const [resolved, setResolved] = useState<{ url: string; source: string; generation: number }>();
+  const [failed, setFailed] = useState<{ source: string; generation: number; message: string }>();
+  const uploaded = !!avatarUrl && isUploadedMediaUrl(avatarUrl);
+  const retired = !!avatarUrl && isRetiredUploadedMediaUrl(avatarUrl);
+  useEffect(() => {
+    let current = true;
+    setResolved(undefined);
+    setFailed(undefined);
+    const lease = uploaded ? acquireAvatarMedia(avatarUrl!) : undefined;
+    if (lease) void lease.promise.then(url => { if (current) setResolved({ url, source: avatarUrl!, generation }); }, error => {
+      if (current) setFailed({ source: avatarUrl!, generation, message: error instanceof Error ? error.message : "Image unavailable" });
+    });
+    return () => { current = false; lease?.release(); };
+  }, [avatarUrl, uploaded, generation]);
+  const error = retired ? "This legacy image is unavailable" : failed && failed.source === avatarUrl && failed.generation === generation ? failed.message : "";
+  const src = error ? undefined : uploaded ? resolved?.source === avatarUrl && resolved.generation === generation ? resolved.url : undefined : avatarUrl;
+  if (src) {
     return (
       <img
-        src={avatarUrl}
+        src={src}
         alt={displayName}
+        onError={() => { if (avatarUrl) setFailed({ source: avatarUrl, generation, message: "Image unavailable" }); }}
         className={cn(
           "rounded-full object-cover",
           sizeClasses[size],
@@ -58,6 +80,9 @@ export function UserAvatar({ displayName, avatarUrl, size = "md", className }: U
         getColor(displayName),
         className,
       )}
+      role="img"
+      aria-label={error ? `${displayName}: image unavailable` : displayName}
+      title={error || undefined}
     >
       {getInitials(displayName)}
     </div>

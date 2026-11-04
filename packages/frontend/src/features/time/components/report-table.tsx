@@ -215,7 +215,7 @@ export function ReportTable({ groups, groupBy }: ReportTableProps) {
                       –
                     </td>
                     <td className="px-3 py-1.5 text-right text-xs">
-                      {formatEntryCost(entry.cost, entry.currency)}
+                      {formatEntryCost(entry.cost, entry.currency, entry.costFractionDigits)}
                     </td>
                   </tr>
                 ))}

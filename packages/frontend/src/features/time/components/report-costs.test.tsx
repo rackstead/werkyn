@@ -1,20 +1,20 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { TimeReportGroup } from "../api";
 import { formatCostLines, formatEntryCost, formatMoney } from "../money";
 import { ReportSummaryCards } from "./report-summary-cards";
 import { ReportTable } from "./report-table";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const mixed = [
-  { currency: "EUR", amount: 50 },
-  { currency: "USD", amount: 110 },
+  { currency: "EUR", amount: 50, fractionDigits: 2 },
+  { currency: "USD", amount: 110, fractionDigits: 2 },
 ];
 
 it("formats each currency separately and never sums different currencies", () => {
   expect(formatCostLines(mixed)).toEqual(["€50.00", "$110.00"]);
-  expect(formatCostLines([{ currency: "USD", amount: 1234.5 }])).toEqual([
+  expect(formatCostLines([{ currency: "USD", amount: 1234.5, fractionDigits: 2 }])).toEqual([
     "$1,234.50",
   ]);
   expect(formatCostLines([])).toEqual(["0.00"]);
@@ -83,6 +83,7 @@ it("renders group costs per currency and unpriced entries as having no rate", ()
         rate: 100,
         currency: "EUR",
         cost: 50,
+        costFractionDigits: 2,
       },
       {
         id: "bob",
@@ -96,6 +97,7 @@ it("renders group costs per currency and unpriced entries as having no rate", ()
         rate: null,
         currency: null,
         cost: null,
+        costFractionDigits: null,
       },
     ],
   };
@@ -106,4 +108,46 @@ it("renders group costs per currency and unpriced entries as having no rate", ()
   fireEvent.click(screen.getByText("Rated work"));
   expect(screen.getAllByText("€50.00")).toHaveLength(2);
   expect(screen.getByText("No rate")).toBeTruthy();
+});
+
+it("renders currency-rounded values and the existing invalid-code fallback", () => {
+  const lines = formatCostLines([
+    { currency: "USD", amount: 9.99, fractionDigits: 2 },
+    { currency: "JPY", amount: 2, fractionDigits: 0 },
+    { currency: "KWD", amount: 1.235, fractionDigits: 3 },
+    { currency: "CLF", amount: 1.2345, fractionDigits: 4 },
+  ]);
+  expect(lines[0]).toBe("$9.99");
+  expect(lines[1]).toBe("¥2");
+  expect(lines[2]).toMatch(/1\.235$/);
+  expect(lines[3]).toMatch(/1\.2345$/);
+  expect(formatEntryCost(1.24, "1$X", 2)).toBe("1.24 1$X");
+});
+
+it("passes server precision explicitly rather than relying on host currency defaults", () => {
+  const spy = vi.spyOn(Intl, "NumberFormat");
+  for (const [currency, digits] of [["JPY", 0], ["KWD", 3], ["CLF", 4]] as const) {
+    formatCostLines([{ currency, amount: 2, fractionDigits: digits }]);
+    formatEntryCost(2, currency, digits);
+    expect(spy).toHaveBeenLastCalledWith("en-US", {
+      style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
+    });
+  }
+});
+
+it("uses the same server precision in summary, group and expanded entry costs", () => {
+  const buckets = [{ currency: "KWD", amount: 1.235, fractionDigits: 3 }];
+  const group: TimeReportGroup = {
+    key: "rounded", label: "Rounded work", totalHours: 1, billableHours: 1,
+    nonBillableHours: 0, totalCost: 1.235, currency: "KWD", costByCurrency: buckets,
+    unratedBillableHours: 0,
+    entries: [{ id: "rounded-entry", date: "2026-01-01", hours: 1, billable: true,
+      description: null, userName: "Worker", projectName: null, taskTitle: null,
+      rate: 1.2345, currency: "KWD", cost: 1.235, costFractionDigits: 3 }],
+  };
+  render(<><ReportSummaryCards totalHours={1} billableHours={1} nonBillableHours={0}
+    costByCurrency={buckets} unratedBillableHours={0} /><ReportTable groups={[group]} groupBy="project" /></>);
+  expect(screen.getAllByText(/1\.235$/)).toHaveLength(2);
+  fireEvent.click(screen.getByText("Rounded work"));
+  expect(screen.getAllByText(/1\.235$/)).toHaveLength(3);
 });

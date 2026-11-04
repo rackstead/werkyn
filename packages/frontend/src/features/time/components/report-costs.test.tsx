@@ -132,13 +132,20 @@ it("passes server precision explicitly rather than relying on host currency defa
     },
   );
   for (const [currency, digits] of [["JPY", 0], ["KWD", 3], ["CLF", 4]] as const) {
+    spy.mockClear();
     const lines = formatCostLines([{ currency, amount: 2, fractionDigits: digits }]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenLastCalledWith("en-US", {
+      style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
+    });
+    spy.mockClear();
     const entry = formatEntryCost(2, currency, digits);
     const expected = new OriginalNumberFormat("en-US", {
       style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
     }).format(2);
     expect(lines).toEqual([expected]);
     expect(entry).toBe(expected);
+    expect(spy).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenLastCalledWith("en-US", {
       style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
     });

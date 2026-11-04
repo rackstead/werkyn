@@ -173,13 +173,27 @@ process.on("disconnect", () => process.exit(0));
         stdio: ["ignore", 1, 2, "ipc"], env: childEnv, windowsHide: true,
       });
       outputChild = child;
-      outputClosed = new Promise<void>((resolve) => child.once("close", (code, signal) => {
+      // There are no owned stdio streams to drain: descriptors1/2 are inherited.
+      // Explicit IPC disconnect need not emit ChildProcess.close on Node22.
+      // Require both actual process exit and IPC disconnect instead.
+      let exited = false, disconnected = false;
+      let resolveOutput!: () => void;
+      outputClosed = new Promise<void>((resolve) => { resolveOutput = resolve; });
+      const settled = () => { if (exited && disconnected) resolveOutput(); };
+      child.once("exit", (code, signal) => {
+        exited = true;
         if (code !== 0 || signal !== null) outputFailed = true;
-        settlePending(); resolve();
-      }));
-      child.on("error", () => { outputFailed = true; settlePending(); });
-      child.on("disconnect", () => {
+        settlePending(); settled();
+      });
+      child.on("error", () => {
+        outputFailed = true; settlePending();
+        if (child.pid === undefined) resolveOutput(); // Spawn failed: no process can emit exit.
+        else killOutput();
+      });
+      child.once("disconnect", () => {
+        disconnected = true;
         if (!closingOutput) { outputFailed = true; settlePending(); killOutput(); }
+        settled();
       });
       child.on("message", (raw) => {
         const message = raw as { id?: unknown; ok?: unknown } | null;

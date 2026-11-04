@@ -252,7 +252,7 @@ test("deadline output settles with a resumed error reader and bounds a never-dra
     async function sample(mode) {
       const stdoutPath = path.join(directory, mode + "-out"), stderrPath = path.join(directory, mode + "-err");
       const marker = path.join(directory, mode + ".notice"), trace = path.join(directory, mode + ".trace"), observer = path.join(directory, mode + ".mjs");
-      let stdoutFd, stderrFd, child, completion, timer, killTimer, failure, outcome;
+      let stdoutFd, stderrFd, stdoutReadFd, stderrReadFd, child, completion, timer, killTimer, failure, outcome;
       let timedOut = false, fillerBytes = 0, notice = false, stderr = "";
       const row = { mode, realPipes: true, internalDeadlineSignalsQualified: true };
       try {
@@ -262,6 +262,9 @@ test("deadline output settles with a resumed error reader and bounds a never-dra
         await exec("mkfifo", [stdoutPath, stderrPath], { timeout: 2000 });
         stdoutFd = openSync(stdoutPath, constants.O_RDWR | constants.O_NONBLOCK);
         stderrFd = openSync(stderrPath, constants.O_RDWR | constants.O_NONBLOCK);
+        // Separate open-file descriptions: child stdio cannot change reader flags.
+        stdoutReadFd = openSync(stdoutPath, constants.O_RDONLY | constants.O_NONBLOCK);
+        stderrReadFd = openSync(stderrPath, constants.O_RDONLY | constants.O_NONBLOCK);
         const filler = Buffer.alloc(4096, "F");
         while (fillerBytes < 1024 * 1024) {
           try { fillerBytes += writeSync(stderrFd, filler); }
@@ -287,7 +290,7 @@ test("deadline output settles with a resumed error reader and bounds a never-dra
           let remaining = fillerBytes;
           while (remaining) {
             const chunk = Buffer.alloc(Math.min(4096, remaining));
-            const count = readSync(stderrFd, chunk, 0, chunk.length, null);
+            const count = readSync(stderrReadFd, chunk, 0, chunk.length, null);
             assert.equal(chunk.subarray(0, count).toString(), "F".repeat(count)); remaining -= count;
           }
         }
@@ -297,18 +300,18 @@ test("deadline output settles with a resumed error reader and bounds a never-dra
           let remaining = fillerBytes;
           while (remaining) {
             const chunk = Buffer.alloc(Math.min(4096, remaining));
-            const count = readSync(stderrFd, chunk, 0, chunk.length, null);
+            const count = readSync(stderrReadFd, chunk, 0, chunk.length, null);
             assert.equal(chunk.subarray(0, count).toString(), "F".repeat(count)); remaining -= count;
           }
         }
         for (;;) {
           const buffer = Buffer.alloc(4096); let bytes;
-          try { bytes = readSync(stderrFd, buffer, 0, buffer.length, null); }
+          try { bytes = readSync(stderrReadFd, buffer, 0, buffer.length, null); }
           catch (error) { if (error.code === "EAGAIN") break; throw error; }
           if (!bytes) break; stderr += buffer.subarray(0, bytes).toString();
           assert(stderr.length < 2048);
         }
-        const buffer = Buffer.alloc(4096); const bytes = readSync(stdoutFd, buffer, 0, buffer.length, null);
+        const buffer = Buffer.alloc(4096); const bytes = readSync(stdoutReadFd, buffer, 0, buffer.length, null);
         row.beginsAsReport = buffer.subarray(0, bytes).toString().startsWith('{"version":1,"readOnly":true,"kind":"notification"');
         row.prefixBytes = bytes; row.writer = JSON.parse(await readFile(trace, "utf8"));
         assert.equal(timedOut, false); assert.equal(outcome.signal, null); assert.equal(outcome.code, 1);
@@ -332,6 +335,8 @@ test("deadline output settles with a resumed error reader and bounds a never-dra
         Object.assign(row, { timedOut, outcome, fillerBytes, stderr, failure: failure?.message });
         observations.push(row);
         if (process.env.DELIVERY_REPORT_CALLBACK_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CALLBACK_FACTS, JSON.stringify(observations, null, 2) + "\n");
+        if (stdoutReadFd !== undefined) closeSync(stdoutReadFd);
+        if (stderrReadFd !== undefined) closeSync(stderrReadFd);
         if (stdoutFd !== undefined) closeSync(stdoutFd);
         if (stderrFd !== undefined) closeSync(stderrFd);
       }

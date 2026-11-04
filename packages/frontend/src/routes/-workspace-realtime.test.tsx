@@ -53,6 +53,7 @@ const { http, server, toast, gets } = vi.hoisted(() => {
       page: null as unknown as {
         id: string;
         spaceId: string;
+        revision: number;
         title: string;
         icon: null;
         updatedAt: string;
@@ -296,6 +297,7 @@ beforeEach(() => {
   server.page = {
     id: "page-1",
     spaceId: "space-1",
+    revision: 0,
     title: "Runbook",
     icon: null,
     updatedAt: "2026-10-01T00:00:00.000Z",
@@ -329,7 +331,15 @@ beforeEach(() => {
       if (path.endsWith("/heartbeat")) return reply(undefined);
       server.patches.push({ path, body: options?.json });
       if (path === "wiki/pages/page-1") {
-        server.page = { ...server.page, ...(options?.json as object) };
+        const { expectedRevision, ...patch } = options?.json ?? {};
+        if (typeof expectedRevision !== "number" || !Number.isInteger(expectedRevision) || expectedRevision < 0 || expectedRevision > 2147483647)
+          return { json: async () => { throw Object.assign(new Error("A page revision is required"), { statusCode: 400 }); } };
+        if (expectedRevision !== server.page.revision)
+          return { json: async () => { throw Object.assign(new Error("This page changed"), {
+            statusCode: 409, code: "REVISION_CONFLICT",
+            current: { revision: server.page.revision, updatedAt: server.page.updatedAt },
+          }); } };
+        server.page = { ...server.page, ...patch, revision: server.page.revision + 1 };
         return reply({ data: server.page });
       }
       return reply({ data: {} });
@@ -449,6 +459,7 @@ describe("wiki pages, locks and notifications", () => {
     server.page = {
       ...server.page,
       title: "Runbook v2",
+      revision: server.page.revision + 1,
       content: paragraph("bob's version"),
     };
     deliver({
@@ -461,14 +472,14 @@ describe("wiki pages, locks and notifications", () => {
     expect(server.patches).toEqual([]);
   });
 
-  it("keeps a dirty draft, and sends only that draft once, when an update arrives mid-edit", async () => {
+  it("keeps a dirty draft and saves it once after a duplicate same-base update", async () => {
     await open("/acme/knowledge?pageId=page-1");
     await waitFor(() => expect(screen.getByText("Start Editing")).toBeTruthy());
     fireEvent.click(screen.getByText("Start Editing"));
     await waitFor(() => expect(textBox().disabled).toBe(false));
 
     fireEvent.change(textBox(), { target: { value: "alice's draft" } });
-    server.page = { ...server.page, content: paragraph("bob's version") };
+    // Redelivery/refetch of the same committed base must not overwrite a draft.
     const before = fetchesOf("wiki/pages/page-1");
     deliver({
       event: "wiki_page_updated",
@@ -485,10 +496,44 @@ describe("wiki pages, locks and notifications", () => {
     expect(server.patches).toEqual([
       {
         path: "wiki/pages/page-1",
-        body: expect.objectContaining({ content: paragraph("alice's draft") }),
+        body: { content: paragraph("alice's draft"), expectedRevision: 0 },
       },
     ]);
     expect(textBox().value).toBe("alice's draft");
+  });
+
+  it("retains a stale dirty draft and lock until explicit reviewed recovery", async () => {
+    await open("/acme/knowledge?pageId=page-1");
+    await waitFor(() => expect(textBox().value).toBe("first version"));
+    // Bob commits after this tab's initial GET but before Alice acquires her
+    // lock. His broadcast is delivered later, while Alice is editing base 0.
+    server.page = { ...server.page, revision: 1, content: paragraph("newer committed content") };
+    fireEvent.click(screen.getByText("Start Editing"));
+    await waitFor(() => expect(textBox().disabled).toBe(false));
+    fireEvent.change(textBox(), { target: { value: "alice's retained draft" } });
+    const before = fetchesOf("wiki/pages/page-1");
+    deliver({ event: "wiki_page_updated", workspaceId: "ws-acme", data: { page: server.page } });
+    await waitFor(() => expect(fetchesOf("wiki/pages/page-1")).toBe(before + 1));
+    expect(textBox().value).toBe("alice's retained draft");
+    fireEvent.click(screen.getByText("Done Editing"));
+    await waitFor(() => expect(screen.getByText("Restore changes")).toBeTruthy());
+    await waitFor(() => expect(textBox().value).toBe("newer committed content"));
+    expect(server.page.revision).toBe(1);
+    expect(server.page.content).toEqual(paragraph("newer committed content"));
+    expect(server.lock?.userId).toBe("u-alice");
+    expect(server.patches).toEqual([{ path: "wiki/pages/page-1", body: { content: paragraph("alice's retained draft"), expectedRevision: 0 } }]);
+    await act(async () => { await Promise.resolve(); });
+    expect(server.patches).toHaveLength(1);
+    fireEvent.click(screen.getByText("Restore changes"));
+    await waitFor(() => expect(server.page.revision).toBe(2));
+    expect(server.page.content).toEqual(paragraph("alice's retained draft"));
+    expect(server.patches).toEqual([
+      { path: "wiki/pages/page-1", body: { content: paragraph("alice's retained draft"), expectedRevision: 0 } },
+      { path: "wiki/pages/page-1", body: { content: paragraph("alice's retained draft"), expectedRevision: 1 } },
+    ]);
+    fireEvent.click(screen.getByText("Done Editing"));
+    await waitFor(() => expect(server.lock).toBeNull());
+    expect(server.patches).toHaveLength(2);
   });
 
   it("follows another user's lock and release on an open page", async () => {
@@ -590,7 +635,7 @@ describe("wiki pages, locks and notifications", () => {
     expect(fetchesOf("wiki/pages/page-1")).toBe(before);
     expect(toast).not.toHaveBeenCalled();
 
-    server.page = { ...server.page, content: paragraph("after noise") };
+    server.page = { ...server.page, revision: server.page.revision + 1, content: paragraph("after noise") };
     deliver({
       event: "wiki_page_updated",
       workspaceId: "ws-acme",

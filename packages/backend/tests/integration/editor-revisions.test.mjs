@@ -444,7 +444,7 @@ test("a restore is a new revision that an in-flight older save cannot overwrite"
   }
 });
 
-test("another user's edit lock refuses optional saves and revision-checked restores", async () => {
+test("another user's edit lock refuses revision-checked saves and restores", async () => {
   const page = await newPage();
   status(await acquire("ALICE", page.id), 200);
   const version = status(
@@ -460,8 +460,8 @@ test("another user's edit lock refuses optional saves and revision-checked resto
   assert.equal(locked.current.lockedBy.id, users.ALICE.id);
   assert.equal(locked.current.lockedBy.displayName, "ALICE");
   assert.ok(Date.parse(locked.current.lockExpiresAt) > Date.now());
-  // An API client that sends no revision is refused the same way.
-  conflict(await save("BOB", page.id, { title: "API" }), "EDIT_LOCKED", 0);
+  // Missing revisions are invalid before edit-lock state is considered.
+  status(await save("BOB", page.id, { title: "API" }), 400);
   conflict(
     await req("BOB", "POST", `/api/wiki/versions/${version.data.id}/restore`, { expectedRevision: 0 }),
     "EDIT_LOCKED",
@@ -473,9 +473,9 @@ test("another user's edit lock refuses optional saves and revision-checked resto
   assert.deepEqual(after.content, doc("original"));
 
   // The holder may save, and once the lock is released anyone may.
-  status(await save("ALICE", page.id, { content: doc("alice") }), 200);
+  status(await save("ALICE", page.id, { content: doc("alice"), expectedRevision: 0 }), 200);
   status(await req("ALICE", "DELETE", `/api/wiki/pages/${page.id}/lock`), 204);
-  const bob = status(await save("BOB", page.id, { content: doc("bob") }), 200);
+  const bob = status(await save("BOB", page.id, { content: doc("bob"), expectedRevision: 1 }), 200);
   assert.equal(bob.data.revision, 2);
 });
 
@@ -623,7 +623,7 @@ test("version numbers stay unique when snapshots race", async () => {
     () => req("ALICE", "POST", `/api/wiki/pages/${page.id}/versions`, { name: "one" }),
     () => req("BOB", "POST", `/api/wiki/pages/${page.id}/versions`, { name: "two" }),
     // A save with no recent auto-save version records one too.
-    () => save("ALICE", page.id, { content: doc("edited") }),
+    () => save("ALICE", page.id, { content: doc("edited"), expectedRevision: 0 }),
   ]);
   assert.deepEqual(
     responses.map((r) => r.statusCode),
@@ -641,7 +641,7 @@ test("version numbers stay unique when snapshots race", async () => {
 
 test("the auto-save version is stored with the save that replaced its content", async () => {
   const page = await newPage("before");
-  status(await save("ALICE", page.id, { content: doc("after") }), 200);
+  status(await save("ALICE", page.id, { content: doc("after"), expectedRevision: 0 }), 200);
   // Recorded in the same transaction: present as soon as the save returns.
   const versions = await app.prisma.wikiPageVersion.findMany({
     where: { pageId: page.id },
@@ -651,16 +651,15 @@ test("the auto-save version is stored with the save that replaced its content", 
   assert.equal(versions[0].isAutoSave, true);
 });
 
-test("saves without a revision keep last-writer-wins and still advance the revision", async () => {
+test("saves without a revision are invalid and leave content/revision unchanged", async () => {
   const page = await newPage();
-  status(await save("ALICE", page.id, { content: doc("one") }), 200);
-  const two = status(await save("BOB", page.id, { content: doc("two") }), 200);
-  assert.equal(two.data.revision, 2);
-  assert.deepEqual((await stored(page.id)).content, doc("two"));
-  // Validation of the new field.
+  status(await save("ALICE", page.id, { content: doc("one") }), 400);
+  status(await save("BOB", page.id, { content: doc("two") }), 400);
+  assert.equal((await stored(page.id)).revision, 0);
+  assert.deepEqual((await stored(page.id)).content, doc("original"));
   status(await save("ALICE", page.id, { expectedRevision: -1 }), 400);
   status(await save("ALICE", page.id, { expectedRevision: "2" }), 400);
-  status(await save("VIEWER", page.id, { content: doc("x"), expectedRevision: 2 }), 403);
+  status(await save("VIEWER", page.id, { content: doc("x"), expectedRevision: 0 }), 403);
 });
 
 // ─── Task descriptions ─────────────────────────────────────
@@ -712,12 +711,9 @@ test("a task description save is a compare-and-set on its description revision",
     200,
   );
 
-  // Without a revision the description is replaced as before.
-  const api = status(
-    await saveTask("BOB", task.id, { description: "<p>api</p>" }),
-    200,
-  );
-  assert.equal(api.data.descriptionRevision, 3);
+  // Missing revisions cannot overwrite the description.
+  status(await saveTask("BOB", task.id, { description: "<p>api</p>" }), 400);
+  assert.equal((await app.prisma.task.findUniqueOrThrow({ where: { id: task.id } })).descriptionRevision, 2);
   // A revision without a description is ignored.
   status(
     await saveTask("BOB", task.id, { title: "Again", expectedDescriptionRevision: 0 }),

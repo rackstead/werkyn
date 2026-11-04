@@ -67,6 +67,7 @@ function page(id: string) {
       title: id,
       content: [{ type: "paragraph", content: id }],
       spaceId: "space",
+      revision: 0,
       updatedAt: "2026-10-27",
       icon: null,
     });
@@ -184,7 +185,7 @@ describe("entity-bound Wiki autosave", () => {
     expect(written).toEqual([
       {
         path: `wiki/pages/${a}`,
-        body: { content: [{ type: "paragraph", content: "A draft" }] },
+        body: { expectedRevision: 0, content: [{ type: "paragraph", content: "A draft" }] },
       },
     ]);
     expect(http.delete).toHaveBeenCalledWith(`wiki/pages/${a}/lock`, {
@@ -249,11 +250,11 @@ describe("entity-bound Wiki autosave", () => {
     expect(written).toEqual([
       {
         path: `wiki/pages/${id}`,
-        body: { content: [{ type: "paragraph", content: "older text" }] },
+        body: { expectedRevision: 0, content: [{ type: "paragraph", content: "older text" }] },
       },
       {
         path: `wiki/pages/${id}`,
-        body: { content: [{ type: "paragraph", content: "newest text" }] },
+        body: { expectedRevision: 0, content: [{ type: "paragraph", content: "newest text" }] },
       },
     ]);
   });
@@ -321,7 +322,7 @@ describe("entity-bound Wiki autosave", () => {
     fireEvent.click(screen.getByText("Done Editing"));
     await tick();
     expect(written).toEqual([
-      { path: `wiki/pages/${id}`, body: { title: "New title before blur" } },
+      { path: `wiki/pages/${id}`, body: { expectedRevision: 0, title: "New title before blur" } },
     ]);
   });
 
@@ -609,7 +610,7 @@ describe("entity-bound Wiki autosave", () => {
     fireEvent.input(heading);
     await tick(801);
     expect(written).toEqual([
-      { path: `wiki/pages/${id}`, body: { title: `${id} draft` } },
+      { path: `wiki/pages/${id}`, body: { expectedRevision: 0, title: `${id} draft` } },
     ]);
     heading.textContent = id;
     fireEvent.input(heading);
@@ -620,7 +621,7 @@ describe("entity-bound Wiki autosave", () => {
     await tick(801);
     expect(written.at(-1)).toEqual({
       path: `wiki/pages/${id}`,
-      body: { title: id },
+      body: { expectedRevision: 0, title: id },
     });
   });
 
@@ -1086,16 +1087,16 @@ describe("server revisions and edit conflicts", () => {
     fireEvent.change(body(screen), { target: { value: "pending body" } });
     // What the tree's rename does, without waiting for the editor's debounce.
     await act(async () => {
-      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async (expectedRevision) => {
         const response = (await http
-          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed", expectedRevision } })
           .json()) as { data: { revision: number } };
         return response.data.revision;
       });
     });
     expect(written.map((w) => w.body)).toEqual([
       { content: paragraph("pending body"), expectedRevision: 4 },
-      { title: "Renamed" },
+      { title: "Renamed", expectedRevision: 5 },
     ]);
     // The cached page has not caught up, yet the next edit builds on the rename.
     fireEvent.change(body(screen), { target: { value: "after rename" } });
@@ -1118,10 +1119,10 @@ describe("server revisions and edit conflicts", () => {
     const gate = new Promise<void>((resolve) => (release = resolve));
     let outside!: Promise<void>;
     await act(async () => {
-      outside = writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+      outside = writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async (expectedRevision) => {
         await gate;
         const response = (await http
-          .patch(`wiki/pages/${id}`, { json: { title: "Renamed" } })
+          .patch(`wiki/pages/${id}`, { json: { title: "Renamed", expectedRevision } })
           .json()) as { data: { revision: number } };
         return response.data.revision;
       });
@@ -1135,7 +1136,7 @@ describe("server revisions and edit conflicts", () => {
     });
     await tick();
     expect(written.map((w) => w.body)).toEqual([
-      { title: "Renamed" },
+      { title: "Renamed", expectedRevision: 4 },
       { content: paragraph("typed during rename"), expectedRevision: 5 },
     ]);
     expect(stored).toMatchObject({ revision: 6, title: "Renamed" });
@@ -1157,7 +1158,7 @@ describe("server revisions and edit conflicts", () => {
     fireEvent.change(body(screen), { target: { value: "unsaved" } });
     let refused: unknown;
     await act(async () => {
-      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async () => {
+      await writeAlongsideAutosave(wikiAutosaveKey("editor-user", id), async (expectedRevision) => {
         throw new Error("the outside write must not run");
       }).catch((error) => {
         refused = error;

@@ -1,3 +1,4 @@
+import { TaskDescriptionRevisionSchema } from "@pm/shared";
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type {
   CreateTaskInput,
@@ -374,6 +375,8 @@ export async function updateTaskWithNotifications(
   data: UpdateTaskInput,
   actorDisplayName?: string,
 ) {
+  if (data.description !== undefined && !TaskDescriptionRevisionSchema.safeParse(data.expectedDescriptionRevision).success)
+    throw new ValidationError("A valid description revision is required");
   actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   const existing = await prisma.task.findUnique({
     where: { id: taskId },
@@ -457,14 +460,11 @@ export async function updateTaskWithNotifications(
       });
     }
 
-    if (
-      data.description !== undefined &&
-      data.expectedDescriptionRevision !== undefined
-    ) {
+    if (data.description !== undefined) {
       await assertDescriptionRevision(
         tx,
         taskId,
-        data.expectedDescriptionRevision,
+        data.expectedDescriptionRevision!,
       );
     }
 

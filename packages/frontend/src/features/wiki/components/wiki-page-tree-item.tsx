@@ -10,7 +10,7 @@ import {
   type WikiPageTreeItem as TreeItem,
 } from "../api";
 import { writeAlongsideAutosave } from "@/hooks/use-entity-autosave";
-import { PendingEditsError } from "@/lib/autosave-queue";
+import { PendingEditsError, advanceOwnRevision, recordOwnRevision, type OwnRevisionSpan } from "@/lib/autosave-queue";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/auth-store";
 import {
@@ -61,15 +61,22 @@ export function WikiPageTreeItem({
   // The page may be open in this user's editor. Its pending edits are stored
   // first, and its later saves build on this change instead of reporting it
   // as made elsewhere.
-  const updateOutsideEditor = (patch: { title?: string; icon?: string | null }) => {
+  const ownWrites = useRef<{ author: string; pageId: string; span?: OwnRevisionSpan } | null>(null);
+  const [renameBase, setRenameBase] = useState(page.revision);
+  const updateOutsideEditor = (patch: { title?: string; icon?: string | null }, displayedBase = page.revision) => {
     const userId = useAuthStore.getState().user?.id ?? "anonymous";
-    void writeAlongsideAutosave(wikiAutosaveKey(userId, page.id), async (baseRevision) => {
-      // The queue supplies its own last ACK after flushing. Without an editor,
-      // compare against the revision of the tree this action was based on.
-      const expectedRevision = baseRevision ?? page.revision;
-      if (expectedRevision === undefined) throw new PendingEditsError("Reload this page before saving: its revision is unavailable");
-      return (await updatePage.mutateAsync({ pageId: page.id, ...patch, expectedRevision })).data.revision;
-    }).catch((error) => {
+    if (!ownWrites.current || ownWrites.current.author !== userId || ownWrites.current.pageId !== page.id)
+      ownWrites.current = { author: userId, pageId: page.id };
+    const owner = ownWrites.current;
+    const capturedBase = advanceOwnRevision(owner.span, displayedBase);
+    void writeAlongsideAutosave(wikiAutosaveKey(userId, page.id), async (expectedRevision) => {
+      if (useAuthStore.getState().user?.id !== userId)
+        throw new PendingEditsError("Sign in as the author to save these changes");
+      if (displayedBase === undefined || expectedRevision === undefined) throw new PendingEditsError("Reload this page before saving: its revision is unavailable");
+      const result = await updatePage.mutateAsync({ pageId: page.id, ...patch, expectedRevision });
+      owner.span = recordOwnRevision(owner.span, expectedRevision, result.data.revision);
+      return result.data.revision;
+    }, capturedBase).catch((error) => {
       // A failed write already shows the update's own error notice.
       if (error instanceof PendingEditsError) toast.error(error.message);
     });
@@ -78,7 +85,7 @@ export function WikiPageTreeItem({
   const handleRenameSubmit = () => {
     const trimmed = renameValue.trim();
     if (trimmed && trimmed !== page.title) {
-      updateOutsideEditor({ title: trimmed });
+      updateOutsideEditor({ title: trimmed }, renameBase);
     }
     setIsRenaming(false);
   };
@@ -171,6 +178,7 @@ export function WikiPageTreeItem({
                 <DropdownMenuItem
                   onClick={() => {
                     setRenameValue(page.title);
+                    setRenameBase(page.revision);
                     setIsRenaming(true);
                   }}
                 >

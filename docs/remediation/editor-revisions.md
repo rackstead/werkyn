@@ -76,6 +76,17 @@ The editor's next save builds on its revision when nothing
 else was written in between, so the user's own change is not reported as a
 conflict.
 
+A rename keeps the revision shown when its input opened, even if a remote
+update rerenders the tree. Only a contiguous sequence of acknowledged local
+writes may advance that captured base; a refetch cannot silently rebase it.
+Outside writes serialize per author/page and resolve the current editor queue
+when each operation starts. Failed writes do not advance the local ACK chain.
+Successful ACKs update existing matching-base tree/detail cache entries, without
+downgrading a newer entry or assigning a revision to unrelated stale metadata.
+A task description remains read-only until its first revision is available;
+existing unsaved drafts are not discarded or silently based on a new revision.
+
+
 ### A page removed in another session
 
 A deletion event makes an open page unavailable without discarding its unsaved

@@ -47,7 +47,7 @@ test("direct page service callers refuse unsupported JSON before entering a tran
       invalid("content"),
     );
     await assert.rejects(
-      updatePage(prisma, "p", "u", { content }),
+      updatePage(prisma, "p", "u", { content, expectedRevision: 0 }),
       invalid("content"),
     );
   }
@@ -73,7 +73,7 @@ test("direct service callers refuse serializer-interpreted members before any da
       invalid("content"),
     );
     await assert.rejects(
-      updatePage(prisma, "p", "u", { content }),
+      updatePage(prisma, "p", "u", { content, expectedRevision: 0 }),
       invalid("content"),
     );
     for (const field of ["selectionStart", "selectionEnd"])

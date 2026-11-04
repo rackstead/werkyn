@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { toast } from "sonner";
-import { AutosaveQueue, type SaveFn } from "@/lib/autosave-queue";
+import { AutosaveQueue, advanceOwnRevision, recordOwnRevision, type OwnRevisionSpan, type SaveFn } from "@/lib/autosave-queue";
 import { useAuthStore } from "@/stores/auth-store";
 
 const queues = new Map<
@@ -22,6 +22,10 @@ if (typeof window !== "undefined") {
   });
 }
 
+// Entries exist only while outside writes are pending, across every mounted
+// writer for the same author/entity. An idle page adds no retained global cache.
+const outsideWrites = new Map<string, { tail: Promise<void>; ownSpan?: OwnRevisionSpan }>();
+
 /**
  * Runs a write of an entity made outside its editor, such as a rename from the
  * page tree, between the editor's saves (see AutosaveQueue.writeAlongside).
@@ -31,10 +35,34 @@ if (typeof window !== "undefined") {
 export async function writeAlongsideAutosave(
   entityKey: string,
   write: (baseRevision?: number) => Promise<number | undefined>,
+  capturedBase?: number,
 ) {
-  const queue = queues.get(entityKey)?.queue as AutosaveQueue<object> | undefined;
-  if (queue) await queue.writeAlongside(write);
-  else await write();
+  let owner = outsideWrites.get(entityKey);
+  if (!owner) {
+    owner = { tail: Promise.resolve() };
+    outsideWrites.set(entityKey, owner);
+  }
+  const state = owner;
+  const operation = state.tail.then(async () => {
+    // Resolve after the previous writer: an editor may have mounted/unmounted.
+    const queue = queues.get(entityKey)?.queue as AutosaveQueue<object> | undefined;
+    const base = advanceOwnRevision(state.ownSpan, capturedBase);
+    let appliedBase: number | undefined, acknowledged: number | undefined;
+    const perform = async (revision?: number) => {
+      appliedBase = revision;
+      acknowledged = await write(revision);
+      return acknowledged;
+    };
+    if (queue) await queue.writeAlongside(perform, base);
+    else await perform(base);
+    state.ownSpan = recordOwnRevision(state.ownSpan, appliedBase, acknowledged);
+  });
+  const settled = operation.then(() => {}, () => {});
+  state.tail = settled;
+  try { await operation; }
+  finally {
+    if (outsideWrites.get(entityKey) === state && state.tail === settled) outsideWrites.delete(entityKey);
+  }
 }
 
 function retained<T extends object>(queue: AutosaveQueue<T>) {

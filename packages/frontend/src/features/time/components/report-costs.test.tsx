@@ -125,10 +125,20 @@ it("renders currency-rounded values and the existing invalid-code fallback", () 
 });
 
 it("passes server precision explicitly rather than relying on host currency defaults", () => {
-  const spy = vi.spyOn(Intl, "NumberFormat");
+  const OriginalNumberFormat = Intl.NumberFormat;
+  const spy = vi.spyOn(Intl, "NumberFormat").mockImplementation(
+    function (...args: ConstructorParameters<typeof OriginalNumberFormat>) {
+      return new OriginalNumberFormat(...args);
+    },
+  );
   for (const [currency, digits] of [["JPY", 0], ["KWD", 3], ["CLF", 4]] as const) {
-    formatCostLines([{ currency, amount: 2, fractionDigits: digits }]);
-    formatEntryCost(2, currency, digits);
+    const lines = formatCostLines([{ currency, amount: 2, fractionDigits: digits }]);
+    const entry = formatEntryCost(2, currency, digits);
+    const expected = new OriginalNumberFormat("en-US", {
+      style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
+    }).format(2);
+    expect(lines).toEqual([expected]);
+    expect(entry).toBe(expected);
     expect(spy).toHaveBeenLastCalledWith("en-US", {
       style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits,
     });

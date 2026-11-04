@@ -363,7 +363,7 @@ test("a writer terminated after its output acknowledgement cannot return success
     // Read at most one bounded key; preserve all stored data and the empty-page oracle.
     const [greatest] = await db.$queryRaw`SELECT CASE WHEN octet_length(id) <= 256 THEN id ELSE NULL END AS id
       FROM "NotificationDelivery" ORDER BY id COLLATE "C" DESC LIMIT 1`;
-    assert(greatest === undefined || (typeof greatest.id === "string" && Buffer.byteLength(greatest.id, "utf8") <= 256));
+    assert(greatest === undefined || (typeof greatest.id === "string" && !greatest.id.includes("\0") && Buffer.byteLength(greatest.id, "utf8") <= 256));
     const after = greatest?.id ?? prefix;
     let outcome;
     try {

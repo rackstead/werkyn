@@ -25,4 +25,19 @@ Refused media displays an error and keeps its stored reference. This accounting
 does not bound decoded browser media memory. Removal and unmount abort requests
 and revoke owned URLs. An account change invalidates the editor's media owner
 and hides its old media until the page is reopened, without remounting or saving
-the editor document. Avatars resolve again in their current account context.
+the editor document. Avatars share one bounded owner per current identity, so
+repeated instances reuse one request and Blob. A live avatar's lease cannot be
+revoked by another instance unmounting. After the last lease, an idle URL may
+remain for at most 30 seconds for virtualization; a different reference may
+evict idle entries sooner. Identity changes revoke the pool immediately.
+
+Loading has separate finite limits: queue wait 120 seconds, active transfer
+300 seconds, and inactivity 20 seconds between response/chunk progress. These
+limits can visibly refuse slow media without changing the stored reference.
+Legacy avatars and failed remote avatars show initials; legacy editor media
+shows an unavailable message instead of requesting a retired public route.
+
+The final UUID-and-extension filename is opaque. A literal percent spelling in
+that leaf is retained; query encoding is decoded once by the API parser, with
+no second decoding into a slash, backslash or different filename. Structural
+path components still require their exact canonical spelling.

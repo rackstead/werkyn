@@ -62,3 +62,12 @@ it("real core resolution refusal is visible and non-rendering without an unhandl
   await waitFor(() => expect(view.container.querySelector<HTMLImageElement>('img[alt="Owned committed image"]')?.getAttribute("src")).toBe("about:blank"));
   expect(created).not.toHaveBeenCalled(); expect(JSON.stringify(content)).toBe(original); expect(observed.current!.document[0].props).toMatchObject({ url: source }); expect(onChange).not.toHaveBeenCalled();
 });
+it("retired stored image is visibly refused after commit without a request or document write", async () => {
+  const content = input(); content[0].props!.url = "/storage/uploads/owned.gif";
+  const original = JSON.stringify(content), onChange = vi.fn();
+  const view = render(<Committed content={content} onChange={onChange} />);
+  await waitFor(() => expect(view.getByRole("status").textContent).toContain("legacy media reference is unavailable"));
+  await waitFor(() => expect(view.container.querySelector<HTMLImageElement>('img[alt="Owned committed image"]')?.getAttribute("src")).toBe("about:blank"));
+  expect(observed.request).not.toHaveBeenCalled(); expect(created).not.toHaveBeenCalled();
+  expect(JSON.stringify(content)).toBe(original); expect(observed.current!.document[0].props).toMatchObject({ url: "/storage/uploads/owned.gif" }); expect(onChange).not.toHaveBeenCalled();
+});

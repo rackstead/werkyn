@@ -99,7 +99,7 @@ function WikiEditorInner({
   const [mediaError, setMediaError] = useState("");
   const [mediaReady, setMediaReady] = useState(false);
   const media = useMemo(() => new UploadedMediaOwner(setMediaError, mediaShareToken, () => setMediaReady(false)), [mediaShareToken]);
-  const resolver = useMemo(() => new EditorMediaResolver(media), [media]);
+  const resolver = useMemo(() => new EditorMediaResolver(media, setMediaError), [media]);
   const mediaRef = useRef(media);
   const resolverRef = useRef(resolver);
   mediaRef.current = media;

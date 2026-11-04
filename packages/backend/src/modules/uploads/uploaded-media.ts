@@ -18,7 +18,9 @@ const SAFE_MEDIA = new Set([
 const responsePolicy = new WeakMap<FastifyReply, { mime: string; filename: string; download: boolean }>();
 
 export function parseUploadedMedia(url: unknown) {
-  if (typeof url !== "string" || url.length > 2048 || /[%\\\x00-\x20?#]/.test(url)) return null;
+  // The query parser decodes the wire value once. The UUID+extension leaf is
+  // opaque: literal percent spellings must never be decoded into separators.
+  if (typeof url !== "string" || url.length > 2048 || /[\\\x00-\x20?#]/.test(url)) return null;
   const match = /^\/storage\/([A-Za-z0-9_-]{1,128})\/uploads\/(avatars|wiki)\/([A-Za-z0-9_-]{1,128})\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?:\.[^/]+)?)$/i.exec(url);
   if (!match || Buffer.byteLength(match[4]) > 255) return null;
   return { url, workspaceId: match[1], kind: match[2].toLowerCase(), scopeId: match[3], filename: match[4], relative: `${match[2]}/${match[3]}/${match[4]}` };

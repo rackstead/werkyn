@@ -8,7 +8,11 @@ const AVATAR_LIMIT = 5 * 1024 * 1024;
 const SAFE = /^(image\/(jpeg|png|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp4|ogg|wav|webm))$/;
 
 export function isUploadedMediaUrl(url: string): boolean {
-  return url.length <= 2048 && !/[%\\\x00-\x20?#]/.test(url) && /^\/storage\/[A-Za-z0-9_-]{1,128}\/uploads\/(avatars|wiki)\/[A-Za-z0-9_-]{1,128}\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?:\.[^/]+)?$/i.test(url);
+  return url.length <= 2048 && !/[\\\x00-\x20?#]/.test(url) && /^\/storage\/[A-Za-z0-9_-]{1,128}\/uploads\/(avatars|wiki)\/[A-Za-z0-9_-]{1,128}\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?:\.[^/]+)?$/i.test(url);
+}
+
+export function isRetiredUploadedMediaUrl(url: string): boolean {
+  return /^\/(?:storage\/(?:avatars|uploads)|uploads)(?:\/|$)/.test(url);
 }
 
 export function uploadedMediaReferences(content: unknown): Set<string> {
@@ -51,7 +55,7 @@ export class UploadedMediaOwner {
   private waiters = new Set<() => void>();
   private downloads = new Map<string, { bytes: number; timer: ReturnType<typeof setTimeout> }>();
 
-  constructor(private notify: (message: string) => void, private shareToken?: string, private invalidated?: () => void) {}
+  constructor(private notify: (message: string) => void, private shareToken?: string, private invalidated?: () => void, private objectLimit = WIKI_LIMIT) {}
 
   activate() {
     this.dispose();
@@ -123,17 +127,27 @@ export class UploadedMediaOwner {
   }
 
   private async load(url: string, entry: Entry, epoch: number) {
-    const timer = setTimeout(() => entry.controller.abort(), 20000);
+    const queueTimer = setTimeout(() => entry.controller.abort(), 120000);
+    let absoluteTimer: ReturnType<typeof setTimeout> | undefined;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    const progress = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => entry.controller.abort(), 20000);
+    };
     let acquired = false;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let body: ReadableStream<Uint8Array> | undefined;
     try {
       await this.slot(entry.controller.signal);
       acquired = true;
+      clearTimeout(queueTimer);
+      absoluteTimer = setTimeout(() => entry.controller.abort(), 300000);
+      progress();
       this.check(url, entry, epoch);
       const head = await this.request(url, "HEAD", entry.controller.signal);
       this.check(url, entry, epoch);
-      const limit = url.includes("/uploads/avatars/") ? AVATAR_LIMIT : WIKI_LIMIT;
+      progress();
+      const limit = Math.min(this.objectLimit, url.includes("/uploads/avatars/") ? AVATAR_LIMIT : WIKI_LIMIT);
       const spelling = head.headers.get("content-length");
       const length = spelling && /^\d+$/.test(spelling) ? Number(spelling) : limit;
       if (!Number.isSafeInteger(length) || length < 0 || length > limit || this.bytes + length > CAP) throw new Error("Media exceeds this page’s loading limit. Its stored reference is unchanged.");
@@ -142,6 +156,7 @@ export class UploadedMediaOwner {
       const response = await this.request(url, "GET", entry.controller.signal);
       body = response.body ?? undefined;
       this.check(url, entry, epoch);
+      progress();
       const mime = (response.headers.get("content-type") ?? "application/octet-stream").split(";", 1)[0].trim().toLowerCase();
       const chunks: Uint8Array<ArrayBuffer>[] = [];
       let total = 0;
@@ -150,6 +165,7 @@ export class UploadedMediaOwner {
       while (true) {
         const chunk = await reader.read();
         this.check(url, entry, epoch);
+        progress();
         if (chunk.done) break;
         total += chunk.value.byteLength;
         if (total > length || total > limit) throw new Error("Media changed or exceeded its loading limit");
@@ -168,7 +184,9 @@ export class UploadedMediaOwner {
       this.release(url, entry);
       throw error;
     } finally {
-      clearTimeout(timer);
+      clearTimeout(queueTimer);
+      clearTimeout(absoluteTimer);
+      clearTimeout(stallTimer);
       await reader?.cancel().catch(() => {});
       reader?.releaseLock();
       if (!reader) await body?.cancel().catch(() => {});
@@ -244,10 +262,10 @@ export class EditorMediaResolver {
   private epoch = 0;
   private pending = new Set<EditorResolution>();
 
-  constructor(private owner: Pick<UploadedMediaOwner, "resolve">) {}
+  constructor(private owner: Pick<UploadedMediaOwner, "resolve">, private refuse?: (message: string) => void) {}
 
   resolve = (url: string): Promise<string> => {
-    if (!isUploadedMediaUrl(url)) return Promise.resolve(url);
+    if (!isUploadedMediaUrl(url) && !isRetiredUploadedMediaUrl(url)) return Promise.resolve(url);
     return new Promise(resolve => {
       const request = { url, generation: identityGeneration(), dispatched: false, finish: resolve };
       this.pending.add(request);
@@ -291,6 +309,11 @@ export class EditorMediaResolver {
         if (request.dispatched) continue;
         if (request.generation !== identityGeneration()) { this.finish(request, "about:blank"); continue; }
         request.dispatched = true;
+        if (isRetiredUploadedMediaUrl(request.url)) {
+          this.refuse?.("This legacy media reference is unavailable. Its stored reference is unchanged.");
+          this.finish(request, "about:blank");
+          continue;
+        }
         void this.owner.resolve(request.url).then(
           url => this.finish(request, this.committed && epoch === this.epoch && request.generation === identityGeneration() ? url : "about:blank"),
           () => this.finish(request, "about:blank"),

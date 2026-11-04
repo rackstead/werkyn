@@ -123,10 +123,16 @@ async function main() {
     catch { return false; }
   };
   // This timer belongs only to this standalone, read-only CLI, never an importer.
+  let deadlineFired = false;
+  const hardStop = setTimeout(() => process.exit(1), 15_000);
   const deadline = setTimeout(() => {
-    try { process.stderr.write('{"error":"deadline_exceeded"}\n'); }
-    finally { process.exit(1); }
-  }, 15_000);
+    deadlineFired = true;
+    process.exitCode = 1;
+    // Give an asynchronous consumer a bounded chance to receive the error.
+    // The independent hard stop remains referenced if stderr never settles.
+    void write(process.stderr, '{"error":"deadline_exceeded"}\n')
+      .finally(() => process.exit(1));
+  }, 14_750);
   try {
     const options = parseDeliveryReportArgs(process.argv.slice(2));
     const url = new URL(process.env.DATABASE_URL ?? "");
@@ -144,15 +150,21 @@ async function main() {
     catch { failure ??= "query_failed"; }
   }
   try {
+    if (deadlineFired) return;
     if (failure || !report) {
       await write(process.stderr, JSON.stringify({ error: failure ?? "query_failed" }) + "\n");
       process.exitCode = 1;
-    } else if (await write(process.stdout, JSON.stringify(report) + "\n")) {
-      process.exitCode = report.rows.length ? 2 : 0;
     } else {
-      await write(process.stderr, '{"error":"output_failed"}\n');
-      process.exitCode = 1;
+      const delivered = await write(process.stdout, JSON.stringify(report) + "\n");
+      if (deadlineFired) return;
+      if (delivered) process.exitCode = report.rows.length ? 2 : 0;
+      else {
+        await write(process.stderr, '{"error":"output_failed"}\n');
+        process.exitCode = 1;
+      }
     }
-  } finally { clearTimeout(deadline); }
+  } finally {
+    if (!deadlineFired) { clearTimeout(deadline); clearTimeout(hardStop); }
+  }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void main();

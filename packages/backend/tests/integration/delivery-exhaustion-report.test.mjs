@@ -242,3 +242,57 @@ test("standalone CLI bounds a blocked output consumer", async () => {
     await db.notificationDelivery.deleteMany({ where: { id: { in: selected } } });
   }
 });
+
+test("deadline output settles an asynchronous callback and bounds an unsettled callback", async () => {
+  const selected = [];
+  const directory = await mkdtemp(path.join(tmpdir(), "delivery-report-callback-"));
+  const observations = [];
+  try {
+    for (let i = 0; i < 100; i++) selected.push(await create("notification", `V-${String(i).padStart(3, "0")}-` + "\u0001".repeat(180)));
+    async function sample(mode) {
+      const fifo = path.join(directory, mode + ".fifo"), marker = path.join(directory, mode + ".notice"), observer = path.join(directory, mode + ".mjs");
+      let descriptor, child, timer, killTimer, completion, timedOut = false, stderr = "";
+      try {
+        // Controlled output transport: delayed forwards the exact write and its
+        // callback after50ms; stalled deliberately never settles. This is not
+        // evidence that an ordinary OS pipe lost output in the earlier controls.
+        writeFileSync(observer, `import {writeFileSync} from 'node:fs';\nconst original=process.stderr.write;\nprocess.stderr.write=function(chunk,...args){if(String(chunk)==='{\"error\":\"deadline_exceeded\"}\\n'){writeFileSync(${JSON.stringify(marker)},'actual deadline write');${mode === "delayed" ? "setTimeout(()=>Reflect.apply(original,this,[chunk,...args]),50);" : ""}return false;}return Reflect.apply(original,this,[chunk,...args]);};\n`);
+        await exec("mkfifo", [fifo], { timeout: 2000 });
+        descriptor = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+        const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
+        const started = performance.now();
+        child = spawn(process.execPath, ["--import", observer, "--import", "tsx", script, "--kind=notification", "--limit=100", `--after=${prefix}V-`], {
+          cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, stdio: ["ignore", descriptor, "pipe"],
+        });
+        child.stderr.on("data", chunk => { stderr = (stderr + chunk.toString()).slice(0, 2048); });
+        completion = new Promise((resolve, reject) => { child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal })); });
+        timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); killTimer = setTimeout(() => child.kill("SIGKILL"), 3000); }, 17_000);
+        const outcome = await completion;
+        clearTimeout(timer); clearTimeout(killTimer);
+        const buffer = Buffer.alloc(4096); let bytes = 0;
+        try { bytes = readSync(descriptor, buffer, 0, buffer.length, null); } catch (error) { if (error.code !== "EAGAIN") throw error; }
+        const actualDeadlineWrite = await import("node:fs/promises").then(fs => fs.readFile(marker, "utf8")).then(s => s === "actual deadline write", () => false);
+        const row = { mode, ...outcome, timedOut, stderr, actualDeadlineWrite, elapsedMs: performance.now() - started, prefixBytes: bytes, beginsAsReport: buffer.subarray(0, bytes).toString().startsWith('{"version":1,"readOnly":true,"kind":"notification"'), controlledTransport: true };
+        observations.push(row);
+        if (process.env.DELIVERY_REPORT_CALLBACK_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CALLBACK_FACTS, JSON.stringify(observations, null, 2) + "\n");
+        assert.equal(timedOut, false); assert.equal(outcome.signal, null); assert.equal(outcome.code, 1);
+        assert.equal(actualDeadlineWrite, true); assert.equal(row.beginsAsReport, true);
+        assert.equal(stderr, mode === "delayed" ? '{"error":"deadline_exceeded"}\n' : "");
+        assert(row.elapsedMs >= 14_000 && row.elapsedMs < 17_000);
+      } finally {
+        clearTimeout(timer); clearTimeout(killTimer);
+        if (child && child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM"); const force = setTimeout(() => child.kill("SIGKILL"), 3000);
+          try { await completion?.catch(() => {}); } finally { clearTimeout(force); }
+        }
+        if (descriptor !== undefined) closeSync(descriptor);
+      }
+    }
+    const results = await Promise.allSettled([sample("delayed"), sample("stalled")]);
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+    assert.equal(observations.length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await db.notificationDelivery.deleteMany({ where: { id: { in: selected } } });
+  }
+});

@@ -1,6 +1,6 @@
 import type { PrismaClient } from "@prisma/client";
 import { randomUUID } from "crypto";
-import bcrypt from "bcrypt";
+import { hashPassword, verifyPassword } from "../../utils/passwords.js";
 import {
   NotFoundError,
   ForbiddenError,
@@ -26,7 +26,7 @@ export async function createShare(
   }
 
   const token = randomUUID();
-  const passwordHash = password ? await bcrypt.hash(password, 10) : undefined;
+  const passwordHash = password ? await hashPassword(password) : undefined;
 
   return prisma.wikiPageShare.create({
     data: {
@@ -53,7 +53,7 @@ export async function updateShare(
   if (data.enabled !== undefined) updateData.enabled = data.enabled;
   if (data.password !== undefined) {
     updateData.passwordHash = data.password
-      ? await bcrypt.hash(data.password, 10)
+      ? await hashPassword(data.password)
       : null;
   }
 
@@ -136,7 +136,7 @@ export async function validateShareAccess(
     return share;
   }
 
-  const valid = await bcrypt.compare(password, share.passwordHash);
+  const valid = await verifyPassword(password, share.passwordHash);
   if (!valid) {
     throw new ForbiddenError("Invalid password");
   }

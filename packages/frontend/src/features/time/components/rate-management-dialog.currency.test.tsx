@@ -49,7 +49,7 @@ vi.mock('@/features/time/api', () => ({
   useUserRates: () => ({ data: owned.rates }),
   useSetUserRate: (workspaceId: string) => ({ mutate: (variables: { userId: string; data: unknown }, callbacks: Callbacks) => owned.mutate(workspaceId, variables, callbacks), isPending: owned.pending }),
 }));
-vi.mock('@/lib/identity', () => ({ getIdentitySnapshot: () => owned.identity, subscribeIdentity: (callback: () => void) => { owned.listeners.add(callback); return () => owned.listeners.delete(callback); } }));
+vi.mock('@/lib/identity', () => ({ identityGeneration: () => owned.identity.departures, getIdentitySnapshot: () => owned.identity, subscribeIdentity: (callback: () => void) => { owned.listeners.add(callback); return () => owned.listeners.delete(callback); } }));
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-04T12:00:00Z') });
   owned.pending = false; owned.outcome = 'success'; owned.calls = []; owned.identity = { departures: 0, settled: true };

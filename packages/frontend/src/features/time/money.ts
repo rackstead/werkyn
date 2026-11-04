@@ -1,14 +1,24 @@
 import type { CurrencyAmount } from "./api";
 
 /** Format an amount in its currency; codes Intl rejects fall back to "12.50 XYZ". */
-export function formatMoney(amount: number, currency: string): string {
+export function formatMoney(amount: number, currency: string, fractionDigits?: number): string {
   try {
     return new Intl.NumberFormat("en-US", {
       style: "currency",
       currency,
+      ...(fractionDigits === undefined ? {} : {
+        minimumFractionDigits: fractionDigits,
+        maximumFractionDigits: fractionDigits,
+      }),
     }).format(amount);
   } catch {
-    return `${amount.toFixed(2)} ${currency}`;
+    const digits = fractionDigits ?? 2;
+    const decimal = new Intl.NumberFormat("en-US", {
+      useGrouping: false,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(amount === 0 ? 0 : amount);
+    return `${decimal} ${currency}`;
   }
 }
 
@@ -18,8 +28,8 @@ export function formatMoney(amount: number, currency: string): string {
  */
 export function formatCostLines(costByCurrency: CurrencyAmount[]): string[] {
   if (costByCurrency.length === 0) return [(0).toFixed(2)];
-  return costByCurrency.map(({ amount, currency }) =>
-    formatMoney(amount, currency),
+  return costByCurrency.map(({ amount, currency, fractionDigits }) =>
+    formatMoney(amount, currency, fractionDigits),
   );
 }
 
@@ -27,9 +37,10 @@ export function formatCostLines(costByCurrency: CurrencyAmount[]): string[] {
 export function formatEntryCost(
   cost: number | null,
   currency: string | null,
+  fractionDigits?: number | null,
 ): string {
   if (cost === null) return "No rate";
-  return currency ? formatMoney(cost, currency) : cost.toFixed(2);
+  return currency ? formatMoney(cost, currency, fractionDigits ?? undefined) : cost.toFixed(2);
 }
 
 export function formatUnratedHours(hours: number): string | null {

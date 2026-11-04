@@ -331,13 +331,13 @@ test("time reports skip legacy non-finite hours and treat non-finite rates as un
     for (const groupBy of ["user", "project", "date"]) {
       const data = assertStatus(await req("GET", reportUrl({ ...query, groupBy })), 200);
       const entries = data.groups.flatMap((group) => group.entries);
-      assert.deepEqual(entries.map((e) => [e.description, e.hours, e.rate, e.cost]), [
-        ["finite", 2, 100, 200], ["after-bad-rate", 1.5, null, null],
+      assert.deepEqual(entries.map((e) => [e.description, e.hours, e.rate, e.cost, e.costFractionDigits]), [
+        ["finite", 2, 100, 200, 2], ["after-bad-rate", 1.5, null, null, null],
       ], groupBy);
       assert.equal(data.summary.totalHours, 3.5);
       assert.equal(data.summary.skippedEntries, 3);
       assert.equal(data.summary.unratedBillableHours, 1.5);
-      assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 200 }]);
+      assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 200, fractionDigits: 2 }]);
     }
     const csv = await req("GET", exportUrl(query));
     assert.equal(csv.statusCode, 200, csv.body);

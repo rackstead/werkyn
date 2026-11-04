@@ -72,6 +72,15 @@ export class CsvBareValue {
     return new CsvBareValue(value.toFixed(fractionDigits));
   }
 
+  /** An already-validated decimal amount, without rounding a Number again. */
+  static exactDecimal(value: string): CsvCell {
+    const match = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.exec(value);
+    if (value.length > 128 || match?.[0] !== value) {
+      throw new TypeError("Expected a bounded canonical decimal CSV value");
+    }
+    return new CsvBareValue(value);
+  }
+
   /** A YYYY-MM-DD date cell; any other value is exported as text. */
   static isoDate(value: string): CsvCell {
     return ISO_DATE.test(value) ? new CsvBareValue(value) : value;
@@ -79,6 +88,7 @@ export class CsvBareValue {
 }
 
 export const csvDecimal = CsvBareValue.decimal;
+export const csvExactDecimal = CsvBareValue.exactDecimal;
 export const csvIsoDate = CsvBareValue.isoDate;
 
 /** Strings are text cells; null and undefined become empty cells. */

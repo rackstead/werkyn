@@ -105,7 +105,7 @@ test("each entry is priced at the latest rate effective on its own date", async 
   assert.deepEqual(priced(byId.get(entries["alice-non-billable"])), { rate: 10, currency: "USD", cost: 0 });
   assert.equal(data.summary.totalCost, 80);
   assert.equal(data.summary.currency, "USD");
-  assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 80 }]);
+  assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 80, fractionDigits: 2 }]);
   assert.equal(data.summary.unratedBillableHours, 0);
   assert.equal(data.summary.totalHours, 7.5);
 });
@@ -147,7 +147,7 @@ test("totals in different currencies are kept apart instead of being added toget
   assert.equal(data.summary.totalCost, null);
   assert.equal(data.summary.currency, null);
   assert.deepEqual(data.summary.costByCurrency, [
-    { currency: "EUR", amount: 50 }, { currency: "USD", amount: 110 },
+    { currency: "EUR", amount: 50, fractionDigits: 2 }, { currency: "USD", amount: 110, fractionDigits: 2 },
   ]);
   assert.equal(data.summary.unratedBillableHours, 4);
   const [group] = data.groups;
@@ -222,7 +222,7 @@ test("a new rate keeps the member's currency unless a valid currency code is sup
   const byId = entriesById(data);
   assert.deepEqual(priced(byId.get(entries["dan-before-legacy"])), { rate: 45, currency: "CHF", cost: 45 });
   assert.deepEqual(priced(byId.get(entries["dan-legacy"])), { rate: 50, currency: "CHF", cost: 50 });
-  assert.deepEqual(data.summary.costByCurrency, [{ currency: "CHF", amount: 95 }]);
+  assert.deepEqual(data.summary.costByCurrency, [{ currency: "CHF", amount: 95, fractionDigits: 2 }]);
   assert.equal(data.summary.totalCost, 95);
   assert.equal(data.summary.currency, "CHF");
 });

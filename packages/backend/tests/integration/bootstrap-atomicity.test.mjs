@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import { after, afterEach, before, beforeEach, test } from "node:test";
 import nodemailer from "nodemailer";
 
@@ -121,6 +122,7 @@ function overlappingClient(participants = 2) {
   return {
     client,
     attempts,
+    release,
     get arrivals() {
       return arrivals;
     },
@@ -251,11 +253,32 @@ for (const [name, first, second, localCount, adminCount] of [
 test("four overlapping ordinary registrations commit without bootstrap predicate contention", async () => {
   const bootstrap = await local("existing-bootstrap");
   const overlap = overlappingClient(4);
-  const results = await Promise.allSettled(
-    Array.from({ length: 4 }, (_, i) => local(`ordinary-${i}`, overlap.client)),
-  );
-  for (const result of results) {
-    if (result.status === "rejected") throw result.reason;
+  // Admit each hash before launching the next; all four operations still
+  // reach the same pre-INSERT barrier before it opens. Native capacity is not
+  // the account-creation serialization contract exercised here.
+  const deadline = performance.now() + 3000;
+  const running = [], settled = [];
+  try {
+    for (let i = 0; i < 4; i++) {
+      const pending = local(`ordinary-${i}`, overlap.client).then(
+        (value) => { const result = { status: "fulfilled", value }; settled.push(result); return result; },
+        (reason) => { const result = { status: "rejected", reason }; settled.push(result); return result; },
+      );
+      running.push(pending);
+      while (overlap.arrivals < i + 1) {
+        const failed = settled.find((result) => result.status === "rejected");
+        if (failed) throw failed.reason;
+        assert(performance.now() < deadline, "Account creation did not overlap");
+        await sleep(Math.min(10, Math.max(0, deadline - performance.now())));
+      }
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    const results = await Promise.all(running);
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+  } finally {
+    overlap.release();
+    await Promise.all(running);
   }
   assert.equal(
     overlap.attempts.length,

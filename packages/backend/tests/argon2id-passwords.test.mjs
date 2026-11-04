@@ -4,6 +4,8 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import test, { after } from "node:test";
 import { hashPassword, verifyPassword } from "../src/utils/passwords.ts";
+import { logger } from "../src/utils/logger.ts";
+const bcrypt=createRequire(import.meta.url)("bcrypt");
 const fixture=JSON.parse(readFileSync(new URL("./fixtures/bcrypt-5.1.1-hashes.json",import.meta.url),"utf8")).fixtures;
 const legacy=fixture.find(x=>x.name==="account password at the application cost (12)");
 const unavailable=e=>{assert.equal(e.statusCode,503);assert.equal(e.message,"Password checks are temporarily unavailable. Try again.");return true;};
@@ -23,3 +25,9 @@ test("an observer finishing early does not release an unfinished native permit",
 
 // Optional owned validation receipt: package provenance, not a general benchmark.
 after(()=>{if(!process.env.R31_NATIVE_FACTS)return;const require=createRequire(import.meta.url);const files=Object.keys(require.cache).filter(name=>name.endsWith(".node")&&name.includes("/argon2/"));assert.equal(files.length,1,"actual loaded Argon2 native module");writeFileSync(process.env.R31_NATIVE_FACTS,JSON.stringify({node:process.version,platform:process.platform,arch:process.arch,napi:process.versions.napi,loadedNative:files.map(path=>({path,sha256:createHash("sha256").update(readFileSync(path)).digest("hex")})),parameters:{algorithm:"argon2id",version:19,memoryKiB:19456,time:2,parallelism:1,saltBytes:16,hashBytes:32},maxRSSKiB:process.resourceUsage().maxRSS,qualification:"Actual controlled ordinary native tests; not production load or cross-platform acceptance"},null,2)+"\n",{mode:0o600});});
+
+test('native work failure has one fixed safe operation diagnostic while saturation has none',async t=>{const entries=[];const spy=t.mock.method(logger,'error',(...args)=>entries.push(args));const marker='OWNED_NATIVE_FAILURE_PRIVATE_SENTINEL';const native=t.mock.method(bcrypt,'compare',async()=>{throw Error(marker+legacy.password+legacy.hash)});let failure;try{await verifyPassword(legacy.password,legacy.hash)}catch(e){failure=e}finally{native.mock.restore()}
+ assert.equal(failure?.statusCode,503);assert.equal(failure?.message,'Password checks are temporarily unavailable. Try again.');assert(!JSON.stringify({statusCode:failure.statusCode,error:failure.error,message:failure.message}).includes(marker));
+ const jobs=[hashPassword('Owned-safe-diagnostic-active1'),hashPassword('Owned-safe-diagnostic-active2')];try{await assert.rejects(hashPassword('Owned-safe-diagnostic-third1'),e=>e.statusCode===503)}finally{await Promise.all(jobs)}const after=await hashPassword('Owned-safe-diagnostic-recovered1');assert.equal(await verifyPassword('Owned-safe-diagnostic-recovered1',after),true);
+ const facts={ordinaryFailure503:true,permitReleasedAfterFailure:true,saturation503:true,recoveredAfterSettlement:true,diagnosticCalls:entries.length,diagnostics:entries};if(process.env.R31_DIAG_FACTS)writeFileSync(process.env.R31_DIAG_FACTS,JSON.stringify(facts,null,2)+'\n',{mode:0o600});assert.equal(entries.length,1,'A genuine native work failure must leave one fixed diagnostic; capacity refusal must not log as native failure');const safe=JSON.stringify(entries);assert.match(safe,/bcrypt_verify/);for(const secret of [marker,legacy.password,legacy.hash])assert(!safe.includes(secret));spy.mock.restore();
+});

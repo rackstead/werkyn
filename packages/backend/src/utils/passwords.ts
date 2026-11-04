@@ -2,6 +2,7 @@ import bcrypt from "bcrypt";
 import * as argon2 from "argon2";
 import { randomBytes } from "node:crypto";
 import { AppError, ValidationError } from "./errors.js";
+import { logger } from "./logger.js";
 
 const MAX_PASSWORD_BYTES = 512;
 const MAX_ACTIVE = 2;
@@ -45,17 +46,21 @@ function unavailable() {
 }
 
 /** No waiting native-job queue; keep the permit until the actual job settles. */
-async function admitted<T>(work: () => Promise<T>): Promise<T> {
+async function admitted<T>(operation: "argon2_hash" | "argon2_verify" | "bcrypt_verify", work: () => Promise<T>): Promise<T> {
   if (active >= MAX_ACTIVE) throw unavailable();
   active++;
   try { return await work(); }
-  catch { throw unavailable(); }
+  catch {
+    // Native error text can contain inputs; keep the diagnostic fixed and local.
+    logger.error({ event: "password_native_work_failed", operation }, "Password operation failed");
+    throw unavailable();
+  }
   finally { active--; }
 }
 
 export async function hashPassword(password: string): Promise<string> {
   if (!validPassword(password)) throw new ValidationError("Password cannot be encoded within the supported limit");
-  return admitted(async () => {
+  return admitted("argon2_hash", async () => {
     const hash = await argon2.hash(Buffer.from(password, "utf8"), { ...PARAMETERS, salt: randomBytes(16) });
     if (!ownArgon2Hash(hash)) throw new Error("Unexpected password hash format");
     return hash;
@@ -65,10 +70,10 @@ export async function hashPassword(password: string): Promise<string> {
 export async function verifyPassword(password: string, hash: string): Promise<boolean> {
   if (!validPassword(password) || typeof hash !== "string" || hash.length > 128) return false;
   if (ownArgon2Hash(hash))
-    return admitted(() => argon2.verify(hash, Buffer.from(password, "utf8")));
+    return admitted("argon2_verify", () => argon2.verify(hash, Buffer.from(password, "utf8")));
   // bcrypt cannot distinguish suffixes after72 bytes. Long legacy inputs need
   // the existing reset route; no login rewrite can recover their lost bytes.
   if (Buffer.byteLength(password, "utf8") <= 72 && legacyHash(hash))
-    return admitted(() => bcrypt.compare(password, hash));
+    return admitted("bcrypt_verify", () => bcrypt.compare(password, hash));
   return false;
 }

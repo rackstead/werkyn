@@ -3,6 +3,7 @@ import { Prisma, type PrismaClient } from "@prisma/client";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
+import { isLockTimeoutError, isStatementCanceledError } from "../../utils/retryable-database-errors.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -337,16 +338,74 @@ export const chatMessageInclude = {
 // A key the sender reuses for a retry of the same logical send.
 export const CLIENT_MESSAGE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
-async function assertSendMembership(
-  db: PrismaClient | Prisma.TransactionClient,
+// Keep the parent rows before memberships: channel/workspace deletion starts
+// at those parents and then cascades. Workspace KEY SHARE remains compatible
+// with membership writers' existing workspace NO KEY UPDATE mutex.
+async function lockSendAdmission(
+  tx: Prisma.TransactionClient,
   channelId: string,
   userId: string,
 ) {
-  const membership = await db.chatChannelMember.findUnique({
-    where: { channelId_userId: { channelId, userId } },
-    select: { id: true },
-  });
-  if (!membership) throw new ForbiddenError("Not a member of this channel");
+  const admissionStarted = performance.now();
+  try {
+    const settings = await tx.$queryRaw<{ name: string; timeoutMs: number }[]>`
+      SELECT name, setting::integer AS "timeoutMs" FROM pg_settings
+      WHERE name IN ('statement_timeout', 'lock_timeout')
+    `;
+    const previousStatement = settings.find((setting) => setting.name === "statement_timeout")!.timeoutMs;
+    const previousLock = settings.find((setting) => setting.name === "lock_timeout")!.timeoutMs;
+    const deadline = admissionStarted + Math.min(previousStatement || 5_000, 5_000);
+    const boundNextLock = async () => {
+      const remaining = Math.floor(deadline - performance.now());
+      if (remaining <= 0) throw new ConflictError("The request conflicted with a concurrent change; try again");
+      await tx.$executeRaw`
+        SELECT set_config('statement_timeout', ${`${remaining}ms`}, true),
+               set_config('lock_timeout', ${`${Math.min(previousLock || remaining, remaining)}ms`}, true)
+      `;
+    };
+    await boundNextLock();
+    const workspaces = await tx.$queryRaw<{ id: string }[]>`
+      SELECT w.id FROM "Workspace" w
+      JOIN "ChatChannel" c ON c."workspaceId" = w.id
+      WHERE c.id = ${channelId} FOR KEY SHARE OF w
+    `;
+    if (!workspaces[0]) throw new ForbiddenError("Not a member of this channel");
+    await boundNextLock();
+    const channels = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "ChatChannel"
+      WHERE id = ${channelId} AND "workspaceId" = ${workspaces[0].id}
+      FOR NO KEY UPDATE
+    `;
+    if (!channels[0]) throw new ForbiddenError("Not a member of this channel");
+    await boundNextLock();
+    const members = await tx.$queryRaw<{ role: string }[]>`
+      SELECT role::text AS role FROM "WorkspaceMember"
+      WHERE "workspaceId" = ${workspaces[0].id} AND "userId" = ${userId}
+      FOR SHARE
+    `;
+    if (!members[0]) throw new ForbiddenError("Not a member of this channel");
+    if (members[0].role !== "ADMIN" && members[0].role !== "MEMBER") {
+      throw new ForbiddenError("Insufficient permissions");
+    }
+    await boundNextLock();
+    const channelMembers = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "ChatChannelMember"
+      WHERE "channelId" = ${channelId} AND "userId" = ${userId}
+      FOR KEY SHARE
+    `;
+    if (!channelMembers[0]) throw new ForbiddenError("Not a member of this channel");
+    // Do not change later statement behavior or leak settings into the pool.
+    // On failure PostgreSQL rolls these LOCAL settings back with the transaction.
+    await tx.$executeRaw`
+      SELECT set_config('statement_timeout', ${`${previousStatement}ms`}, true),
+             set_config('lock_timeout', ${`${previousLock}ms`}, true)
+    `;
+  } catch (error) {
+    if (isLockTimeoutError(error) || isStatementCanceledError(error)) {
+      throw new ConflictError("The request conflicted with a concurrent change; try again");
+    }
+    throw error;
+  }
 }
 
 function clientMessageHash(channelId: string, parentId: string | undefined, content: string) {
@@ -358,7 +417,7 @@ function clientMessageHash(channelId: string, parentId: string | undefined, cont
 // Returns the message an earlier send with this key stored, after checking
 // that the retry describes the same original request.
 async function findKeyedMessage(
-  prisma: PrismaClient,
+  prisma: Prisma.TransactionClient,
   userId: string,
   clientMessageId: string,
   requestHash: string,
@@ -402,16 +461,13 @@ export async function sendMessage(
   const requestHash = clientMessageId
     ? clientMessageHash(channelId, parentId, content)
     : undefined;
-  if (clientMessageId && requestHash) {
-    // Replays are still sends: only a current member gets the stored message.
-    await assertSendMembership(prisma, channelId, userId);
-    const existing = await findKeyedMessage(prisma, userId, clientMessageId, requestHash);
-    if (existing) return { message: existing, replayed: true };
-  }
-
   try {
-    const message = await prisma.$transaction(async (tx) => {
-      await assertSendMembership(tx, channelId, userId);
+    return await prisma.$transaction(async (tx) => {
+      await lockSendAdmission(tx, channelId, userId);
+      if (clientMessageId && requestHash) {
+        const existing = await findKeyedMessage(tx, userId, clientMessageId, requestHash);
+        if (existing) return { message: existing, replayed: true };
+      }
 
       // Touch updatedAt for sorting. The archived guard and the row lock make
       // a concurrent archive either precede this send or wait for it.
@@ -463,14 +519,19 @@ export async function sendMessage(
         },
       });
 
-      return created;
-    });
-    return { message, replayed: false };
+      return { message: created, replayed: false };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
   } catch (err) {
     // A concurrent send with the same key committed first.
     if (clientMessageId && requestHash && isClientMessageIdConflict(err)) {
-      const existing = await findKeyedMessage(prisma, userId, clientMessageId, requestHash);
-      if (existing) return { message: existing, replayed: true };
+      // The failed transaction released its admission locks. Re-admit before
+      // exposing the winner, since membership may have changed in between.
+      return prisma.$transaction(async (tx) => {
+        await lockSendAdmission(tx, channelId, userId);
+        const existing = await findKeyedMessage(tx, userId, clientMessageId, requestHash);
+        if (existing) return { message: existing, replayed: true };
+        throw err;
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
     }
     throw err;
   }

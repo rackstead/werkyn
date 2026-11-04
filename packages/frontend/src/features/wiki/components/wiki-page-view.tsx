@@ -8,6 +8,7 @@ import { isEditConflict } from "@/lib/edit-conflict";
 import { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { EditorNavigationGuard } from "@/components/shared/editor-navigation-guard";
 import type { UpdateWikiPageInput } from "@pm/shared";
+type WikiPagePatch = Omit<UpdateWikiPageInput, "expectedRevision">;
 import { ChevronRight, FileText, History, Lock, MessageSquare, Share2, Smile } from "lucide-react";
 import { EmojiPicker } from "@/components/shared/emoji-picker";
 import {
@@ -62,15 +63,16 @@ function WikiPageSession({
   const { mutateAsync: updatePage } = useUpdateWikiPage();
   const userId = useAuthStore((s) => s.user?.id ?? "anonymous");
   const save = useCallback(
-    async (patch: UpdateWikiPageInput, expectedRevision: number | undefined) => {
+    async (patch: WikiPagePatch, expectedRevision: number | undefined) => {
       if (useAuthStore.getState().user?.id !== userId) {
         throw new Error("Sign in as the author to save these changes");
       }
+      if (expectedRevision === undefined) throw new Error("Reload this page before saving: its revision is unavailable");
       // The server refuses (409) a save based on an older revision, or one
       // made while another user holds the lock, instead of overwriting.
       const result = await updatePage({
         ...patch,
-        ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        expectedRevision,
         pageId,
         expectedUserId: userId,
         canWrite: () => availabilityGate.current?.canWrite() ?? false,

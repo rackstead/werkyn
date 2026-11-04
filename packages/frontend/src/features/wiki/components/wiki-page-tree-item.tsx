@@ -63,9 +63,13 @@ export function WikiPageTreeItem({
   // as made elsewhere.
   const updateOutsideEditor = (patch: { title?: string; icon?: string | null }) => {
     const userId = useAuthStore.getState().user?.id ?? "anonymous";
-    void writeAlongsideAutosave(wikiAutosaveKey(userId, page.id), async () =>
-      (await updatePage.mutateAsync({ pageId: page.id, ...patch })).data.revision,
-    ).catch((error) => {
+    void writeAlongsideAutosave(wikiAutosaveKey(userId, page.id), async (baseRevision) => {
+      // The queue supplies its own last ACK after flushing. Without an editor,
+      // compare against the revision of the tree this action was based on.
+      const expectedRevision = baseRevision ?? page.revision;
+      if (expectedRevision === undefined) throw new PendingEditsError("Reload this page before saving: its revision is unavailable");
+      return (await updatePage.mutateAsync({ pageId: page.id, ...patch, expectedRevision })).data.revision;
+    }).catch((error) => {
       // A failed write already shows the update's own error notice.
       if (error instanceof PendingEditsError) toast.error(error.message);
     });

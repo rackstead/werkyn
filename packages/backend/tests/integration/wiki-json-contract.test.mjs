@@ -553,12 +553,12 @@ test("editor JSON, Unicode, primitives, null and omitted fields keep their meani
   }
   const page = await create("kept");
   const omitted = result(
-    await request("PATCH", `/wiki/pages/${page.id}`, { title: "Renamed" }),
+    await request("PATCH", `/wiki/pages/${page.id}`, { title: "Renamed", expectedRevision: 0 }),
     200,
   ).data;
   assert.equal(omitted.content, "kept");
   const cleared = result(
-    await request("PATCH", `/wiki/pages/${page.id}`, { content: null }),
+    await request("PATCH", `/wiki/pages/${page.id}`, { content: null, expectedRevision: 1 }),
     200,
   ).data;
   assert.equal(cleared.content, null);
@@ -672,7 +672,7 @@ test("stored legacy content is identified when a due snapshot refuses a metadata
       const body = await refused(
         "PATCH",
         `/wiki/pages/${page.id}`,
-        { [field]: value },
+        { [field]: value, expectedRevision: 0 },
         "content",
         page.id,
       );
@@ -684,7 +684,7 @@ test("stored legacy content is identified when a due snapshot refuses a metadata
 test("body edits and a throttled metadata edit retain legacy JSON they do not write", async () => {
   const page = await create("initial");
   result(
-    await request("PATCH", `/wiki/pages/${page.id}`, { title: "First" }),
+    await request("PATCH", `/wiki/pages/${page.id}`, { title: "First", expectedRevision: 0 }),
     200,
   );
   const legacy = JSON.stringify(nested(124));
@@ -692,7 +692,7 @@ test("body edits and a throttled metadata edit retain legacy JSON they do not wr
     .$executeRaw`UPDATE "WikiPage" SET "content" = ${legacy}::jsonb WHERE "id" = ${page.id}`;
   const before = await state(page.id);
   const edited = result(
-    await request("PATCH", `/wiki/pages/${page.id}`, { title: "Second" }),
+    await request("PATCH", `/wiki/pages/${page.id}`, { title: "Second", expectedRevision: 1 }),
     200,
   ).data;
   assert.deepEqual(edited.content, nested(124));
@@ -738,7 +738,7 @@ for (const kind of ["SQL", "JSON"])
       .$queryRaw`SELECT "content" IS NULL AS "sqlNull" FROM "WikiPageVersion" WHERE "id" = ${version.id}`;
     assert.equal(storedVersion.sqlNull, kind === "SQL");
     result(
-      await request("PATCH", `/wiki/pages/${page.id}`, { content: "current" }),
+      await request("PATCH", `/wiki/pages/${page.id}`, { content: "current", expectedRevision: 0 }),
       200,
     );
     const before = await state(page.id);
@@ -1015,6 +1015,7 @@ test("literal members: direct writes refuse serializer-interpreted objects witho
         () =>
           pageService.updatePage(app.prisma, page.id, actor.id, {
             content: value,
+            expectedRevision: 0,
           }),
         "content",
         page.id,
@@ -1089,7 +1090,7 @@ test("literal members: unsupported legacy snapshots and historical restores refu
       refused(
         "PATCH",
         `/wiki/pages/${page.id}`,
-        { content: "replacement" },
+        { content: "replacement", expectedRevision: 0 },
         "content",
         page.id,
       ),
@@ -1170,6 +1171,7 @@ test("literal members: supported controls round trip through services, HTTP, ver
       assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
       await pageService.updatePage(app.prisma, page.id, actor.id, {
         content: value,
+        expectedRevision: 0,
       });
       assert.deepEqual(await storedJson("WikiPage", "content", page.id), value);
       const version = result(
@@ -1180,6 +1182,7 @@ test("literal members: supported controls round trip through services, HTTP, ver
       ).data;
       await pageService.updatePage(app.prisma, page.id, actor.id, {
         content: "replaced",
+        expectedRevision: 1,
       });
       assert.deepEqual(
         result(

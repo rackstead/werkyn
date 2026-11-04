@@ -30,7 +30,7 @@ if (typeof window !== "undefined") {
  */
 export async function writeAlongsideAutosave(
   entityKey: string,
-  write: () => Promise<number | undefined>,
+  write: (baseRevision?: number) => Promise<number | undefined>,
 ) {
   const queue = queues.get(entityKey)?.queue as AutosaveQueue<object> | undefined;
   if (queue) await queue.writeAlongside(write);

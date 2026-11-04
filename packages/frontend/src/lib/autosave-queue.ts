@@ -160,13 +160,13 @@ export class AutosaveQueue<T extends object> {
    * they cannot be, the outside write is not made. Saves of edits made
    * meanwhile wait for it and are then based on its revision.
    */
-  writeAlongside = async (write: () => Promise<number | undefined>) => {
+  writeAlongside = async (write: (baseRevision?: number) => Promise<number | undefined>) => {
     try {
       await this.flush();
     } catch {
       throw new PendingEditsError();
     }
-    const outside = write().then((revision) => this.acknowledgeRevision(revision));
+    const outside = write(this.baseRevision).then((revision) => this.acknowledgeRevision(revision));
     // Flushes requested meanwhile wait for this, then for the edits made
     // meanwhile, which are saved on the acknowledged revision.
     const held: Promise<void> = outside

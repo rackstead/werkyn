@@ -295,7 +295,7 @@ test("historical restore: valid base preserves other-user lock refusal",async()=
  const {page,version,base}=await fixture();status(await acquire("ALICE",page.id),200);const before=await state(page.id);
  const body=conflict(await restore(version,base,"BOB"),"EDIT_LOCKED",base);assert.equal(body.current.lockedBy.id,users.ALICE.id);assert.deepEqual(await state(page.id),before);
 });
-test("historical restore: ordinary optional PATCH semantics remain unchanged",async()=>{
- const page=await newPage();status(await save("ALICE",page.id,{title:"Optional revision"}),200);const before=await state(page.id);
+test("historical restore: ordinary revision-checked PATCH preserves stale refusal",async()=>{
+ const page=await newPage();status(await save("ALICE",page.id,{title:"Reviewed edit",expectedRevision:0}),200);const before=await state(page.id);
  assert.equal(before.page.revision,1);conflict(await save("ALICE",page.id,{content:doc("stale"),expectedRevision:0}),"REVISION_CONFLICT",1);assert.deepEqual(await state(page.id),before);
 });

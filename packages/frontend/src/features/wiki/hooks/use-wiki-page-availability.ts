@@ -6,7 +6,7 @@ import type { useEntityAutosave } from "@/hooks/use-entity-autosave";
 import { queryKeys } from "@/lib/query-keys";
 import { markWikiPageAvailability, type useWikiPage } from "../api";
 
-type Autosave = ReturnType<typeof useEntityAutosave<UpdateWikiPageInput>>;
+type Autosave = ReturnType<typeof useEntityAutosave<Omit<UpdateWikiPageInput, "expectedRevision">>>;
 type Flush = Autosave["flush"];
 interface Owner { token: symbol; active: boolean; notify: () => void }
 interface Barrier { ready: boolean }

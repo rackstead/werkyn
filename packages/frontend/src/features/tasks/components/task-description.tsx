@@ -75,13 +75,12 @@ function TaskDescriptionEditor({
       if (useAuthStore.getState().user?.id !== userId) {
         throw new Error("Sign in as the author to save these changes");
       }
+      if (expectedDescriptionRevision === undefined) throw new Error("Reload this task before saving: its description revision is unavailable");
       // The server refuses (409) a description based on an older revision
       // instead of replacing the newer one.
       const result = await updateTask({
         description: savableDescription(patch.description),
-        ...(expectedDescriptionRevision === undefined
-          ? {}
-          : { expectedDescriptionRevision }),
+        expectedDescriptionRevision,
         id: taskId,
         expectedUserId: userId,
       });

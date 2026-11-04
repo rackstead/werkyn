@@ -1,3 +1,4 @@
+import { WikiPageRevisionSchema } from "@pm/shared";
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type {
   CreateWikiPageInput,
@@ -28,6 +29,7 @@ const pageSelect = {
   title: true,
   icon: true,
   position: true,
+  revision: true,
   createdById: true,
   lastEditedById: true,
   createdAt: true,
@@ -233,8 +235,7 @@ export async function getPage(prisma: PrismaClient, pageId: string) {
 /**
  * Saves a page as a compare-and-set under the page row lock: another user's
  * unexpired edit lock refuses the write, and so does an `expectedRevision`
- * other than the stored one. Without `expectedRevision` (older API clients)
- * the write applies to whatever is stored, as before. The occasional auto-save
+ * other than the stored one. Every edit requires a valid revision. The occasional auto-save
  * version records the content this save replaces in the same transaction.
  */
 export async function updatePage(
@@ -243,6 +244,8 @@ export async function updatePage(
   actorId: string,
   data: UpdateWikiPageInput,
 ) {
+  if (!WikiPageRevisionSchema.safeParse(data.expectedRevision).success)
+    throw new ValidationError("A valid page revision is required");
   const content = data.content;
   assertWikiJson(content, "content");
   return prisma.$transaction(async (tx) => {

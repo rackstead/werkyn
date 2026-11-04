@@ -40,6 +40,7 @@ export interface WikiSpace {
 
 export interface WikiPageTreeItem {
   id: string;
+  revision: number;
   spaceId: string;
   parentId: string | null;
   title: string;

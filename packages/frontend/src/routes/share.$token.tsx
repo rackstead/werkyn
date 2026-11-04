@@ -136,6 +136,7 @@ function SharePage() {
         <WikiEditor
           initialContent={page.content}
           readOnly
+          mediaShareToken={token}
         />
       </main>
     </div>

@@ -3,11 +3,13 @@ import "@blocknote/mantine/style.css";
 
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
-import { Component, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
+import { Component, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { Block } from "@blocknote/core";
 import { useAuthStore } from "@/stores/auth-store";
 import { stripPastedStyleSheets } from "@/lib/pasted-html";
 import { apiBase } from "@/lib/api-url";
+import { EditorMediaResolver, UploadedMediaOwner, uploadedMediaReferences } from "@/lib/uploaded-media";
+import { UploadedMediaToolbar } from "./uploaded-file-download";
 
 function useIsDark() {
   return useSyncExternalStore(
@@ -28,6 +30,7 @@ export interface WikiEditorProps {
   workspaceId?: string;
   spaceId?: string;
   onChange?: (content: Block[]) => void;
+  mediaShareToken?: string;
 }
 
 interface EditorBoundaryProps {
@@ -84,6 +87,7 @@ function WikiEditorInner({
   workspaceId,
   spaceId,
   onChange,
+  mediaShareToken,
 }: WikiEditorProps) {
   const isDark = useIsDark();
   const onChangeRef = useRef(onChange);
@@ -92,10 +96,19 @@ function WikiEditorInner({
   const initialDocument = recoveredContent ?? initialContent;
   const appliedSource = useRef(JSON.stringify(initialContent));
   const wasDirty = useRef(hasUnsavedChanges);
+  const [mediaError, setMediaError] = useState("");
+  const [mediaReady, setMediaReady] = useState(false);
+  const media = useMemo(() => new UploadedMediaOwner(setMediaError, mediaShareToken, () => setMediaReady(false)), [mediaShareToken]);
+  const resolver = useMemo(() => new EditorMediaResolver(media), [media]);
+  const mediaRef = useRef(media);
+  const resolverRef = useRef(resolver);
+  mediaRef.current = media;
+  resolverRef.current = resolver;
 
   const editor = useCreateBlockNote({
     selectAllBehavior: "document",
     domAttributes: { editor: { tabindex: "0" } },
+    resolveFileUrl: (url: string) => resolverRef.current.resolve(url),
     initialContent:
       Array.isArray(initialDocument) && initialDocument.length > 0
         ? (initialDocument as Block[])
@@ -133,6 +146,15 @@ function WikiEditorInner({
     },
   });
 
+  useLayoutEffect(() => {
+    media.activate();
+    media.reconcile(uploadedMediaReferences(editor.document));
+    resolver.commit();
+    setMediaError("");
+    setMediaReady(true);
+    return () => { resolver.deactivate(); media.dispose(); };
+  }, [media, resolver, editor]);
+
   // Toggling editability (Start/Done Editing) makes BlockNote report a change
   // for an unchanged document. Only real edits may reach autosave, or opening
   // the editor would save (and mark as edited) the page as it was.
@@ -147,6 +169,7 @@ function WikiEditorInner({
   }, [editor]);
 
   const handleChange = useCallback(() => {
+    mediaRef.current.reconcile(uploadedMediaReferences(editor.document));
     const serialized = JSON.stringify(editor.document);
     if (serialized === lastDocument.current) return;
     lastDocument.current = serialized;
@@ -175,6 +198,7 @@ function WikiEditorInner({
         ? (initialContent as Block[])
         : [{ type: "paragraph" }],
     );
+    mediaRef.current.reconcile(uploadedMediaReferences(editor.document));
     // A change event for this replacement, even a late one, is not an edit.
     lastDocument.current = JSON.stringify(editor.document);
     queueMicrotask(() => {
@@ -189,12 +213,16 @@ function WikiEditorInner({
   }, [editor, readOnly]);
 
   return (
-    <div className={`wiki-editor-wrapper${readOnly ? "" : " is-editing"}`}>
+    <div className={`wiki-editor-wrapper${readOnly ? "" : " is-editing"}${mediaReady ? "" : " [&_.bn-visual-media]:invisible"}`}>
+      {mediaError && <p role="status" className="text-sm text-muted-foreground">{mediaError}</p>}
       <BlockNoteView
         editor={editor}
         onChange={handleChange}
         theme={isDark ? "dark" : "light"}
-      />
+        formattingToolbar={false}
+      >
+        <UploadedMediaToolbar owner={media} />
+      </BlockNoteView>
     </div>
   );
 }

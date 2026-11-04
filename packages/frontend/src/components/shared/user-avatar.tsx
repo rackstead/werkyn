@@ -1,4 +1,7 @@
 import { cn } from "@/lib/utils";
+import { useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { identityGeneration, subscribeIdentity } from "@/lib/identity";
+import { isUploadedMediaUrl, UploadedMediaOwner } from "@/lib/uploaded-media";
 
 interface UserAvatarProps {
   displayName: string;
@@ -36,10 +39,25 @@ function getColor(name: string): string {
 }
 
 export function UserAvatar({ displayName, avatarUrl, size = "md", className }: UserAvatarProps) {
-  if (avatarUrl) {
+  const generation = useSyncExternalStore(subscribeIdentity, identityGeneration);
+  const [resolved, setResolved] = useState<{ url: string; source: string; generation: number }>();
+  const [error, setError] = useState("");
+  const media = useMemo(() => new UploadedMediaOwner(setError), []);
+  const uploaded = !!avatarUrl && isUploadedMediaUrl(avatarUrl);
+  useLayoutEffect(() => { media.activate(); return () => media.dispose(); }, [media, generation]);
+  useEffect(() => {
+    let current = true;
+    setResolved(undefined);
+    setError("");
+    media.reconcile(new Set(uploaded ? [avatarUrl!] : []));
+    if (uploaded) void media.resolve(avatarUrl!).then(url => { if (current) setResolved({ url, source: avatarUrl!, generation }); }).catch(() => {});
+    return () => { current = false; };
+  }, [media, avatarUrl, uploaded, generation]);
+  const src = uploaded ? resolved?.source === avatarUrl && resolved.generation === generation ? resolved.url : undefined : avatarUrl;
+  if (src) {
     return (
       <img
-        src={avatarUrl}
+        src={src}
         alt={displayName}
         className={cn(
           "rounded-full object-cover",
@@ -58,6 +76,9 @@ export function UserAvatar({ displayName, avatarUrl, size = "md", className }: U
         getColor(displayName),
         className,
       )}
+      role="img"
+      aria-label={error ? `${displayName}: image unavailable` : displayName}
+      title={error || undefined}
     >
       {getInitials(displayName)}
     </div>

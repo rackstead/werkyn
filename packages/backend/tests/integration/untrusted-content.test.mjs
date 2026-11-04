@@ -183,9 +183,11 @@ for (const kind of ["avatar", "upload", "workspace", "legacy"]) {
     }[kind];
     for (const name of activeFiles) {
       const response = await get(`${prefix}/${name}?inline=true`);
-      assert.equal(response.statusCode, 200, response.body);
-      assertPolicy(response, true);
-      assert.deepEqual(response.rawPayload, marker);
+      assert.equal(response.statusCode, kind === "workspace" ? 200 : 410, response.body);
+      if (kind === "workspace") {
+        assertPolicy(response, true);
+        assert.deepEqual(response.rawPayload, marker);
+      } else assert.equal(response.rawPayload.includes(marker), false);
     }
   });
 }
@@ -196,9 +198,13 @@ test("directory index documents receive the same static isolation policy", async
     `/storage/${workspace.id}/uploads/wiki/index-fixture/`,
   ]) {
     const response = await get(url);
-    assert.equal(response.statusCode, 200, response.body);
-    assertPolicy(response, true);
-    assert.deepEqual(response.rawPayload, marker);
+    const retired = url.startsWith("/storage/uploads/");
+    assert.equal(response.statusCode, retired ? 410 : 200, response.body);
+    if (retired) assert.equal(response.rawPayload.includes(marker), false);
+    else {
+      assertPolicy(response, true);
+      assert.deepEqual(response.rawPayload, marker);
+    }
   }
 });
 

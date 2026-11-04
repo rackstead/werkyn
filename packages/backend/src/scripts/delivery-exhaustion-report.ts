@@ -1,5 +1,6 @@
 /** Local read-only report; see docs/remediation/delivery-exhaustion-report.md. */
 import { pathToFileURL } from "node:url";
+import { spawn, type ChildProcess } from "node:child_process";
 import { Prisma, PrismaClient } from "@prisma/client";
 
 // Coupled to the workers by integration tests, without importing their app graph.
@@ -113,25 +114,110 @@ async function main() {
   let prisma: PrismaClient | undefined;
   let report: Awaited<ReturnType<typeof findExhaustedDeliveries>> | undefined;
   let failure: Failure | undefined;
-  // Only the standalone process installs these listeners. Stream errors must
-  // not escape as raw exceptions, including an error emitted after a callback.
-  process.stdout.on("error", () => {});
-  process.stderr.on("error", () => {});
-  const write = async (stream: NodeJS.WriteStream, text: string) => {
-    if (stream.destroyed) return false;
-    try { return await new Promise<boolean>((resolve) => stream.write(text, (error) => resolve(!error))); }
-    catch { return false; }
-  };
-  // This timer belongs only to this standalone, read-only CLI, never an importer.
   let deadlineFired = false;
-  const hardStop = setTimeout(() => process.exit(1), 15_000);
+  let outputChild: ChildProcess | undefined;
+  let outputClosed: Promise<void> = Promise.resolve();
+  let outputFailed = false, closingOutput = false, killSent = false, nextOutputId = 0;
+  const pending = new Map<number, (ok: boolean) => void>();
+  const settlePending = () => { for (const resolve of pending.values()) resolve(false); pending.clear(); };
+  // The child owns potentially blocking descriptors. It receives no database or
+  // application environment and has no child-launch code. Its IPC is finite:
+  // one report and at most two fixed errors, with at most two writes in flight.
+  const outputProgram = String.raw`
+const fs = require("node:fs");
+let received = 0, active = 0;
+process.on("message", m => {
+  if (!m || typeof m !== "object" || Object.keys(m).length !== 3 ||
+      !Number.isInteger(m.id) || m.id !== received || received >= 3 ||
+      (m.fd !== 1 && m.fd !== 2) || typeof m.text !== "string" || active >= 2)
+    return process.exit(1);
+  const bytes = Buffer.from(m.text, "utf8");
+  if (bytes.length > ${MAX_REPORT_BYTES + 1}) return process.exit(1);
+  received++; active++;
+  let offset = 0, settled = false;
+  const finish = ok => {
+    if (settled) return; settled = true; active--;
+    if (process.connected) process.send({ id: m.id, ok }, () => {});
+  };
+  const step = () => {
+    try {
+      fs.write(m.fd, bytes, offset, bytes.length - offset, null, (error, count) => {
+        if (error && (error.code === "EAGAIN" || error.code === "EWOULDBLOCK")) return setTimeout(step, 10);
+        if (error || count <= 0) return finish(false);
+        offset += count;
+        if (offset === bytes.length) finish(true); else step();
+      });
+    } catch { finish(false); }
+  };
+  if (bytes.length) step(); else finish(true);
+});
+process.on("disconnect", () => process.exit(0));
+`;
+  const killOutput = () => {
+    if (outputChild && outputChild.exitCode === null && outputChild.signalCode === null && !killSent) {
+      killSent = outputChild.kill("SIGKILL");
+    }
+  };
+  const closeOutput = async (force: boolean) => {
+    if (!outputChild) return;
+    if (force) killOutput();
+    else if (outputChild.connected) { closingOutput = true; outputChild.disconnect(); }
+    await outputClosed;
+  };
+  const startOutput = () => {
+    if (outputChild || outputFailed) return;
+    const childEnv: NodeJS.ProcessEnv = {};
+    if (process.platform === "win32" && process.env.SystemRoot) childEnv.SystemRoot = process.env.SystemRoot;
+    try {
+      const child = spawn(process.execPath, ["--input-type=commonjs", "-e", outputProgram], {
+        stdio: ["ignore", 1, 2, "ipc"], env: childEnv, windowsHide: true,
+      });
+      outputChild = child;
+      outputClosed = new Promise<void>((resolve) => child.once("close", (code, signal) => {
+        if (code !== 0 || signal !== null) outputFailed = true;
+        settlePending(); resolve();
+      }));
+      child.on("error", () => { outputFailed = true; settlePending(); });
+      child.on("disconnect", () => {
+        if (!closingOutput) { outputFailed = true; settlePending(); killOutput(); }
+      });
+      child.on("message", (raw) => {
+        const message = raw as { id?: unknown; ok?: unknown } | null;
+        if (!message || typeof message !== "object" || Object.keys(message).length !== 2 ||
+            typeof message.id !== "number" || !Number.isInteger(message.id) ||
+            typeof message.ok !== "boolean" || !pending.has(message.id)) {
+          outputFailed = true; settlePending(); killOutput(); return;
+        }
+        const resolve = pending.get(message.id)!; pending.delete(message.id); resolve(message.ok);
+      });
+    } catch { outputFailed = true; settlePending(); }
+  };
+  const write = (fd: 1 | 2, text: string): Promise<boolean> => {
+    if (Buffer.byteLength(text, "utf8") > MAX_REPORT_BYTES + 1 || pending.size >= 2 || nextOutputId >= 3)
+      return Promise.resolve(false);
+    startOutput();
+    if (outputFailed || !outputChild?.connected || !outputChild.send) return Promise.resolve(false);
+    const id = nextOutputId++;
+    return new Promise<boolean>((resolve) => {
+      pending.set(id, resolve);
+      try {
+        outputChild!.send!({ id, fd, text }, (error) => {
+          if (error) { outputFailed = true; settlePending(); killOutput(); }
+        });
+      } catch { outputFailed = true; settlePending(); killOutput(); }
+    });
+  };
+  // Reserve the last100ms for collecting the owned output child. The absolute
+  // 15-second stop remains referenced, including child startup and blocked I/O.
+  const absoluteStop = setTimeout(() => { deadlineFired = true; killOutput(); process.exit(1); }, 15_000);
+  const collectDeadline = setTimeout(() => {
+    deadlineFired = true; process.exitCode = 1;
+    void closeOutput(true).finally(() => process.exit(1));
+  }, 14_900);
   const deadline = setTimeout(() => {
-    deadlineFired = true;
-    process.exitCode = 1;
-    // Give an asynchronous consumer a bounded chance to receive the error.
-    // The independent hard stop remains referenced if stderr never settles.
-    void write(process.stderr, '{"error":"deadline_exceeded"}\n')
-      .finally(() => process.exit(1));
+    deadlineFired = true; process.exitCode = 1;
+    void write(2, '{"error":"deadline_exceeded"}\n')
+      .finally(() => closeOutput(true).finally(() => process.exit(1)));
   }, 14_750);
   try {
     const options = parseDeliveryReportArgs(process.argv.slice(2));
@@ -152,19 +238,22 @@ async function main() {
   try {
     if (deadlineFired) return;
     if (failure || !report) {
-      await write(process.stderr, JSON.stringify({ error: failure ?? "query_failed" }) + "\n");
+      await write(2, JSON.stringify({ error: failure ?? "query_failed" }) + "\n");
       process.exitCode = 1;
     } else {
-      const delivered = await write(process.stdout, JSON.stringify(report) + "\n");
+      const delivered = await write(1, JSON.stringify(report) + "\n");
       if (deadlineFired) return;
       if (delivered) process.exitCode = report.rows.length ? 2 : 0;
       else {
-        await write(process.stderr, '{"error":"output_failed"}\n');
+        await write(2, '{"error":"output_failed"}\n');
         process.exitCode = 1;
       }
     }
   } finally {
-    if (!deadlineFired) { clearTimeout(deadline); clearTimeout(hardStop); }
+    if (!deadlineFired) {
+      await closeOutput(false);
+      if (!deadlineFired) { clearTimeout(deadline); clearTimeout(collectDeadline); clearTimeout(absoluteStop); }
+    }
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void main();

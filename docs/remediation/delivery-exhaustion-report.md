@@ -42,10 +42,15 @@ connection/pool waiting and has a 15-second failure deadline, including
 disconnect and actual stdout/stderr write settlement. A blocked output consumer
 can therefore cause a fixed failure exit with incomplete output; it is never a
 completed report. Consumers must check exit status and parse the complete JSON.
-At 14.75 seconds it attempts the fixed deadline error and waits for that write's
-callback; an independent 15-second hard stop remains active. Error delivery is
-best effort when stderr is blocked, so a nonzero exit may have incomplete error
-output as well as incomplete report output.
+One lazy, core-only Node output child receives bounded output over IPC, without
+the database URL or application credentials. This keeps blocked stdout/stderr
+out of the parent's deadline clock. At 14.75 seconds the parent attempts the
+fixed deadline error. At 14.9 seconds it terminates and collects an output child
+that is still pending, reserving time before the absolute 15-second stop. These
+internal deadline signals are intentional; ordinary successful output collects
+the child without terminating it. Error delivery is best effort when stderr is
+blocked, so a nonzero exit may have incomplete error output as well as incomplete
+report output.
 
 Rows use the same explicit `C` collation for ordering and the ID keyset. The
 query fetches at most the requested limit plus one lookahead. SQL checks ID
@@ -83,6 +88,9 @@ IDs, maximum escaped-ID output, malformed options, standalone JSON/exit codes,
 and PostgreSQL rejecting an attempted write in the report transaction.
 The POSIX/Linux FIFO case checks the standalone deadline with an actual blocked
 consumer, alongside the ordinary CLI completion controls.
-Separate controlled output transports exercise a delayed asynchronous error
-write and one that never settles. These checks do not claim that the earlier
-real-pipe controls lost an error: both delivered the complete fixed error.
+Separate real error pipes exercise a reader that resumes after the deadline
+request and one that never drains. Public process/IPC observations check the
+single output child and its collection. The earlier two error-delivery controls
+both delivered the complete fixed error; a distinct never-drained condition
+reproduced a process still alive after 17 seconds and required recorded
+termination. This was a deadline stall, not a proven lost-error result.

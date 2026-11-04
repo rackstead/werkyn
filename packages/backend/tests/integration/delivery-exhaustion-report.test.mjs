@@ -4,8 +4,8 @@ import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, rm } from "node:fs/promises";
-import { openSync, closeSync, readSync, constants, writeFileSync } from "node:fs";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { openSync, closeSync, readSync, writeSync, constants, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -243,56 +243,130 @@ test("standalone CLI bounds a blocked output consumer", async () => {
   }
 });
 
-test("deadline output settles an asynchronous callback and bounds an unsettled callback", async () => {
+test("deadline output settles with a resumed error reader and bounds a never-drained error reader", async () => {
   const selected = [];
-  const directory = await mkdtemp(path.join(tmpdir(), "delivery-report-callback-"));
+  const directory = await mkdtemp(path.join(tmpdir(), "delivery-report-stderr-"));
   const observations = [];
   try {
     for (let i = 0; i < 100; i++) selected.push(await create("notification", `V-${String(i).padStart(3, "0")}-` + "\u0001".repeat(180)));
     async function sample(mode) {
-      const fifo = path.join(directory, mode + ".fifo"), marker = path.join(directory, mode + ".notice"), observer = path.join(directory, mode + ".mjs");
-      let descriptor, child, timer, killTimer, completion, timedOut = false, stderr = "";
+      const stdoutPath = path.join(directory, mode + "-out"), stderrPath = path.join(directory, mode + "-err");
+      const marker = path.join(directory, mode + ".notice"), trace = path.join(directory, mode + ".trace"), observer = path.join(directory, mode + ".mjs");
+      let stdoutFd, stderrFd, child, completion, timer, killTimer, failure, outcome;
+      let timedOut = false, fillerBytes = 0, notice = false, stderr = "";
+      const row = { mode, realPipes: true, internalDeadlineSignalsQualified: true };
       try {
-        // Controlled output transport: delayed forwards the exact write and its
-        // callback after50ms; stalled deliberately never settles. This is not
-        // evidence that an ordinary OS pipe lost output in the earlier controls.
-        writeFileSync(observer, `import {writeFileSync} from 'node:fs';\nconst original=process.stderr.write;\nprocess.stderr.write=function(chunk,...args){if(String(chunk)==='{\"error\":\"deadline_exceeded\"}\\n'){writeFileSync(${JSON.stringify(marker)},'actual deadline write');${mode === "delayed" ? "setTimeout(()=>Reflect.apply(original,this,[chunk,...args]),50);" : ""}return false;}return Reflect.apply(original,this,[chunk,...args]);};\n`);
-        await exec("mkfifo", [fifo], { timeout: 2000 });
-        descriptor = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+        // Public observation only. Forward the original spawn/send/kill with
+        // the same receiver/arguments; never fabricate an acknowledgement.
+        writeFileSync(observer, `import {createRequire,syncBuiltinESMExports} from 'node:module';import{writeFileSync}from'node:fs';const cp=createRequire(import.meta.url)('node:child_process');const original=cp.spawn;const facts={children:[]};const save=()=>writeFileSync(${JSON.stringify(trace)},JSON.stringify(facts));cp.spawn=function(...args){const c=Reflect.apply(original,this,args);if(args[0]===process.execPath&&args[2]?.stdio?.[3]==='ipc'){const r={pid:c.pid,envKeys:Object.keys(args[2].env||{}),requests:[],signals:[]};facts.children.push(r);save();const send=c.send;c.send=function(m,...rest){r.requests.push({id:m?.id,fd:m?.fd,bytes:typeof m?.text==='string'?Buffer.byteLength(m.text):null});if(m?.fd===2&&m?.text===JSON.stringify({error:'deadline_exceeded'})+String.fromCharCode(10))writeFileSync(${JSON.stringify(marker)},'actual deadline request');save();return Reflect.apply(send,this,[m,...rest]);};const kill=c.kill;c.kill=function(...rest){r.signals.push(rest[0]);save();return Reflect.apply(kill,this,rest);};c.on('close',(code,signal)=>{r.closed={code,signal};save();});}return c;};syncBuiltinESMExports();`);
+        await exec("mkfifo", [stdoutPath, stderrPath], { timeout: 2000 });
+        stdoutFd = openSync(stdoutPath, constants.O_RDWR | constants.O_NONBLOCK);
+        stderrFd = openSync(stderrPath, constants.O_RDWR | constants.O_NONBLOCK);
+        const filler = Buffer.alloc(4096, "F");
+        while (fillerBytes < 1024 * 1024) {
+          try { fillerBytes += writeSync(stderrFd, filler); }
+          catch (error) { if (error.code === "EAGAIN") break; throw error; }
+        }
+        assert(fillerBytes > 0 && fillerBytes < 1024 * 1024, "Real finite stderr pipe filled before dispatch");
         const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
         const started = performance.now();
         child = spawn(process.execPath, ["--import", observer, "--import", "tsx", script, "--kind=notification", "--limit=100", `--after=${prefix}V-`], {
-          cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, stdio: ["ignore", descriptor, "pipe"],
+          cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, stdio: ["ignore", stdoutFd, stderrFd],
         });
-        child.stderr.on("data", chunk => { stderr = (stderr + chunk.toString()).slice(0, 2048); });
         completion = new Promise((resolve, reject) => { child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal })); });
         timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); killTimer = setTimeout(() => child.kill("SIGKILL"), 3000); }, 17_000);
-        const outcome = await completion;
-        clearTimeout(timer); clearTimeout(killTimer);
-        const buffer = Buffer.alloc(4096); let bytes = 0;
-        try { bytes = readSync(descriptor, buffer, 0, buffer.length, null); } catch (error) { if (error.code !== "EAGAIN") throw error; }
-        const actualDeadlineWrite = await import("node:fs/promises").then(fs => fs.readFile(marker, "utf8")).then(s => s === "actual deadline write", () => false);
-        const row = { mode, ...outcome, timedOut, stderr, actualDeadlineWrite, elapsedMs: performance.now() - started, prefixBytes: bytes, beginsAsReport: buffer.subarray(0, bytes).toString().startsWith('{"version":1,"readOnly":true,"kind":"notification"'), controlledTransport: true };
-        observations.push(row);
-        if (process.env.DELIVERY_REPORT_CALLBACK_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CALLBACK_FACTS, JSON.stringify(observations, null, 2) + "\n");
+        while (performance.now() - started < 16_500) {
+          notice = await readFile(marker, "utf8").then(s => s === "actual deadline request", e => { if (e.code === "ENOENT") return false; throw e; });
+          if (notice) break;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        row.actualDeadlineRequest = notice;
+        assert.equal(notice, true, "Owned writer received the actual deadline request");
+        if (mode === "resumed") {
+          await new Promise(resolve => setTimeout(resolve, 50));
+          let remaining = fillerBytes;
+          while (remaining) {
+            const chunk = Buffer.alloc(Math.min(4096, remaining));
+            const count = readSync(stderrFd, chunk, 0, chunk.length, null);
+            assert.equal(chunk.subarray(0, count).toString(), "F".repeat(count)); remaining -= count;
+          }
+        }
+        outcome = await completion;
+        row.elapsedMs = performance.now() - started;
+        if (mode === "never") {
+          let remaining = fillerBytes;
+          while (remaining) {
+            const chunk = Buffer.alloc(Math.min(4096, remaining));
+            const count = readSync(stderrFd, chunk, 0, chunk.length, null);
+            assert.equal(chunk.subarray(0, count).toString(), "F".repeat(count)); remaining -= count;
+          }
+        }
+        for (;;) {
+          const buffer = Buffer.alloc(4096); let bytes;
+          try { bytes = readSync(stderrFd, buffer, 0, buffer.length, null); }
+          catch (error) { if (error.code === "EAGAIN") break; throw error; }
+          if (!bytes) break; stderr += buffer.subarray(0, bytes).toString();
+          assert(stderr.length < 2048);
+        }
+        const buffer = Buffer.alloc(4096); const bytes = readSync(stdoutFd, buffer, 0, buffer.length, null);
+        row.beginsAsReport = buffer.subarray(0, bytes).toString().startsWith('{"version":1,"readOnly":true,"kind":"notification"');
+        row.prefixBytes = bytes; row.writer = JSON.parse(await readFile(trace, "utf8"));
         assert.equal(timedOut, false); assert.equal(outcome.signal, null); assert.equal(outcome.code, 1);
-        assert.equal(actualDeadlineWrite, true); assert.equal(row.beginsAsReport, true);
-        assert.equal(stderr, mode === "delayed" ? '{"error":"deadline_exceeded"}\n' : "");
+        assert.equal(row.beginsAsReport, true);
+        assert.equal(stderr, mode === "resumed" ? '{"error":"deadline_exceeded"}\n' : "");
         assert(row.elapsedMs >= 14_000 && row.elapsedMs < 17_000);
-      } finally {
+        assert.equal(row.writer.children.length, 1);
+        const writer = row.writer.children[0];
+        assert.deepEqual(writer.envKeys, process.platform === "win32" && process.env.SystemRoot ? ["SystemRoot"] : []);
+        assert(writer.requests.length <= 3); assert(writer.requests.every(r => r.bytes <= MAX_REPORT_BYTES + 1));
+        assert(writer.closed, "The one owned output child was collected before CLI exit");
+        assert.equal(writer.closed.signal, "SIGKILL");
+        assert.deepEqual(writer.signals, ["SIGKILL"], "Internal deadline collection is explicit, not outer cleanup");
+      } catch (error) { failure = error; }
+      finally {
         clearTimeout(timer); clearTimeout(killTimer);
         if (child && child.exitCode === null && child.signalCode === null) {
           child.kill("SIGTERM"); const force = setTimeout(() => child.kill("SIGKILL"), 3000);
-          try { await completion?.catch(() => {}); } finally { clearTimeout(force); }
+          try { outcome = await completion?.catch(() => undefined); } finally { clearTimeout(force); }
         }
-        if (descriptor !== undefined) closeSync(descriptor);
+        Object.assign(row, { timedOut, outcome, fillerBytes, stderr, failure: failure?.message });
+        observations.push(row);
+        if (process.env.DELIVERY_REPORT_CALLBACK_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CALLBACK_FACTS, JSON.stringify(observations, null, 2) + "\n");
+        if (stdoutFd !== undefined) closeSync(stdoutFd);
+        if (stderrFd !== undefined) closeSync(stderrFd);
       }
+      if (failure) throw failure;
     }
-    const results = await Promise.allSettled([sample("delayed"), sample("stalled")]);
+    const results = await Promise.allSettled([sample("resumed"), sample("never")]);
     for (const result of results) if (result.status === "rejected") throw result.reason;
     assert.equal(observations.length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
     await db.notificationDelivery.deleteMany({ where: { id: { in: selected } } });
   }
+});
+
+test("a writer terminated after its output acknowledgement cannot return success", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "delivery-report-writer-status-"));
+  const observer = path.join(directory, "observer.mjs"), marker = path.join(directory, "terminated");
+  try {
+    // Actual bytes and acknowledgement flow unchanged; terminate the actual
+    // owned child when normal finalization requests its graceful disconnect.
+    writeFileSync(observer, `import{createRequire,syncBuiltinESMExports}from'node:module';import{writeFileSync}from'node:fs';const cp=createRequire(import.meta.url)('node:child_process');const original=cp.spawn;cp.spawn=function(...args){const c=Reflect.apply(original,this,args);if(args[0]===process.execPath&&args[2]?.stdio?.[3]==='ipc'){c.disconnect=function(){writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:c.pid,signal:'SIGTERM'}));return c.kill('SIGTERM');};}return c;};syncBuiltinESMExports();`);
+    const script = fileURLToPath(new URL("../../src/scripts/delivery-exhaustion-report.ts", import.meta.url));
+    let outcome;
+    try {
+      outcome = { ...(await exec(process.execPath, ["--import", observer, "--import", "tsx", script, "--kind=notification", `--after=${prefix}W-`], {
+        cwd: fileURLToPath(new URL("../..", import.meta.url)), env: process.env, timeout: 10_000, maxBuffer: 512 * 1024,
+      })), code: 0, signal: null };
+    } catch (error) { outcome = { stdout: error.stdout, stderr: error.stderr, code: error.code, signal: error.signal }; }
+    const parsed = JSON.parse(outcome.stdout);
+    const termination = JSON.parse(await readFile(marker, "utf8"));
+    const facts = { code: outcome.code, signal: outcome.signal, stderr: outcome.stderr, completeReport: parsed.readOnly === true && parsed.kind === "notification", rows: parsed.rows.length, intentionalPostAcknowledgementTermination: termination };
+    if (process.env.DELIVERY_REPORT_CHILD_STATUS_FACTS) writeFileSync(process.env.DELIVERY_REPORT_CHILD_STATUS_FACTS, JSON.stringify(facts, null, 2) + "\n");
+    assert.equal(facts.completeReport, true); assert.equal(facts.rows, 0);
+    assert.equal(termination.signal, "SIGTERM"); assert.equal(typeof termination.pid, "number");
+    assert.equal(outcome.signal, null); assert.equal(outcome.stderr, "");
+    assert.equal(outcome.code, 1, "An abnormal output-child close must not leave a successful CLI status");
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

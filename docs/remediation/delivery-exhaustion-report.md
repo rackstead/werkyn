@@ -51,6 +51,8 @@ internal deadline signals are intentional; ordinary successful output collects
 the child without terminating it. Error delivery is best effort when stderr is
 blocked, so a nonzero exit may have incomplete error output as well as incomplete
 report output.
+A successful 0 or 2 requires normal output-child collection as well as complete
+bytes. An abnormal child close after its acknowledgement still returns 1.
 
 Rows use the same explicit `C` collation for ordering and the ID keyset. The
 query fetches at most the requested limit plus one lookahead. SQL checks ID

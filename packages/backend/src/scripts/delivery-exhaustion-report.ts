@@ -252,6 +252,7 @@ process.on("disconnect", () => process.exit(0));
   } finally {
     if (!deadlineFired) {
       await closeOutput(false);
+      if (outputFailed) process.exitCode = 1;
       if (!deadlineFired) { clearTimeout(deadline); clearTimeout(collectDeadline); clearTimeout(absoluteStop); }
     }
   }

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useId, useRef, useState } from "react";
+import { SetUserRateSchema } from "@pm/shared";
 import { DollarSign } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -75,7 +76,7 @@ function RatesList({ workspaceId }: { workspaceId: string }) {
     <div className="space-y-1 max-h-80 overflow-y-auto">
       {members.map((member) => (
         <MemberRateRow
-          key={member.id}
+          key={`${workspaceId}:${member.id}:${member.user.id}`}
           workspaceId={workspaceId}
           userId={member.user.id}
           displayName={member.user.displayName}
@@ -106,31 +107,64 @@ function MemberRateRow({
   const setRateMutation = useSetUserRate(workspaceId);
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [opening, setOpening] = useState<{ rate: number; currency: string }>();
+  const [error, setError] = useState("");
+  const submitting = useRef(false);
+  const inputId = useId();
 
   function startEdit() {
     setValue(currentRate ? String(currentRate.rate) : "");
+    setCurrency(currentRate?.currency ?? "USD");
+    setOpening(currentRate
+      ? { rate: currentRate.rate, currency: currentRate.currency }
+      : undefined);
+    setError("");
     setEditing(true);
   }
 
-  function handleSave() {
-    const parsed = parseFloat(value);
-    if (isNaN(parsed) || parsed < 0) {
+  function handleSave(event: React.FormEvent) {
+    event.preventDefault();
+    if (submitting.current || setRateMutation.isPending) return;
+    const parsed = SetUserRateSchema.safeParse({
+      rate: value === "" ? NaN : Number(value),
+      currency,
+    });
+    if (!parsed.success) {
+      setError(parsed.error.issues.some((issue) => issue.path[0] === "currency")
+        ? "Currency must contain exactly three letters."
+        : "Enter a finite rate between 0 and 1,000,000,000.");
+      return;
+    }
+    const currencyChanged = parsed.data.currency !== (opening?.currency ?? "USD");
+    if (opening && parsed.data.rate === opening.rate && !currencyChanged) {
       setEditing(false);
       return;
     }
-    if (parsed === (currentRate?.rate ?? 0)) {
-      setEditing(false);
-      return;
-    }
+    setError("");
+    submitting.current = true;
     setRateMutation.mutate(
-      { userId, data: { rate: parsed } },
-      { onSuccess: () => setEditing(false) },
+      {
+        userId,
+        data: {
+          rate: parsed.data.rate,
+          ...(currencyChanged ? { currency: parsed.data.currency } : {}),
+        },
+      },
+      {
+        onSuccess: () => setEditing(false),
+        onError: () => setError("Failed to save the rate. Please try again."),
+        onSettled: () => { submitting.current = false; },
+      },
     );
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Enter") handleSave();
-    if (e.key === "Escape") setEditing(false);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!submitting.current && !setRateMutation.isPending) setEditing(false);
+    }
   }
 
   return (
@@ -146,26 +180,50 @@ function MemberRateRow({
       </div>
       <div className="flex items-center gap-1.5">
         {editing ? (
-          <>
-            <div className="flex items-center">
-              <span className="text-sm text-muted-foreground mr-1">
-                {currentRate?.currency ?? "USD"}
-              </span>
+          <form
+            aria-label={`Hourly rate for ${displayName}`}
+            onSubmit={handleSave}
+            onKeyDown={handleKeyDown}
+            noValidate
+            className="flex flex-wrap items-center justify-end gap-1.5"
+          >
+            <div>
+              <label htmlFor={`${inputId}-amount`} className="sr-only">Hourly rate</label>
               <Input
+                id={`${inputId}-amount`}
                 type="number"
                 min="0"
                 max="1000000000"
-                step="0.01"
+                step="any"
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
-                onKeyDown={handleKeyDown}
-                onBlur={handleSave}
+                disabled={setRateMutation.isPending}
+                aria-invalid={!!error}
+                aria-describedby={error ? `${inputId}-error` : undefined}
                 autoFocus
                 className="h-7 w-20 text-sm"
               />
             </div>
+            <div>
+              <label htmlFor={`${inputId}-currency`} className="sr-only">Currency</label>
+              <Input
+                id={`${inputId}-currency`}
+                value={currency}
+                onChange={(event) => setCurrency(event.target.value)}
+                disabled={setRateMutation.isPending}
+                aria-invalid={!!error}
+                aria-describedby={error ? `${inputId}-error` : undefined}
+                className="h-7 w-16 text-sm"
+              />
+            </div>
             <span className="text-xs text-muted-foreground">/hr</span>
-          </>
+            <Button type="submit" size="sm" disabled={setRateMutation.isPending}>
+              {setRateMutation.isPending ? "Saving…" : "Save"}
+            </Button>
+            <Button type="button" size="sm" variant="outline" disabled={setRateMutation.isPending}
+              onClick={() => setEditing(false)}>Cancel</Button>
+            {error && <p id={`${inputId}-error`} role="alert" className="w-full text-sm text-destructive">{error}</p>}
+          </form>
         ) : (
           <button
             type="button"

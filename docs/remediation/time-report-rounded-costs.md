@@ -28,3 +28,18 @@ No database migration is needed. Float storage remains; this calculation does
 not recover decimal precision lost before storage or change rates, currency
 selection, effective dates or historical entries. Earlier reports and exports
 can consequently show different rounded costs under this selected policy.
+
+## Editing hourly rates
+
+Manage Rates provides an amount and a three-letter currency field, with explicit
+Save and Cancel. Currency-only changes keep the displayed rate, including its
+stored precision; moving between fields does not save. Currency letters are
+uppercased by the existing shared contract, without adding an ISO-only list.
+The editor uses the rate in force on today's UTC date, excluding future rates.
+
+Each draft captures the values shown when editing begins. Amount-only changes
+omit the unchanged currency, preserving the API's existing optional-field
+behavior. A changed currency sends that currency and the reviewed amount.
+The existing last-writer API remains: this does not add revisions or preserve a
+required rate concurrently changed by another writer. Failed saves retain the
+draft for an explicit retry; pending saves prevent duplicate submissions.

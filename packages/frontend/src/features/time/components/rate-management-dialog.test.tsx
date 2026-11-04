@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RateManagementDialog } from "./rate-management-dialog";
 
@@ -28,8 +28,11 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-06-15T12:00:00Z") });
   state.mutate.mockReset();
 });
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => {
+    cleanup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
   vi.useRealTimers();
 });
 
@@ -54,10 +57,10 @@ it("shows and edits the rate in force today rather than a future-dated one", () 
   expect(screen.queryByText("€90.00/hr")).toBeNull();
 
   fireEvent.click(screen.getByText("$40.00/hr"));
-  expect(screen.getByText("USD")).toBeTruthy();
+  expect((screen.getByRole("textbox", { name: "Currency" }) as HTMLInputElement).value).toBe("USD");
   const input = screen.getByRole("spinbutton");
   fireEvent.change(input, { target: { value: "45" } });
-  fireEvent.keyDown(input, { key: "Enter" });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(state.mutate).toHaveBeenCalledWith(
     { userId: "user-1", data: { rate: 45 } },
     expect.anything(),

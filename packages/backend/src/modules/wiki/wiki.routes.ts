@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { sharedMediaHandler } from "../uploads/uploaded-media.js";
 import { publicShareNoStore } from "../../utils/share-grants.js";
 import { authenticate } from "../../middleware/authenticate.js";
 import { authorize } from "../../middleware/authorize.js";
@@ -55,6 +56,7 @@ import {
 } from "./wiki.controller.js";
 
 export default async function wikiRoutes(fastify: FastifyInstance) {
+  fastify.route({ method: ["GET", "HEAD"], url: "/public/wiki/:token/media", onRequest: publicShareNoStore, handler: sharedMediaHandler });
   // ─── Spaces ───────────────────────────────────────────
 
   fastify.route({

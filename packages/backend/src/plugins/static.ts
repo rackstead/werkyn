@@ -2,17 +2,15 @@ import fp from "fastify-plugin";
 import fastifyStatic from "@fastify/static";
 import type { FastifyInstance } from "fastify";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { env } from "../config/env.js";
 import { authenticate } from "../middleware/authenticate.js";
+import { applyUploadedMediaResponsePolicy } from "../modules/uploads/uploaded-media.js";
 import { ForbiddenError } from "../utils/errors.js";
 import { frontendCacheControl, frontendPathname, isPublicFrontendRequest } from "./frontend-static.js";
 import {
   applyUntrustedContentPolicy,
   isSafeInlineContentType,
 } from "../utils/untrusted-content.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default fp(async (fastify: FastifyInstance) => {
   const storageDir = path.resolve(env.STORAGE_DIR);
@@ -24,6 +22,7 @@ export default fp(async (fastify: FastifyInstance) => {
     "/uploads/*",
   ]);
   fastify.addHook("onSend", async (request, reply, payload) => {
+    applyUploadedMediaResponsePolicy(reply);
     if (env.NODE_ENV === "production" && isPublicFrontendRequest(request) && reply.statusCode >= 400) {
       reply.header("Cache-Control", "no-store");
     }
@@ -46,14 +45,13 @@ export default fp(async (fastify: FastifyInstance) => {
     root: path.join(storageDir, "avatars"),
     prefix: "/storage/avatars/",
     decorateReply: true,
+    serve: false,
   });
 
   // General uploads (wiki images, etc.)
-  await fastify.register(fastifyStatic, {
-    root: path.join(storageDir, "uploads"),
-    prefix: "/storage/uploads/",
-    decorateReply: false,
-  });
+  for (const url of ["/storage/avatars/*", "/storage/uploads/*", "/uploads/*"]) {
+    fastify.route({ method: ["GET", "HEAD"], url, handler: async (_request, reply) => reply.header("Cache-Control", "no-store").code(410).send({ message: "Public uploaded media URLs have been retired" }) });
+  }
 
   // Workspace-scoped uploads
   fastify.get<{ Params: { workspaceId: string; '*': string } }>(
@@ -89,12 +87,6 @@ export default fp(async (fastify: FastifyInstance) => {
   );
 
   // Legacy uploads path (fallback for existing avatars)
-  const legacyUploadsDir = path.join(__dirname, "../../uploads");
-  await fastify.register(fastifyStatic, {
-    root: legacyUploadsDir,
-    prefix: "/uploads/",
-    decorateReply: false,
-  });
 
   // Serve frontend static assets in production
   if (env.NODE_ENV === "production") {

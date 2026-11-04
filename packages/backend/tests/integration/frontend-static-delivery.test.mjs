@@ -171,7 +171,7 @@ test("API namespaces and route-specific authentication limits stay protected", a
     assert.equal(response.statusCode, 400, `login request ${n}: ${response.body}`);
   }
   assert.equal((await request("/api/auth/login", { ip, method: "POST" })).statusCode, 429);
-  for (const [target, status] of [["/api/no-such-route", 404], ["/api/not-a-file.js", 404], ["/api", 404], ["/dex/missing", 503], ["/storage/missing", 404], ["/uploads/missing", 404]]) {
+  for (const [target, status] of [["/api/no-such-route", 404], ["/api/not-a-file.js", 404], ["/api", 404], ["/dex/missing", 503], ["/storage/missing", 404], ["/uploads/missing", 410]]) {
     const response = await request(target, { ip: "127.0.0.84" });
     assert.equal(response.statusCode, status, target);
     assert.ok(!response.body.includes(index), target);

@@ -99,7 +99,7 @@ after(async () => {
   }
 });
 
-test("canonical static paths still serve their own root", async () => {
+test("private canonical static path serves its own root while public roots are retired", async () => {
   for (const [target, marker, authenticated] of [
     ["/storage/avatars/avatar.txt", MARKERS.avatar, false],
     ["/storage/uploads/public.txt", MARKERS.public, false],
@@ -108,8 +108,8 @@ test("canonical static paths still serve their own root", async () => {
     [`/storage/${workspace.id}/uploads/guarded.txt`, MARKERS.guarded, true],
   ]) {
     const response = await rawGet(target, authenticated);
-    assert.equal(response.statusCode, 200, target);
-    assert.deepEqual(leaked(response), [Object.keys(MARKERS).find((k) => MARKERS[k] === marker)], target);
+    assert.equal(response.statusCode, authenticated ? 200 : 410, target);
+    assert.deepEqual(leaked(response), authenticated ? [Object.keys(MARKERS).find((k) => MARKERS[k] === marker)] : [], target);
   }
   assert.equal((await rawGet(`/storage/${workspace.id}/uploads/guarded.txt`)).statusCode, 401);
 });
@@ -139,7 +139,7 @@ test("dot segments and encoded separators never leave the public roots or reach 
   ];
   for (const target of targets) {
     const response = await rawGet(target);
-    assert.ok([403, 404].includes(response.statusCode), `${target} answered ${response.statusCode}`);
+    assert.ok((target.startsWith("/storage/avatars/") || target.startsWith("/storage/uploads/") || target.startsWith("/uploads/") ? [403, 404, 410] : [403, 404]).includes(response.statusCode), `${target} answered ${response.statusCode}`);
     assert.deepEqual(leaked(response), [], target);
     assert.ok(!response.text.includes('"name": "@pm/backend"'), target);
   }
@@ -179,7 +179,7 @@ test("non-canonical forms of a public file are refused instead of normalized", a
     [`/storage/${W}/uploads/x/%2e%2e/guarded.txt`, true],
   ]) {
     const response = await rawGet(target, authenticated);
-    assert.ok([403, 404].includes(response.statusCode), `${target} answered ${response.statusCode}`);
+    assert.ok((target.startsWith("/storage/avatars/") || target.startsWith("/storage/uploads/") || target.startsWith("/uploads/") ? [403, 404, 410] : [403, 404]).includes(response.statusCode), `${target} answered ${response.statusCode}`);
     assert.deepEqual(leaked(response), [], target);
   }
 });

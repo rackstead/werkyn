@@ -30,6 +30,7 @@ import {
   jpegWithJunkBeforeScan,
   largeCanvasWebp,
   locatedAvif,
+  manyItemAvif,
   manyScanJpeg,
   restructuredAvif,
   stripesWebp,
@@ -535,6 +536,14 @@ test("container checks stop after a bounded amount of work on crafted files", as
     assert.equal(check(), refused, name);
     assert.ok(performance.now() - started < 50, `${name} took ${performance.now() - started} ms`);
   }
+  // 680 Exif items in the last of 2,000 mdat boxes stay within the entry
+  // limit; locating their extents is a binary search, not a scan of every
+  // box for every item (32 ms before, about 4 ms after, on the test host).
+  const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
+  const manyItems = manyItemAvif(small, 680, 2000);
+  const started = performance.now();
+  assert.deepEqual(checkAvif(manyItems), { codedPixels: 64 * 32 });
+  assert.ok(performance.now() - started < 20, `many items took ${performance.now() - started} ms`);
   for (const [name, bytes, outcome] of [["avif", avif, "unsupported"], ["webp", webp, "unsupported"], ["jpeg", segments, "unsupported"]]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { [outcome]: 1 }, name);
   }

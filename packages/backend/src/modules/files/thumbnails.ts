@@ -304,6 +304,22 @@ function checkAvifItemLocations(
   if (indexSize !== 0) refuse("iloc extent indexes");
   const itemCount = Number(take(version < 2 ? 2 : 4));
   const fileEnd = BigInt(buffer.length);
+  // Data boxes as [start, end) ranges, built once; mdat boxes are in file
+  // order, so an extent's box is found by binary search.
+  const mdatRanges = mdats.map((box) => [BigInt(box.body), BigInt(box.end)] as const);
+  const idatRange = idat ? ([BigInt(idat.body), BigInt(idat.end)] as const) : undefined;
+  const insideData = (method: number, start: bigint, end: bigint) => {
+    if (method === 1) return start >= idatRange![0] && end <= idatRange![1];
+    let low = 0, high = mdatRanges.length - 1;
+    while (low <= high) {
+      const middle = (low + high) >> 1;
+      const [from, to] = mdatRanges[middle];
+      if (start < from) high = middle - 1;
+      else if (start >= to) low = middle + 1;
+      else return end <= to;
+    }
+    return false;
+  };
   const extentsBySpace: Array<Array<[bigint, bigint]>> = [[], []];
   const located = new Set<number>();
   for (let item = 0; item < itemCount; item++) {
@@ -322,18 +338,15 @@ function checkAvifItemLocations(
     if (method === 1 && !idat) refuse(`item ${id} in idat without one`);
     if (extentCount < 1 || extentCount > AVIF_MAX_EXTENTS_PER_ITEM) refuse(`item ${id} with ${extentCount} extents`);
     // Method 0 data must lie inside an mdat box; method 1 is relative to idat's data.
-    const spaces = method === 0
-      ? mdats.map((box) => [BigInt(box.body), BigInt(box.end)] as const)
-      : [[BigInt(idat!.body), BigInt(idat!.end)] as const];
     let itemBytes = 0n;
     for (let extent = 0; extent < extentCount; extent++) {
       if (--budget.left < 0) refuse("too many iloc extents");
       const offset = take(offsetSize);
       const length = take(lengthSize);
       if (length === 0n) refuse(`item ${id} extent to the end of the file`);
-      const start = baseOffset + offset + (method === 1 ? BigInt(idat!.body) : 0n);
+      const start = baseOffset + offset + (method === 1 ? idatRange![0] : 0n);
       const end = start + length;
-      if (end > fileEnd || !spaces.some(([from, to]) => start >= from && end <= to)) {
+      if (end > fileEnd || !insideData(method, start, end)) {
         refuse(`item ${id} extent outside its data box`);
       }
       extentsBySpace[method].push([start, end]);

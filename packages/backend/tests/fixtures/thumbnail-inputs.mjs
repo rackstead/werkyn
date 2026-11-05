@@ -574,3 +574,30 @@ export function locatedAvif(small, {
   const first = assemble(layout(0, 0));
   return assemble(layout(first.meta.length, first.file.length)).file;
 }
+
+/**
+ * An AVIF with `items` Exif items besides the primary, each stored in its
+ * own one of `mdats` mdat boxes: a structure that stays within the entry
+ * limit but makes a naive per-item scan of every data box quadratic.
+ */
+export function manyItemAvif(small, items, mdats) {
+  const s = avifParts(small);
+  const build = (offsets) => fullBox("meta", 0, 0,
+    fullBox("hdlr", 0, 0, u32(0), Buffer.from("pict"), u32(0, 0, 0), Buffer.from([0])),
+    fullBox("pitm", 0, 0, u16(1)),
+    fullBox("iloc", 1, 0, Buffer.from([0x44, 0x00]), u16(items + 1),
+      ...Array.from({ length: items + 1 }, (_, i) => Buffer.concat([u16(i + 1, 0, 0, 1), u32(offsets[i] ?? 0, i === 0 ? s.coded.length : 1)]))),
+    fullBox("iinf", 0, 0, u16(items + 1), ...Array.from({ length: items + 1 }, (_, i) =>
+      fullBox("infe", 2, 0, u16(i + 1, 0), Buffer.from(i === 0 ? "av01" : "Exif"), Buffer.from([0])))),
+    box("iprp", box("ipco", s.av1C, fullBox("ispe", 0, 0, u32(s.width, s.height)), s.pixi),
+      fullBox("ipma", 0, 0, u32(1), u16(1), Buffer.from([3, 0x81, 0x02, 0x03]))));
+  const ftyp = box("ftyp", Buffer.from("avif"), u32(0), Buffer.from("avifmif1miaf"));
+  const boxes = [box("mdat", s.coded), ...Array.from({ length: mdats - 1 }, () => box("mdat", Buffer.from([0])))];
+  const at = ftyp.length + build([]).length;
+  const offsets = [];
+  let pos = at;
+  for (const b of boxes) { offsets.push(pos + 8); pos += b.length; }
+  // Items 2.. use the last data boxes, so a linear search walks almost all.
+  const itemOffsets = [offsets[0], ...offsets.slice(offsets.length - items)];
+  return Buffer.concat([ftyp, build(itemOffsets), ...boxes]);
+}

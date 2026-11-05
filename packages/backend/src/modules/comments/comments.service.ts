@@ -40,14 +40,17 @@ export async function listComments(
 
   const take = query.limit + 1;
 
-  // If cursor provided, validate it exists to avoid Prisma errors
+  // An unknown cursor restarts at the first page; a comment of another task
+  // gives an empty page. Both are what the list returned before the ID
+  // tie-breaker.
   let validCursor = query.cursor;
   if (validCursor) {
-    const cursorExists = await prisma.comment.findUnique({
+    const cursorRow = await prisma.comment.findUnique({
       where: { id: validCursor },
-      select: { id: true },
+      select: { taskId: true },
     });
-    if (!cursorExists) validCursor = undefined;
+    if (!cursorRow) validCursor = undefined;
+    else if (cursorRow.taskId !== taskId) return { data: [], nextCursor: undefined };
   }
 
   const comments = await prisma.comment.findMany({
@@ -57,7 +60,8 @@ export async function listComments(
         select: { id: true, displayName: true, avatarUrl: true },
       },
     },
-    orderBy: { createdAt: "desc" },
+    // The unique ID breaks createdAt ties, so Prisma applies LIMIT to the page.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take,
     ...(validCursor
       ? { cursor: { id: validCursor }, skip: 1 }

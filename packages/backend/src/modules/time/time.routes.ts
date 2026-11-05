@@ -6,6 +6,7 @@ import {
   deleteEntryHandler,
   getReportHandler,
   exportCSVHandler,
+  listReportEntriesHandler,
   setRateHandler,
   getRateHandler,
   listRatesHandler,
@@ -18,6 +19,7 @@ import {
   UpdateTimeEntrySchema,
   TimeEntryQuerySchema,
   TimeReportQuerySchema,
+  TimeReportEntriesQuerySchema,
   SetUserRateSchema,
 } from "@pm/shared";
 
@@ -80,6 +82,18 @@ export default async function timeRoutes(fastify: FastifyInstance) {
       validateQuery(TimeReportQuerySchema),
     ],
     handler: getReportHandler,
+  });
+
+  // GET /api/workspaces/:wid/time/reports/entries?groupKey&cursor&limit
+  fastify.route({
+    method: "GET",
+    url: "/workspaces/:wid/time/reports/entries",
+    preHandler: [
+      authenticate,
+      authorize("ADMIN"),
+      validateQuery(TimeReportEntriesQuerySchema),
+    ],
+    handler: listReportEntriesHandler,
   });
 
   // GET /api/workspaces/:wid/time/reports/export

@@ -7,6 +7,9 @@ import { ReportTable } from "./report-table";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+const filters = { startDate: "2026-01-01", endDate: "2026-01-31", groupBy: "project" };
+const complete = { entryCount: 0, hasMoreEntries: false, nextEntryCursor: null };
+
 const mixed = [
   { currency: "EUR", amount: 50, fractionDigits: 2 },
   { currency: "USD", amount: 110, fractionDigits: 2 },
@@ -70,6 +73,8 @@ it("renders group costs per currency and unpriced entries as having no rate", ()
     currency: null,
     costByCurrency: mixed,
     unratedBillableHours: 4,
+    ...complete,
+    entryCount: 2,
     entries: [
       {
         id: "carla",
@@ -101,7 +106,7 @@ it("renders group costs per currency and unpriced entries as having no rate", ()
       },
     ],
   };
-  render(<ReportTable groups={[group]} groupBy="project" />);
+  render(<ReportTable groups={[group]} groupBy="project" workspaceId="w" filters={filters} />);
   expect(screen.getAllByText("€50.00")).toHaveLength(1);
   expect(screen.getByText("$110.00")).toBeTruthy();
   expect(screen.getByText("4h billable without a rate")).toBeTruthy();
@@ -158,12 +163,14 @@ it("uses the same server precision in summary, group and expanded entry costs", 
     key: "rounded", label: "Rounded work", totalHours: 1, billableHours: 1,
     nonBillableHours: 0, totalCost: 1.235, currency: "KWD", costByCurrency: buckets,
     unratedBillableHours: 0,
+    ...complete,
+    entryCount: 1,
     entries: [{ id: "rounded-entry", date: "2026-01-01", hours: 1, billable: true,
       description: null, userName: "Worker", projectName: null, taskTitle: null,
       rate: 1.2345, currency: "KWD", cost: 1.235, costFractionDigits: 3 }],
   };
   render(<><ReportSummaryCards totalHours={1} billableHours={1} nonBillableHours={0}
-    costByCurrency={buckets} unratedBillableHours={0} /><ReportTable groups={[group]} groupBy="project" /></>);
+    costByCurrency={buckets} unratedBillableHours={0} /><ReportTable groups={[group]} groupBy="project" workspaceId="w" filters={filters} /></>);
   expect(screen.getAllByText(/1\.235$/)).toHaveLength(2);
   fireEvent.click(screen.getByText("Rounded work"));
   expect(screen.getAllByText(/1\.235$/)).toHaveLength(3);

@@ -37,6 +37,13 @@ export function parseDateISO(value: string): Date | null {
   return new Date(y, m - 1, d);
 }
 
+/** The calendar date `days` after a YYYY-MM-DD date, in local time. */
+export function addDaysISO(value: string, days: number): string {
+  const date = parseDateISO(value) ?? new Date(value + "T00:00:00");
+  date.setDate(date.getDate() + days);
+  return formatDateISO(date);
+}
+
 export function parseWeekParam(week?: string): Date {
   const d = week ? parseDateISO(week) : null;
   return getMonday(d ?? new Date());

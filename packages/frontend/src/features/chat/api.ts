@@ -4,7 +4,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useRef } from "react";
+import { useMemo, useRef } from "react";
 import { ApiError, api } from "@/lib/api-client";
 import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
@@ -32,6 +32,10 @@ export interface ChatChannel {
   updatedAt: string;
   _count: { members: number };
   isMember?: boolean;
+  /**
+   * In the channel list: the first ten members by join time (every member of
+   * a DM). `_count.members` is the full count.
+   */
   members?: Array<{
     id: string;
     userId: string;
@@ -394,15 +398,33 @@ export function useFindOrCreateDm(wid: string) {
 
 // ─── Member Hooks ──────────────────────────────────────
 
+/**
+ * A channel's members in join order, one server page (100) at a time.
+ * `members` holds every page loaded so far.
+ */
 export function useChannelMembers(wid: string, channelId: string) {
-  return useQuery({
+  const query = useInfiniteQuery({
     queryKey: queryKeys.chatMembers(channelId),
-    queryFn: () =>
+    queryFn: ({ pageParam }) =>
       api
-        .get(`chat/${wid}/channels/${channelId}/members`)
-        .json<{ data: ChatMember[] }>(),
+        .get(`chat/${wid}/channels/${channelId}/members`, {
+          searchParams: pageParam ? { cursor: pageParam } : {},
+        })
+        .json<{ data: ChatMember[]; nextCursor: string | null }>(),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
     enabled: !!wid && !!channelId,
   });
+  const members = useMemo(
+    () => query.data?.pages.flatMap((page) => page.data) ?? [],
+    [query.data],
+  );
+  return {
+    members,
+    hasNextPage: query.hasNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    fetchNextPage: query.fetchNextPage,
+  };
 }
 
 export function useAddMembers(wid: string, channelId: string) {

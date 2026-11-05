@@ -40,7 +40,14 @@ export const TimeEntryQuerySchema = z.object({
 });
 export type TimeEntryQuery = z.infer<typeof TimeEntryQuerySchema>;
 
-export const TimeReportQuerySchema = z.object({
+/** Entries a report group carries by default; totals always cover every entry. */
+export const REPORT_GROUP_ENTRY_LIMIT = 20;
+/** Entries one report response carries across all of its groups. */
+export const REPORT_ENTRY_TOTAL_LIMIT = 5_000;
+/** Largest page of report entries one request can ask for. */
+export const REPORT_ENTRY_PAGE_MAX = 500;
+
+const TimeReportFilterSchema = z.object({
   startDate: dateOnly("startDate"),
   endDate: dateOnly("endDate"),
   userIds: z.string().optional(),
@@ -51,7 +58,30 @@ export const TimeReportQuerySchema = z.object({
     .optional()
     .default("user"),
 });
+
+export const TimeReportQuerySchema = TimeReportFilterSchema.extend({
+  /** Entries per group in the response (0 for totals only). The CSV export ignores it. */
+  entryLimit: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(REPORT_ENTRY_PAGE_MAX)
+    .default(REPORT_GROUP_ENTRY_LIMIT),
+});
 export type TimeReportQuery = z.infer<typeof TimeReportQuerySchema>;
+
+/** The next entries of one report group, after the group's `nextEntryCursor`. */
+export const TimeReportEntriesQuerySchema = TimeReportFilterSchema.extend({
+  groupKey: z.string().min(1).max(200),
+  cursor: z.string().min(1).max(200).optional(),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(REPORT_ENTRY_PAGE_MAX)
+    .default(100),
+});
+export type TimeReportEntriesQuery = z.infer<typeof TimeReportEntriesQuerySchema>;
 
 export const SetUserRateSchema = z.object({
   rate: z

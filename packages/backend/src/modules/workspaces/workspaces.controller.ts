@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
-import type { WorkspaceSearchInput, UpdateWorkspaceSettingsInput, ActivityLogQueryInput, UpdateDashboardPreferenceInput } from "@pm/shared";
+import type { WorkspaceSearchInput, UpdateWorkspaceSettingsInput, ActivityLogQueryInput, MyTasksQueryInput, UpdateDashboardPreferenceInput } from "@pm/shared";
 import * as workspacesService from "./workspaces.service.js";
 import * as chatService from "../chat/chat.service.js";
 import * as dashboardPreferenceService from "./dashboard-preference.service.js";
@@ -131,6 +131,7 @@ export async function getMyTasksHandler(
     params.wid,
     request.user!.id,
     request.workspaceMember!.role,
+    request.query as MyTasksQueryInput,
   );
   return reply.send(result);
 }

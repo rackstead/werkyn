@@ -3,9 +3,10 @@ import { useMyTasks, type MyTask } from "@/features/my-tasks/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
+import { LoadMoreButton } from "@/components/shared/load-more-button";
 import { cn } from "@/lib/utils";
 import { CalendarDays } from "lucide-react";
-import { formatDateISO } from "@/features/time/utils";
+import { addDaysISO, formatDateISO } from "@/features/time/utils";
 
 interface UpcomingDatesWidgetProps {
   workspaceId: string;
@@ -22,18 +23,13 @@ function formatDueDate(dateStr: string, todayStr: string): string {
   return due.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 }
 
-function addDays(dateStr: string, days: number): string {
-  const d = new Date(dateStr + "T00:00:00");
-  d.setDate(d.getDate() + days);
-  return formatDateISO(d);
-}
-
 export function UpcomingDatesWidget({ workspaceId, onTaskClick }: UpcomingDatesWidgetProps) {
-  const { data, isLoading } = useMyTasks(workspaceId);
-  const tasks = data?.data ?? [];
-
   const todayStr = formatDateISO(new Date());
-  const weekEnd = addDays(todayStr, 7);
+  const weekEnd = addDaysISO(todayStr, 7);
+  // The server returns only open tasks due in the next week, soonest first,
+  // page by page: later pages never hold an earlier date.
+  const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage } =
+    useMyTasks(workspaceId, { dueAfter: todayStr, dueBefore: weekEnd, completed: false, sort: "dueDate" });
 
   const upcoming = useMemo(() => {
     return tasks
@@ -98,6 +94,13 @@ export function UpcomingDatesWidget({ workspaceId, onTaskClick }: UpcomingDatesW
                 </button>
               );
             })}
+            {hasNextPage && (
+              <LoadMoreButton
+                className="px-2"
+                loading={isFetchingNextPage}
+                onClick={() => void fetchNextPage()}
+              />
+            )}
           </div>
         )}
       </CardContent>

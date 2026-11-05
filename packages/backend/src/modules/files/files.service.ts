@@ -204,6 +204,36 @@ export async function createFolder(
   });
 }
 
+/**
+ * Files after `at` in the drive listing sorted by size: `isFolder` descending,
+ * then `size` and `id` in `order`. Prisma's `cursor` reads every following
+ * row without LIMIT when an order column is nullable, so this condition is
+ * written out. Null sizes follow PostgreSQL's defaults: last when ascending,
+ * first when descending.
+ */
+function filesAfterBySize(
+  at: { id: string; isFolder: boolean; size: bigint | null },
+  order: "asc" | "desc",
+): Prisma.FileWhereInput {
+  const beyond = order === "asc" ? "gt" : "lt";
+  const group = { isFolder: at.isFolder };
+  const idBeyond = { id: { [beyond]: at.id } };
+  const after: Prisma.FileWhereInput[] =
+    at.size === null
+      ? [
+          { ...group, size: null, ...idBeyond },
+          ...(order === "desc" ? [{ ...group, size: { not: null } }] : []),
+        ]
+      : [
+          { ...group, size: { [beyond]: at.size } },
+          { ...group, size: at.size, ...idBeyond },
+          ...(order === "asc" ? [{ ...group, size: null }] : []),
+        ];
+  // Folders sort before files.
+  if (at.isFolder) after.push({ isFolder: false });
+  return { OR: after };
+}
+
 export async function listFiles(
   prisma: PrismaClient,
   workspaceId: string,
@@ -257,18 +287,37 @@ export async function listFiles(
     where.ownerId = ctx.userId;
   }
 
-  const orderBy: Record<string, unknown>[] = [{ isFolder: "desc" }];
-  if (sortBy === "uploadedBy") {
-    orderBy.push({ uploadedBy: { displayName: sortOrder } });
-  } else {
-    orderBy.push({ [sortBy]: sortOrder });
+  // Folders first, then the sort column, then the unique ID so equal values
+  // have one order and the page query can use LIMIT.
+  const orderBy: Prisma.FileOrderByWithRelationInput[] = [
+    { isFolder: "desc" },
+    sortBy === "uploadedBy"
+      ? { uploadedBy: { displayName: sortOrder } }
+      : { [sortBy]: sortOrder },
+    { id: sortOrder },
+  ];
+
+  let page: Prisma.FileWhereInput = where;
+  let after: { cursor: { id: string }; skip: number } | undefined;
+  if (cursor) {
+    // A cursor must be one of the listed files; any other ID gives an empty
+    // page, as it did before the ID tie-breaker.
+    const at = await prisma.file.findFirst({
+      where: { AND: [where, { id: cursor }] },
+      select: { id: true, isFolder: true, size: true },
+    });
+    if (!at) return { data: [], nextCursor: null };
+    // With the ID last, Prisma's cursor applies LIMIT for the non-null sort
+    // columns; size is nullable and takes the written-out condition.
+    if (sortBy === "size") page = { AND: [where, filesAfterBySize(at, sortOrder)] };
+    else after = { cursor: { id: cursor }, skip: 1 };
   }
 
   const files = await prisma.file.findMany({
-    where,
+    where: page,
     orderBy,
     take: limit + 1,
-    ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+    ...after,
     include: {
       uploadedBy: {
         select: { id: true, displayName: true, avatarUrl: true },

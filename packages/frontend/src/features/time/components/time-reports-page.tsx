@@ -50,14 +50,15 @@ export function TimeReportsPage({
   const groupBy = filters.groupBy ?? "user";
   const billable = filters.billable ?? "all";
 
-  const { data: report, isLoading } = useTimeReport(workspaceId, {
+  const reportFilters = {
     startDate,
     endDate,
     userIds: filters.userIds,
     projectIds: filters.projectIds,
     billable,
     groupBy,
-  });
+  };
+  const { data: report, isLoading } = useTimeReport(workspaceId, reportFilters);
 
   function updateFilters(patch: Record<string, string | undefined>) {
     navigate({
@@ -252,7 +253,12 @@ export function TimeReportsPage({
           <div className="h-32 animate-pulse bg-muted rounded" />
         </div>
       ) : report ? (
-        <ReportTable groups={report.groups} groupBy={groupBy} />
+        <ReportTable
+          groups={report.groups}
+          groupBy={groupBy}
+          workspaceId={workspaceId}
+          filters={reportFilters}
+        />
       ) : null}
     </div>
   );

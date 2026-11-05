@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "@prisma/client";
+import { CHANNEL_LIST_MEMBER_LIMIT, CHANNEL_MEMBER_PAGE_DEFAULT } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
@@ -23,17 +24,84 @@ export async function listChannels(
     },
     include: {
       _count: { select: { members: true } },
-      members: {
-        include: {
-          user: {
-            select: { id: true, displayName: true, avatarUrl: true },
-          },
-        },
-      },
     },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
   });
-  return channels;
+  const members = await memberPreviews(prisma, channels.map((c) => c.id));
+  return channels.map((channel) => ({
+    ...channel,
+    members: members.get(channel.id) ?? [],
+  }));
+}
+
+/**
+ * The first CHANNEL_LIST_MEMBER_LIMIT members (by join time, then ID) of each
+ * channel. `_count.members` stays the full count; a DM has at most eight
+ * members, so its preview is complete.
+ *
+ * The recursive query takes one member per channel and step from the
+ * ("channelId", "joinedAt", "id") index, so it reads at most the limit per
+ * channel. A plain LATERAL ... LIMIT is not enough: PostgreSQL estimates every
+ * channel at the average membership and, next to many small channels, reads
+ * and sorts all members of a large one.
+ */
+async function memberPreviews(prisma: PrismaClient, channelIds: string[]) {
+  const byChannel = new Map<string, MemberPreview[]>();
+  if (channelIds.length === 0) return byChannel;
+  const rows = await prisma.$queryRaw<
+    Array<{
+      id: string;
+      channelId: string;
+      userId: string;
+      lastReadAt: Date;
+      joinedAt: Date;
+      displayName: string;
+      avatarUrl: string | null;
+    }>
+  >`
+    WITH RECURSIVE preview AS (
+      SELECT m.*, 1 AS step
+      FROM unnest(${channelIds}::text[]) AS c("id")
+      CROSS JOIN LATERAL (
+        SELECT cm."id", cm."channelId", cm."userId", cm."lastReadAt", cm."joinedAt"
+        FROM "ChatChannelMember" cm
+        WHERE cm."channelId" = c."id"
+        ORDER BY cm."joinedAt", cm."id"
+        LIMIT 1
+      ) m
+      UNION ALL
+      SELECT m.*, p.step + 1
+      FROM preview p
+      CROSS JOIN LATERAL (
+        SELECT cm."id", cm."channelId", cm."userId", cm."lastReadAt", cm."joinedAt"
+        FROM "ChatChannelMember" cm
+        WHERE cm."channelId" = p."channelId"
+          AND (cm."joinedAt", cm."id") > (p."joinedAt", p."id")
+        ORDER BY cm."joinedAt", cm."id"
+        LIMIT 1
+      ) m
+      WHERE p.step < ${CHANNEL_LIST_MEMBER_LIMIT}
+    )
+    SELECT p."id", p."channelId", p."userId", p."lastReadAt", p."joinedAt",
+           u."displayName", u."avatarUrl"
+    FROM preview p
+    JOIN "User" u ON u."id" = p."userId"
+    ORDER BY p."channelId", p."joinedAt", p."id"`;
+  for (const { displayName, avatarUrl, ...member } of rows) {
+    const list = byChannel.get(member.channelId) ?? [];
+    list.push({ ...member, user: { id: member.userId, displayName, avatarUrl } });
+    byChannel.set(member.channelId, list);
+  }
+  return byChannel;
+}
+
+interface MemberPreview {
+  id: string;
+  channelId: string;
+  userId: string;
+  lastReadAt: Date;
+  joinedAt: Date;
+  user: { id: string; displayName: string; avatarUrl: string | null };
 }
 
 export async function getChannel(
@@ -735,16 +803,37 @@ export async function removeMembers(
 export async function listMembers(
   prisma: PrismaClient,
   channelId: string,
+  cursor?: string,
+  limit = CHANNEL_MEMBER_PAGE_DEFAULT,
 ) {
-  return prisma.chatChannelMember.findMany({
+  // A cursor must be a member of this channel; any other ID gives an empty
+  // page, like the other cursor lists.
+  if (cursor) {
+    const scopedCursor = await prisma.chatChannelMember.findFirst({
+      where: { id: cursor, channelId },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: null };
+  }
+
+  const members = await prisma.chatChannelMember.findMany({
     where: { channelId },
     include: {
       user: {
         select: { id: true, displayName: true, avatarUrl: true, email: true },
       },
     },
-    orderBy: { joinedAt: "asc" },
+    orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
+
+  const hasMore = members.length > limit;
+  if (hasMore) members.pop();
+  return {
+    data: members,
+    nextCursor: hasMore ? members[members.length - 1].id : null,
+  };
 }
 
 // ─── Reactions ────────────────────────────────────────
@@ -881,17 +970,28 @@ export async function listBookmarks(
   cursor?: string,
   limit = 20,
 ) {
-  const bookmarks = await prisma.chatBookmark.findMany({
-    where: {
-      userId,
-      message: {
-        channel: {
-          workspaceId,
-          OR: [{ type: "PUBLIC" }, { members: { some: { userId } } }],
-        },
-        deletedAt: null,
+  const where: Prisma.ChatBookmarkWhereInput = {
+    userId,
+    message: {
+      channel: {
+        workspaceId,
+        OR: [{ type: "PUBLIC" }, { members: { some: { userId } } }],
       },
+      deletedAt: null,
     },
+  };
+  // A cursor must be one of the listed bookmarks; any other ID gives an empty
+  // page, as it did before the ID tie-breaker.
+  if (cursor) {
+    const scopedCursor = await prisma.chatBookmark.findFirst({
+      where: { AND: [where, { id: cursor }] },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: undefined };
+  }
+
+  const bookmarks = await prisma.chatBookmark.findMany({
+    where,
     include: {
       message: {
         omit: chatMessageOmit,
@@ -905,7 +1005,8 @@ export async function listBookmarks(
         },
       },
     },
-    orderBy: { createdAt: "desc" },
+    // The unique ID breaks createdAt ties, so Prisma applies LIMIT to the page.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });

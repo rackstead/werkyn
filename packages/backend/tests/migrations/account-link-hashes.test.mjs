@@ -77,9 +77,13 @@ test("populated previous-schema upgrade preserves account links and hashes each 
       path.join(temporary, "migrations"),
       { recursive: true },
     );
-    await rm(path.join(temporary, "migrations", migration), {
-      recursive: true,
-    });
+    // The previous schema is every migration before this one; it and any
+    // later migrations are applied by the upgrade below.
+    for (const name of await readdir(path.join(temporary, "migrations"))) {
+      if (/^\d/.test(name) && name >= migration) {
+        await rm(path.join(temporary, "migrations", name), { recursive: true });
+      }
+    }
     assert(
       (await readdir(path.join(temporary, "migrations")))
         .filter((name) => /^\d/.test(name))

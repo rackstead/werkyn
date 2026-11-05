@@ -11,6 +11,7 @@ import {
   AddMembersSchema,
   ChatMessageQuerySchema,
   ChatBookmarkQuerySchema,
+  ChannelMemberQuerySchema,
   ToggleReactionSchema,
   PinMessageSchema,
   ArchiveChannelSchema,
@@ -117,7 +118,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/:wid/channels/:channelId/members",
-    preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
+    preHandler: [
+      authenticate,
+      authorize("ADMIN", "MEMBER", "VIEWER"),
+      validateQuery(ChannelMemberQuerySchema),
+    ],
     handler: listMembersHandler,
   });
 

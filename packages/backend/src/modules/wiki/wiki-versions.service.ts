@@ -29,9 +29,20 @@ export async function listVersions(
   cursor?: string,
   limit = 20,
 ) {
+  // A cursor must be a version of this page; any other ID gives an empty page,
+  // as it did before the ID tie-breaker.
+  if (cursor) {
+    const scopedCursor = await prisma.wikiPageVersion.findFirst({
+      where: { id: cursor, pageId },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: null };
+  }
+
   const versions = await prisma.wikiPageVersion.findMany({
     where: { pageId },
-    orderBy: { createdAt: "desc" },
+    // The unique ID breaks createdAt ties, so Prisma applies LIMIT to the page.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     include: {

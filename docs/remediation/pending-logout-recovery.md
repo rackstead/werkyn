@@ -112,14 +112,16 @@ meanwhile) is kept.
 
 **The rule that protects a newer sign-in.** A record is removed only on
 evidence that this browser can no longer restore its session: `revoked`,
-`superseded` or `absent` from recovery; a 204 from ordinary sign-out, a 401
-from the refresh it may use, or a refresh showing another session, during the
-sign-out request itself; or a sign-in response that replaced the cookie. It is
-never compared by account or by time. Every sign-in starts a new family, and
-the recorded family is revoked only when the cookie the browser sends at that
-moment proves it, so a stale record cannot end a sign-in made after it, in
-this tab or another, even by the same account. The sign-out request itself now
-compares session ids before revoking with a renewed token.
+`superseded` or `absent` from recovery; a 204 from the ordinary sign-out
+request; or a sign-in response that replaced the cookie. It is never compared
+by account or by time. Every sign-in starts a new family, and the recorded
+family is revoked only when the cookie the browser sends at that moment
+proves it, so a stale record cannot end a sign-in made after it, in this tab or
+another, even by the same account. When the access token has already expired
+(ordinary sign-out answers 401), the sign-out request itself also uses
+conditional recovery, instead of exchanging the cookie for a new token and
+signing out with that; only a token without a session id, from an earlier
+server, still takes that older path.
 
 **Cross-tab.** Records are shared by every tab of the origin. A tab that
 reloads after another tab's failed sign-out completes it first. A tab that

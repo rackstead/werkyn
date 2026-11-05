@@ -439,6 +439,24 @@ describe("a sign-out whose request fails", () => {
     expect(family.revoked).toBe(true);
   });
 
+  it("whose access token has expired is completed by recovery, without renewing the session", async () => {
+    const { family } = serverSignIn("alice");
+    const tab = await openTab();
+    tab.useAuthStore
+      .getState()
+      .setAuth(users.alice, accessToken("alice", family.id, -60), []);
+    routes.set("auth/logout", () => json(401, { statusCode: 401 }));
+    const from = calls.length;
+    await run(tab.useAuthStore.getState().logout());
+    expect(paths(from)).toEqual(["auth/logout", "auth/logout/recover"]);
+    expect(calls.at(-1)).toMatchObject({
+      keepalive: true,
+      body: { sessionId: family.id },
+    });
+    expect(family.revoked).toBe(true);
+    expect(pendingKeys()).toHaveLength(0);
+  });
+
   it("leaves nothing behind when the sign-out succeeds", async () => {
     const { tab, family } = await signedInTab("alice");
     await run(tab.useAuthStore.getState().logout());
@@ -582,7 +600,7 @@ describe("a newer sign-in", () => {
     expect(pendingKeys()).toHaveLength(1);
   });
 
-  it("of the same account is not revoked by an expired-token sign-out's renewed cookie", async () => {
+  it("of the same account is not revoked when an expired-token sign-out completes", async () => {
     const { tab, family: first } = await signedInTab("alice");
     // Alice's access token is rejected; meanwhile the cookie was replaced by a
     // newer Alice sign-in elsewhere in this browser.
@@ -592,8 +610,12 @@ describe("a newer sign-in", () => {
         : defaultRoutes["auth/logout"](call),
     );
     const { family: second } = serverSignIn("alice");
+    const from = calls.length;
     await run(tab.useAuthStore.getState().logout());
     expect(second.revoked).toBe(false);
+    // Completed by conditional recovery, which never touches the cookie.
+    expect(paths(from)).toEqual(["auth/logout", "auth/logout/recover"]);
+    expect(pendingKeys()).toHaveLength(0);
   });
 });
 

@@ -347,11 +347,6 @@ async function revokeSession(
   // Another tab announced a newer sign-in or sign-out: the cookie may now
   // belong to that session, which this sign-out must not touch.
   const overtaken = () => compareEpochs(knownEpoch, logoutEpoch) > 0;
-  // A renewed session is the one being signed out: the same session id when
-  // known (a newer sign-in of the same account is another session), else the
-  // same account.
-  const isSignedOutSession = (token: string, renewedUserId: unknown) =>
-    sessionId ? sessionIdOf(token) === sessionId : renewedUserId === userId;
   // keepalive: the UI is already signed out, so the user may close or reload
   // the tab at once; the revocation must still reach the server.
   const signOut = (token: string | null) =>
@@ -369,19 +364,27 @@ async function revokeSession(
       keepalive: true,
       signal: controller.signal,
     });
-  // Resolves true once the server has settled the sign-out: the session was
-  // revoked, or the cookie holds no session or a different one, so this
-  // browser can no longer restore it.
+  // Resolves true once the server has settled the sign-out: this browser can
+  // no longer restore the session (see completeSignOuts).
   const revoke = async (): Promise<boolean> => {
     const res = await signOut(accessToken);
     if (res.ok) return true;
-    if (res.status !== 401 || overtaken()) return false;
+    if (res.status !== 401) return false;
     // The server only accepts a sign-out with a current access token. When
-    // ours has expired, exchange the cookie for one, without signing this
-    // tab back in, and sign out with that, unless the cookie now belongs to
-    // another session (signed in from another tab meanwhile). A cookie that
-    // another tab has just rotated (409) or a busy session (503) is retried
-    // with the browser's current cookie, within the deadline.
+    // ours has expired, ask the server to end this session if the cookie
+    // still belongs to it. That request never sets or clears the cookie, so
+    // it cannot replace or end a newer sign-in, from this tab or another.
+    if (sessionId) {
+      const recovery = await recoverSession(sessionId, controller.signal);
+      return recovery !== "unsettled";
+    }
+    // A token without a session id (from an earlier server): exchange the
+    // cookie for a token, without signing this tab back in, and sign out with
+    // that, unless the cookie now belongs to another account (signed in from
+    // another tab meanwhile). A cookie that another tab has just rotated
+    // (409) or a busy session (503) is retried with the browser's current
+    // cookie, within the deadline. No sign-out is recorded for such a token.
+    if (overtaken()) return false;
     let refreshed = await refreshCookie();
     for (const delay of LOGOUT_REFRESH_RETRY_DELAYS_MS) {
       if (!retryable(refreshed) || overtaken()) break;
@@ -389,16 +392,14 @@ async function revokeSession(
       if (overtaken()) return false;
       refreshed = await refreshCookie();
     }
-    if (refreshed.status === 401) return true;
     if (!refreshed.ok || overtaken()) return false;
     const body = (await refreshed.json()) as {
       data?: { user?: { id?: string }; accessToken?: string };
     };
-    const renewed = body.data?.accessToken;
-    if (!renewed) return false;
-    if (!isSignedOutSession(renewed, body.data?.user?.id)) return !!sessionId;
+    if (body.data?.user?.id !== userId || !body.data.accessToken) return false;
     if (overtaken()) return false;
-    return (await signOut(renewed)).ok;
+    await signOut(body.data.accessToken);
+    return false;
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Settles at the deadline even if a request ignores its abort signal.

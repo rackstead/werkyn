@@ -865,6 +865,61 @@ test("a workspace whose uploads end decoder workers waits, and no other workspac
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
 });
 
+test("a crash holds back uploads already waiting, and an older success does not lift it", async () => {
+  // Decodes that finish when told to, crashing or not.
+  const finishers = [];
+  const workers = {
+    run: () => new Promise((resolve) => finishers.push((crashed) => resolve(crashed
+      ? { ok: false, outcome: "crashed", details: { signal: "SIGABRT" } }
+      : { ok: true, thumbnail: smallWebp, details: {} }))),
+  };
+  const nextTick = () => new Promise((resolve) => setImmediate(resolve));
+
+  // One turn: the second upload waits, then finds its workspace held back.
+  let crashBackoff = new CrashBackoff(60_000, 60_000);
+  let admission = new TransformAdmission({ maxActive: 1, maxQueued: 4, queueTimeoutMs: 5000 });
+  const options = () => ({ workspaceId: "a", admission, workers, crashBackoff });
+  let { result, delta } = await outcomes(async () => {
+    const crashing = thumbnailOf(smallPng, options());
+    while (finishers.length < 1) await nextTick();
+    const queued = thumbnailOf(smallPng, options());
+    while (admission.usage.queued < 1) await nextTick();
+    finishers.shift()(true);
+    return Promise.all([crashing, queued]);
+  });
+  assert.deepEqual(result, [null, null]);
+  assert.deepEqual(delta, { crashed: 1, busy: 1 }, "rechecked once admitted");
+  assert.equal(finishers.length, 0, "the queued upload reached no worker");
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+
+  // Two turns: a success that started before a crash leaves the crash's wait.
+  crashBackoff = new CrashBackoff(60_000, 60_000);
+  admission = new TransformAdmission({ maxActive: 2, maxQueued: 0, queueTimeoutMs: 100 });
+  ({ result, delta } = await outcomes(async () => {
+    const slow = thumbnailOf(smallPng, options());
+    const fast = thumbnailOf(smallPng, options());
+    while (finishers.length < 2) await nextTick();
+    const [finishSlow, finishFast] = finishers.splice(0);
+    finishFast(true);
+    await fast;
+    finishSlow(false);
+    return Promise.all([slow, fast]);
+  }));
+  assert.ok(result[0] && result[1] === null);
+  assert.deepEqual(delta, { crashed: 1, created: 1 });
+  assert.ok(crashBackoff.remaining("a") > 0, "the crash's wait stands");
+
+  // A success that started after the crash lifts it; other workspaces' crashes do not matter.
+  crashBackoff = new CrashBackoff(0, 0);
+  crashBackoff.crashed("a");
+  const later = thumbnailOf(smallPng, options());
+  while (finishers.length < 1) await nextTick();
+  crashBackoff.crashed("b");
+  finishers.shift()(false);
+  assert.ok(await later);
+  assert.equal(crashBackoff.remaining("a", 0), 0);
+});
+
 test("a path that is not a regular file is refused without stalling the worker", async () => {
   // Opening a FIFO for reading would block until a writer appears.
   const fifo = path.join(scratch, "stalled.fifo");

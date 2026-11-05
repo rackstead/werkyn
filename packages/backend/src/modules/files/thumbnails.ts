@@ -179,7 +179,9 @@ export const thumbnailWorkers = new ThumbnailWorkerPool({
  * into a stream of restarts, without holding back any other workspace.
  */
 export class CrashBackoff {
-  private readonly entries = new Map<string, { crashes: number; until: number }>();
+  private readonly entries = new Map<string, { crashes: number; until: number; crash: number }>();
+  /** Numbers every crash, so a decode can tell whether one came after it started. */
+  private sequence = 0;
 
   constructor(
     readonly initialMs = 1_000,
@@ -194,15 +196,29 @@ export class CrashBackoff {
     return entry ? Math.max(0, entry.until - now) : 0;
   }
 
+  /** Taken when a decode starts, for succeeded(). */
+  mark(): number {
+    return this.sequence;
+  }
+
   crashed(key: string, now = Date.now()): void {
     const crashes = (this.entries.get(key)?.crashes ?? 0) + 1;
     this.entries.delete(key);
-    this.entries.set(key, { crashes, until: now + Math.min(this.maxMs, this.initialMs * 2 ** (crashes - 1)) });
+    this.entries.set(key, {
+      crashes,
+      until: now + Math.min(this.maxMs, this.initialMs * 2 ** (crashes - 1)),
+      crash: ++this.sequence,
+    });
     if (this.entries.size > this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
   }
 
-  succeeded(key: string): void {
-    this.entries.delete(key);
+  /**
+   * A decode of `key` that started at `mark` succeeded: the wait is cleared,
+   * unless another of its decodes crashed after this one started.
+   */
+  succeeded(key: string, mark = Infinity): void {
+    const entry = this.entries.get(key);
+    if (entry && entry.crash <= mark) this.entries.delete(key);
   }
 }
 
@@ -289,6 +305,13 @@ export async function createThumbnail(
   }
   const release = await admission.acquire(workspaceId);
   if (!release) return skipped("busy", context);
+  // Another upload from this workspace may have crashed while this one waited.
+  const heldBackMs = crashBackoff.remaining(key);
+  if (heldBackMs > 0) {
+    release();
+    return skipped("busy", { ...context, reason: `this workspace's uploads recently ended a decoder worker (${heldBackMs} ms left)` });
+  }
+  const mark = crashBackoff.mark();
   const stop = new AbortController();
   const work: Promise<WorkerResult> = workers.run(source.path, stop.signal)
     .catch((err) => ({ ok: false, outcome: "failed", details: { reason: errorReason(err) } }));
@@ -309,7 +332,7 @@ export async function createThumbnail(
       return skipped("timed-out", context);
     }
     if (result.ok) {
-      crashBackoff.succeeded(key);
+      crashBackoff.succeeded(key, mark);
       thumbnailOutcomes.created++;
       return result.thumbnail;
     }

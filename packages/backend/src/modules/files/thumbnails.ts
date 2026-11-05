@@ -110,6 +110,8 @@ export const THUMBNAIL_LIMITS = Object.freeze({
   transformTimeoutSeconds: 10,
   /** ...and the upload stops waiting for it a little after that. */
   transformDeadlineMs: 12_000,
+  /** How long reading the first bytes, before admission, may take. */
+  headTimeoutMs: 2_000,
 });
 
 /** Options for every decode, metadata included. */
@@ -293,21 +295,25 @@ export function avifStructure(
 /**
  * Whether a WebP decodes at full size (lossless or alpha), whether it is
  * animated, and its VP8X canvas size, from its RIFF chunks. Null when the
- * chunks overrun the file or there are too many to read.
+ * container or a chunk overruns the file or there are too many to read.
  */
 export function webpFeatures(
   buffer: Buffer,
 ): { fullCanvas: boolean; animated: boolean; canvasPixels: number } | null {
+  // Only the RIFF container's declared length is image data; libwebp
+  // ignores anything after it.
+  const end = 8 + buffer.readUInt32LE(4);
+  if (end > buffer.length) return null;
   let fullCanvas = false;
   let animated = false;
   let canvasPixels = 0;
   let chunks = 0;
-  for (let pos = 12; pos + 8 <= buffer.length && !animated; ) {
+  for (let pos = 12; pos + 8 <= end && !animated; ) {
     if (++chunks > MAX_CONTAINER_ENTRIES) return null;
     const type = buffer.toString("latin1", pos, pos + 4);
     const size = buffer.readUInt32LE(pos + 4);
     const body = pos + 8;
-    if (body + size > buffer.length) return null;
+    if (body + size > end) return null;
     if (type === "VP8X") {
       if (size < 10) return null;
       // Flags: alpha 0x10, animation 0x02.
@@ -547,8 +553,11 @@ const TIMED_OUT = Symbol("timed out");
 export interface ThumbnailSource {
   /** Its size in bytes. */
   size: number;
-  /** At least its first THUMBNAIL_HEAD_BYTES bytes, or all of a shorter file. */
-  head(): Promise<Buffer>;
+  /**
+   * At least its first THUMBNAIL_HEAD_BYTES bytes, or all of a shorter file.
+   * `signal` aborts when the caller stops waiting.
+   */
+  head(signal: AbortSignal): Promise<Buffer>;
   /** The whole file. */
   read(): Promise<Buffer>;
 }
@@ -569,6 +578,7 @@ export interface ThumbnailOptions {
   fileId?: string;
   admission?: TransformAdmission;
   deadlineMs?: number;
+  headTimeoutMs?: number;
 }
 
 /**
@@ -588,13 +598,32 @@ export async function createThumbnail(
     fileId,
     admission = thumbnailAdmission,
     deadlineMs = THUMBNAIL_LIMITS.transformDeadlineMs,
+    headTimeoutMs = THUMBNAIL_LIMITS.headTimeoutMs,
   }: ThumbnailOptions = {},
 ): Promise<Buffer | null> {
   const context = { workspaceId, fileId };
+  // The head read happens before admission, so it has its own deadline: a
+  // stalled read is abandoned and the upload goes on without a thumbnail.
+  const stopHead = new AbortController();
+  let headTimer: NodeJS.Timeout | undefined;
   try {
-    if (!thumbnailFormat(await source.head(), source.size)) return skipped("unsupported", context);
+    const reading = source.head(stopHead.signal);
+    reading.catch(() => {}); // settles after an abandonment
+    const head = await Promise.race([
+      reading,
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        headTimer = setTimeout(resolve, headTimeoutMs, TIMED_OUT);
+      }),
+    ]);
+    if (head === TIMED_OUT) {
+      stopHead.abort();
+      return skipped("timed-out", { ...context, reason: "reading the first bytes" });
+    }
+    if (!thumbnailFormat(head, source.size)) return skipped("unsupported", context);
   } catch (err) {
     return skipped("failed", { ...context, reason: errorReason(err) });
+  } finally {
+    clearTimeout(headTimer);
   }
   const release = await admission.acquire(workspaceId);
   if (!release) return skipped("busy", context);

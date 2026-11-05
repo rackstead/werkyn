@@ -342,6 +342,13 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   assert.deepEqual((await outcomes(() => thumbnailOf(canvas))).delta, { "over-budget": 1 });
   assert.ok(performance.now() - started < 1000);
   assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
+  // Bytes after the RIFF container are not image data, even if they look like an oversized chunk.
+  const trailing = Buffer.alloc(8);
+  trailing.write("JUNK", 0, "latin1");
+  trailing.writeUInt32LE(0x7fffffff, 4);
+  const withTrailing = Buffer.concat([lossy, trailing]);
+  assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 0 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(withTrailing))).delta, { created: 1 });
   // Lossless with more than 16 colours is not packed; it still gets a thumbnail at ordinary sizes.
   const stripes = await stripesWebp(2048, 1024, 32);
   assert.equal(webpFeatures(stripes).fullCanvas, true);
@@ -490,6 +497,26 @@ test("a stalled source read times out, keeps its turn, and a late read starts no
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
   assert.equal(nativeCalls, 0, "the late read reached no decoder");
+});
+
+test("a stalled read of the first bytes is abandoned before admission", async () => {
+  const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
+  let seen;
+  const source = {
+    size: smallPng.length,
+    head: (signal) => { seen = signal; return new Promise((resolve) => signal.addEventListener("abort", () => resolve(smallPng))); },
+    read: async () => smallPng,
+  };
+  const started = performance.now();
+  const { result, delta } = await outcomes(() => createThumbnail(source, { admission, headTimeoutMs: 50 }));
+  assert.equal(result, null);
+  assert.deepEqual(delta, { "timed-out": 1 });
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(seen.aborted, true, "the read is told to stop");
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 }, "no turn was taken");
+  // A failing read omits only the thumbnail.
+  const failing = { ...source, head: async () => { throw new Error("Owned head read failure"); } };
+  assert.deepEqual((await outcomes(() => createThumbnail(failing, { admission }))).delta, { failed: 1 });
 });
 
 test("admission is shared fairly between workspaces", async () => {

@@ -33,17 +33,30 @@ import {
   resolveFileDestination,
   type AccessContext,
 } from "./file-access.js";
-import { THUMBNAIL_SOURCE_MAX_BYTES, createThumbnail } from "./thumbnails.js";
+import {
+  THUMBNAIL_HEAD_BYTES,
+  THUMBNAIL_SOURCE_MAX_BYTES,
+  createThumbnail,
+} from "./thumbnails.js";
 
 export { THUMBNAIL_SOURCE_MAX_BYTES };
 
-/** The first bytes of a stored file: one read of the opened stream. */
-async function readHead(storage: StorageProvider, storagePath: string): Promise<Buffer> {
-  const stream = await storage.openReadStream(storagePath);
+/** The first THUMBNAIL_HEAD_BYTES of a stored file; abandoned when `signal` aborts. */
+async function readHead(
+  storage: StorageProvider,
+  storagePath: string,
+  signal: AbortSignal,
+): Promise<Buffer> {
+  const stream = await storage.openReadStream(storagePath, { start: 0, end: THUMBNAIL_HEAD_BYTES - 1 });
+  const abandon = () => stream.destroy();
+  if (signal.aborted) abandon();
+  signal.addEventListener("abort", abandon, { once: true });
   try {
-    for await (const chunk of stream) return chunk as Buffer;
-    return Buffer.alloc(0);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks);
   } finally {
+    signal.removeEventListener("abort", abandon);
     stream.destroy();
   }
 }
@@ -94,7 +107,7 @@ export async function uploadFileStream(
     const thumbBuffer = await createThumbnail(
       {
         size,
-        head: () => readHead(storage, storagePath),
+        head: (signal) => readHead(storage, storagePath, signal),
         read: () => storage.read(storagePath),
       },
       { workspaceId, fileId },

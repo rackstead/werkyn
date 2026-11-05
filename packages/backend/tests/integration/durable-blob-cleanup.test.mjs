@@ -513,6 +513,62 @@ test("a row made due now is claimed by the next claim even when its stored milli
   }
 });
 
+/** `client` whose raw queries (the claim) read `instant` as CURRENT_TIMESTAMP. */
+async function claimingAt(client, instant) {
+  const { Prisma } = await import("@prisma/client");
+  return new Proxy(client, {
+    get(target, key) {
+      if (key !== "$queryRaw") return Reflect.get(target, key);
+      return (strings, ...values) => {
+        const fixed = strings.map((s) => s.replaceAll("CURRENT_TIMESTAMP", `TIMESTAMPTZ '${instant}'`));
+        assert.notDeepEqual(fixed, [...strings], "the claim reads CURRENT_TIMESTAMP");
+        return target.$queryRaw(Prisma.sql(fixed, ...values));
+      };
+    },
+  });
+}
+
+// The claim's rounded clock stays an absolute instant. In a non-UTC session a
+// lease taken at 01:45 PDT on the fall-back night ends at 01:00 PST, stored as
+// the earlier-looking wall time 01:00; it must not be claimed again before it
+// ends, while a due-now row whose stored millisecond rounded up still is.
+test("claims at fixed clocks: a rounded-up due-now row is due, a lease across the fall-back hour is not", { timeout: 15000 }, async () => {
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  const quiet = { warn() {}, error() {} };
+  const due = await blob(workspace.id, ".txt", Buffer.from("Fixed-clock due-now cleanup.\n"));
+  const leased = await blob(workspace.id, ".txt", Buffer.from("Fixed-clock leased cleanup.\n"));
+  try {
+    const outcome = await app.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
+      // Made due at .125600, stored as .126; claimed at .125900.
+      await tx.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+        VALUES (${due}, TIMESTAMPTZ '2026-11-01 07:30:00.125600+00')`;
+      const dueResult = await processBlobCleanup(
+        await claimingAt(tx, "2026-11-01 07:30:00.125900+00"), app.storage, { paths: [due], limit: 1, log: quiet });
+      // Claimed at 08:45:00.0004 UTC (01:45 PDT) with the 15-minute lease.
+      await tx.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "attempts", "availableAt")
+        VALUES (${leased}, 1, TIMESTAMPTZ '2026-11-01 08:45:00.000400+00' + interval '15 minutes')`;
+      const [lease] = await tx.$queryRaw`
+        SELECT to_char("availableAt", 'HH24:MI:SS.MS') AS "storedWallTime"
+        FROM "BlobCleanup" WHERE "storagePath" = ${leased}`;
+      const leasedResult = await processBlobCleanup(
+        await claimingAt(tx, "2026-11-01 08:45:00.000400+00"), app.storage, { paths: [leased], limit: 1, log: quiet });
+      return { dueResult, lease, leasedResult };
+    });
+    assert.deepEqual(outcome.dueResult, { claimed: 1, deleted: 1, retained: 0, failed: 0 });
+    assert.equal(outcome.lease.storedWallTime, "01:00:00.000");
+    assert.deepEqual(outcome.leasedResult, { claimed: 0, deleted: 0, retained: 0, failed: 0 });
+    assert.deepEqual(await queued([due]), []);
+    assert.deepEqual(await present([due, leased]), { [due]: false, [leased]: true });
+  } finally {
+    await app.prisma.blobCleanup.deleteMany({ where: { storagePath: { in: [due, leased] } } });
+    await app.storage.delete(due);
+    await app.storage.delete(leased);
+  }
+});
+
 test("a stale worker failure preserves a newer cleanup lease and its error state", async () => {
   const storagePath = await blob(workspace.id, ".txt", Buffer.from("ordinary cleanup renewal\n"));
   await app.prisma.blobCleanup.create({ data: { storagePath } });

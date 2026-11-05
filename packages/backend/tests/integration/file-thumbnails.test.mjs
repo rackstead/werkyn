@@ -8,6 +8,11 @@ import { after, before, test } from "node:test";
 import sharp from "sharp";
 import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
+import {
+  avif100Megapixels, avifStructureCases, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader,
+  jpegWithJunkBeforeScan, largeCanvasWebp, locatedAvif, manyScanJpeg, restructuredAvif, rgb16Png,
+  iccpChunk, jpegWithIcc, paddedIcc, pngWithChunks, zTxtChunk,
+} from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -65,7 +70,7 @@ function request(method, url, payload, headers = {}, auth = token) {
   });
 }
 
-async function uploadResponse(filename, contentType, bytes, auth = token) {
+async function uploadResponse(filename, contentType, bytes, auth = token, workspaceId = workspace.id) {
   const boundary = `werkyn-thumbnail-${crypto.randomUUID()}`;
   const payload = Buffer.concat([
     Buffer.from(
@@ -74,7 +79,7 @@ async function uploadResponse(filename, contentType, bytes, auth = token) {
     bytes,
     Buffer.from(`\r\n--${boundary}--\r\n`),
   ]);
-  return request("POST", `/api/workspaces/${workspace.id}/files/upload`, payload, {
+  return request("POST", `/api/workspaces/${workspaceId}/files/upload`, payload, {
     "content-type": `multipart/form-data; boundary=${boundary}`,
   }, auth);
 }
@@ -110,7 +115,6 @@ test("raster uploads get a 400-pixel-wide WebP thumbnail without enlargement", a
     ["alpha.png", "image/png", await solid(800, 400, { r: 0, g: 128, b: 0, alpha: 0.5 }, 4).png().toBuffer(), [400, 200]],
     ["photo.jpg", "image/jpeg", await solid(1000, 500, "#999999").jpeg().toBuffer(), [400, 200]],
     ["tall.webp", "image/webp", await solid(300, 900, "#112233").webp().toBuffer(), [300, 900]],
-    ["scan.tiff", "image/tiff", await solid(1600, 1200, "#abcdef").tiff().toBuffer(), [400, 300]],
     ["flat.gif", "image/gif", await solid(640, 320, "#ff0000").gif().toBuffer(), [400, 200]],
   ];
   for (const [name, type, bytes, [width, height]] of cases) {
@@ -144,6 +148,7 @@ test("SVG declared as SVG is never rasterized", async () => {
 });
 
 test("raster entry boundaries preserve originals and exclude unrelated detector/native dispatch", async () => {
+  const tiffBytes = await solid(64, 32, "#abcdef").tiff().toBuffer();
   await withDispatchSpies(async (state) => {
     const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>');
     for (const [name, mime, bytes] of [
@@ -152,10 +157,14 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
       ["passive-document.png", "image/png", makePdf()],
       ["declared.svg", "image/svg+xml", svg],
       ["ordinary.bin", "application/octet-stream", smallPng],
+      ["scan-tiff.png", "image/png", tiffBytes],
+      ["declared.tiff", "image/tiff", tiffBytes],
+      ["photo-heic.png", "image/png", isoHeader("heic")],
     ]) {
       const file = await upload(name, mime, bytes);
       assert.equal(file.thumbnailPath, null, name);
       assert.equal(state.detectorCalls, 0, name);
+      assert.equal(state.headerCalls, 0, name);
       assert.equal(state.nativeCalls, 0, name);
     }
   });
@@ -167,7 +176,8 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
 async function withDispatchSpies(run) {
   const detector = FileTypeParser.prototype.fromBuffer;
   const render = sharp.prototype.toBuffer;
-  const state = { detectorCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
+  const header = sharp.prototype.metadata;
+  const state = { detectorCalls: 0, headerCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
   FileTypeParser.prototype.fromBuffer = async function (...args) {
     state.detectorCalls++;
     if (state.detectorMode === "throw") throw new Error("Owned detector failure");
@@ -180,16 +190,22 @@ async function withDispatchSpies(run) {
     if (state.nativeMode === "throw") return Promise.reject(new Error("Owned transform failure"));
     return Promise.resolve(smallWebp);
   };
+  sharp.prototype.metadata = function (...args) {
+    state.headerCalls++;
+    return header.apply(this, args);
+  };
   try {
     const control = await upload("dispatch-control.png", "image/jpeg", smallPng);
     assert.ok(control.thumbnailPath);
     assert.equal(state.detectorCalls, 1, "Exact ESM detector spy must be armed");
+    assert.equal(state.headerCalls, 1, "Exact ESM header spy must be armed");
     assert.equal(state.nativeCalls, 1, "Exact ESM transform spy must be armed");
-    state.detectorCalls = state.nativeCalls = 0;
+    state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
     return await run(state);
   } finally {
     FileTypeParser.prototype.fromBuffer = detector;
     sharp.prototype.toBuffer = render;
+    sharp.prototype.metadata = header;
   }
 }
 
@@ -297,30 +313,31 @@ function pngChunk(type, data) {
   return chunk;
 }
 
-test("HEIF brands and both TIFF byte orders retain detector and transform dispatch", async () => {
+test("only the AVIF brand reaches detection and decoding; other HEIF brands and TIFF are stored without", async () => {
+  // A real AVIF, and the same bytes with each other major brand.
+  const avif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
   await withDispatchSpies(async (state) => {
     const cases = [];
     for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
-      const bytes = Buffer.alloc(24);
-      bytes.writeUInt32BE(24);
-      bytes.write("ftyp" + brand, 4);
-      cases.push([brand, bytes]);
+      const bytes = Buffer.from(avif);
+      bytes.write(brand, 8, "latin1");
+      cases.push([brand, bytes, brand === "avif"]);
     }
     for (const little of [true, false]) for (const version of [42, 43]) {
       const bytes = Buffer.alloc(16);
       bytes.write(little ? "II" : "MM");
       if (little) { bytes.writeUInt16LE(version, 2); bytes.writeUInt32LE(8, 4); }
       else { bytes.writeUInt16BE(version, 2); bytes.writeUInt32BE(8, 4); }
-      cases.push([`${little ? "little" : "big"}-${version}`, bytes]);
+      cases.push([`${little ? "little" : "big"}-${version}`, bytes, false]);
     }
-    // Container headers exercise dispatch only. The armed transform returns
-    // a known small WebP; these are never presented to a native decoder.
-    for (const [name, bytes] of cases) {
-      state.detectorCalls = state.nativeCalls = 0;
+    // The armed transform returns a known WebP.
+    for (const [name, bytes, dispatched] of cases) {
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       const file = await upload(`${name}.bin`, "image/heic", bytes);
-      assert.ok(file.thumbnailPath, name);
-      assert.equal(state.detectorCalls, 1, name);
-      assert.equal(state.nativeCalls, 1, name);
+      assert.equal(!!file.thumbnailPath, dispatched, name);
+      for (const calls of [state.detectorCalls, state.headerCalls, state.nativeCalls]) {
+        assert.equal(calls, dispatched ? 1 : 0, name);
+      }
     }
   });
 });
@@ -333,22 +350,25 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
       bytes.write("ftypavif", 4);
       return bytes;
     };
-    // Plain header controls only; the armed transform returns a known WebP.
+    // Plain headers reach the detector, then stop at the item-structure
+    // check: they have no meta box, so nothing native reads them.
     for (const size of [16, 20, 24]) {
-      state.detectorCalls = state.nativeCalls = 0;
-      assert.ok((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath);
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
+      assert.equal((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath, null);
       assert.equal(state.detectorCalls, 1);
-      assert.equal(state.nativeCalls, 1);
+      assert.equal(state.headerCalls, 0);
+      assert.equal(state.nativeCalls, 0);
     }
     const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
     for (const [size, length] of [
       [0, 24], [1, 24], [8, 24], [12, 24], [15, 24],
       [28, 24], [16, 12], [THUMBNAIL_SOURCE_MAX_BYTES + 4, 24],
     ]) {
-      state.detectorCalls = state.nativeCalls = 0;
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       const file = await upload(`omitted-${size}-${length}.avif`, "image/avif", header(size, length));
       assert.equal(file.thumbnailPath, null);
       assert.equal(state.detectorCalls, 0);
+      assert.equal(state.headerCalls, 0);
       assert.equal(state.nativeCalls, 0);
     }
   });
@@ -397,7 +417,7 @@ test("refused upload actors stop before storage, detector and native dispatch", 
         assert.equal(response.statusCode, status, response.body);
       }
       assert.equal(writes, 0); assert.equal(reads, 0);
-      assert.equal(state.detectorCalls, 0); assert.equal(state.nativeCalls, 0);
+      assert.equal(state.detectorCalls, 0); assert.equal(state.headerCalls, 0); assert.equal(state.nativeCalls, 0);
       assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id } }), count);
     } finally { app.storage.saveStream = save; app.storage.read = read; }
   });
@@ -474,4 +494,142 @@ for (const recognized of [true, false]) test(`failed File insert retains durable
   assert.deepEqual(await app.storage.read(guard.storagePath), smallPng);
   assert.ok(await app.prisma.file.findUnique({ where: { id: guard.id } }));
   await app.prisma.blobCleanup.delete({ where: { storagePath: guard.storagePath } });
+});
+
+async function outcomeDelta(run) {
+  const { thumbnailOutcomes } = await import("../../src/modules/files/thumbnails.ts");
+  const before = { ...thumbnailOutcomes };
+  const result = await run();
+  const delta = {};
+  for (const [key, value] of Object.entries(thumbnailOutcomes)) if (value !== before[key]) delta[key] = value - before[key];
+  return { result, delta };
+}
+
+test("disguised formats, polyglots and decompression bombs are stored unchanged without a thumbnail", async () => {
+  const tiffBytes = await solid(800, 400, "#abcdef").tiff().toBuffer();
+  const smallAvif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
+  const icc = (await sharp(await solid(8, 8, "#208040").withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  const bigText = zTxtChunk("Comment", { size: 49_000_000 });
+  const avifCases = avifStructureCases(avif100Megapixels, smallAvif);
+  const scanBomb = manyScanJpeg(64, 64);
+  for (const [name, type, bytes, outcome] of [
+    ["scan.png", "image/png", tiffBytes, "unsupported"],
+    ["scan.tiff", "image/tiff", tiffBytes, "unsupported"],
+    ["drawing.gif", "image/gif", gifSvgPolyglot(), "failed"],
+    ["photo.avif", "image/avif", avif100Megapixels, "over-budget"],
+    ["photo.heic", "image/heic", avif100Megapixels, "over-budget"],
+    ["banner.gif", "image/gif", blankGif(10000, 10000), "over-budget"],
+    ["poster.png", "image/png", await blankPng(10000, 10000, { depth: 8, color: 6, interlace: true }), "over-budget"],
+    // Reported as 64 x 64 by a crop, a grid or an overlay; coded 10000 x 10000.
+    ["cropped.avif", "image/avif", restructuredAvif(avif100Megapixels, "clap", 64, 64), "over-budget"],
+    ["grid.avif", "image/avif", restructuredAvif(avif100Megapixels, "grid", 64, 64), "unsupported"],
+    ["overlay.avif", "image/avif", restructuredAvif(avif100Megapixels, "overlay", 64, 64), "unsupported"],
+    ["canvas.webp", "image/webp", await largeCanvasWebp(16383, 16383), "over-budget"],
+    ["scans.jpg", "image/jpeg", scanBomb, "over-budget"],
+    // Read differently by a lenient parser and libheif or libjpeg.
+    ["two-meta.avif", "image/avif", avifCases.twoMetaSmallFirst, "unsupported"],
+    ["hidden-alpha.avif", "image/avif", avifCases.alphaWithoutIspe, "unsupported"],
+    ["stray-byte.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0xfe, 0x00, 0x02, 0x00])), "unsupported"],
+    ["tem.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0x01, 0x00])), "unsupported"],
+    // Item extents that repeat the whole upload, which libheif concatenates.
+    ["extents.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, primary: (L) => [[L.frame, L.frameLength], ...Array(30).fill([0, L.size])] }), "unsupported"],
+    ["exif.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "Exif", data: Buffer.from("Exif"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
+    ["xmp.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "mime", data: Buffer.from("<x/>"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
+    // Metadata libvips inflates or copies while reading the header.
+    ["notes.png", "image/png", pngWithChunks(Array(10).fill(bigText)), "unsupported"],
+    ["profile.png", "image/png", pngWithChunks([iccpChunk(paddedIcc(icc, 49_000_000))]), "unsupported"],
+    ["profile.jpg", "image/jpeg", jpegWithIcc(await solid(64, 32, "#208040").jpeg().toBuffer(), paddedIcc(icc, 5 * 1024 * 1024)), "over-budget"],
+  ]) {
+    const rss = process.memoryUsage().rss;
+    const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
+    assert.equal(file.thumbnailPath, null, name);
+    assert.deepEqual(delta, { [outcome]: 1 }, name);
+    assert.ok(process.memoryUsage().rss - rss < 128 * 1024 * 1024, name);
+  }
+});
+
+test("CMYK, 16-bit, idat-stored AVIF and many-frame uploads get first-frame sRGB thumbnails", async () => {
+  const idatAvif = locatedAvif(await solid(800, 400, "#208040").avif({ effort: 0 }).toBuffer(), { method: 1 });
+  const iccP3 = (await sharp(await solid(8, 8, "#208040").withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  for (const [name, type, bytes, size] of [
+    ["idat.avif", "image/avif", idatAvif, [400, 200]],
+    ["profiled.png", "image/png", pngWithChunks([iccpChunk(iccP3), pngChunk("tEXt", Buffer.from("Title\0hello")), zTxtChunk("Comment", { size: 2000 })]), [64, 32]],
+    ["cmyk-profiled.jpg", "image/jpeg", await solid(800, 400, "#3366cc").toColourspace("cmyk").withIccProfile("cmyk").jpeg().toBuffer(), [400, 200]],
+    ["print.jpg", "image/jpeg", await cmykJpeg(800, 400), [400, 200]],
+    ["deep.png", "image/png", await rgb16Png(800, 400), [400, 200]],
+    ["loop.gif", "image/gif", blankGif(800, 400, 3000), [400, 200]],
+  ]) {
+    const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
+    assert.deepEqual(delta, { created: 1 }, name);
+    const thumb = await thumbnail(file);
+    assert.deepEqual([thumb.format, thumb.width, thumb.height, thumb.pages], ["webp", ...size, 1], name);
+    const meta = await sharp(thumb.bytes).metadata();
+    assert.deepEqual([meta.space, meta.depth], ["srgb", "uchar"], name);
+  }
+});
+
+test("uploads beyond the transform limit all succeed; the excess are stored at once without a thumbnail, and other workspaces keep a share", async (t) => {
+  const { thumbnailAdmission } = await import("../../src/modules/files/thumbnails.ts");
+  const { maxActive, maxQueued } = thumbnailAdmission.limits;
+  const extra = 3, total = maxActive + maxQueued + extra;
+  const tiffBytes = await solid(64, 32, "#abcdef").tiff().toBuffer();
+  const render = sharp.prototype.toBuffer;
+  let inFlight = 0, peak = 0, open;
+  const gate = new Promise((resolve) => { open = resolve; });
+  const held = async function () {
+    inFlight++; peak = Math.max(peak, inFlight);
+    try { await gate; return smallWebp; } finally { inFlight--; }
+  };
+  sharp.prototype.toBuffer = held;
+  t.after(() => { open(); sharp.prototype.toBuffer = render; });
+  let responded = 0;
+  const pending = Array.from({ length: total }, (_, i) =>
+    uploadResponse(`burst-${i}.png`, "image/png", smallPng).then((response) => { responded++; return response; }));
+  // While every admitted transform is held, the uploads that found the queue
+  // full are already answered.
+  const deadline = Date.now() + 10_000;
+  while (responded < extra || thumbnailAdmission.usage.queued < maxQueued) {
+    assert.ok(Date.now() < deadline, JSON.stringify({ responded, ...thumbnailAdmission.usage }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(responded, extra);
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  // Content outside the allowlist neither waits nor displaces a waiter.
+  const { result: junk, delta: junkDelta } = await outcomeDelta(() => Promise.all([
+    uploadResponse("junk.png", "image/png", Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')),
+    uploadResponse("scan.png", "image/png", tiffBytes),
+  ]));
+  for (const response of junk) {
+    assert.equal(response.statusCode, 201, response.body);
+    assert.equal(response.json().data.thumbnailPath, null);
+  }
+  assert.deepEqual(junkDelta, { unsupported: 2 });
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  // Another workspace still gets a place: this workspace's newest waiter
+  // goes without instead.
+  const other = await app.prisma.workspace.create({
+    data: { name: "Thumbnails 2", slug: `thumbs-${crypto.randomUUID().slice(0, 20)}`, members: { create: { userId: user.id, role: "ADMIN" } } },
+  });
+  t.after(async () => {
+    await app.prisma.workspace.deleteMany({ where: { id: other.id } });
+    await app.prisma.blobCleanup.deleteMany({ where: { storagePath: { startsWith: `${other.id}/` } } });
+  });
+  const otherUpload = uploadResponse("other.png", "image/png", smallPng, token, other.id);
+  while (responded < extra + 1) {
+    assert.ok(Date.now() < deadline, JSON.stringify({ responded, ...thumbnailAdmission.usage }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  open();
+  const files = (await Promise.all(pending)).map((response) => {
+    assert.equal(response.statusCode, 201, response.body);
+    return response.json().data;
+  });
+  assert.equal(files.filter((file) => file.thumbnailPath).length, maxActive + maxQueued - 1);
+  assert.equal(files.filter((file) => !file.thumbnailPath).length, extra + 1);
+  const otherResponse = await otherUpload;
+  assert.equal(otherResponse.statusCode, 201, otherResponse.body);
+  assert.ok(otherResponse.json().data.thumbnailPath);
+  assert.equal(peak, maxActive);
+  assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
 });

@@ -23,6 +23,11 @@ export function isMissingBlobError(error: unknown) {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+export interface ByteRange {
+  start: number;
+  end: number;
+}
+
 export interface StorageProvider {
   save(
     category: string,
@@ -40,9 +45,10 @@ export interface StorageProvider {
     options?: { maxSize?: number },
   ): Promise<{ storagePath: string; size: number }>;
   read(storagePath: string): Promise<Buffer>;
-  readStream(storagePath: string): fss.ReadStream;
+  /** `range` selects bytes `start` to `end` inclusive, as in `fs.createReadStream`. */
+  readStream(storagePath: string, range?: ByteRange): fss.ReadStream;
   /** Opens the blob first; a missing blob rejects with MissingBlobError. */
-  openReadStream(storagePath: string): Promise<fss.ReadStream>;
+  openReadStream(storagePath: string, range?: ByteRange): Promise<fss.ReadStream>;
   /**
    * Idempotent: a blob that is already gone counts as deleted. Any other
    * storage failure is thrown so durable cleanup can retry it.
@@ -182,13 +188,13 @@ export class LocalStorageProvider implements StorageProvider {
     return fs.readFile(fullPath);
   }
 
-  readStream(storagePath: string): fss.ReadStream {
+  readStream(storagePath: string, range?: ByteRange): fss.ReadStream {
     const fullPath = this.safePath(storagePath);
-    return fss.createReadStream(fullPath);
+    return fss.createReadStream(fullPath, range);
   }
 
-  async openReadStream(storagePath: string): Promise<fss.ReadStream> {
-    const stream = this.readStream(storagePath);
+  async openReadStream(storagePath: string, range?: ByteRange): Promise<fss.ReadStream> {
+    const stream = this.readStream(storagePath, range);
     try {
       await once(stream, "open");
     } catch (error) {

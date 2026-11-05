@@ -7,6 +7,7 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import test, { after } from "node:test";
 import sharp from "sharp";
 import {
+  CrashBackoff,
   THUMBNAIL_HEAD_BYTES,
   THUMBNAIL_LIMITS,
   TransformAdmission,
@@ -823,6 +824,45 @@ test("at the deadline the worker is killed, and the turn returns once it has exi
   assert.ok(await thumbnailOf(smallPng, { admission, workers }));
   assert.notEqual(workers.stats.workers[0].pid, pid);
   assert.equal(workers.stats.workers[0].failures, 0, "a timeout is not a worker failure");
+});
+
+test("a workspace whose uploads end decoder workers waits, and no other workspace does", async () => {
+  const backoff = new CrashBackoff(1000, 4000, 2);
+  assert.equal(backoff.remaining("a", 0), 0);
+  backoff.crashed("a", 0);
+  assert.equal(backoff.remaining("a", 0), 1000);
+  backoff.crashed("a", 0);
+  backoff.crashed("a", 0);
+  assert.equal(backoff.remaining("a", 0), 4000, "doubling up to the maximum");
+  assert.equal(backoff.remaining("b", 0), 0);
+  backoff.succeeded("a");
+  assert.equal(backoff.remaining("a", 0), 0, "a thumbnail clears it");
+  backoff.crashed("a", 0); backoff.crashed("b", 0); backoff.crashed("c", 0);
+  assert.equal(backoff.remaining("a", 0), 0, "the longest-unseen workspace is forgotten first");
+  assert.ok(backoff.remaining("c", 0) > 0);
+
+  // Through createThumbnail, with workers whose every decode crashes.
+  const crashBackoff = new CrashBackoff(200, 1000);
+  const admission = new TransformAdmission({ maxActive: 2, maxQueued: 2, queueTimeoutMs: 100 });
+  let runs = 0, crash = true;
+  const workers = {
+    run: async () => {
+      runs++;
+      return crash
+        ? { ok: false, outcome: "crashed", details: { signal: "SIGABRT", reason: "worker killed by SIGABRT" } }
+        : { ok: true, thumbnail: smallWebp, details: {} };
+    },
+  };
+  const options = (workspaceId) => ({ workspaceId, admission, workers, crashBackoff });
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { crashed: 1 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { busy: 1 }, "held back");
+  assert.equal(runs, 1, "no worker was asked");
+  crash = false;
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("b")))).delta, { created: 1 }, "another workspace is not");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { created: 1 });
+  assert.equal(crashBackoff.remaining("a"), 0);
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
 });
 
 test("a path that is not a regular file is refused without stalling the worker", async () => {

@@ -182,8 +182,10 @@ async function decode(source: Buffer, progress: DecodeDetails, { memoryChecks = 
     .toBuffer();
 }
 
-export function errorReason(err: unknown) {
-  return err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : String(err).slice(0, 200);
+/** libvips stacks its messages; the cause (such as an allocation failure) is often the last. */
+function errorReason(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.split("\n").map((line) => line.trim()).filter(Boolean).join("; ").slice(0, 200);
 }
 
 /**

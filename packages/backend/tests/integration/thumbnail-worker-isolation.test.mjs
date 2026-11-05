@@ -27,7 +27,7 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-thumbnail-worker
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
-const { thumbnailOutcomes, thumbnailWorkers } = await import("../../src/modules/files/thumbnails.ts");
+const { thumbnailCrashBackoff, thumbnailOutcomes, thumbnailWorkers } = await import("../../src/modules/files/thumbnails.ts");
 
 const MiB = 1024 * 1024;
 let app, user, token;
@@ -42,7 +42,7 @@ before(async () => {
     data: { email: `thumb-workers-${suffix}@example.test`, displayName: "Thumbnail worker fixture", emailVerified: true },
   });
   token = signAccessToken({ sub: user.id, email: user.email });
-  for (const name of ["A", "B"]) {
+  for (const name of ["A", "B", "C"]) {
     workspaces.push(await app.prisma.workspace.create({
       data: { name, slug: `thumb-workers-${name.toLowerCase()}-${suffix}`, members: { create: { userId: user.id, role: "ADMIN" } } },
     }));
@@ -106,16 +106,23 @@ test("decompression bombs past the checks end only a worker; the server and othe
   const { result: notesFile, delta: notesDelta } = await outcomeDelta(() => upload(a, "notes.png", "image/png", notes));
   assert.equal(notesFile.thumbnailPath, null);
   assert.ok(notesDelta.crashed === 1 || notesDelta.failed === 1, JSON.stringify(notesDelta));
+  if (process.platform === "linux") {
+    assert.equal(thumbnailWorkers.stats.mechanism, "ulimit");
+    assert.deepEqual(notesDelta, { crashed: 1 });
+    assert.ok(thumbnailWorkers.stats.crashed > before.crashed, "the zTXt bomb ended a worker");
+    assert.notDeepEqual(pids(), before.pids, "a crashed worker was replaced");
+    // That workspace now waits a moment before its next decode; others do not.
+    assert.ok(thumbnailCrashBackoff.remaining(a.id) > 0);
+    const { result: held, delta: heldDelta } = await outcomeDelta(() => upload(a, "held.png", "image/png", smallPng));
+    assert.equal(held.thumbnailPath, null);
+    assert.deepEqual(heldDelta, { busy: 1 });
+    await new Promise((resolve) => setTimeout(resolve, thumbnailCrashBackoff.remaining(a.id) + 50));
+  }
   // 2 KiB, decoded at 10000 x 10000 (about 1.7 GiB): refused by the limit.
   const cropped = restructuredAvif(avif100Megapixels, "clap", 64, 64);
   const { result: croppedFile, delta: croppedDelta } = await outcomeDelta(() => upload(a, "cropped.avif", "image/avif", cropped));
   assert.equal(croppedFile.thumbnailPath, null);
   assert.ok(croppedDelta.crashed === 1 || croppedDelta.failed === 1, JSON.stringify(croppedDelta));
-  if (process.platform === "linux") {
-    assert.equal(thumbnailWorkers.stats.mechanism, "ulimit");
-    assert.ok(thumbnailWorkers.stats.crashed > before.crashed, "the zTXt bomb ended a worker");
-    assert.notDeepEqual(pids(), before.pids, "a crashed worker was replaced");
-  }
   // The server never held that memory, and another workspace's upload is thumbnailed.
   assert.ok(process.memoryUsage().rss - before.rss < 128 * MiB);
   const jpeg = await sharp({ create: { width: 1200, height: 800, channels: 3, background: "#3366cc" } }).jpeg().toBuffer();
@@ -124,22 +131,22 @@ test("decompression bombs past the checks end only a worker; the server and othe
   assert.deepEqual(delta, { created: 1 });
 });
 
-test("bombs from one workspace at once leave the other workspace's thumbnail to be made", async () => {
-  const [a, b] = workspaces;
+test("bombs from one workspace at once leave the other workspace's thumbnails to be made", async () => {
+  const [, b, c] = workspaces;
   const notes = pngWithChunks(Array(10).fill(zTxtChunk("Comment", { size: 49_000_000 })));
   const files = await Promise.all([
-    upload(a, "notes-1.png", "image/png", notes),
-    upload(a, "notes-2.png", "image/png", notes),
+    upload(c, "notes-1.png", "image/png", notes),
+    upload(c, "notes-2.png", "image/png", notes),
     upload(b, "ordinary.png", "image/png", smallPng),
   ]);
   assert.deepEqual(files.map((file) => !!file.thumbnailPath), [false, false, true]);
-  assert.ok((await upload(a, "after.png", "image/png", smallPng)).thumbnailPath);
+  assert.ok((await upload(b, "after.png", "image/png", smallPng)).thumbnailPath);
 });
 
 test("a worker killed while idle is replaced before the next upload needs it", async () => {
-  const [a] = workspaces;
-  assert.ok((await upload(a, "before.png", "image/png", smallPng)).thumbnailPath);
+  const [, b] = workspaces;
+  assert.ok((await upload(b, "before.png", "image/png", smallPng)).thumbnailPath);
   for (const pid of pids()) if (pid) process.kill(pid, "SIGKILL");
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.ok((await upload(a, "after-kill.png", "image/png", smallPng)).thumbnailPath);
+  assert.ok((await upload(b, "after-kill.png", "image/png", smallPng)).thumbnailPath);
 });

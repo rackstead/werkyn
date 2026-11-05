@@ -218,31 +218,105 @@ test("workers exit when the server process dies", { skip: !linux }, async () => 
   await waitFor(() => pids.every(exited), 5000);
 });
 
+/** A stand-in worker speaking the frame protocol at fd 3; `answer(id, path, send)` replies. */
+const fakeWorker = (name, answer) => stored(`
+  import net from "node:net";
+  const channel = new net.Socket({ fd: 3, readable: true, writable: true });
+  channel.on("end", () => process.exit(0));
+  const frame = (header, body = Buffer.alloc(0)) => {
+    const json = Buffer.from(JSON.stringify(header));
+    const lengths = Buffer.alloc(8);
+    lengths.writeUInt32BE(json.length, 0);
+    lengths.writeUInt32BE(body.length, 4);
+    return Buffer.concat([lengths, json, body]);
+  };
+  const send = (bytes) => channel.write(bytes);
+  let pending = "";
+  channel.on("data", (chunk) => {
+    pending += chunk;
+    for (let end = pending.indexOf("\\n"); end !== -1; end = pending.indexOf("\\n")) {
+      const { id, path } = JSON.parse(pending.slice(0, end));
+      pending = pending.slice(end + 1);
+      (${answer})(id, path.split("/").pop(), send, frame);
+    }
+  });
+  send(frame({ type: "ready", pid: process.pid, dataLimitBytes: null, oomScoreAdj: null }));
+`, name);
+
 test("a worker's answer is checked before the server uses it", async () => {
   // Stands in for a worker taken over through a decoder bug.
-  const liar = stored(`
-    process.on("disconnect", () => process.exit(0));
-    process.on("message", ({ id, path }) => {
-      const answers = {
-        html: { ok: true, thumbnail: Buffer.from("<html><script>alert(1)</script></html>"), details: {} },
-        huge: { ok: true, thumbnail: Buffer.concat([Buffer.from("RIFF\\0\\0\\0\\0WEBP"), Buffer.alloc(17 * 1024 * 1024)]), details: {} },
-        odd: { ok: false, outcome: "owned", details: { reason: "x".repeat(10_000), stage: "elsewhere", format: "svg", width: "wide", extra: 1 } },
-        webp: { ok: true, thumbnail: Buffer.from("RIFF\\x04\\0\\0\\0WEBPVP8 "), details: { stage: "transform", format: "png", width: 1 } },
-      };
-      process.send({ type: "result", id, result: answers[path.split("/").pop()], memory: { dataBytes: 0, rssBytes: 0 } });
-    });
-    process.send({ type: "ready", pid: process.pid, dataLimitBytes: null, oomScoreAdj: null });
-  `, "liar.mjs");
+  const liar = fakeWorker("liar.mjs", `(id, name, send, frame) => {
+    const memory = { dataBytes: 0, rssBytes: 0 };
+    const answers = {
+      html: [{ ok: true, details: {} }, Buffer.from("<html><script>alert(1)</script></html>")],
+      odd: [{ ok: false, outcome: "owned", details: { reason: "x".repeat(10_000), stage: "elsewhere", format: "svg", width: "wide", extra: 1 } }],
+      webp: [{ ok: true, details: { stage: "transform", format: "png", width: 1 } }, Buffer.from("RIFF\\x04\\0\\0\\0WEBPVP8 ")],
+    };
+    const [header, body] = answers[name];
+    send(frame({ type: "result", id, memory, ...header }, body));
+  }`);
   const workers = pool({ script: liar, execArgv: [] });
   const html = await workers.run(path.join(scratch, "html"));
   assert.deepEqual([html.ok, html.outcome], [false, "failed"]);
   assert.match(html.details.reason, /other than a WebP/);
-  assert.equal((await workers.run(path.join(scratch, "huge"))).outcome, "failed");
   const odd = await workers.run(path.join(scratch, "odd"));
   assert.deepEqual(odd, { ok: false, outcome: "failed", details: { reason: "x".repeat(200) } });
   const webp = await workers.run(path.join(scratch, "webp"));
   assert.equal(webp.ok, true);
   assert.deepEqual(webp.details, { stage: "transform", format: "png", width: 1 });
+  assert.equal(workers.stats.crashed, 0);
+});
+
+test("a worker that sends more than one bounded frame is killed before the server holds it", async () => {
+  // Node's own IPC channel would parse a message of any size first; the
+  // frame reader refuses one by its declared length.
+  const flood = fakeWorker("flood.mjs", `(id, name, send, frame) => {
+    if (name === "huge") {
+      const lengths = Buffer.alloc(8);
+      lengths.writeUInt32BE(64, 0);
+      lengths.writeUInt32BE(1024 * 1024 * 1024, 4); // a 1 GiB "thumbnail"
+      send(lengths);
+      for (let i = 0; i < 64; i++) send(Buffer.alloc(1024 * 1024)); // and 64 MiB of it
+    } else if (name === "header") {
+      const lengths = Buffer.alloc(8);
+      lengths.writeUInt32BE(32 * 1024 * 1024, 0);
+      send(lengths);
+    } else if (name === "garbage") {
+      send(Buffer.concat([Buffer.from([0, 0, 0, 4, 0, 0, 0, 0]), Buffer.from("nope")]));
+    } else if (name === "twice") {
+      const reply = frame({ type: "result", id, ok: false, outcome: "failed", details: {}, memory: {} });
+      send(reply);
+      setTimeout(() => send(reply), 20);
+    }
+  }`);
+  const workers = pool({ script: flood, execArgv: [] });
+  const rss = process.memoryUsage().rss;
+  for (const [name, reason] of [["huge", /reply frame of 64 \+ 1073741824 bytes/], ["header", /reply frame of 33554432/], ["garbage", /not JSON/]]) {
+    const result = await workers.run(path.join(scratch, name));
+    assert.deepEqual([result.ok, result.outcome], [false, "crashed"], name);
+    assert.match(result.details.reason, reason, name);
+  }
+  assert.ok(process.memoryUsage().rss - rss < 48 * MiB, "the server never buffered the flood");
+  // An answer nobody asked for ends the worker too, and counts as a failure.
+  assert.equal((await workers.run(path.join(scratch, "twice"))).outcome, "failed");
+  const pid = workers.stats.workers[0].pid;
+  await waitFor(() => gone(pid));
+  assert.equal(workers.stats.workers[0].failures, 1);
+});
+
+test("crashes while decoding restart the worker at once, without a delay", async () => {
+  // Backing them off would let one workspace's crashing uploads hold back
+  // every workspace; thumbnails.ts backs off that workspace instead.
+  const workers = pool({ memoryChecks: false, restartDelayMs: { initial: 10_000, max: 10_000 } });
+  const notes = stored(pngWithChunks(Array(10).fill(zTxtChunk("Comment", { size: 49_000_000 }))), "notes.png");
+  for (let i = 0; i < 3; i++) {
+    const result = await workers.run(notes);
+    assert.ok(["crashed", "failed"].includes(result.outcome), JSON.stringify(result));
+    assert.equal(workers.stats.workers[0].failures, 0);
+  }
+  const started = performance.now();
+  assert.equal((await workers.run(small)).ok, true);
+  assert.ok(performance.now() - started < 5000);
 });
 
 test("without a way to set the limit, workers start without it and say so", { skip: !linux }, async () => {

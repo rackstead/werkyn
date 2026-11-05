@@ -1,18 +1,20 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import type { Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "../../utils/logger.js";
-import type { DecodeDetails, DecodeResult } from "./thumbnail-decode.js";
-import type { WorkerMemory, WorkerMessage, WorkerRequest } from "./thumbnail-worker.js";
+import type { DecodeDetails, DecodeOutcome, DecodeResult } from "./thumbnail-decode.js";
+import { FrameReader, ProtocolError, type Frame } from "./thumbnail-protocol.js";
+import type { WorkerRequest } from "./thumbnail-worker.js";
 
 /**
  * A small pool of long-lived decoder processes for Drive thumbnails. Each
  * worker (thumbnail-worker.ts) runs sharp under a hard data limit, so an
  * image that needs more memory than its estimate said fails or ends that
  * worker, never the server. A worker that crashes or is killed at the
- * deadline is replaced; repeated failures are backed off. See
- * docs/remediation/r19.md.
+ * deadline is replaced at once; a worker that keeps failing to start is
+ * restarted later and later. See docs/remediation/r19.md.
  *
  * The limit is RLIMIT_DATA, which counts a process's heap, anonymous
  * mappings and thread stacks but not the address space V8 reserves, so
@@ -21,6 +23,12 @@ import type { WorkerMemory, WorkerMessage, WorkerRequest } from "./thumbnail-wor
  * needs no privilege (glibc and Alpine's busybox both have it). Without
  * /bin/sh or on another platform the workers run without a limit: a crash
  * still ends only the worker, and the pre-decode checks remain the bound.
+ *
+ * The workers run as the server's user. Their small environment and the
+ * checks on their answers keep secrets out of a worker and a malformed
+ * answer out of the server, but they are not a sandbox: code that takes
+ * over a worker through a decoder bug can still read what the server's
+ * user can read.
  */
 
 /** A decode result, or why the worker produced none. */
@@ -41,14 +49,17 @@ export interface ThumbnailWorkerPoolOptions {
   dataLimitBytes: number | null;
   /** Tests only: decode without the container checks and memory estimate. */
   memoryChecks?: boolean;
-  /** A started worker that has not reported ready by then is killed. */
+  /** A started worker that has not reported ready by then is killed (30 s). */
   startTimeoutMs?: number;
   /**
-   * After a failure (a crash, or a start that never got ready) the worker
-   * is restarted at once; after each further failure without a completed
-   * decode in between, the delay doubles from `initial` up to `max`.
+   * After a start failure (exiting or hanging before ready, or exiting
+   * while idle) the worker is restarted at once; after each further one in
+   * a row, the delay doubles from `initial` up to `max`. A crash during a
+   * decode is the input's doing and is restarted at once.
    */
   restartDelayMs?: { initial: number; max: number };
+  /** A worker alive this long has proved it starts, and its failures are forgotten (30 s). */
+  healthyAfterMs?: number;
   /**
    * A worker whose data size is over this after a decode is replaced, so
    * memory the allocator keeps does not count against the next decode.
@@ -64,7 +75,11 @@ export interface ThumbnailWorkerPoolOptions {
 const SHELL = "/bin/sh";
 /** Exit status of the start wrapper when it cannot set the limit. */
 const LIMIT_REFUSED = 125;
-/** Environment the workers get: no secrets, nothing but what Node and libvips need. */
+/**
+ * Environment the workers get: nothing secret, only what Node and libvips
+ * need. (This keeps secrets from leaking into a worker by accident; see
+ * above for what it does not do.)
+ */
 const WORKER_ENV_KEYS = ["PATH", "TMPDIR", "TZ", "LANG", "LC_ALL", "NODE_ENV"];
 /**
  * - One libuv thread: a worker reads and decodes one file at a time, and
@@ -74,8 +89,6 @@ const WORKER_ENV_KEYS = ["PATH", "TMPDIR", "TZ", "LANG", "LC_ALL", "NODE_ENV"];
  *   hundreds of MiB in the allocator for the next one to run out of.
  */
 const WORKER_ENV = { UV_THREADPOOL_SIZE: "1", MALLOC_ARENA_MAX: "2", MALLOC_MMAP_THRESHOLD_: "131072" };
-/** A thumbnail is a 400-pixel-wide WebP; anything larger is not one. */
-const MAX_THUMBNAIL_BYTES = 16 * 1024 * 1024;
 
 type SlotState = "stopped" | "starting" | "ready" | "busy" | "exiting";
 
@@ -91,13 +104,17 @@ interface Job {
 interface Slot {
   state: SlotState;
   child: ChildProcess | null;
+  channel: Socket | null;
   job: Job | null;
-  /** Failures since the last completed decode. */
+  /** Start failures in a row (see restartDelayMs). */
   failures: number;
+  readyAt: number;
   restartTimer: NodeJS.Timeout | null;
   startTimer: NodeJS.Timeout | null;
   /** Why the current worker is being stopped, when the pool asked it to. */
-  stopping: "retire" | "timeout" | "start-timeout" | "close" | null;
+  stopping: "retire" | "timeout" | "start-timeout" | "close" | "violation" | null;
+  /** How the worker broke the reply protocol, if it did. */
+  violation: string | null;
   exited: Promise<void> | null;
 }
 
@@ -129,8 +146,8 @@ export class ThumbnailWorkerPool {
 
   constructor(readonly options: ThumbnailWorkerPoolOptions) {
     this.slots = Array.from({ length: options.size }, () => ({
-      state: "stopped", child: null, job: null, failures: 0,
-      restartTimer: null, startTimer: null, stopping: null, exited: null,
+      state: "stopped", child: null, channel: null, job: null, failures: 0, readyAt: 0,
+      restartTimer: null, startTimer: null, stopping: null, violation: null, exited: null,
     }));
     const ownFile = fileURLToPath(import.meta.url);
     const typescript = ownFile.endsWith(".ts");
@@ -169,7 +186,7 @@ export class ThumbnailWorkerPool {
     if (!slot) {
       return signal?.aborted
         ? { ok: false, outcome: "timed-out", details: { reason: "waiting for a thumbnail worker" } }
-        : failed(this.closed ? "thumbnail workers are shut down" : "thumbnail workers are restarting after repeated failures");
+        : failed(this.closed ? "thumbnail workers are shut down" : "thumbnail workers are restarting after repeated start failures");
     }
     this.counts.jobs++;
     this.setRef(slot, true);
@@ -187,7 +204,7 @@ export class ThumbnailWorkerPool {
     return done;
   }
 
-  /** Stops every worker: asks them to exit, kills any left after the grace period. */
+  /** Stops every worker: closes its channel, kills any left after the grace period. */
   async close(): Promise<void> {
     this.closed = true;
     for (const wake of this.waiting.splice(0)) wake();
@@ -198,8 +215,8 @@ export class ThumbnailWorkerPool {
       const child = slot.child;
       if (!child) return;
       slot.stopping = "close";
-      if (slot.state !== "exiting") slot.state = "exiting";
-      if (child.connected) child.disconnect();
+      slot.state = "exiting";
+      slot.channel?.end();
       const kill = setTimeout(() => child.kill("SIGKILL"), grace);
       await slot.exited;
       clearTimeout(kill);
@@ -256,6 +273,7 @@ export class ThumbnailWorkerPool {
     if (this.closed) return;
     slot.restartTimer = null;
     slot.stopping = null;
+    slot.violation = null;
     slot.state = "starting";
     const node = [process.execPath, ...this.execArgv, "--v8-pool-size=1", "--expose-gc", this.script];
     if (this.options.memoryChecks === false) node.push("--no-memory-checks");
@@ -268,9 +286,10 @@ export class ThumbnailWorkerPool {
     for (const key of WORKER_ENV_KEYS) if (process.env[key] !== undefined) env[key] = process.env[key];
     let child: ChildProcess;
     try {
+      // fd 3 is the worker's channel (thumbnail-protocol.ts); its output
+      // goes straight to the server's, never through the server's memory.
       child = spawn(command, args as string[], {
-        stdio: ["ignore", "inherit", "inherit", "ipc"],
-        serialization: "advanced",
+        stdio: ["ignore", "inherit", "inherit", "pipe"],
         env,
         windowsHide: true,
       });
@@ -287,7 +306,9 @@ export class ThumbnailWorkerPool {
       return;
     }
     this.counts.spawned++;
+    const channel = child.stdio[3] as Socket;
     slot.child = child;
+    slot.channel = channel;
     let ended = false;
     let markExited!: () => void;
     slot.exited = new Promise((resolve) => { markExited = resolve; });
@@ -300,7 +321,19 @@ export class ThumbnailWorkerPool {
     child.on("exit", (code, signal) => end(code, signal));
     // A process that could not be started never emits "exit".
     child.on("error", (error) => { if (child.pid === undefined) end(null, null, error); });
-    child.on("message", (message: WorkerMessage) => this.received(slot, child, message));
+    const reader = new FrameReader();
+    channel.on("error", () => {}); // a worker gone mid-write; its exit reports it
+    channel.on("data", (chunk: Buffer) => {
+      if (slot.child !== child || slot.violation) return;
+      let frames: Frame[];
+      try {
+        frames = reader.push(chunk);
+      } catch (error) {
+        this.violated(slot, error instanceof ProtocolError ? error.message : "an unreadable reply");
+        return;
+      }
+      for (const frame of frames) this.received(slot, child, frame);
+    });
     slot.startTimer = setTimeout(() => {
       if (slot.child !== child || slot.state !== "starting") return;
       slot.stopping = "start-timeout";
@@ -310,17 +343,30 @@ export class ThumbnailWorkerPool {
     this.setRef(slot, slot.job !== null);
   }
 
-  private received(slot: Slot, child: ChildProcess, message: WorkerMessage) {
-    if (slot.child !== child || !message || typeof message !== "object") return;
-    if (message.type === "ready" && slot.state === "starting") {
+  /** The worker sent something it should not have: it is killed, and its decode reported as a crash. */
+  private violated(slot: Slot, how: string) {
+    if (slot.violation) return;
+    slot.violation = how;
+    logger.warn({ pid: slot.child?.pid, violation: how }, "Thumbnail worker broke the reply protocol");
+    this.stop(slot, "violation");
+  }
+
+  private received(slot: Slot, child: ChildProcess, frame: Frame) {
+    // Nothing from a worker that is being stopped counts any more.
+    if (slot.child !== child || slot.violation || slot.state === "exiting") return;
+    const message = frame.header as Record<string, unknown> | null;
+    if (!message || typeof message !== "object") return this.violated(slot, "a reply that is not an object");
+    if (message.type === "ready") {
+      if (slot.state !== "starting") return this.violated(slot, "an unexpected ready message");
       if (slot.startTimer) clearTimeout(slot.startTimer);
       slot.state = "ready";
+      slot.readyAt = Date.now();
       this.reportedLimit = typeof message.dataLimitBytes === "number" ? message.dataLimitBytes : null;
-      if (this.mechanism === "ulimit" && this.reportedLimit === null && !this.announced) {
-        logger.warn("Thumbnail workers report no memory limit although one was set");
-      }
       if (!this.announced) {
         this.announced = true;
+        if (this.mechanism === "ulimit" && this.reportedLimit === null) {
+          logger.warn("Thumbnail workers report no memory limit although one was set");
+        }
         logger.info(
           { workers: this.slots.length, mechanism: this.mechanism, dataLimitBytes: this.reportedLimit, oomScoreAdj: message.oomScoreAdj },
           "Thumbnail workers started",
@@ -330,14 +376,17 @@ export class ThumbnailWorkerPool {
       else this.wakeWaiter();
       return;
     }
-    if (message.type !== "result") return;
     const job = slot.job;
-    if (!job || message.id !== job.id || job.timedOut || slot.state !== "busy") return;
+    if (message.type !== "result" || !job || slot.state !== "busy" || message.id !== job.id) {
+      return this.violated(slot, "an unexpected reply");
+    }
     slot.failures = 0;
     slot.job = null;
     slot.state = "ready";
-    job.resolve(checkedResult(message.result));
-    if (this.tooBig(message.memory)) {
+    job.resolve(checkedResult(message, frame.body));
+    const memory = message.memory as { dataBytes?: unknown; rssBytes?: unknown } | undefined;
+    const size = typeof memory?.dataBytes === "number" ? memory.dataBytes : memory?.rssBytes;
+    if (this.options.recycleAboveBytes && typeof size === "number" && size > this.options.recycleAboveBytes) {
       this.counts.recycled++;
       this.stop(slot, "retire");
     } else {
@@ -347,11 +396,11 @@ export class ThumbnailWorkerPool {
   }
 
   private send(slot: Slot, job: Job) {
-    if (slot.job !== job || job.timedOut || slot.state !== "ready" || !slot.child) return;
+    if (slot.job !== job || job.timedOut || slot.state !== "ready" || !slot.channel) return;
     slot.state = "busy";
     job.sent = true;
     const request: WorkerRequest = { id: job.id, path: job.path };
-    slot.child.send(request, (error) => {
+    slot.channel.write(`${JSON.stringify(request)}\n`, (error) => {
       if (error && slot.job === job) this.stop(slot, null); // reported as a crash on exit
     });
   }
@@ -377,8 +426,8 @@ export class ThumbnailWorkerPool {
     if (!child || slot.state === "exiting") return;
     slot.stopping = reason;
     slot.state = "exiting";
-    if (reason === "retire" && child.connected) {
-      child.disconnect(); // exits on its own once the channel closes
+    if (reason === "retire") {
+      slot.channel?.end(); // exits on its own once the channel closes
       setTimeout(() => child.kill("SIGKILL"), this.options.closeGraceMs ?? 250).unref();
     } else {
       child.kill("SIGKILL");
@@ -397,9 +446,13 @@ export class ThumbnailWorkerPool {
     if (slot.startTimer) clearTimeout(slot.startTimer);
     const wasStarting = slot.state === "starting";
     const reason = slot.stopping;
+    const violation = slot.violation;
+    const aliveMs = slot.readyAt ? Date.now() - slot.readyAt : 0;
     slot.child = null;
+    slot.channel = null;
     slot.state = "stopped";
     slot.stopping = null;
+    slot.readyAt = 0;
     const details: WorkerDetails = { pid: child.pid, exitCode: code, signal };
     const job = slot.job;
     slot.job = null;
@@ -415,6 +468,7 @@ export class ThumbnailWorkerPool {
       return;
     }
 
+    const decoding = job !== null && job.sent && !job.timedOut;
     if (job) {
       if (job.timedOut) {
         job.resolve({ ok: false, outcome: "timed-out", details });
@@ -424,16 +478,25 @@ export class ThumbnailWorkerPool {
         job.resolve(failed("thumbnail worker could not start", details));
       } else {
         this.counts.crashed++;
-        const how = error?.message ?? (signal ? `killed by ${signal}` : `exited with status ${code}`);
+        const how = violation
+          ? `sent ${violation}`
+          : error?.message ?? (signal ? `killed by ${signal}` : `exited with status ${code}`);
         job.resolve({ ok: false, outcome: "crashed", details: { ...details, reason: `worker ${how}` } });
       }
     }
-    // A timed-out decode or a retired worker says nothing about the next start.
-    const failure = reason !== "timeout" && reason !== "retire" && reason !== "close";
-    if (failure) {
-      slot.failures++;
-      logger.warn({ ...details, failures: slot.failures, starting: wasStarting, err: error }, "Thumbnail worker exited");
+    if (reason === "timeout" || reason === "retire" || reason === "close") {
+      this.respawn(slot);
+      return;
     }
+    // A crash while decoding is the input's doing (it is backed off per
+    // workspace, in thumbnails.ts): restart at once. Anything else that
+    // ends a worker before it proved itself counts towards the delay.
+    if (aliveMs >= (this.options.healthyAfterMs ?? 30_000)) slot.failures = 0;
+    if (!decoding) slot.failures++;
+    logger.warn(
+      { ...details, failures: slot.failures, starting: wasStarting, decoding, violation, err: error },
+      "Thumbnail worker exited",
+    );
     this.respawn(slot);
   }
 
@@ -459,7 +522,7 @@ export class ThumbnailWorkerPool {
   private respawnLater(slot: Slot) {
     if (this.closed) return;
     const delay = Math.max(this.restartDelay(slot), 100);
-    logger.warn({ failures: slot.failures, delayMs: delay }, "Thumbnail worker keeps failing; restarting later");
+    logger.warn({ failures: slot.failures, delayMs: delay }, "Thumbnail worker keeps failing to start; restarting later");
     slot.restartTimer = setTimeout(() => {
       this.spawn(slot);
       this.wakeWaiter();
@@ -469,21 +532,14 @@ export class ThumbnailWorkerPool {
 
   /** Idle workers never keep the server (or a test) running. */
   private setRef(slot: Slot, ref: boolean) {
-    const child = slot.child as (ChildProcess & { channel?: { ref(): void; unref(): void } }) | null;
-    if (!child) return;
+    if (!slot.child) return;
     if (ref) {
-      child.ref();
-      child.channel?.ref();
+      slot.child.ref();
+      slot.channel?.ref();
     } else {
-      child.unref();
-      child.channel?.unref();
+      slot.child.unref();
+      slot.channel?.unref();
     }
-  }
-
-  private tooBig(memory: WorkerMemory | undefined) {
-    const limit = this.options.recycleAboveBytes;
-    if (!limit || !memory) return false;
-    return (memory.dataBytes ?? memory.rssBytes) > limit;
   }
 }
 
@@ -493,26 +549,24 @@ function failed(reason: string, details: WorkerDetails = {}): WorkerResult {
 
 /**
  * A worker's answer, checked: a decoder bug that took over the worker can
- * still only return a small WebP or a known outcome.
+ * still only return a WebP of at most MAX_BODY_BYTES (thumbnail-protocol.ts)
+ * or a known outcome with bounded details.
  */
-function checkedResult(result: DecodeResult): WorkerResult {
-  const details = checkedDetails(result?.details);
-  if (result?.ok === true) {
-    const bytes = result.thumbnail as unknown;
-    if (bytes instanceof Uint8Array && bytes.length >= 12 && bytes.length <= MAX_THUMBNAIL_BYTES) {
-      const thumbnail = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      if (thumbnail.toString("latin1", 0, 4) === "RIFF" && thumbnail.toString("latin1", 8, 12) === "WEBP") {
-        return { ok: true, thumbnail, details };
-      }
+function checkedResult(message: Record<string, unknown>, body: Buffer): WorkerResult {
+  const details = checkedDetails(message.details);
+  if (message.ok === true) {
+    if (body.length >= 12 && body.toString("latin1", 0, 4) === "RIFF" && body.toString("latin1", 8, 12) === "WEBP") {
+      return { ok: true, thumbnail: Buffer.from(body), details };
     }
-    return failed("the worker returned something other than a WebP", {});
+    return failed("the worker returned something other than a WebP");
   }
-  const outcome = result?.ok === false && ["unsupported", "over-budget", "failed"].includes(result.outcome)
-    ? result.outcome
+  const outcome = message.ok === false && typeof message.outcome === "string" && OUTCOMES.has(message.outcome)
+    ? message.outcome as DecodeOutcome
     : "failed";
   return { ok: false, outcome, details };
 }
 
+const OUTCOMES = new Set(["unsupported", "over-budget", "failed"]);
 const STAGES = new Set(["read", "signature", "detector", "container", "header", "transform"]);
 const FORMAT_NAMES = new Set(["jpeg", "png", "webp", "gif", "avif"]);
 

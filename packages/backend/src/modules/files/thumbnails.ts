@@ -170,6 +170,44 @@ export const thumbnailWorkers = new ThumbnailWorkerPool({
   recycleAboveBytes: THUMBNAIL_LIMITS.workerRecycleBytes,
 });
 
+/**
+ * Workspaces whose uploads recently ended a decoder worker (a crash, out of
+ * memory under its limit) wait before their next decode: 1 s after the
+ * first, doubling up to 60 s, until one of their thumbnails succeeds. A
+ * restarted worker costs about as much CPU as decoding an ordinary photo,
+ * so this keeps one workspace from turning a stream of crashing uploads
+ * into a stream of restarts, without holding back any other workspace.
+ */
+export class CrashBackoff {
+  private readonly entries = new Map<string, { crashes: number; until: number }>();
+
+  constructor(
+    readonly initialMs = 1_000,
+    readonly maxMs = 60_000,
+    /** Workspaces remembered; the longest-unseen are forgotten first. */
+    readonly maxEntries = 10_000,
+  ) {}
+
+  /** Milliseconds before `key` may decode again; 0 when it may now. */
+  remaining(key: string, now = Date.now()): number {
+    const entry = this.entries.get(key);
+    return entry ? Math.max(0, entry.until - now) : 0;
+  }
+
+  crashed(key: string, now = Date.now()): void {
+    const crashes = (this.entries.get(key)?.crashes ?? 0) + 1;
+    this.entries.delete(key);
+    this.entries.set(key, { crashes, until: now + Math.min(this.maxMs, this.initialMs * 2 ** (crashes - 1)) });
+    if (this.entries.size > this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
+  }
+
+  succeeded(key: string): void {
+    this.entries.delete(key);
+  }
+}
+
+export const thumbnailCrashBackoff = new CrashBackoff();
+
 /** A stored file to make a thumbnail of. */
 export interface ThumbnailSource {
   /** Its size in bytes. */
@@ -190,6 +228,7 @@ export interface ThumbnailOptions {
   fileId?: string;
   admission?: TransformAdmission;
   workers?: ThumbnailWorkerPool;
+  crashBackoff?: CrashBackoff;
   deadlineMs?: number;
   headTimeoutMs?: number;
 }
@@ -204,7 +243,8 @@ const TIMED_OUT = Symbol("timed out");
  * `transformDeadlineMs` after admission: the worker is then killed, and the
  * turn returns once it has exited, so the turn always covers a worker's
  * memory. A worker that crashes or runs out of memory costs only this
- * thumbnail. Never throws.
+ * thumbnail, and holds back this workspace's next ones for a while
+ * (CrashBackoff). Never throws.
  */
 export async function createThumbnail(
   source: ThumbnailSource,
@@ -213,6 +253,7 @@ export async function createThumbnail(
     fileId,
     admission = thumbnailAdmission,
     workers = thumbnailWorkers,
+    crashBackoff = thumbnailCrashBackoff,
     deadlineMs = THUMBNAIL_LIMITS.transformDeadlineMs,
     headTimeoutMs = THUMBNAIL_LIMITS.headTimeoutMs,
   }: ThumbnailOptions = {},
@@ -241,6 +282,11 @@ export async function createThumbnail(
   } finally {
     clearTimeout(headTimer);
   }
+  const key = workspaceId ?? "";
+  const holdBackMs = crashBackoff.remaining(key);
+  if (holdBackMs > 0) {
+    return skipped("busy", { ...context, reason: `this workspace's uploads recently ended a decoder worker (${holdBackMs} ms left)` });
+  }
   const release = await admission.acquire(workspaceId);
   if (!release) return skipped("busy", context);
   const stop = new AbortController();
@@ -263,9 +309,11 @@ export async function createThumbnail(
       return skipped("timed-out", context);
     }
     if (result.ok) {
+      crashBackoff.succeeded(key);
       thumbnailOutcomes.created++;
       return result.thumbnail;
     }
+    if (result.outcome === "crashed") crashBackoff.crashed(key);
     return skipped(result.outcome, { ...context, ...result.details });
   } finally {
     clearTimeout(timer);

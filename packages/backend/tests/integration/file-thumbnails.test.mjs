@@ -9,7 +9,8 @@ import sharp from "sharp";
 import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
 import {
-  avif100Megapixels, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader, rgb16Png,
+  avif100Megapixels, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader, largeCanvasWebp,
+  manyScanJpeg, restructuredAvif, rgb16Png,
 } from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
@@ -175,9 +176,7 @@ async function withDispatchSpies(run) {
   const detector = FileTypeParser.prototype.fromBuffer;
   const render = sharp.prototype.toBuffer;
   const header = sharp.prototype.metadata;
-  // `fakeHeader`, when set, stands in for libvips' header of container-only
-  // fixtures, which are never presented to a native decoder.
-  const state = { detectorCalls: 0, headerCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub", fakeHeader: null };
+  const state = { detectorCalls: 0, headerCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
   FileTypeParser.prototype.fromBuffer = async function (...args) {
     state.detectorCalls++;
     if (state.detectorMode === "throw") throw new Error("Owned detector failure");
@@ -192,7 +191,7 @@ async function withDispatchSpies(run) {
   };
   sharp.prototype.metadata = function (...args) {
     state.headerCalls++;
-    return state.fakeHeader ? Promise.resolve(state.fakeHeader) : header.apply(this, args);
+    return header.apply(this, args);
   };
   try {
     const control = await upload("dispatch-control.png", "image/jpeg", smallPng);
@@ -313,14 +312,15 @@ function pngChunk(type, data) {
   return chunk;
 }
 
-const avifHeader = { format: "heif", width: 2, height: 2, channels: 3, depth: "uchar" };
-
 test("only the AVIF brand reaches detection and decoding; other HEIF brands and TIFF are stored without", async () => {
+  // A real AVIF, and the same bytes with each other major brand.
+  const avif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
   await withDispatchSpies(async (state) => {
-    state.fakeHeader = avifHeader;
     const cases = [];
     for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
-      cases.push([brand, isoHeader(brand), brand === "avif"]);
+      const bytes = Buffer.from(avif);
+      bytes.write(brand, 8, "latin1");
+      cases.push([brand, bytes, brand === "avif"]);
     }
     for (const little of [true, false]) for (const version of [42, 43]) {
       const bytes = Buffer.alloc(16);
@@ -329,9 +329,7 @@ test("only the AVIF brand reaches detection and decoding; other HEIF brands and 
       else { bytes.writeUInt16BE(version, 2); bytes.writeUInt32BE(8, 4); }
       cases.push([`${little ? "little" : "big"}-${version}`, bytes, false]);
     }
-    // Container headers exercise dispatch only. The armed header read and
-    // transform return known values; these are never presented to a native
-    // decoder.
+    // The armed transform returns a known WebP.
     for (const [name, bytes, dispatched] of cases) {
       state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       const file = await upload(`${name}.bin`, "image/heic", bytes);
@@ -351,14 +349,14 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
       bytes.write("ftypavif", 4);
       return bytes;
     };
-    // Plain header controls only; the armed header read and transform
-    // return known values.
-    state.fakeHeader = avifHeader;
+    // Plain headers reach the detector, then stop at the item-structure
+    // check: they have no meta box, so nothing native reads them.
     for (const size of [16, 20, 24]) {
       state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
-      assert.ok((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath);
+      assert.equal((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath, null);
       assert.equal(state.detectorCalls, 1);
-      assert.equal(state.nativeCalls, 1);
+      assert.equal(state.headerCalls, 0);
+      assert.equal(state.nativeCalls, 0);
     }
     const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
     for (const [size, length] of [
@@ -516,6 +514,12 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
     ["photo.heic", "image/heic", avif100Megapixels, "over-budget"],
     ["banner.gif", "image/gif", blankGif(10000, 10000), "over-budget"],
     ["poster.png", "image/png", await blankPng(10000, 10000, { depth: 8, color: 6, interlace: true }), "over-budget"],
+    // Reported as 64 x 64 by a crop, a grid or an overlay; coded 10000 x 10000.
+    ["cropped.avif", "image/avif", restructuredAvif(avif100Megapixels, "clap", 64, 64), "over-budget"],
+    ["grid.avif", "image/avif", restructuredAvif(avif100Megapixels, "grid", 64, 64), "unsupported"],
+    ["overlay.avif", "image/avif", restructuredAvif(avif100Megapixels, "overlay", 64, 64), "unsupported"],
+    ["canvas.webp", "image/webp", await largeCanvasWebp(16383, 16383), "over-budget"],
+    ["scans.jpg", "image/jpeg", manyScanJpeg(64, 64), "over-budget"],
   ]) {
     const rss = process.memoryUsage().rss;
     const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
@@ -544,13 +548,15 @@ test("uploads beyond the transform limit all succeed; the excess are stored at o
   const { thumbnailAdmission } = await import("../../src/modules/files/thumbnails.ts");
   const { maxActive, maxQueued } = thumbnailAdmission.limits;
   const extra = 3, total = maxActive + maxQueued + extra;
+  const tiffBytes = await solid(64, 32, "#abcdef").tiff().toBuffer();
   const render = sharp.prototype.toBuffer;
   let inFlight = 0, peak = 0, open;
   const gate = new Promise((resolve) => { open = resolve; });
-  sharp.prototype.toBuffer = async function () {
+  const held = async function () {
     inFlight++; peak = Math.max(peak, inFlight);
     try { await gate; return smallWebp; } finally { inFlight--; }
   };
+  sharp.prototype.toBuffer = held;
   t.after(() => { open(); sharp.prototype.toBuffer = render; });
   let responded = 0;
   const pending = Array.from({ length: total }, (_, i) =>
@@ -563,6 +569,17 @@ test("uploads beyond the transform limit all succeed; the excess are stored at o
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(responded, extra);
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  // Content outside the allowlist neither waits nor displaces a waiter.
+  const { result: junk, delta: junkDelta } = await outcomeDelta(() => Promise.all([
+    uploadResponse("junk.png", "image/png", Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')),
+    uploadResponse("scan.png", "image/png", tiffBytes),
+  ]));
+  for (const response of junk) {
+    assert.equal(response.statusCode, 201, response.body);
+    assert.equal(response.json().data.thumbnailPath, null);
+  }
+  assert.deepEqual(junkDelta, { unsupported: 2 });
   assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
   // Another workspace still gets a place: this workspace's newest waiter
   // goes without instead.

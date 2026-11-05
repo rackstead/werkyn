@@ -213,3 +213,179 @@ export function isoHeader(brand, size = 24, length = 24) {
   bytes.write(`ftyp${brand}`, 4, "latin1");
   return bytes;
 }
+
+// ---------------------------------------------------------------------------
+// AVIF item structures. libheif decodes an item's whole coded image (its
+// `ispe`); a `clap` crop, a grid or an overlay can report a far smaller
+// output size.
+
+const box = (type, ...parts) => {
+  const body = Buffer.concat(parts);
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(8 + body.length);
+  header.write(type, 4, "latin1");
+  return Buffer.concat([header, body]);
+};
+const fullBox = (type, version, flags, ...parts) => {
+  const head = Buffer.alloc(4);
+  head.writeUInt32BE(((version & 0xff) << 24) | (flags & 0xffffff));
+  return box(type, head, ...parts);
+};
+const u16 = (...values) => { const b = Buffer.alloc(2 * values.length); values.forEach((v, i) => b.writeUInt16BE(v, 2 * i)); return b; };
+const u32 = (...values) => { const b = Buffer.alloc(4 * values.length); values.forEach((v, i) => b.writeUInt32BE(v, 4 * i)); return b; };
+
+/** The av1C and pixi property boxes and the coded AV1 data of a single-image AVIF made by sharp. */
+function avifParts(avif) {
+  const children = (start, end) => {
+    const out = {};
+    for (let pos = start; pos + 8 <= end; pos += avif.readUInt32BE(pos)) {
+      out[avif.toString("latin1", pos + 4, pos + 8)] = [pos, pos + avif.readUInt32BE(pos)];
+    }
+    return out;
+  };
+  const top = children(0, avif.length);
+  const meta = children(top.meta[0] + 12, top.meta[1]);
+  const ipco = children(children(meta.iprp[0] + 8, meta.iprp[1]).ipco[0] + 8, children(meta.iprp[0] + 8, meta.iprp[1]).ipco[1]);
+  const iloc = meta.iloc[0] + 8;
+  // sharp writes iloc version 0: offset, length and base offset of 4 bytes, one item, one extent.
+  if (avif[iloc] !== 0 || avif[iloc + 4] !== 0x44 || avif[iloc + 5] !== 0x40) throw new Error("unexpected iloc layout");
+  const base = avif.readUInt32BE(iloc + 12), offset = avif.readUInt32BE(iloc + 18), length = avif.readUInt32BE(iloc + 22);
+  const ispe = ipco.ispe[0];
+  return {
+    av1C: avif.subarray(...ipco.av1C),
+    pixi: avif.subarray(...ipco.pixi),
+    width: avif.readUInt32BE(ispe + 12),
+    height: avif.readUInt32BE(ispe + 16),
+    coded: avif.subarray(base + offset, base + offset + length),
+  };
+}
+
+/**
+ * An AVIF rebuilt from `avif`'s coded image. `layout` is "plain" (the image
+ * itself), "clap" (cropped to `width` x `height` by a clean aperture),
+ * "grid" (a 1 x 1 grid whose output is `width` x `height`) or "overlay" (an
+ * `iovl` canvas of `width` x `height` holding the image).
+ */
+export function restructuredAvif(avif, layout, width, height) {
+  const parts = avifParts(avif);
+  const ispe = (w, h) => fullBox("ispe", 0, 0, u32(w, h));
+  const derived = layout === "grid" || layout === "overlay";
+  // Properties: 1 av1C, 2 coded ispe, 3 pixi, 4 output ispe or clap.
+  const properties = [parts.av1C, ispe(parts.width, parts.height), parts.pixi];
+  if (layout === "clap") properties.push(box("clap", u32(width, 1, height, 1, 0, 1, 0, 1)));
+  if (derived) properties.push(ispe(width, height));
+  const data = layout === "grid"
+    ? Buffer.concat([Buffer.from([0, 0, 0, 0]), u16(width, height)])
+    : layout === "overlay"
+      ? Buffer.concat([Buffer.from([0, 0]), u16(0, 0, 0, 0xffff, width, height), u16(0, 0)])
+      : Buffer.alloc(0);
+  const itemType = layout === "grid" ? "grid" : "iovl";
+  const infe = (id, type) => fullBox("infe", 2, 0, u16(id, 0), Buffer.from(type, "latin1"), Buffer.from([0]));
+  const entry = (id, ...assoc) => Buffer.concat([u16(id), Buffer.from([assoc.length, ...assoc])]);
+  const build = (mdatOffset) => {
+    const items = [Buffer.concat([u16(1, 0, 0, 1), u32(mdatOffset, parts.coded.length)])];
+    if (derived) items.push(Buffer.concat([u16(2, 1, 0, 1), u32(0, data.length)])); // construction method 1: idat
+    const meta = fullBox("meta", 0, 0,
+      fullBox("hdlr", 0, 0, u32(0), Buffer.from("pict"), u32(0, 0, 0), Buffer.from([0])),
+      fullBox("pitm", 0, 0, u16(derived ? 2 : 1)),
+      fullBox("iloc", 1, 0, Buffer.from([0x44, 0x00]), u16(items.length), ...items),
+      fullBox("iinf", 0, 0, u16(derived ? 2 : 1), infe(1, "av01"), ...(derived ? [infe(2, itemType)] : [])),
+      ...(derived ? [fullBox("iref", 0, 0, box("dimg", u16(2, 1, 1)))] : []),
+      box("iprp",
+        box("ipco", ...properties),
+        fullBox("ipma", 0, 0, u32(derived ? 2 : 1),
+          derived ? entry(1, 0x81, 0x02, 0x03) : entry(1, 0x81, 0x02, 0x03, ...(layout === "clap" ? [0x84] : [])),
+          ...(derived ? [entry(2, 0x04, 0x03)] : []))),
+      ...(derived ? [box("idat", data)] : []));
+    return meta;
+  };
+  const ftyp = box("ftyp", Buffer.from("avif"), u32(0), Buffer.from("avifmif1miaf"));
+  const placeholder = build(0);
+  const mdatOffset = ftyp.length + placeholder.length + 8;
+  return Buffer.concat([ftyp, build(mdatOffset), box("mdat", parts.coded)]);
+}
+
+// ---------------------------------------------------------------------------
+// WebP and JPEG structures.
+
+const riffChunk = (type, data) =>
+  Buffer.concat([Buffer.from(type, "latin1"), (() => { const b = Buffer.alloc(4); b.writeUInt32LE(data.length); return b; })(), data, data.length % 2 ? Buffer.alloc(1) : Buffer.alloc(0)]);
+const u24le = (v) => Buffer.from([v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff]);
+
+/**
+ * An animated WebP whose canvas is `width` x `height` but whose two frames
+ * are 1 x 1: libvips composites frames onto an RGBA canvas of the whole
+ * image, so a few hundred bytes can need a gigabyte.
+ */
+export async function largeCanvasWebp(width, height) {
+  const one = await sharp({ create: { width: 1, height: 1, channels: 3, background: "#204060" } }).webp({ lossless: true }).toBuffer();
+  const frame = one.subarray(12); // the VP8L chunk
+  const anmf = riffChunk("ANMF", Buffer.concat([u24le(0), u24le(0), u24le(0), u24le(0), u24le(100), Buffer.from([0x02]), frame]));
+  const body = Buffer.concat([
+    Buffer.from("WEBP"),
+    riffChunk("VP8X", Buffer.concat([Buffer.from([0x02, 0, 0, 0]), u24le(width - 1), u24le(height - 1)])),
+    riffChunk("ANIM", Buffer.from([0xff, 0xff, 0xff, 0xff, 0, 0])),
+    anmf, anmf,
+  ]);
+  const size = Buffer.alloc(4);
+  size.writeUInt32LE(body.length);
+  return Buffer.concat([Buffer.from("RIFF"), size, body]);
+}
+
+/** A lossless WebP of vertical stripes in `colors` colours (more than 16 disables pixel packing). */
+export function stripesWebp(width, height, colors) {
+  const row = Buffer.alloc(width * 3);
+  for (let x = 0; x < width; x++) {
+    const c = Math.floor((x * colors) / width);
+    row[x * 3] = (c * 37) & 255; row[x * 3 + 1] = (c * 91) & 255; row[x * 3 + 2] = (c * 13 + 7) & 255;
+  }
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) row.copy(raw, y * width * 3);
+  return sharp(raw, { raw: { width, height, channels: 3 } }).webp({ lossless: true, effort: 0 }).toBuffer();
+}
+
+/**
+ * A flat progressive JPEG (4:4:4, all coefficients zero) with a valid but
+ * long scan script: one DC scan, then for each component and each of
+ * `bands` AC coefficients a first scan and `steps` refinement scans, so
+ * 1 + 3 x bands x (steps + 1) scans. Every scan visits every block.
+ */
+export function manyScanJpeg(width, height, bands = 63, steps = 13) {
+  const seg = (marker, payload) => Buffer.concat([Buffer.from([0xff, marker]), u16(payload.length + 2), payload]);
+  const bits = () => {
+    const out = []; let acc = 0, n = 0;
+    const put = (value, length) => {
+      for (let i = length - 1; i >= 0; i--) {
+        acc = (acc << 1) | ((value >> i) & 1);
+        if (++n === 8) { out.push(acc); if (acc === 0xff) out.push(0); acc = 0; n = 0; }
+      }
+    };
+    const flush = () => { while (n) put(1, 1); return Buffer.from(out); };
+    return { put, flush };
+  };
+  const blocks = Math.ceil(width / 8) * Math.ceil(height / 8);
+  const parts = [Buffer.from([0xff, 0xd8]), seg(0xdb, Buffer.from([0, ...Array(64).fill(1)]))];
+  parts.push(seg(0xc2, Buffer.concat([Buffer.from([8]), u16(height, width), Buffer.from([3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0])])));
+  parts.push(seg(0xc4, Buffer.from([0x00, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, ...Array.from({ length: 12 }, (_, i) => i)])));
+  parts.push(seg(0xc4, Buffer.from([0x10, 0, 0, 0, 15, ...Array(12).fill(0), ...Array.from({ length: 15 }, (_, r) => r << 4)])));
+  const dc = bits();
+  for (let i = 0; i < Math.floor((blocks * 3) / 4); i++) dc.put(0, 8);
+  for (let i = 0; i < (blocks * 3) % 4; i++) dc.put(0, 2);
+  parts.push(seg(0xda, Buffer.from([3, 1, 0x00, 2, 0x00, 3, 0x00, 0, 0, 0x00])), dc.flush());
+  const eob = bits();
+  for (let left = blocks; left; ) {
+    const run = Math.min(left, 32767), r = 31 - Math.clz32(run);
+    eob.put(r, 4);
+    if (r) eob.put(run - (1 << r), r);
+    left -= run;
+  }
+  const eobData = eob.flush();
+  for (const component of [1, 2, 3]) {
+    for (let k = 1; k <= bands; k++) {
+      parts.push(seg(0xda, Buffer.from([1, component, 0x00, k, k, steps])), eobData);
+      for (let ah = steps; ah > 0; ah--) parts.push(seg(0xda, Buffer.from([1, component, 0x00, k, k, (ah << 4) | (ah - 1)])), eobData);
+    }
+  }
+  parts.push(Buffer.from([0xff, 0xd9]));
+  return Buffer.concat(parts);
+}

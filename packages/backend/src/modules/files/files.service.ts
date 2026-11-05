@@ -37,6 +37,17 @@ import { THUMBNAIL_SOURCE_MAX_BYTES, createThumbnail } from "./thumbnails.js";
 
 export { THUMBNAIL_SOURCE_MAX_BYTES };
 
+/** The first bytes of a stored file: one read of the opened stream. */
+async function readHead(storage: StorageProvider, storagePath: string): Promise<Buffer> {
+  const stream = await storage.openReadStream(storagePath);
+  try {
+    for await (const chunk of stream) return chunk as Buffer;
+    return Buffer.alloc(0);
+  } finally {
+    stream.destroy();
+  }
+}
+
 export async function uploadFileStream(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -80,10 +91,14 @@ export async function uploadFileStream(
     !mimeType.includes("svg") &&
     size <= THUMBNAIL_SOURCE_MAX_BYTES
   ) {
-    const thumbBuffer = await createThumbnail(() => storage.read(storagePath), {
-      workspaceId,
-      fileId,
-    });
+    const thumbBuffer = await createThumbnail(
+      {
+        size,
+        head: () => readHead(storage, storagePath),
+        read: () => storage.read(storagePath),
+      },
+      { workspaceId, fileId },
+    );
     if (thumbBuffer) {
       try {
         thumbnailPath = await storage.save(

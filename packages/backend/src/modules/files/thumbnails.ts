@@ -41,13 +41,17 @@ const WEBP_CHUNKS = new Set(["VP8 ", "VP8L", "VP8X"]);
 // no HEVC decoder. libvips 8.18 does not load the AVIF sequence brand (avis).
 const AVIF_BRANDS = new Set(["avif"]);
 
+/** How many leading bytes `thumbnailFormat` needs. */
+export const THUMBNAIL_HEAD_BYTES = 64;
+
 /**
- * The allowlisted format these bytes start as, or null. Only fixed
- * signatures at fixed offsets are read: SVG, PDF, TIFF, HEIC and anything
- * else are never sent to the detector or a decoder, whatever their declared
- * type or filename.
+ * The allowlisted format a stored file starts as, or null. `buffer` is the
+ * file or at least its first THUMBNAIL_HEAD_BYTES bytes, and `size` the
+ * file's size. Only fixed signatures at fixed offsets are read: SVG, PDF,
+ * TIFF, HEIC and anything else are never sent to the detector or a decoder,
+ * whatever their declared type or filename.
  */
-export function thumbnailFormat(buffer: Buffer): ThumbnailFormat | null {
+export function thumbnailFormat(buffer: Buffer, size = buffer.length): ThumbnailFormat | null {
   const text = (start: number, end: number) => buffer.toString("latin1", start, end);
   if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
     return "jpeg";
@@ -75,7 +79,7 @@ export function thumbnailFormat(buffer: Buffer): ThumbnailFormat | null {
     // An ordinary 32-bit ftyp box that fits the buffer (see
     // thumbnail-content-boundary.md); other size forms get no thumbnail.
     const boxSize = buffer.readUInt32BE(0);
-    if (boxSize >= 16 && boxSize <= buffer.length && boxSize <= THUMBNAIL_SOURCE_MAX_BYTES) {
+    if (boxSize >= 16 && boxSize <= size && boxSize <= THUMBNAIL_SOURCE_MAX_BYTES) {
       return "avif";
     }
   }
@@ -96,6 +100,12 @@ export const THUMBNAIL_LIMITS = Object.freeze({
    * 100-megapixel AVIF needs about 1.7 GiB.
    */
   decodeBudgetBytes: 384 * 1024 * 1024,
+  /**
+   * Scans in one JPEG. libjpeg reads every scan of a progressive JPEG before
+   * libvips' timeout can act, so a long scan script is otherwise limited
+   * only by time. Encoders write about 10.
+   */
+  maxJpegScans: 100,
   /** libvips stops a transform after this long... */
   transformTimeoutSeconds: 10,
   /** ...and the upload stops waiting for it a little after that. */
@@ -119,21 +129,34 @@ const SAMPLE_BYTES: Record<string, number> = {
   uchar: 1, char: 1, ushort: 2, short: 2, uint: 4, int: 4, float: 4,
 };
 
+/** What the container says about the decode, beyond libvips' header. */
+export interface DecodeHints {
+  /**
+   * Pixels the decoder really produces, when more than the reported size:
+   * the largest coded AVIF image (a `clap` crop only trims the output) or
+   * the WebP canvas.
+   */
+  codedPixels?: number;
+  /** WebP that is lossless, has alpha or is animated. */
+  webpFullCanvas?: boolean;
+}
+
 /**
  * Upper estimate of the memory libvips 8.18 and its codecs need to make one
  * thumbnail, from the header alone (measured in docs/remediation/r19.md,
  * plus at least 20% headroom). Formats that cannot be read row by row
- * (interlaced PNG, progressive JPEG, GIF frames, AVIF) are charged for the
- * whole decoded image; the others for the buffering seen while they stream
- * through the resize.
+ * (interlaced PNG, progressive JPEG, GIF frames, AVIF, lossless, alpha and
+ * animated WebP) are charged for the whole decoded image; the others for
+ * the buffering seen while they stream through the resize.
  */
 export function estimateDecodeBytes(
   meta: Pick<Metadata, "format" | "width" | "height" | "channels" | "depth" | "isProgressive">,
+  hints: DecodeHints = {},
 ): number {
   const { width, height, channels } = meta;
   const sampleBytes = SAMPLE_BYTES[meta.depth ?? ""];
   if (!width || !height || !channels || !sampleBytes) return Infinity;
-  const pixels = width * height;
+  const pixels = Math.max(width * height, hints.codedPixels ?? 0);
   const bytes = pixels * channels * sampleBytes;
   switch (meta.format) {
     case "jpeg":
@@ -146,14 +169,168 @@ export function estimateDecodeBytes(
       // Frames are drawn onto an RGBA canvas of the whole image.
       return pixels * 7;
     case "webp":
-      // libwebp decodes still and animated frames at the reduced size.
-      return pixels * 1.5;
+      // libwebp decodes lossless (VP8L) images whole as 32-bit ARGB, and
+      // libvips composites alpha and animation onto a full RGBA canvas.
+      // Plain lossy VP8 decodes scaled.
+      return pixels * (hints.webpFullCanvas ? 5.5 : 2);
     case "heif":
       // AV1 frame buffers, then RGB(A) copies in libheif and libvips.
       return pixels * 16 + bytes * 2;
     default:
       return Infinity;
   }
+}
+
+interface Box {
+  type: string;
+  body: number;
+  end: number;
+}
+
+/** ISO BMFF boxes between `start` and `end`; throws on a malformed size. */
+function isoBoxes(buffer: Buffer, start: number, end: number): Box[] {
+  const found: Box[] = [];
+  for (let pos = start; pos + 8 <= end; ) {
+    let size = buffer.readUInt32BE(pos);
+    let header = 8;
+    if (size === 1) {
+      const large = buffer.readBigUInt64BE(pos + 8);
+      if (large > BigInt(end - pos)) throw new RangeError("box");
+      size = Number(large);
+      header = 16;
+    } else if (size === 0) {
+      size = end - pos;
+    }
+    if (size < header || pos + size > end) throw new RangeError("box");
+    found.push({ type: buffer.toString("latin1", pos + 4, pos + 8), body: pos + header, end: pos + size });
+    pos += size;
+  }
+  return found;
+}
+
+/** Derived image items, whose output libheif composes from other items. */
+const DERIVED_ITEMS = new Set(["grid", "iovl", "iden"]);
+
+/**
+ * The AVIF item structure that decides what libheif decodes: the primary
+ * item's type, any derived (grid, overlay or identity) items, and the
+ * largest coded image size (`ispe`) of any item. libvips reports the size
+ * after `clap` cropping, but the whole coded image is decoded; libheif
+ * refuses an image whose coded size differs from its `ispe`. Null when the
+ * structure cannot be read.
+ */
+export function avifStructure(
+  buffer: Buffer,
+): { primaryType: string; derived: string[]; maxCodedPixels: number } | null {
+  try {
+    const meta = isoBoxes(buffer, 0, buffer.length).find((box) => box.type === "meta");
+    if (!meta) return null;
+    let primary: number | undefined;
+    const types = new Map<number, string>();
+    let maxCodedPixels = 0;
+    for (const box of isoBoxes(buffer, meta.body + 4, meta.end)) {
+      if (box.type === "pitm" && box.end - box.body >= 6) {
+        primary = buffer[box.body] === 0 ? buffer.readUInt16BE(box.body + 4) : buffer.readUInt32BE(box.body + 4);
+      } else if (box.type === "iinf" && box.end - box.body >= 6) {
+        const first = box.body + 4 + (buffer[box.body] === 0 ? 2 : 4);
+        for (const infe of isoBoxes(buffer, first, box.end)) {
+          const version = buffer[infe.body];
+          if (infe.type !== "infe" || version < 2) continue;
+          const idBytes = version === 2 ? 2 : 4;
+          const typeAt = infe.body + 4 + idBytes + 2;
+          if (typeAt + 4 > infe.end) return null;
+          const id = idBytes === 2 ? buffer.readUInt16BE(infe.body + 4) : buffer.readUInt32BE(infe.body + 4);
+          types.set(id, buffer.toString("latin1", typeAt, typeAt + 4));
+        }
+      } else if (box.type === "iprp") {
+        for (const container of isoBoxes(buffer, box.body, box.end)) {
+          if (container.type !== "ipco") continue;
+          for (const property of isoBoxes(buffer, container.body, container.end)) {
+            if (property.type !== "ispe") continue;
+            if (property.end - property.body < 12) return null;
+            const pixels = buffer.readUInt32BE(property.body + 4) * buffer.readUInt32BE(property.body + 8);
+            maxCodedPixels = Math.max(maxCodedPixels, pixels);
+          }
+        }
+      }
+    }
+    if (primary === undefined || maxCodedPixels === 0) return null;
+    return {
+      primaryType: types.get(primary) ?? "unknown",
+      derived: [...types.values()].filter((type) => DERIVED_ITEMS.has(type)),
+      maxCodedPixels,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a WebP decodes onto a full-size canvas (lossless, alpha or
+ * animation) and the VP8X canvas size, from its RIFF chunks. Null when the
+ * chunks overrun the file.
+ */
+export function webpFeatures(buffer: Buffer): { fullCanvas: boolean; canvasPixels: number } | null {
+  let fullCanvas = false;
+  let canvasPixels = 0;
+  for (let pos = 12; pos + 8 <= buffer.length && !fullCanvas; ) {
+    const type = buffer.toString("latin1", pos, pos + 4);
+    const size = buffer.readUInt32LE(pos + 4);
+    const body = pos + 8;
+    if (body + size > buffer.length) return null;
+    if (type === "VP8X") {
+      if (size < 10) return null;
+      // Flags: alpha 0x10, animation 0x02.
+      if (buffer[body] & 0x12) fullCanvas = true;
+      canvasPixels = (buffer.readUIntLE(body + 4, 3) + 1) * (buffer.readUIntLE(body + 7, 3) + 1);
+    } else if (type === "VP8L" || type === "ALPH" || type === "ANIM" || type === "ANMF") {
+      fullCanvas = true;
+    }
+    pos = body + size + (size & 1);
+  }
+  return { fullCanvas, canvasPixels };
+}
+
+/**
+ * Start-of-scan markers in a JPEG, counting no further than `stopAfter + 1`.
+ * Entropy-coded data is skipped by searching for the next marker byte.
+ */
+export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
+  let scans = 0;
+  let pos = 2;
+  while (pos + 4 <= buffer.length && buffer[pos] === 0xff) {
+    const marker = buffer[pos + 1];
+    if (marker === 0xff) {
+      pos++; // fill byte
+      continue;
+    }
+    if (marker === 0xd9) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      pos += 2;
+      continue;
+    }
+    const length = buffer.readUInt16BE(pos + 2);
+    if (length < 2) break;
+    pos += 2 + length;
+    if (marker !== 0xda) continue;
+    if (++scans > stopAfter) break;
+    // Skip entropy-coded data: stuffed 0xFF00 bytes and restart markers
+    // belong to the scan; any other marker ends it.
+    for (;;) {
+      const at = buffer.indexOf(0xff, pos);
+      if (at === -1 || at + 1 >= buffer.length) return scans;
+      const next = buffer[at + 1];
+      if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+        pos = at + 2;
+      } else if (next === 0xff) {
+        pos = at + 1;
+      } else {
+        pos = at;
+        break;
+      }
+    }
+  }
+  return scans;
 }
 
 /** Concurrent transforms in one process. */
@@ -328,6 +505,25 @@ class Skip extends Error {
 
 const TIMED_OUT = Symbol("timed out");
 
+/** A stored file to make a thumbnail of. */
+export interface ThumbnailSource {
+  /** Its size in bytes. */
+  size: number;
+  /** At least its first THUMBNAIL_HEAD_BYTES bytes, or all of a shorter file. */
+  head(): Promise<Buffer>;
+  /** The whole file. */
+  read(): Promise<Buffer>;
+}
+
+/** A source over bytes already in memory. */
+export function bufferSource(bytes: Buffer): ThumbnailSource {
+  return {
+    size: bytes.length,
+    head: async () => bytes.subarray(0, THUMBNAIL_HEAD_BYTES),
+    read: async () => bytes,
+  };
+}
+
 export interface ThumbnailOptions {
   /** Admission is shared fairly between workspaces; also logged. */
   workspaceId?: string;
@@ -338,15 +534,17 @@ export interface ThumbnailOptions {
 }
 
 /**
- * A WebP thumbnail of the bytes `read` returns, or null. Waits for a turn
- * first (at most `queueTimeoutMs`), reads the source only once admitted, and
- * stops waiting `transformDeadlineMs` after admission, whether the read or
- * the decoder is slow. The turn is held until that work has actually
- * settled, so work the upload stopped waiting for still counts against the
- * limit, and a read that finishes late starts no decode. Never throws.
+ * A WebP thumbnail of `source`, or null. The file's first bytes are checked
+ * against the allowlisted signatures before it waits for a turn, so other
+ * content never takes one. It then waits (at most `queueTimeoutMs`), reads
+ * the whole file only once admitted, and stops waiting `transformDeadlineMs`
+ * after admission, whether the read or the decoder is slow. The turn is held
+ * until that work has actually settled, so work the upload stopped waiting
+ * for still counts against the limit, and a read that finishes late starts
+ * no decode. Never throws.
  */
 export async function createThumbnail(
-  read: () => Promise<Buffer>,
+  source: ThumbnailSource,
   {
     workspaceId,
     fileId,
@@ -355,10 +553,15 @@ export async function createThumbnail(
   }: ThumbnailOptions = {},
 ): Promise<Buffer | null> {
   const context = { workspaceId, fileId };
+  try {
+    if (!thumbnailFormat(await source.head(), source.size)) return skipped("unsupported", context);
+  } catch (err) {
+    return skipped("failed", { ...context, reason: errorReason(err) });
+  }
   const release = await admission.acquire(workspaceId);
   if (!release) return skipped("busy", context);
   const abandoned = { value: false };
-  const work = produce(read, abandoned);
+  const work = produce(source, abandoned);
   let timer: NodeJS.Timeout | undefined;
   let releaseLater = false;
   try {
@@ -380,23 +583,26 @@ export async function createThumbnail(
     if (err instanceof Skip) return skipped(err.outcome, { ...context, ...err.details });
     // Undecodable, truncated, over a pixel or channel limit, stopped by the
     // libvips timeout, or the source could not be read.
-    const reason = err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : String(err);
-    return skipped("failed", { ...context, reason });
+    return skipped("failed", { ...context, reason: errorReason(err) });
   } finally {
     clearTimeout(timer);
     if (!releaseLater) release();
   }
 }
 
+function errorReason(err: unknown) {
+  return err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : String(err);
+}
+
 /** Reads, checks and decodes; stops before native work once abandoned. */
 async function produce(
-  read: () => Promise<Buffer>,
+  file: ThumbnailSource,
   abandoned: { value: boolean },
 ): Promise<Buffer> {
   const giveUpIfAbandoned = () => {
     if (abandoned.value) throw new Skip("timed-out");
   };
-  const source = await read();
+  const source = await file.read();
   giveUpIfAbandoned();
   const format = thumbnailFormat(source);
   if (!format) throw new Skip("unsupported");
@@ -404,13 +610,14 @@ async function produce(
   if (!detected || !FORMATS[format].detected.has(detected.mime)) {
     throw new Skip("unsupported", { format, reason: detected?.mime ?? "undetected" });
   }
+  const hints = containerHints(source, format);
   giveUpIfAbandoned();
   const meta = await sharp(source, INPUT_OPTIONS).metadata();
   const details: Details = { format, width: meta.width, height: meta.height };
   if (meta.format !== FORMATS[format].libvips) {
     throw new Skip("unsupported", { ...details, reason: `libvips ${meta.format}` });
   }
-  const estimateBytes = estimateDecodeBytes(meta);
+  const estimateBytes = estimateDecodeBytes(meta, hints);
   if (estimateBytes > THUMBNAIL_LIMITS.decodeBudgetBytes) {
     throw new Skip("over-budget", { ...details, estimateBytes });
   }
@@ -421,6 +628,36 @@ async function produce(
     .webp({ quality: THUMBNAIL_LIMITS.quality })
     .timeout({ seconds: THUMBNAIL_LIMITS.transformTimeoutSeconds })
     .toBuffer();
+}
+
+/**
+ * Checks of the container that libvips' header does not show, made before
+ * any native call: the JPEG scan count, the AVIF item structure and coded
+ * size, and the WebP features that decide its memory.
+ */
+function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
+  if (format === "jpeg") {
+    const scans = jpegScanCount(source, THUMBNAIL_LIMITS.maxJpegScans);
+    if (scans > THUMBNAIL_LIMITS.maxJpegScans) {
+      throw new Skip("over-budget", { format, reason: `more than ${THUMBNAIL_LIMITS.maxJpegScans} scans` });
+    }
+  } else if (format === "avif") {
+    const structure = avifStructure(source);
+    if (!structure) throw new Skip("unsupported", { format, reason: "unreadable item structure" });
+    if (structure.primaryType !== "av01" || structure.derived.length) {
+      const reason = `primary ${structure.primaryType}, derived ${structure.derived.join(",") || "none"}`;
+      throw new Skip("unsupported", { format, reason });
+    }
+    if (structure.maxCodedPixels > THUMBNAIL_LIMITS.maxInputPixels) {
+      throw new Skip("over-budget", { format, reason: `coded ${structure.maxCodedPixels} pixels` });
+    }
+    return { codedPixels: structure.maxCodedPixels };
+  } else if (format === "webp") {
+    const features = webpFeatures(source);
+    if (!features) throw new Skip("unsupported", { format, reason: "chunks overrun the file" });
+    return { codedPixels: features.canvasPixels, webpFullCanvas: features.fullCanvas };
+  }
+  return {};
 }
 
 function skipped(

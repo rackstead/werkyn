@@ -15,6 +15,11 @@ out of the production dependency importer.
 
 Local build contexts exclude directories named `node_modules` or `dist` and
 TypeScript `*.tsbuildinfo` files at every depth, including workspace packages.
+Environment files named `.env` or `.env.*` are excluded at every depth too, so
+local secrets and Vite settings such as `packages/frontend/.env.production`
+never reach the build or the image; only `.env.example` files are kept. The
+context policy gate applies Docker's `.dockerignore` matching to check these
+exclusions and that every tracked file the Dockerfile copies is still sent.
 Source, manifests, the lockfile, TypeScript configuration, Prisma schema and
 migrations, public assets, and container scripts remain available to the build.
 The Dockerfile installs frozen dependencies and compiles artifacts inside its

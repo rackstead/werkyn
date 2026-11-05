@@ -5,9 +5,9 @@
 **/*.tsbuildinfo
 *.md
 LICENSE
-.env
-.env.*
-!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 storage/
 packages/backend/storage/
 packages/backend/uploads/

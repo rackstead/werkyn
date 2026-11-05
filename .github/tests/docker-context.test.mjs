@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { inBuildContext, readDockerignore } from "./docker-context.mjs";
+import { inBuildContext, readDockerignore, skipsExcludedDirectories } from "./docker-context.mjs";
 
 const root = new URL("../../", import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), "utf8");
@@ -21,21 +21,20 @@ test("local environment files stay out of the build context at every depth", () 
     "packages/frontend/.env.production",
     "packages/frontend/.env.production.local",
     "packages/frontend/public/.env",
-    "packages/frontend/.env/values.json",
     "packages/backend/.env",
     "packages/backend/.env.test",
     "packages/backend/prisma/.env",
     "packages/shared/.env.development",
+    "packages/shared/.env/values.json",
     "docker/.env",
   ];
   assert.deepEqual(secrets.filter(inContext), []);
 });
 
-test("env examples and similarly named sources stay in the build context", () => {
+test("tracked env examples and similarly named sources stay in the build context", () => {
   const kept = [
     ".env.example",
     "packages/backend/.env.example",
-    "packages/frontend/.env.example",
     "packages/frontend/.environment",
     "packages/frontend/src/vite-env.d.ts",
     "packages/backend/src/config/env.ts",
@@ -61,7 +60,13 @@ test("every tracked file the Dockerfile copies from the context is sent", () => 
   assert.deepEqual(copied.filter((file) => !inContext(file)), []);
 });
 
-// Each case was compared with a BuildKit context export of the same tree.
+test("exceptions are literal paths, so excluded directories are not reopened", () => {
+  assert.ok(skipsExcludedDirectories(rules), "a wildcard exception makes BuildKit walk every excluded directory");
+  const inside = ["node_modules/pkg/.env.example", "packages/frontend/dist/.env.example", "packages/backend/storage/.env.example"];
+  assert.deepEqual(inside.filter(inContext), []);
+});
+
+// Each case was compared with a BuildKit 0.33 context export of the same tree.
 test("the context check follows Docker's .dockerignore matching", () => {
   const sent = (lines, paths) => {
     const parsed = readDockerignore(lines.join("\n"));
@@ -81,7 +86,9 @@ test("the context check follows Docker's .dockerignore matching", () => {
   // The last matching rule wins.
   assert.deepEqual(sent(["**/.env.*", "!**/.env.example"], ["a/.env.example", "a/.env.local"]), ["a/.env.example"]);
   assert.deepEqual(sent(["!keep.txt", "*.txt"], ["keep.txt", "other.bin"]), ["other.bin"]);
-  // An excluded directory is skipped unless an exception names a path in it.
+  // A plain exception reaches into an excluded directory only by naming a path
+  // in it; a wildcard exception reaches into every excluded directory.
   assert.deepEqual(sent(["cache", "!cache/keep"], ["cache/keep", "cache/drop"]), ["cache/keep"]);
-  assert.deepEqual(sent(["cache", "!**/keep"], ["cache/keep", "keep"]), ["keep"]);
+  assert.deepEqual(sent(["cache", "!keep"], ["cache/keep", "keep"]), ["keep"]);
+  assert.deepEqual(sent(["cache", "!**/keep"], ["cache/keep", "cache/drop", "keep"]), ["cache/keep", "keep"]);
 });

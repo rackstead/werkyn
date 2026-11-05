@@ -1,6 +1,6 @@
 // Evaluates `.dockerignore` the way BuildKit selects the build context
-// (moby/patternmatcher and tonistiigi/fsutil), so policy tests can check what a
-// build receives without running Docker.
+// (moby/patternmatcher and the tonistiigi/fsutil walk in BuildKit 0.33), so
+// policy tests can check what a build receives without running Docker.
 import { posix } from "node:path";
 
 // Go's filepath.Clean for slash paths: no empty, "." or resolvable ".."
@@ -67,14 +67,24 @@ function excluded(rules, path) {
   return matched;
 }
 
-// The context walk skips an excluded directory entirely unless an exception
-// is written as a path inside it, so `!**/x` cannot reach into `dist/`.
+// An exception's path without a trailing "/**" or "/*".
+const exceptionPrefix = (rule) => rule.pattern.replace(/\/\*\*$/, "").replace(/\/\*$/, "");
+
+// BuildKit skips an excluded directory only while every exception is a plain
+// path. With one wildcard exception it walks every excluded directory, and
+// the last matching rule decides for each file inside.
+export function skipsExcludedDirectories(rules) {
+  return rules.every((rule) => !rule.exception || !/[*[\]?^\\]/.test(exceptionPrefix(rule)));
+}
+
 export function inBuildContext(rules, path) {
   const parts = path.split("/");
-  for (let depth = 1; depth < parts.length; depth++) {
-    const dir = parts.slice(0, depth).join("/");
-    const reopened = rules.some((rule) => rule.exception && `${rule.pattern}/`.startsWith(`${dir}/`));
-    if (!reopened && excluded(rules, dir)) return false;
+  if (skipsExcludedDirectories(rules)) {
+    for (let depth = 1; depth < parts.length; depth++) {
+      const dir = parts.slice(0, depth).join("/");
+      const reopened = rules.some((rule) => rule.exception && `${exceptionPrefix(rule)}/`.startsWith(`${dir}/`));
+      if (!reopened && excluded(rules, dir)) return false;
+    }
   }
   return !excluded(rules, path);
 }

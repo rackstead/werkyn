@@ -1,15 +1,99 @@
-import { Fragment, useMemo, useState } from "react";
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  defaultRangeExtractor,
+  useVirtualizer,
+  type Range,
+} from "@tanstack/react-virtual";
 import {
   useReactTable,
   getCoreRowModel,
   flexRender,
+  type Row,
   type RowSelectionState,
 } from "@tanstack/react-table";
-import { useProjectTasks } from "@/features/tasks/api";
+import { useProjectTasks, type Task } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels, useCustomFields } from "@/features/projects/api";
 import { getColumns } from "./columns";
 import { ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+// Heights assumed for rows not rendered yet; rendered rows are measured.
+// The estimates stay fixed: changing them would move every row not yet
+// measured, including those above the view.
+const GROUP_ROW_ESTIMATE = 33;
+const TASK_ROW_ESTIMATE = 41;
+// Rows rendered beyond each edge of the visible area.
+const OVERSCAN = 8;
+// The title column takes the width the other columns leave, but no less.
+const TITLE_MIN_WIDTH = 240;
+
+// Browsers with CSS scroll anchoring keep the visible rows in place when rows
+// above them are rendered at a height other than their estimate.
+const scrollAnchoring =
+  typeof CSS !== "undefined" && CSS.supports?.("overflow-anchor", "auto");
+
+interface TaskRowProps {
+  row: Row<Task>;
+  // Cells read these through the row; they are props so that a memoized row
+  // renders again when its selection or the column definitions change.
+  selected: boolean;
+  columns: readonly unknown[];
+  color: string;
+  index: number;
+  ariaRowIndex: number;
+  rowKey: string;
+  measureRow?: (element: HTMLTableRowElement | null) => void;
+  onRowFocus?: (key: string) => void;
+}
+
+// Memoized: scrolling re-renders the table, and only rows coming into view
+// need to render.
+const TaskRow = memo(function TaskRow({
+  row,
+  selected,
+  color,
+  index,
+  ariaRowIndex,
+  rowKey,
+  measureRow,
+  onRowFocus,
+}: TaskRowProps) {
+  const cells = row.getVisibleCells();
+  return (
+    <tr
+      ref={measureRow}
+      data-index={index}
+      data-task-id={row.id}
+      aria-rowindex={ariaRowIndex}
+      onFocus={onRowFocus && (() => onRowFocus(rowKey))}
+      className={cn(
+        "border-b hover:bg-accent/50 transition-colors",
+        selected && "bg-primary/5",
+      )}
+      style={{ borderLeft: `4px solid ${color}` }}
+    >
+      {cells.map((cell, i) => (
+        <td
+          key={cell.id}
+          className={cn(
+            "px-3 py-1.5",
+            i < cells.length - 1 && "border-r border-border",
+          )}
+        >
+          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+        </td>
+      ))}
+    </tr>
+  );
+});
 
 interface TaskTableProps {
   projectId: string;
@@ -119,6 +203,119 @@ export function TaskTable({
     return map;
   }, [rowModel.rows]);
 
+  // The List renders one row per status group header and, unless the group is
+  // collapsed, one per task in it. Only rows in or near the visible part of
+  // the workspace <main> scroller are in the DOM; spacer rows hold the height
+  // of the rest. The task data, row model and selection still cover every
+  // loaded task (select-all, group counts and bulk actions are unchanged).
+  const listRows = useMemo(() => {
+    const rows: Array<{
+      key: string;
+      status: (typeof statuses)[number];
+      taskId?: string;
+    }> = [];
+    for (const status of statuses) {
+      rows.push({ key: `status:${status.id}`, status });
+      if (collapsedGroups.has(status.id)) continue;
+      for (const task of tasksByStatus.get(status.id) ?? []) {
+        rows.push({ key: `task:${task.id}`, status, taskId: task.id });
+      }
+    }
+    return rows;
+  }, [statuses, tasksByStatus, collapsedGroups]);
+
+  const tableRef = useRef<HTMLTableElement>(null);
+  const bodyRef = useRef<HTMLTableSectionElement>(null);
+  // undefined until the table is in the DOM; null when it has no <main>
+  // ancestor to scroll it, in which case every row is rendered.
+  const [scroller, setScroller] = useState<HTMLElement | null>();
+  // Offset of the first body row from the top of the scroller's content.
+  const [scrollMargin, setScrollMargin] = useState(0);
+
+  // The row that last held focus, with its neighbours, stays rendered while
+  // scrolled out of view: an open inline editor keeps its draft until it is
+  // saved on blur, a popover keeps its trigger, focus can return to the task
+  // title when the task panel closes, and Tab / Shift+Tab reach the next and
+  // previous rows.
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
+  const onRowFocus = useCallback((key: string) => setFocusedKey(key), []);
+  const focusedIndex = useMemo(
+    () =>
+      focusedKey === null
+        ? -1
+        : listRows.findIndex((row) => row.key === focusedKey),
+    [listRows, focusedKey],
+  );
+  const rangeExtractor = useCallback(
+    (range: Range) => {
+      const indexes = defaultRangeExtractor(range);
+      if (focusedIndex < 0) return indexes;
+      const keep = new Set(indexes);
+      const last = Math.min(range.count - 1, focusedIndex + 1);
+      for (let i = Math.max(0, focusedIndex - 1); i <= last; i++) keep.add(i);
+      return [...keep].sort((a, b) => a - b);
+    },
+    [focusedIndex],
+  );
+
+  // Stable unless the rows change: the virtualizer recomputes every row's
+  // position when this function changes.
+  const getItemKey = useCallback((index: number) => listRows[index].key, [listRows]);
+  const virtualizer = useVirtualizer({
+    count: listRows.length,
+    enabled: !!scroller,
+    getScrollElement: () => scroller ?? null,
+    // Start from where <main> already is rather than scrolling it to the top.
+    initialOffset: () => scroller?.scrollTop ?? 0,
+    scrollMargin,
+    estimateSize: (index) =>
+      listRows[index].taskId === undefined
+        ? GROUP_ROW_ESTIMATE
+        : TASK_ROW_ESTIMATE,
+    getItemKey,
+    rangeExtractor,
+    overscan: OVERSCAN,
+    measureElement: (element) => element.getBoundingClientRect().height,
+  });
+  // Rows are laid out in normal table flow, so a row that turns out taller
+  // or shorter than its estimate already moves the rows after it; scroll
+  // anchoring then keeps the visible rows still. Correcting the scroll
+  // position as well would make them jump.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = scrollAnchoring
+    ? () => false
+    : undefined;
+
+  const hasRows = !isLoading && tasks.length > 0;
+  useLayoutEffect(() => {
+    const table = tableRef.current;
+    if (!table) return;
+    const main = table.closest("main");
+    setScroller(main);
+    if (!main) return;
+    const measureMargin = () => {
+      const body = bodyRef.current;
+      const top =
+        body && body.rows.length > 0
+          ? body.getBoundingClientRect().top
+          : (table.tHead ?? table).getBoundingClientRect().bottom;
+      // Whole pixels: sub-pixel changes would only re-render the same rows.
+      setScrollMargin(
+        Math.round(
+          top - main.getBoundingClientRect().top - main.clientTop + main.scrollTop,
+        ),
+      );
+    };
+    measureMargin();
+    // Content above the table (such as the filter bar) can change height;
+    // every ancestor up to <main> then changes size too.
+    const observer = new ResizeObserver(measureMargin);
+    for (let element: HTMLElement | null = table; element; element = element.parentElement) {
+      observer.observe(element);
+      if (element === main) break;
+    }
+    return () => observer.disconnect();
+  }, [hasRows]);
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center p-12">
@@ -136,13 +333,52 @@ export function TaskTable({
   }
 
   const headerGroups = table.getHeaderGroups();
+  const headerRows = headerGroups.length;
+  const flexibleColumn = "title";
+  const fixedColumnsWidth = (headerGroups[0]?.headers ?? []).reduce(
+    (sum, header) =>
+      header.column.id === flexibleColumn ? sum : sum + header.getSize(),
+    0,
+  );
+
+  // Rows to render, each with the height of the spacer it needs before it.
+  let rendered: Array<{ index: number; gapBefore: number }> = [];
+  let gapAfter = 0;
+  if (scroller === null) {
+    rendered = listRows.map((_, index) => ({ index, gapBefore: 0 }));
+  } else if (scroller) {
+    let end = scrollMargin;
+    for (const item of virtualizer.getVirtualItems()) {
+      rendered.push({ index: item.index, gapBefore: Math.max(0, item.start - end) });
+      end = item.end;
+    }
+    gapAfter = Math.max(0, virtualizer.getTotalSize() + scrollMargin - end);
+  }
+  const measureRow = scroller ? virtualizer.measureElement : undefined;
+  const spacer = (height: number, key: string) => (
+    // Spacers are never the scroll anchor and are not part of the table for
+    // assistive technology (aria-rowcount and aria-rowindex describe the
+    // rows that are not rendered).
+    <tr key={key} aria-hidden="true" style={{ height, overflowAnchor: "none" }}>
+      <td colSpan={columns.length} style={{ height, padding: 0, border: 0 }} />
+    </tr>
+  );
 
   return (
     <div className="flex-1 overflow-auto">
-      <table className="w-full border-collapse text-sm">
+      {/* Fixed layout: column widths come from the column sizes, not from
+          the content of whichever rows happen to be rendered. The title
+          column takes the rest of the width; with many columns the table
+          is wider than the view and scrolls sideways. */}
+      <table
+        ref={tableRef}
+        className="w-full table-fixed border-collapse text-sm"
+        style={{ minWidth: fixedColumnsWidth + TITLE_MIN_WIDTH }}
+        aria-rowcount={headerRows + listRows.length}
+      >
         <thead className="sticky top-0 z-10 bg-background border-b">
-          {headerGroups.map((headerGroup) => (
-            <tr key={headerGroup.id}>
+          {headerGroups.map((headerGroup, i) => (
+            <tr key={headerGroup.id} aria-rowindex={i + 1}>
               {headerGroup.headers.map((header, i) => (
                 <th
                   key={header.id}
@@ -151,7 +387,12 @@ export function TaskTable({
                     i < headerGroup.headers.length - 1 &&
                       "border-r border-border",
                   )}
-                  style={{ width: header.getSize() }}
+                  style={{
+                    width:
+                      header.column.id === flexibleColumn
+                        ? undefined
+                        : header.getSize(),
+                  }}
                 >
                   {flexRender(
                     header.column.columnDef.header,
@@ -162,80 +403,77 @@ export function TaskTable({
             </tr>
           ))}
         </thead>
-        <tbody>
-          {statuses.map((status) => {
-            const groupTasks = tasksByStatus.get(status.id) ?? [];
-            const isCollapsed = collapsedGroups.has(status.id);
+        <tbody ref={bodyRef}>
+          {rendered.map(({ index, gapBefore }) => {
+            const { key, status, taskId } = listRows[index];
             const color = status.color ?? "#94a3b8";
+            const ariaRowIndex = headerRows + index + 1;
 
-            return (
-              <Fragment key={status.id}>
-                {/* Group header row */}
-                <tr className="bg-muted/30">
-                  <td
-                    colSpan={columns.length}
-                    className="px-2 py-1.5"
-                    style={{ borderLeft: `4px solid ${color}` }}
+            if (taskId === undefined) {
+              const isCollapsed = collapsedGroups.has(status.id);
+              const groupSize = tasksByStatus.get(status.id)?.length ?? 0;
+              return (
+                <Fragment key={key}>
+                  {gapBefore > 0 && spacer(gapBefore, `gap:${key}`)}
+                  {/* Group header row */}
+                  <tr
+                    ref={measureRow}
+                    data-index={index}
+                    aria-rowindex={ariaRowIndex}
+                    onFocus={scroller ? () => onRowFocus(key) : undefined}
+                    className="bg-muted/30"
                   >
-                    <button
-                      onClick={() => toggleCollapse(status.id)}
-                      className="flex items-center gap-2 w-full"
+                    <td
+                      colSpan={columns.length}
+                      className="px-2 py-1.5"
+                      style={{ borderLeft: `4px solid ${color}` }}
                     >
-                      {isCollapsed ? (
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                      ) : (
-                        <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                      )}
-                      <span
-                        className="font-semibold text-sm"
-                        style={{ color }}
+                      <button
+                        onClick={() => toggleCollapse(status.id)}
+                        className="flex items-center gap-2 w-full"
                       >
-                        {status.name}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {groupTasks.length} task
-                        {groupTasks.length !== 1 ? "s" : ""}
-                      </span>
-                    </button>
-                  </td>
-                </tr>
-
-                {/* Task rows */}
-                {!isCollapsed &&
-                  groupTasks.map((task) => {
-                    const row = rowById.get(task.id);
-                    if (!row) return null;
-                    return (
-                      <tr
-                        key={row.id}
-                        className={cn(
-                          "border-b hover:bg-accent/50 transition-colors",
-                          row.getIsSelected() && "bg-primary/5",
+                        {isCollapsed ? (
+                          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                        ) : (
+                          <ChevronDown className="h-4 w-4 text-muted-foreground" />
                         )}
-                        style={{ borderLeft: `4px solid ${color}` }}
-                      >
-                        {row.getVisibleCells().map((cell, i) => (
-                          <td
-                            key={cell.id}
-                            className={cn(
-                              "px-3 py-1.5",
-                              i < row.getVisibleCells().length - 1 &&
-                                "border-r border-border",
-                            )}
-                            style={{ width: cell.column.getSize() }}
-                          >
-                            {flexRender(
-                              cell.column.columnDef.cell,
-                              cell.getContext(),
-                            )}
-                          </td>
-                        ))}
-                      </tr>
-                    );
-                  })}
+                        <span
+                          className="font-semibold text-sm"
+                          style={{ color }}
+                        >
+                          {status.name}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {groupSize} task
+                          {groupSize !== 1 ? "s" : ""}
+                        </span>
+                      </button>
+                    </td>
+                  </tr>
+                </Fragment>
+              );
+            }
+
+            const row = rowById.get(taskId);
+            if (!row) return null;
+            return (
+              <Fragment key={key}>
+                {gapBefore > 0 && spacer(gapBefore, `gap:${key}`)}
+                <TaskRow
+                  row={row}
+                  selected={row.getIsSelected()}
+                  columns={columns}
+                  color={color}
+                  index={index}
+                  ariaRowIndex={ariaRowIndex}
+                  rowKey={key}
+                  measureRow={measureRow}
+                  onRowFocus={scroller ? onRowFocus : undefined}
+                />
               </Fragment>
             );
           })}
+          {gapAfter > 0 && spacer(gapAfter, "gap:end")}
         </tbody>
       </table>
     </div>

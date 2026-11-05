@@ -145,7 +145,8 @@ export function InlineDueDateCell({
         <input
           type="date"
           autoFocus
-          className="text-xs border border-border rounded px-1 py-0.5 bg-background"
+          // Can be wider than its column; drawn above the next cell.
+          className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
           defaultValue={task.dueDate ?? ""}
           onChange={(e) => {
             // Keep editing while a year is still being typed.
@@ -407,7 +408,7 @@ function CustomFieldDisplay({
       // Only http(s) values are links; values saved before URL fields were
       // checked may use other schemes such as javascript: or data:.
       if (!isHttpUrl(String(value))) {
-        return <span className="text-xs truncate">{String(value)}</span>;
+        return <span className="block text-xs truncate">{String(value)}</span>;
       }
       return (
         <a
@@ -426,7 +427,7 @@ function CustomFieldDisplay({
     case "NUMBER":
       return <span className="text-xs">{String(value)}</span>;
     default:
-      return <span className="text-xs truncate">{String(value)}</span>;
+      return <span className="block text-xs truncate">{String(value)}</span>;
   }
 }
 
@@ -539,7 +540,8 @@ function InlineCustomFieldCell({
           <input
             type="date"
             autoFocus
-            className="text-xs border border-border rounded px-1 py-0.5 bg-background"
+            // Can be wider than its column; drawn above the next cell.
+            className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
             defaultValue={typeof value === "string" ? value : ""}
             onChange={(e) => {
               const date = committedDate(e.target.value);
@@ -603,8 +605,10 @@ function InlineCustomFieldCell({
           />
         );
       }
+      // A block: as an inline box around the cut-off text (overflow hidden)
+      // it would sit above the middle of the row.
       return (
-        <button onClick={() => setEditing(true)} className="w-full text-left transition-opacity hover:opacity-80">
+        <button onClick={() => setEditing(true)} className="block w-full text-left transition-opacity hover:opacity-80">
           <CustomFieldDisplay task={task} field={field} />
         </button>
       );
@@ -659,7 +663,7 @@ export function getColumns(options: {
       cell: ({ row }) => (
         <button
           onClick={() => onTaskClick(row.original.id)}
-          className="text-left font-medium text-sm hover:underline truncate max-w-xs"
+          className="text-left font-medium text-sm hover:underline truncate max-w-full"
         >
           {row.original.title}
         </button>

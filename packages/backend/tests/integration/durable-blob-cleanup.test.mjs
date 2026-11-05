@@ -466,6 +466,53 @@ test("non-UTC cleanup records deletion errors and the ordinary retry backoff", {
   await nonUtcCleanup(t, true);
 });
 
+// "availableAt" is TIMESTAMP(3): a row made due with CURRENT_TIMESTAMP is
+// stored rounded to the nearest millisecond, up to half a millisecond after
+// the clock that wrote it. A failed restore makes its staged files due that
+// way and claims them in the next statement, so on a fast host the claim used
+// to miss them (R04). Inside one transaction both statements share one clock,
+// the closest any following claim can come; only clocks that round up are
+// used, so the case is exercised deterministically.
+test("a row made due now is claimed by the next claim even when its stored millisecond rounds up", { timeout: 15000 }, async (t) => {
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  for (const zone of ["UTC", "America/Los_Angeles"]) {
+    const storagePath = await blob(workspace.id, ".txt", Buffer.from(`Due-now cleanup in ${zone}.\n`));
+    await app.prisma.$executeRaw`
+      INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+      VALUES (${storagePath}, CURRENT_TIMESTAMP + interval '1 hour')`;
+    try {
+      let outcome;
+      for (let attempt = 1; attempt <= 64 && !outcome; attempt++)
+        outcome = await app.prisma.$transaction(async (tx) => {
+          if (zone === "UTC") await tx.$executeRaw`SET LOCAL TIME ZONE 'UTC'`;
+          else await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
+          const [clock] = await tx.$queryRaw`
+            SELECT CURRENT_TIMESTAMP::timestamp(3) > CURRENT_TIMESTAMP::timestamp AS "roundsUp"`;
+          if (!clock.roundsUp) return undefined;
+          await tx.$executeRaw`
+            UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP
+            WHERE "storagePath" = ${storagePath}`;
+          const [row] = await tx.$queryRaw`
+            SELECT "availableAt" > CURRENT_TIMESTAMP AS "storedAfterClock"
+            FROM "BlobCleanup" WHERE "storagePath" = ${storagePath}`;
+          const result = await processBlobCleanup(tx, app.storage, {
+            paths: [storagePath], limit: 1, log: { warn() {}, error() {} },
+          });
+          return { attempt, storedAfterClock: row.storedAfterClock, result };
+        });
+      t.diagnostic(JSON.stringify({ zone, outcome }));
+      assert.ok(outcome, "no transaction clock rounded up in 64 tries");
+      assert.equal(outcome.storedAfterClock, true);
+      assert.deepEqual(outcome.result, { claimed: 1, deleted: 1, retained: 0, failed: 0 });
+      assert.deepEqual(await queued([storagePath]), []);
+      assert.equal(await exists(storagePath), false);
+    } finally {
+      await app.prisma.blobCleanup.deleteMany({ where: { storagePath } });
+      await app.storage.delete(storagePath);
+    }
+  }
+});
+
 test("a stale worker failure preserves a newer cleanup lease and its error state", async () => {
   const storagePath = await blob(workspace.id, ".txt", Buffer.from("ordinary cleanup renewal\n"));
   await app.prisma.blobCleanup.create({ data: { storagePath } });

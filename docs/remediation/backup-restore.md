@@ -52,8 +52,10 @@ writing anything.
    - run the restore plan (`restore-plan.ts`) and insert its rows in batches.
 
    A restore that fails for any reason rolls back every row. Its files are
-   made due at once and removed through the cleanup queue. A commit removes
-   the queue entries in the same transaction, so the files stay.
+   made due at once and removed through the cleanup queue. The queue stores
+   due times rounded to the millisecond, so the cleanup that follows compares
+   its clock at that same precision and always finds them due. A commit
+   removes the queue entries in the same transaction, so the files stay.
 4. **Crashes.** If the process dies after step 2, the queue entries are still
    there and the cleanup worker removes the files once they are due. A
    cleanup that fails after a rollback leaves its entries due, and the worker

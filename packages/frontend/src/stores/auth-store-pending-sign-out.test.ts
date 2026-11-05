@@ -393,25 +393,38 @@ describe("a sign-out whose request fails", () => {
     expect(pendingKeys()).toHaveLength(0);
   });
 
-  it("is settled through the cookie's own session when the server refuses conditional recovery", async () => {
-    const { tab, family } = await signedInTab("alice");
-    offline = true;
-    await run(tab.useAuthStore.getState().logout());
-    offline = false;
-    // An untrusted Origin or an older server without the recovery route.
-    routes.set("auth/logout/recover", () => json(403, { statusCode: 403 }));
-    const from = calls.length;
-    const reloaded = await load();
-    expect(reloaded.useAuthStore.getState().user).toBeNull();
-    expect(family.revoked).toBe(true);
-    expect(paths(from)).toEqual([
-      "auth/logout/recover",
-      "auth/refresh",
-      "auth/logout",
-    ]);
-    expect(calls.slice(from).every((call) => call.keepalive)).toBe(true);
-    expect(pendingKeys()).toHaveLength(0);
-  });
+  it.each([
+    ["refuses the request (untrusted Origin)", 403],
+    ["has no recovery route", 404],
+    ["keeps failing", 500],
+  ])(
+    "is kept, restoring nothing and sending nothing that changes the cookie, while the server %s",
+    async (_label, status) => {
+      const { tab, family } = await signedInTab("alice");
+      offline = true;
+      await run(tab.useAuthStore.getState().logout());
+      offline = false;
+      routes.set("auth/logout/recover", () =>
+        json(status, { statusCode: status }),
+      );
+      const from = calls.length;
+      const reloaded = await load();
+      expect(reloaded.useAuthStore.getState().user).toBeNull();
+      expect(family.revoked).toBe(false);
+      // No refresh or ordinary logout: either could replace or end a sign-in
+      // landing meanwhile, such as a single sign-on callback.
+      expect(paths(from)).toEqual(["auth/logout/recover"]);
+      expect(pendingKeys()).toHaveLength(1);
+
+      // Signing in again replaces the cookie; the record cannot hold back the
+      // new session.
+      const second = await signInWithForm(reloaded, "alice");
+      expect(pendingKeys()).toHaveLength(0);
+      const again = await load();
+      expect(sidOf(again.useAuthStore.getState().accessToken)).toBe(second);
+      expect(families.get(second)!.revoked).toBe(false);
+    },
+  );
 
   it("is recorded even when the access token has already expired", async () => {
     const { family } = serverSignIn("alice");
@@ -536,19 +549,37 @@ describe("a newer sign-in", () => {
     expect(tabD.useAuthStore.getState().user?.id).toBe("bob");
   });
 
-  it("is adopted when conditional recovery is refused and the cookie holds the newer session", async () => {
+  it("set by a single sign-on callback is restored: recovery reports superseded and leaves it", async () => {
     const { tab, family: first } = await signedInTab("alice");
+    offline = true;
+    await run(tab.useAuthStore.getState().logout());
+    offline = false;
+    // The callback sets the new session's cookie without this page's sign-in.
+    const { family: second } = serverSignIn("alice");
+    const from = calls.length;
+    const reloaded = await load();
+    expect(calls[from]).toMatchObject({
+      path: "auth/logout/recover",
+      body: { sessionId: first.id },
+    });
+    expect(reloaded.useAuthStore.getState().user?.id).toBe("alice");
+    expect(sidOf(reloaded.useAuthStore.getState().accessToken)).toBe(second.id);
+    expect(second.revoked).toBe(false);
+    expect(pendingKeys()).toHaveLength(0);
+  });
+
+  it("set by a single sign-on callback is not restored while recovery is refused", async () => {
+    const { tab } = await signedInTab("alice");
     offline = true;
     await run(tab.useAuthStore.getState().logout());
     offline = false;
     routes.set("auth/logout/recover", () => json(404, { statusCode: 404 }));
     const { family: second } = serverSignIn("alice");
     const reloaded = await load();
-    expect(reloaded.useAuthStore.getState().user?.id).toBe("alice");
-    expect(sidOf(reloaded.useAuthStore.getState().accessToken)).toBe(second.id);
+    // Fail closed: nothing restored, nothing revoked, the record kept.
+    expect(reloaded.useAuthStore.getState().user).toBeNull();
     expect(second.revoked).toBe(false);
-    expect(first.revoked).toBe(false);
-    expect(pendingKeys()).toHaveLength(0);
+    expect(pendingKeys()).toHaveLength(1);
   });
 
   it("of the same account is not revoked by an expired-token sign-out's renewed cookie", async () => {
@@ -590,12 +621,14 @@ describe("the pending sign-out record", () => {
   it("is bounded, keeping the newest sign-outs", async () => {
     let last: Family | undefined;
     for (let n = 0; n < 20; n++) {
-      // Each sign-in replaces the cookie, so older records cannot be settled.
+      // Each session is restored from a cookie set elsewhere (such as single
+      // sign-on), so older records cannot be settled and are not retired.
       const { family, session } = serverSignIn("alice");
       const tab = await openTab();
-      tab.useAuthStore
-        .getState()
-        .setAuth(session.user, session.accessToken, []);
+      tab.useAuthStore.setState({
+        user: session.user,
+        accessToken: session.accessToken,
+      });
       offline = true;
       await run(tab.useAuthStore.getState().logout());
       offline = false;

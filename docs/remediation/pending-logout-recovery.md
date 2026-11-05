@@ -90,32 +90,36 @@ id and the time. No token is stored; the id is a selector, as above.
 **Completion.** A page load, and a sign-in before it replaces the cookie,
 first completes every record of this API, with `keepalive`:
 
-| Recovery result                | Record    | Session restored by this load?          |
-| ------------------------------ | --------- | --------------------------------------- |
-| `revoked`                      | removed   | No: the cookie's session was just ended |
-| `superseded`                   | removed   | Yes, the newer session the cookie holds |
-| `absent`                       | removed   | Only if a refresh then succeeds         |
-| 503/429                        | kept      | Retried within 10 s, else no            |
-| Network failure or deadline    | kept      | No; the next load tries again           |
-| Any other answer (403/404/5xx) | see below | see below                               |
+| Recovery result                     | Record  | Session restored by this load?          |
+| ----------------------------------- | ------- | --------------------------------------- |
+| `revoked`                           | removed | No: the cookie's session was just ended |
+| `superseded`                        | removed | Yes, the newer session the cookie holds |
+| `absent`                            | removed | Only if a refresh then succeeds         |
+| 503/429                             | kept    | Retried within 10 s, else no            |
+| Network failure, deadline           | kept    | No; a later load tries again            |
+| Refused or failed (403/404/5xx/...) | kept    | No; a later load tries again            |
 
-When the server refuses the request itself (an untrusted Origin, a server
-without the route), the browser asks through the cookie's own session: a
-refresh tells which session the cookie holds. Only if that is a recorded
-session is it signed out with ordinary logout; a 401 means the cookie holds no
-session. Records of other sessions are removed, since the cookie no longer
-belongs to them. These cookie-setting requests are announced like any other
-sign-out, so a sign-in in another tab waits for them.
+Nothing that sets or clears the cookie is sent to settle a record. A refresh
+followed by ordinary logout could identify the recorded session and then, if a
+sign-in landed in between (for example a single sign-on callback, which no
+tab can coordinate with), replace or revoke the newer session instead.
 
-**The rule that protects a newer sign-in.** A record is removed only when the
-server has settled it: revoked, `superseded` or `absent` from recovery, a 204
-or a 401 from ordinary sign-out and refresh, or a refresh showing that the
-cookie holds a different session. It is never compared by account or by time.
-Every sign-in starts a new family, and the recorded family is revoked only
-when the cookie the browser sends at that moment proves it, so a stale record
-cannot end a sign-in made after it, in this tab or another, even by the same
-account. The sign-out request itself also compares session ids before
-revoking with a renewed token.
+A password sign-in or registration replaces the cookie. Its response then
+removes the records of every other session: this browser can no longer
+complete them or restore those sessions, so they must not hold back the new
+one. A record of the session just signed in (signed out from another tab
+meanwhile) is kept.
+
+**The rule that protects a newer sign-in.** A record is removed only on
+evidence that this browser can no longer restore its session: `revoked`,
+`superseded` or `absent` from recovery; a 204 from ordinary sign-out, a 401
+from the refresh it may use, or a refresh showing another session, during the
+sign-out request itself; or a sign-in response that replaced the cookie. It is
+never compared by account or by time. Every sign-in starts a new family, and
+the recorded family is revoked only when the cookie the browser sends at that
+moment proves it, so a stale record cannot end a sign-in made after it, in
+this tab or another, even by the same account. The sign-out request itself now
+compares session ids before revoking with a renewed token.
 
 **Cross-tab.** Records are shared by every tab of the origin. A tab that
 reloads after another tab's failed sign-out completes it first. A tab that
@@ -128,17 +132,21 @@ old cookie (and revoked only the old session) or the new one (and is told
 overwrite the new one.
 
 **Bounds.** At most eight records per API are kept, oldest dropped first:
-signing out again needs a new sign-in, which replaces the cookie, so older
-records can no longer match it. A record expires eight days after it was
-written (the seven-day refresh-token lifetime plus a day). No tab renews a
-recorded session, and the cookie-based fallback renews the record whenever it
-renews the cookie, so an expired record names a session that can no longer be
-used from this browser.
+while a record is pending no session is restored, so a later record follows a
+new sign-in, which replaced the cookie, and older records can no longer match
+it. A record expires eight days after it was written (the seven-day
+refresh-token lifetime plus a day). No tab renews a recorded session, so an
+expired record names a session that can no longer be used from this browser.
 
 **Limits.** Without localStorage (blocked, or quota exhausted) nothing is
 durable and a failed sign-out behaves as before. While a record cannot be
-settled, page loads stay signed out until the server is reachable or the user
-signs in again. `superseded` and `absent` do not revoke the old family on the
-server; it stays valid until it expires, but this browser no longer holds a
-cookie for it. Tabs still running an earlier build ignore records. OIDC
-completion, invitation redirects and the cookie rules above are unchanged.
+settled (the server is unreachable, or refuses recovery, for example when the
+page's origin is not `FRONTEND_URL` or in `CORS_ORIGIN`), page loads restore
+nothing, and that includes single sign-on completion, which restores the new
+session the same way; a password sign-in clears it, and so does recovery
+succeeding or the record expiring. `superseded`, `absent` and a replacing
+sign-in do not revoke the old family on the server (a password sign-in of the
+same account ends that account's other sessions anyway). It stays valid until
+it expires, but this browser no longer holds a cookie for it. Tabs still
+running an earlier build ignore records. OIDC completion, invitation redirects
+and the cookie rules above are unchanged.

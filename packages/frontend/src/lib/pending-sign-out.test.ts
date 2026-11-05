@@ -3,6 +3,7 @@ import {
   MAX_PENDING_SIGN_OUTS,
   PENDING_SIGN_OUT_TTL_MS,
   clearPendingSignOut,
+  clearPendingSignOutsExcept,
   hasPendingSignOut,
   pendingSignOuts,
   recordPendingSignOut,
@@ -74,6 +75,18 @@ describe("pending sign-out records", () => {
     expect(hasPendingSignOut(null, NOW)).toBe(false);
     clearPendingSignOut(sid(1));
     expect(keys()).toEqual([]);
+  });
+
+  it("after a sign-in, keeps only the record of the session signed in", () => {
+    recordPendingSignOut(sid(1), "alice", NOW);
+    recordPendingSignOut(sid(2), "alice", NOW + 1);
+    recordPendingSignOut(sid(3), "bob", NOW + 2);
+    clearPendingSignOutsExcept(sid(2));
+    expect(pendingSignOuts(NOW + 2).map((record) => record.sessionId)).toEqual([
+      sid(2),
+    ]);
+    clearPendingSignOutsExcept(sid(9));
+    expect(pendingSignOuts(NOW + 2)).toEqual([]);
   });
 
   it("separates APIs and leaves other keys alone", () => {

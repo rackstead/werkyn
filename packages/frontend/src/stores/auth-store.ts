@@ -3,11 +3,11 @@ import { apiUrl } from "@/lib/api-url";
 import { changeIdentity, identityGeneration } from "@/lib/identity";
 import {
   clearPendingSignOut,
+  clearPendingSignOutsExcept,
   hasPendingSignOut,
   pendingSignOuts,
   recordPendingSignOut,
   sessionIdOf,
-  type PendingSignOut,
 } from "@/lib/pending-sign-out";
 
 interface User {
@@ -434,12 +434,14 @@ async function revokeSession(
 //   useless, so nothing is restored), "superseded" (the cookie belongs to a
 //   newer sign-in, which is left alone; the recorded session can no longer be
 //   restored from here) or "absent" (the cookie holds no session).
-// - A busy server (503) is retried within the deadline. An unreachable one
-//   leaves the record for the next load, and this load restores nothing.
-// - A server that refuses the request itself (an untrusted Origin, a server
-//   without the route) is asked through the cookie's own session instead: a
-//   refresh tells which session the cookie holds. Only a recorded one is then
-//   signed out with ordinary logout; any other session is left alone.
+// - A busy server (503/429) is retried within the deadline. Any other answer
+//   (unreachable, refused, failed) leaves the record for a later load, and
+//   this load restores nothing. Nothing that sets or clears the cookie is
+//   sent to settle a record: a refresh or an ordinary logout could replace or
+//   end a sign-in that lands meanwhile (such as a single sign-on callback).
+// - A password sign-in or registration replaces the cookie, so records of any
+//   other session are then removed (see setAuth): this browser can no longer
+//   restore those sessions, and a newer session is never held back by them.
 
 /**
  * "clear": nothing is left to complete and a session may be restored;
@@ -447,7 +449,7 @@ async function revokeSession(
  * could not be completed, and no session may be restored now.
  */
 type Settlement = "clear" | "revoked" | "pending";
-type Recovery = "revoked" | "superseded" | "absent" | "refused" | "unreachable";
+type Recovery = "revoked" | "superseded" | "absent" | "unsettled";
 
 const RECOVERY_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 let settling: Promise<Settlement> | null = null;
@@ -487,17 +489,11 @@ function settlePendingSignOuts(): Promise<Settlement> {
 
 async function completeSignOuts(signal: AbortSignal): Promise<Settlement> {
   let revoked = false;
-  const refused: PendingSignOut[] = [];
   for (const record of pendingSignOuts()) {
     const recovery = await recoverSession(record.sessionId, signal);
-    if (recovery === "refused") refused.push(record);
-    else if (recovery !== "unreachable") {
-      clearPendingSignOut(record.sessionId);
-      if (recovery === "revoked") revoked = true;
-    }
-  }
-  if (refused.length > 0 && (await settleThroughCookie(refused, signal))) {
-    revoked = true;
+    if (recovery === "unsettled") continue;
+    clearPendingSignOut(record.sessionId);
+    if (recovery === "revoked") revoked = true;
   }
   if (revoked) return "revoked";
   // Includes a sign-out another tab recorded meanwhile.
@@ -531,7 +527,7 @@ async function recoverSession(
   for (let attempt = 0; ; attempt++) {
     const res =
       (await send(true)) ?? (signal.aborted ? null : await send(false));
-    if (!res) return "unreachable";
+    if (!res) return "unsettled";
     if (res.ok) {
       const body = (await res.json().catch(() => null)) as {
         data?: { status?: unknown };
@@ -541,62 +537,14 @@ async function recoverSession(
         status === "superseded" ||
         status === "absent"
         ? status
-        : "refused";
+        : "unsettled";
     }
-    if (res.status !== 503 && res.status !== 429) return "refused";
+    if (res.status !== 503 && res.status !== 429) return "unsettled";
     const delay = RECOVERY_RETRY_DELAYS_MS[attempt];
-    if (delay === undefined) return "unreachable";
+    if (delay === undefined) return "unsettled";
     await new Promise((resolve) => setTimeout(resolve, delay));
-    if (signal.aborted) return "unreachable";
+    if (signal.aborted) return "unsettled";
   }
-}
-
-/**
- * Settles records the server would not settle conditionally, by asking which
- * session the cookie holds. Returns true when it revoked a recorded session.
- */
-function settleThroughCookie(
-  records: PendingSignOut[],
-  signal: AbortSignal,
-): Promise<boolean> {
-  return cookieRequest(async () => {
-    const refreshed = await fetch(apiUrl("auth/refresh"), {
-      method: "POST",
-      credentials: "include",
-      keepalive: true,
-      signal,
-    });
-    if (refreshed.status === 401) {
-      // The cookie holds no session.
-      for (const record of records) clearPendingSignOut(record.sessionId);
-      return false;
-    }
-    if (!refreshed.ok) return false;
-    const body = (await refreshed.json()) as {
-      data?: { accessToken?: string };
-    };
-    const token = body.data?.accessToken;
-    const held = sessionIdOf(token);
-    if (!token || !held) return false;
-    // Records of other sessions: the cookie no longer belongs to them.
-    for (const record of records) {
-      if (record.sessionId !== held) clearPendingSignOut(record.sessionId);
-    }
-    const target = records.find((record) => record.sessionId === held);
-    if (!target) return false;
-    // The refresh renewed the session's cookie: renew its record with it.
-    recordPendingSignOut(target.sessionId, target.userId);
-    const res = await fetch(apiUrl("auth/logout"), {
-      method: "POST",
-      credentials: "include",
-      keepalive: true,
-      headers: { Authorization: `Bearer ${token}` },
-      signal,
-    });
-    if (!res.ok) return false;
-    clearPendingSignOut(target.sessionId);
-    return true;
-  });
 }
 
 // ─── Store ────────────────────────────────────────────────
@@ -659,6 +607,11 @@ export const useAuthStore = create<AuthState>((set, get) => {
     _refreshPromise: null,
 
     setAuth: (user, accessToken, workspaces) => {
+      // The sign-in's response replaced the cookie: sign-outs still recorded
+      // for other sessions can no longer be completed from this browser, and
+      // those sessions can no longer be restored here.
+      const sessionId = sessionIdOf(accessToken);
+      if (sessionId) clearPendingSignOutsExcept(sessionId);
       // A sign-in is newer than anything announced before it.
       applySession({ user, accessToken, workspaces }, advanceEpoch(Date.now()));
     },

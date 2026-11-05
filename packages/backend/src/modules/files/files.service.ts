@@ -21,6 +21,7 @@ import {
 } from "../../utils/errors.js";
 import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
+import { withSearchPlans } from "../../utils/text-search.js";
 import {
   blobPaths,
   cleanupBlobsNow,
@@ -297,7 +298,7 @@ export async function listFiles(
     else after = { cursor: { id: cursor }, skip: 1 };
   }
 
-  const files = await prisma.file.findMany({
+  const pageQuery = prisma.file.findMany({
     where: page,
     orderBy,
     take: limit + 1,
@@ -308,6 +309,9 @@ export async function listFiles(
       },
     },
   });
+  // A name search is planned for its term (utils/text-search.ts). The cursor
+  // lookup above also filters by name but finds one row by ID.
+  const files = search ? (await withSearchPlans(prisma, [pageQuery]))[0] : await pageQuery;
 
   const hasMore = files.length > limit;
   const sliced = hasMore ? files.slice(0, limit) : files;

@@ -134,6 +134,14 @@ async function check(name: string, res: Response) {
 }
 
 const round = (n: number) => Math.round(n * 10) / 10;
+/** Search terms: two and three letters, a common word, two words, no match. */
+const SEARCH_TERMS: [string, string][] = [
+  ["2 letters", "in"],
+  ["3 letters", "upl"],
+  ["word", "warehouse"],
+  ["two words", "webhook audit"],
+  ["no match", "qzxv"],
+];
 const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
 
 async function fixture() {
@@ -303,6 +311,18 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
     ["drive: shared with me, page 2 (limit 10)", await deep(m, `/workspaces/${f.wid}/files/shared-with-me?limit=10`, 1)],
     ["tasks: comments, page 2 (limit 2)", f.commented ? await deep(m, `/tasks/${f.commented.id}/comments?limit=2`, 1) : undefined],
     ["wiki: versions, page 2 (limit 1)", f.versioned ? await deep(a, `/wiki/pages/${f.versioned.id}/versions?limit=1`, 1) : undefined],
+    // Text search by term length (docs/remediation/p02c.md).
+    ...SEARCH_TERMS.flatMap(([label, term]): [string, () => Promise<Response>][] => {
+      const q = encodeURIComponent(term);
+      return [
+        [`search: global (member), ${label}`, get(m, `/workspaces/${f.wid}/search?q=${q}`)],
+        [`search: global (admin), ${label}`, get(a, `/workspaces/${f.wid}/search?q=${q}`)],
+        [`search: chat (member), ${label}`, get(m, `/chat/${f.wid}/messages/search?q=${q}`)],
+        [`search: drive (member), ${label}`, get(m, `/workspaces/${f.wid}/files?search=${q}`)],
+        [`search: drive (admin), ${label}`, get(a, `/workspaces/${f.wid}/files?search=${q}`)],
+        [`search: task list, ${label}`, get(m, `/projects/${f.big.id}/tasks?search=${q}`)],
+      ];
+    }),
   ];
   const results: Result[] = [];
   for (const [name, run] of endpoints) {
@@ -331,6 +351,17 @@ async function writeBench(f: Awaited<ReturnType<typeof fixture>>) {
         return res;
       },
       n,
+      2,
+    ),
+  );
+  // A description of about 70 words, as the fixture's (indexed for search).
+  const description = `<p>${Array.from({ length: 70 }, (_, w) => ["invoice", "migration", "release", "warehouse", "budget", "review", "sync"][(w * 5) % 7]).join(" ")}.</p>`;
+  let edited = 0;
+  results.push(
+    await measure(
+      "write: update task description",
+      () => request("PATCH", `/tasks/${created[edited++]}`, m, { description, expectedDescriptionRevision: 0 }),
+      n - 2,
       2,
     ),
   );

@@ -5,6 +5,7 @@ import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
 import { isLockTimeoutError, isStatementCanceledError } from "../../utils/retryable-database-errors.js";
+import { withSearchPlans } from "../../utils/text-search.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -1139,21 +1140,23 @@ export async function searchMessages(
       }
     : undefined;
 
-  const messages = await prisma.chatMessage.findMany({
-    where: cursorEligibility ? { AND: [where, cursorEligibility] } : where,
-    omit: chatMessageOmit,
-    include: {
-      user: {
-        select: { id: true, displayName: true, avatarUrl: true },
+  const [messages] = await withSearchPlans(prisma, [
+    prisma.chatMessage.findMany({
+      where: cursorEligibility ? { AND: [where, cursorEligibility] } : where,
+      omit: chatMessageOmit,
+      include: {
+        user: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
+        channel: {
+          select: { id: true, name: true, type: true },
+        },
       },
-      channel: {
-        select: { id: true, name: true, type: true },
-      },
-    },
-    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take: limit + 1,
-    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-  });
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    }),
+  ]);
 
   const hasMore = messages.length > limit;
   if (hasMore) messages.pop();

@@ -14,6 +14,7 @@ import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { clearAssignments } from "../../utils/task-references.js";
 import { scopeTaskRelations } from "../../utils/task-scope.js";
+import { withSearchPlans } from "../../utils/text-search.js";
 import {
   revokeWorkspaceAccess,
   revokeWorkspaceProjects,
@@ -518,39 +519,12 @@ export async function searchTasks(
   }
 
   // Search title matches first, then description matches
-  const titleMatches = await prisma.task.findMany({
-    where: {
-      archived: false,
-      project: projectWhere,
-      title: { contains: query, mode: "insensitive" },
-    },
-    include: {
-      project: { select: { id: true, name: true, color: true } },
-      status: true,
-      labels: { include: { label: true } },
-      assignees: {
-        include: {
-          user: {
-            select: { id: true, displayName: true, avatarUrl: true },
-          },
-        },
-      },
-    },
-    take: limit,
-    orderBy: { updatedAt: "desc" },
-  });
-
-  const remaining = limit - titleMatches.length;
-  let descriptionMatches: typeof titleMatches = [];
-
-  if (remaining > 0) {
-    const titleIds = titleMatches.map((t) => t.id);
-    descriptionMatches = await prisma.task.findMany({
+  const [titleMatches] = await withSearchPlans(prisma, [
+    prisma.task.findMany({
       where: {
         archived: false,
         project: projectWhere,
-        id: { notIn: titleIds },
-        description: { contains: query, mode: "insensitive" },
+        title: { contains: query, mode: "insensitive" },
       },
       include: {
         project: { select: { id: true, name: true, color: true } },
@@ -564,9 +538,40 @@ export async function searchTasks(
           },
         },
       },
-      take: remaining,
+      take: limit,
       orderBy: { updatedAt: "desc" },
-    });
+    }),
+  ]);
+
+  const remaining = limit - titleMatches.length;
+  let descriptionMatches: typeof titleMatches = [];
+
+  if (remaining > 0) {
+    const titleIds = titleMatches.map((t) => t.id);
+    [descriptionMatches] = await withSearchPlans(prisma, [
+      prisma.task.findMany({
+        where: {
+          archived: false,
+          project: projectWhere,
+          id: { notIn: titleIds },
+          description: { contains: query, mode: "insensitive" },
+        },
+        include: {
+          project: { select: { id: true, name: true, color: true } },
+          status: true,
+          labels: { include: { label: true } },
+          assignees: {
+            include: {
+              user: {
+                select: { id: true, displayName: true, avatarUrl: true },
+              },
+            },
+          },
+        },
+        take: remaining,
+        orderBy: { updatedAt: "desc" },
+      }),
+    ]);
   }
 
   return { data: [...titleMatches, ...descriptionMatches].map(scopeTaskRelations) };
@@ -694,20 +699,23 @@ export async function searchWikiPages(
   query: string,
   limit: number,
 ) {
-  return prisma.wikiPage.findMany({
-    where: {
-      space: { workspaceId },
-      title: { contains: query, mode: "insensitive" },
-    },
-    select: {
-      id: true,
-      title: true,
-      icon: true,
-      spaceId: true,
-      updatedAt: true,
-      space: { select: { id: true, name: true, icon: true } },
-    },
-    take: limit,
-    orderBy: { updatedAt: "desc" },
-  });
+  const [pages] = await withSearchPlans(prisma, [
+    prisma.wikiPage.findMany({
+      where: {
+        space: { workspaceId },
+        title: { contains: query, mode: "insensitive" },
+      },
+      select: {
+        id: true,
+        title: true,
+        icon: true,
+        spaceId: true,
+        updatedAt: true,
+        space: { select: { id: true, name: true, icon: true } },
+      },
+      take: limit,
+      orderBy: { updatedAt: "desc" },
+    }),
+  ]);
+  return pages;
 }

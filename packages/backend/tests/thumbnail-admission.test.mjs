@@ -368,6 +368,37 @@ test("JPEGs with more scans than the limit are refused before decoding", async (
   assert.deepEqual((await outcomes(() => thumbnailOf(progressive))).delta, { created: 1 });
 });
 
+test("container checks stop after a bounded amount of work on crafted files", async () => {
+  const size = 32 * MiB - 1024;
+  // An AVIF of tiny boxes, a WebP of tiny chunks, and JPEGs of empty
+  // segments or of stuffed 0xFF bytes, each filling the source cap.
+  const avif = Buffer.alloc(size);
+  isoHeader("avif", 24).copy(avif);
+  for (let at = 24; at + 8 <= size; at += 8) { avif.writeUInt32BE(8, at); avif.write("free", at + 4, "latin1"); }
+  const webp = Buffer.alloc(size);
+  webp.write("RIFF", 0, "latin1"); webp.writeUInt32LE(size - 8, 4); webp.write("WEBP", 8, "latin1");
+  for (let at = 12; at + 8 <= size; at += 8) webp.write("JUNK", at, "latin1");
+  const segments = Buffer.alloc(size);
+  segments[0] = 0xff; segments[1] = 0xd8;
+  for (let at = 2; at + 4 <= size; at += 4) { segments[at] = 0xff; segments[at + 1] = 0xfe; segments.writeUInt16BE(2, at + 2); }
+  const stuffed = Buffer.alloc(size);
+  Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]).copy(stuffed);
+  for (let at = 6; at + 2 <= size; at += 2) stuffed[at] = 0xff;
+  for (const [name, check, refused] of [
+    ["avif boxes", () => avifStructure(avif), null],
+    ["webp chunks", () => webpFeatures(webp), null],
+    ["jpeg segments", () => jpegScanCount(segments, 100), Infinity],
+    ["jpeg stuffing", () => jpegScanCount(stuffed, 100), Infinity],
+  ]) {
+    const started = performance.now();
+    assert.equal(check(), refused, name);
+    assert.ok(performance.now() - started < 50, `${name} took ${performance.now() - started} ms`);
+  }
+  for (const [name, bytes, outcome] of [["avif", avif, "unsupported"], ["webp", webp, "unsupported"], ["jpeg", segments, "unsupported"]]) {
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { [outcome]: 1 }, name);
+  }
+});
+
 test("content outside the allowlisted signatures never takes a turn", async (t) => {
   const junk = [svg(), await tiff(8, 8), makePdf(), Buffer.alloc(0), Buffer.from("text")];
   const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });

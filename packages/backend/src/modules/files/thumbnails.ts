@@ -183,16 +183,33 @@ export function estimateDecodeBytes(
   }
 }
 
+/**
+ * Boxes, chunks or markers one container check reads before it refuses the
+ * file. Real files have tens; the bound keeps a crafted 32 MiB file of tiny
+ * entries from blocking the event loop.
+ */
+const MAX_CONTAINER_ENTRIES = 4096;
+
+/**
+ * Bytes of entropy-coded JPEG data that may be 0xFF (each stuffed or a
+ * restart marker) before the scan count stops. Noise-like data has one in
+ * 256, about 131,000 in 32 MiB.
+ */
+const MAX_JPEG_ESCAPES = 1 << 20;
+
 interface Box {
   type: string;
   body: number;
   end: number;
 }
 
-/** ISO BMFF boxes between `start` and `end`; throws on a malformed size. */
-function isoBoxes(buffer: Buffer, start: number, end: number): Box[] {
-  const found: Box[] = [];
+/**
+ * ISO BMFF boxes between `start` and `end`, read one at a time. Throws on a
+ * malformed size, or once `budget` boxes have been read in total.
+ */
+function* isoBoxes(buffer: Buffer, start: number, end: number, budget: { left: number }): Generator<Box> {
   for (let pos = start; pos + 8 <= end; ) {
+    if (--budget.left < 0) throw new RangeError("too many boxes");
     let size = buffer.readUInt32BE(pos);
     let header = 8;
     if (size === 1) {
@@ -204,10 +221,9 @@ function isoBoxes(buffer: Buffer, start: number, end: number): Box[] {
       size = end - pos;
     }
     if (size < header || pos + size > end) throw new RangeError("box");
-    found.push({ type: buffer.toString("latin1", pos + 4, pos + 8), body: pos + header, end: pos + size });
+    yield { type: buffer.toString("latin1", pos + 4, pos + 8), body: pos + header, end: pos + size };
     pos += size;
   }
-  return found;
 }
 
 /** Derived image items, whose output libheif composes from other items. */
@@ -225,17 +241,24 @@ export function avifStructure(
   buffer: Buffer,
 ): { primaryType: string; derived: string[]; maxCodedPixels: number } | null {
   try {
-    const meta = isoBoxes(buffer, 0, buffer.length).find((box) => box.type === "meta");
+    const budget = { left: MAX_CONTAINER_ENTRIES };
+    let meta: Box | undefined;
+    for (const box of isoBoxes(buffer, 0, buffer.length, budget)) {
+      if (box.type === "meta") {
+        meta = box;
+        break;
+      }
+    }
     if (!meta) return null;
     let primary: number | undefined;
     const types = new Map<number, string>();
     let maxCodedPixels = 0;
-    for (const box of isoBoxes(buffer, meta.body + 4, meta.end)) {
+    for (const box of isoBoxes(buffer, meta.body + 4, meta.end, budget)) {
       if (box.type === "pitm" && box.end - box.body >= 6) {
         primary = buffer[box.body] === 0 ? buffer.readUInt16BE(box.body + 4) : buffer.readUInt32BE(box.body + 4);
       } else if (box.type === "iinf" && box.end - box.body >= 6) {
         const first = box.body + 4 + (buffer[box.body] === 0 ? 2 : 4);
-        for (const infe of isoBoxes(buffer, first, box.end)) {
+        for (const infe of isoBoxes(buffer, first, box.end, budget)) {
           const version = buffer[infe.body];
           if (infe.type !== "infe" || version < 2) continue;
           const idBytes = version === 2 ? 2 : 4;
@@ -245,9 +268,9 @@ export function avifStructure(
           types.set(id, buffer.toString("latin1", typeAt, typeAt + 4));
         }
       } else if (box.type === "iprp") {
-        for (const container of isoBoxes(buffer, box.body, box.end)) {
+        for (const container of isoBoxes(buffer, box.body, box.end, budget)) {
           if (container.type !== "ipco") continue;
-          for (const property of isoBoxes(buffer, container.body, container.end)) {
+          for (const property of isoBoxes(buffer, container.body, container.end, budget)) {
             if (property.type !== "ispe") continue;
             if (property.end - property.body < 12) return null;
             const pixels = buffer.readUInt32BE(property.body + 4) * buffer.readUInt32BE(property.body + 8);
@@ -270,7 +293,7 @@ export function avifStructure(
 /**
  * Whether a WebP decodes at full size (lossless or alpha), whether it is
  * animated, and its VP8X canvas size, from its RIFF chunks. Null when the
- * chunks overrun the file.
+ * chunks overrun the file or there are too many to read.
  */
 export function webpFeatures(
   buffer: Buffer,
@@ -278,7 +301,9 @@ export function webpFeatures(
   let fullCanvas = false;
   let animated = false;
   let canvasPixels = 0;
+  let chunks = 0;
   for (let pos = 12; pos + 8 <= buffer.length && !animated; ) {
+    if (++chunks > MAX_CONTAINER_ENTRIES) return null;
     const type = buffer.toString("latin1", pos, pos + 4);
     const size = buffer.readUInt32LE(pos + 4);
     const body = pos + 8;
@@ -302,11 +327,15 @@ export function webpFeatures(
 /**
  * Start-of-scan markers in a JPEG, counting no further than `stopAfter + 1`.
  * Entropy-coded data is skipped by searching for the next marker byte.
+ * Infinity when the file has more markers or escaped bytes than are read.
  */
 export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
   let scans = 0;
   let pos = 2;
+  let markers = 0;
+  let escapes = 0;
   while (pos + 4 <= buffer.length && buffer[pos] === 0xff) {
+    if (++markers > MAX_CONTAINER_ENTRIES) return Infinity;
     const marker = buffer[pos + 1];
     if (marker === 0xff) {
       pos++; // fill byte
@@ -327,6 +356,7 @@ export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
     for (;;) {
       const at = buffer.indexOf(0xff, pos);
       if (at === -1 || at + 1 >= buffer.length) return scans;
+      if (++escapes > MAX_JPEG_ESCAPES) return Infinity;
       const next = buffer[at + 1];
       if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
         pos = at + 2;
@@ -646,6 +676,9 @@ async function produce(
 function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
   if (format === "jpeg") {
     const scans = jpegScanCount(source, THUMBNAIL_LIMITS.maxJpegScans);
+    if (scans === Infinity) {
+      throw new Skip("unsupported", { format, reason: "too many markers to check" });
+    }
     if (scans > THUMBNAIL_LIMITS.maxJpegScans) {
       throw new Skip("over-budget", { format, reason: `more than ${THUMBNAIL_LIMITS.maxJpegScans} scans` });
     }

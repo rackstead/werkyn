@@ -66,6 +66,7 @@ const TaskRow = memo(function TaskRow({
     <tr
       ref={measureRow}
       data-index={index}
+      data-row-key={rowKey}
       data-task-id={row.id}
       aria-rowindex={ariaRowIndex}
       onFocus={onRowFocus && (() => onRowFocus(rowKey))}
@@ -285,44 +286,67 @@ export function TaskTable({
   // The rows in view stay where they are when rows above them change: tasks
   // created, deleted or moved by others or by a bulk action, rows rendered
   // at a height other than their estimate, an editor above the view
-  // closing. The first rows in view are remembered with their place and the
-  // scroll position; after a change, <main> scrolls by however far they
-  // moved other than by scrolling. The browser's scroll anchoring is off for
-  // the table: it did not apply to these changes, and together they would
-  // move the rows twice. Nothing is kept at the very top of the list.
+  // closing. The rows in view are remembered with their place and the
+  // scroll position; after a change, <main> scrolls by however far the first
+  // of them still in the List moved other than by scrolling. The browser's
+  // scroll anchoring is off for the table: it did not apply to these
+  // changes, and together they would move the rows twice. Nothing is kept
+  // at the very top of the list.
+  const listRowsRef = useRef(listRows);
+  listRowsRef.current = listRows;
   const inView = useRef<{
     scrollTop: number;
-    rows: Array<{ row: HTMLTableRowElement; top: number }>;
+    rows: Array<{ key: string; top: number }>;
   } | null>(null);
   const keepRowsInView = useCallback(() => {
     const body = bodyRef.current;
     if (!scroller || !body) return;
     const viewTop = scroller.getBoundingClientRect().top;
+    const rendered = new Map<string, HTMLTableRowElement>();
+    for (const row of body.rows) {
+      if (row.dataset.rowKey) rendered.set(row.dataset.rowKey, row);
+    }
     const last = inView.current;
     // Scroll positions are whole pixels; what a correction could not make up
     // is carried over, so repeated changes do not add up to a visible drift.
     let remainder = 0;
     if (last && scroller.scrollTop > 0) {
-      const kept = last.rows.find(({ row }) => row.parentNode === body);
+      const scrolled = scroller.scrollTop - last.scrollTop;
+      const kept = last.rows.find(({ key }) => rendered.has(key));
       if (kept) {
-        const scrolled = scroller.scrollTop - last.scrollTop;
+        const row = rendered.get(kept.key)!;
         const want = kept.top - scrolled;
-        const moved = kept.row.getBoundingClientRect().top - viewTop - want;
+        const moved = row.getBoundingClientRect().top - viewTop - want;
         if (Math.abs(moved) >= 0.5) scroller.scrollTop += moved;
-        remainder = kept.row.getBoundingClientRect().top - viewTop - want;
+        remainder = row.getBoundingClientRect().top - viewTop - want;
+      } else {
+        // None of them is rendered any more: so many rows were added or
+        // removed above (a bulk change) that the rendered range now holds
+        // other rows. Scroll to where the first of them still in the List
+        // is now; once it is rendered, the next pass places it exactly.
+        for (const { key, top } of last.rows) {
+          const index = listRowsRef.current.findIndex((row) => row.key === key);
+          const item = index < 0 ? undefined : virtualizer.measurementsCache[index];
+          if (!item) continue;
+          const want = top - scrolled;
+          scroller.scrollTop = item.start - want;
+          inView.current = { scrollTop: scroller.scrollTop, rows: [{ key, top: want }] };
+          return;
+        }
       }
     }
-    const rows: Array<{ row: HTMLTableRowElement; top: number }> = [];
+    const rows: Array<{ key: string; top: number }> = [];
     const viewBottom = viewTop + scroller.clientHeight;
     for (const row of body.rows) {
-      if (row.hasAttribute("aria-hidden")) continue;
+      const key = row.dataset.rowKey;
+      if (!key) continue;
       const { top, bottom } = row.getBoundingClientRect();
       if (bottom <= viewTop) continue;
-      if (top >= viewBottom || rows.length === 3) break;
-      rows.push({ row, top: top - viewTop - remainder });
+      if (top >= viewBottom) break;
+      rows.push({ key, top: top - viewTop - remainder });
     }
     inView.current = { scrollTop: scroller.scrollTop, rows };
-  }, [scroller]);
+  }, [scroller, virtualizer]);
   // After every render of the table, before the browser paints.
   useLayoutEffect(keepRowsInView);
 
@@ -471,6 +495,7 @@ export function TaskTable({
                   <tr
                     ref={measureRow}
                     data-index={index}
+                    data-row-key={key}
                     aria-rowindex={ariaRowIndex}
                     onFocus={scroller ? () => onRowFocus(key) : undefined}
                     className="bg-muted/30"

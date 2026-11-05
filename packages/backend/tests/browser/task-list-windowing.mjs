@@ -1200,6 +1200,35 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await settle("2 deleted above");
       await api("PATCH", `/tasks/${doneTasks.at(-1).id}/move`, { statusId: review.id, position: 0 });
       await settle("1 moved in from below");
+      // A bulk change moves more rows above the view than the rendered range
+      // holds, so none of the rows that were in view is rendered afterwards.
+      const below = await prisma.task.findMany({
+        where: { projectId: fixture.project.id, statusId: done.id },
+        orderBy: [{ position: "desc" }],
+        select: { id: true },
+        take: 50,
+      });
+      await api("POST", `/projects/${fixture.project.id}/tasks/bulk-update`, {
+        taskIds: below.map((t) => t.id),
+        statusId: review.id,
+      });
+      await settle("50 moved in from below (bulk)");
+      // The first three rows in view are deleted; the reference row below
+      // them stays.
+      const topTitles = await page.evaluate(() => {
+        const main = document.querySelector("main").getBoundingClientRect();
+        return [...document.querySelector("table").tBodies[0].rows]
+          .filter((r) => r.cells.length > 1 && r.getBoundingClientRect().bottom > main.top + 1)
+          .slice(0, 3)
+          .map((r) => r.cells[1].textContent);
+      });
+      assert(!topTitles.includes(reference.title));
+      const topIds = await prisma.task.findMany({
+        where: { projectId: fixture.project.id, title: { in: topTitles } },
+        select: { id: true },
+      });
+      for (const { id } of topIds) await api("DELETE", `/tasks/${id}`);
+      await settle("first 3 rows in view deleted");
       log("anchor shifts (from the starting place)", JSON.stringify(shifts));
 
       // The pointer rests on the reference row's checkbox while a colleague

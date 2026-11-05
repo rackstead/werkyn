@@ -38,8 +38,8 @@ const FORMATS: Record<
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const WEBP_CHUNKS = new Set(["VP8 ", "VP8L", "VP8X"]);
 // HEIC/HEVC and generic HEIF brands are not decoded: the bundled libheif has
-// no HEVC decoder, and only AVIF is supported.
-const AVIF_BRANDS = new Set(["avif", "avis"]);
+// no HEVC decoder. libvips 8.18 does not load the AVIF sequence brand (avis).
+const AVIF_BRANDS = new Set(["avif"]);
 
 /**
  * The allowlisted format these bytes start as, or null. Only fixed
@@ -183,43 +183,95 @@ export function defaultAdmissionLimits(
 
 type Release = () => void;
 
-/** A FIFO semaphore with a bounded queue and a bounded wait. */
+interface Waiter {
+  key: string;
+  grant: (release: Release | null) => void;
+}
+
+/**
+ * A semaphore with a bounded queue and a bounded wait, shared fairly between
+ * keys (workspaces). A free turn goes to the oldest waiter among the keys
+ * with the fewest active transforms, and when the queue is full a key holding
+ * fewer turns takes the newest place of the key holding the most, so one
+ * workspace cannot keep another's uploads from ever being admitted.
+ */
 export class TransformAdmission {
   private active = 0;
-  private readonly queue: Array<(release: Release | null) => void> = [];
+  private readonly activeByKey = new Map<string, number>();
+  private readonly queue: Waiter[] = [];
 
   constructor(readonly limits: ThumbnailAdmissionLimits) {}
 
-  /** A release function once admitted; null when the queue is full or the wait times out. */
-  acquire(): Promise<Release | null> {
-    if (this.active < this.limits.maxActive) {
-      this.active++;
-      return Promise.resolve(this.releaser());
+  /** A release function once admitted; null when refused or the wait times out. */
+  acquire(key = ""): Promise<Release | null> {
+    if (this.active < this.limits.maxActive) return Promise.resolve(this.admit(key));
+    if (this.queue.length >= this.limits.maxQueued && !this.makeRoomFor(key)) {
+      return Promise.resolve(null);
     }
-    if (this.queue.length >= this.limits.maxQueued) return Promise.resolve(null);
     return new Promise((resolve) => {
-      const grant = (release: Release | null) => {
-        clearTimeout(timer);
-        resolve(release);
+      const waiter: Waiter = {
+        key,
+        grant: (release) => {
+          clearTimeout(timer);
+          resolve(release);
+        },
       };
       const timer = setTimeout(() => {
-        const index = this.queue.indexOf(grant);
+        const index = this.queue.indexOf(waiter);
         if (index !== -1) this.queue.splice(index, 1);
         resolve(null);
       }, this.limits.queueTimeoutMs);
-      this.queue.push(grant);
+      this.queue.push(waiter);
     });
   }
 
-  private releaser(): Release {
+  /** Active plus queued turns of `key`. */
+  private held(key: string) {
+    return (this.activeByKey.get(key) ?? 0) + this.queue.filter((w) => w.key === key).length;
+  }
+
+  /**
+   * Refuse the newest waiter of the key holding the most turns, if that is
+   * at least two more than `key` holds, so the swap never reverses.
+   */
+  private makeRoomFor(key: string): boolean {
+    let busiest: string | undefined;
+    for (const waiter of this.queue) {
+      if (busiest === undefined || this.held(waiter.key) > this.held(busiest)) busiest = waiter.key;
+    }
+    if (busiest === undefined || busiest === key || this.held(busiest) < this.held(key) + 2) {
+      return false;
+    }
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      if (this.queue[i].key === busiest) {
+        const [evicted] = this.queue.splice(i, 1);
+        evicted.grant(null);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private admit(key: string): Release {
+    this.active++;
+    this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + 1);
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      // Hand the slot straight to the next waiter, if any.
-      const next = this.queue.shift();
-      if (next) next(this.releaser());
-      else this.active--;
+      this.active--;
+      const left = (this.activeByKey.get(key) ?? 1) - 1;
+      if (left > 0) this.activeByKey.set(key, left);
+      else this.activeByKey.delete(key);
+      let next: Waiter | undefined;
+      for (const waiter of this.queue) {
+        const active = this.activeByKey.get(waiter.key) ?? 0;
+        if (!next || active < (this.activeByKey.get(next.key) ?? 0)) next = waiter;
+      }
+      if (next) {
+        this.queue.splice(this.queue.indexOf(next), 1);
+        next.grant(this.admit(next.key));
+      }
     };
   }
 
@@ -256,76 +308,114 @@ sharp.cache(false);
 sharp.block({ operation: ["VipsForeignLoad"] });
 sharp.unblock({ operation: Object.values(FORMATS).map((format) => format.loader) });
 
+/** What a skipped thumbnail is logged with. */
+interface Details {
+  format?: ThumbnailFormat;
+  width?: number;
+  height?: number;
+  estimateBytes?: number;
+  reason?: string;
+}
+
 class Skip extends Error {
-  constructor(readonly outcome: ThumbnailOutcome) {
+  constructor(
+    readonly outcome: ThumbnailOutcome,
+    readonly details: Details = {},
+  ) {
     super(outcome);
   }
 }
 
 const TIMED_OUT = Symbol("timed out");
 
+export interface ThumbnailOptions {
+  /** Admission is shared fairly between workspaces; also logged. */
+  workspaceId?: string;
+  /** Logged with a skipped thumbnail. */
+  fileId?: string;
+  admission?: TransformAdmission;
+  deadlineMs?: number;
+}
+
 /**
  * A WebP thumbnail of the bytes `read` returns, or null. Waits for a turn
  * first (at most `queueTimeoutMs`), reads the source only once admitted, and
- * gives up waiting on the decoder after `transformDeadlineMs`. The turn is
- * held until libvips has actually finished, so a transform the upload
- * stopped waiting for still counts against the limit. Never throws.
+ * stops waiting `transformDeadlineMs` after admission, whether the read or
+ * the decoder is slow. The turn is held until that work has actually
+ * settled, so work the upload stopped waiting for still counts against the
+ * limit, and a read that finishes late starts no decode. Never throws.
  */
 export async function createThumbnail(
   read: () => Promise<Buffer>,
   {
+    workspaceId,
+    fileId,
     admission = thumbnailAdmission,
     deadlineMs = THUMBNAIL_LIMITS.transformDeadlineMs,
-  }: { admission?: TransformAdmission; deadlineMs?: number } = {},
+  }: ThumbnailOptions = {},
 ): Promise<Buffer | null> {
-  const release = await admission.acquire();
-  if (!release) return skipped("busy");
-  let releaseNow = true;
+  const context = { workspaceId, fileId };
+  const release = await admission.acquire(workspaceId);
+  if (!release) return skipped("busy", context);
+  const abandoned = { value: false };
+  const work = produce(read, abandoned);
+  let timer: NodeJS.Timeout | undefined;
+  let releaseLater = false;
   try {
-    const source = await read();
-    const format = thumbnailFormat(source);
-    if (!format) return skipped("unsupported");
-    const detected = await fileTypeFromBuffer(source);
-    if (!detected || !FORMATS[format].detected.has(detected.mime)) return skipped("unsupported");
-
-    const abandoned = { value: false };
-    const work = transform(source, format, abandoned);
-    let timer: NodeJS.Timeout | undefined;
     const outcome = await Promise.race([
       work,
       new Promise<typeof TIMED_OUT>((resolve) => {
         timer = setTimeout(resolve, deadlineMs, TIMED_OUT);
       }),
-    ]).finally(() => clearTimeout(timer));
+    ]);
     if (outcome === TIMED_OUT) {
       abandoned.value = true;
-      releaseNow = false;
+      releaseLater = true;
       work.then(release, release);
-      return skipped("timed-out");
+      return skipped("timed-out", context);
     }
     thumbnailOutcomes.created++;
     return outcome;
   } catch (err) {
-    if (err instanceof Skip) return skipped(err.outcome);
-    // Undecodable, truncated, over a pixel or channel limit, or stopped by
-    // the libvips timeout.
-    logger.debug({ err }, "Thumbnail omitted");
-    return skipped("failed");
+    if (err instanceof Skip) return skipped(err.outcome, { ...context, ...err.details });
+    // Undecodable, truncated, over a pixel or channel limit, stopped by the
+    // libvips timeout, or the source could not be read.
+    const reason = err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : String(err);
+    return skipped("failed", { ...context, reason });
   } finally {
-    if (releaseNow) release();
+    clearTimeout(timer);
+    if (!releaseLater) release();
   }
 }
 
-async function transform(
-  source: Buffer,
-  format: ThumbnailFormat,
+/** Reads, checks and decodes; stops before native work once abandoned. */
+async function produce(
+  read: () => Promise<Buffer>,
   abandoned: { value: boolean },
 ): Promise<Buffer> {
+  const giveUpIfAbandoned = () => {
+    if (abandoned.value) throw new Skip("timed-out");
+  };
+  const source = await read();
+  giveUpIfAbandoned();
+  const format = thumbnailFormat(source);
+  if (!format) throw new Skip("unsupported");
+  const detected = await fileTypeFromBuffer(source);
+  if (!detected || !FORMATS[format].detected.has(detected.mime)) {
+    throw new Skip("unsupported", { format, reason: detected?.mime ?? "undetected" });
+  }
+  giveUpIfAbandoned();
   const meta = await sharp(source, INPUT_OPTIONS).metadata();
-  if (meta.format !== FORMATS[format].libvips) throw new Skip("unsupported");
-  if (estimateDecodeBytes(meta) > THUMBNAIL_LIMITS.decodeBudgetBytes) throw new Skip("over-budget");
+  const details: Details = { format, width: meta.width, height: meta.height };
+  if (meta.format !== FORMATS[format].libvips) {
+    throw new Skip("unsupported", { ...details, reason: `libvips ${meta.format}` });
+  }
+  const estimateBytes = estimateDecodeBytes(meta);
+  if (estimateBytes > THUMBNAIL_LIMITS.decodeBudgetBytes) {
+    throw new Skip("over-budget", { ...details, estimateBytes });
+  }
   // Nobody waits for a decode that would start after the deadline.
-  if (abandoned.value) throw new Skip("timed-out");
+  giveUpIfAbandoned();
   return sharp(source, INPUT_OPTIONS)
     .resize(THUMBNAIL_LIMITS.width, undefined, { withoutEnlargement: true })
     .webp({ quality: THUMBNAIL_LIMITS.quality })
@@ -333,10 +423,13 @@ async function transform(
     .toBuffer();
 }
 
-function skipped(outcome: ThumbnailOutcome): null {
+function skipped(
+  outcome: ThumbnailOutcome,
+  details: Details & { workspaceId?: string; fileId?: string },
+): null {
   thumbnailOutcomes[outcome]++;
-  if (outcome === "busy" || outcome === "timed-out" || outcome === "over-budget") {
-    logger.info({ outcome }, "Thumbnail omitted");
-  }
+  // Not decoding a non-allowlisted format is the expected case.
+  if (outcome === "unsupported") logger.debug({ outcome, ...details }, "Thumbnail omitted");
+  else logger.info({ outcome, ...details }, "Thumbnail omitted");
   return null;
 }

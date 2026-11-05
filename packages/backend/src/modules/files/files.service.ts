@@ -80,7 +80,10 @@ export async function uploadFileStream(
     !mimeType.includes("svg") &&
     size <= THUMBNAIL_SOURCE_MAX_BYTES
   ) {
-    const thumbBuffer = await createThumbnail(() => storage.read(storagePath));
+    const thumbBuffer = await createThumbnail(() => storage.read(storagePath), {
+      workspaceId,
+      fileId,
+    });
     if (thumbBuffer) {
       try {
         thumbnailPath = await storage.save(

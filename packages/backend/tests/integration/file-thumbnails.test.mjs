@@ -68,7 +68,7 @@ function request(method, url, payload, headers = {}, auth = token) {
   });
 }
 
-async function uploadResponse(filename, contentType, bytes, auth = token) {
+async function uploadResponse(filename, contentType, bytes, auth = token, workspaceId = workspace.id) {
   const boundary = `werkyn-thumbnail-${crypto.randomUUID()}`;
   const payload = Buffer.concat([
     Buffer.from(
@@ -77,7 +77,7 @@ async function uploadResponse(filename, contentType, bytes, auth = token) {
     bytes,
     Buffer.from(`\r\n--${boundary}--\r\n`),
   ]);
-  return request("POST", `/api/workspaces/${workspace.id}/files/upload`, payload, {
+  return request("POST", `/api/workspaces/${workspaceId}/files/upload`, payload, {
     "content-type": `multipart/form-data; boundary=${boundary}`,
   }, auth);
 }
@@ -315,12 +315,12 @@ function pngChunk(type, data) {
 
 const avifHeader = { format: "heif", width: 2, height: 2, channels: 3, depth: "uchar" };
 
-test("only AVIF brands reach detection and decoding; other HEIF brands and TIFF are stored without", async () => {
+test("only the AVIF brand reaches detection and decoding; other HEIF brands and TIFF are stored without", async () => {
   await withDispatchSpies(async (state) => {
     state.fakeHeader = avifHeader;
     const cases = [];
     for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
-      cases.push([brand, isoHeader(brand), brand.startsWith("avi")]);
+      cases.push([brand, isoHeader(brand), brand === "avif"]);
     }
     for (const little of [true, false]) for (const version of [42, 43]) {
       const bytes = Buffer.alloc(16);
@@ -540,7 +540,7 @@ test("CMYK, 16-bit and many-frame uploads get first-frame sRGB thumbnails", asyn
   }
 });
 
-test("uploads beyond the transform limit all succeed; the excess are stored at once without a thumbnail", async (t) => {
+test("uploads beyond the transform limit all succeed; the excess are stored at once without a thumbnail, and other workspaces keep a share", async (t) => {
   const { thumbnailAdmission } = await import("../../src/modules/files/thumbnails.ts");
   const { maxActive, maxQueued } = thumbnailAdmission.limits;
   const extra = 3, total = maxActive + maxQueued + extra;
@@ -564,13 +564,31 @@ test("uploads beyond the transform limit all succeed; the excess are stored at o
   }
   assert.equal(responded, extra);
   assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  // Another workspace still gets a place: this workspace's newest waiter
+  // goes without instead.
+  const other = await app.prisma.workspace.create({
+    data: { name: "Thumbnails 2", slug: `thumbs-${crypto.randomUUID().slice(0, 20)}`, members: { create: { userId: user.id, role: "ADMIN" } } },
+  });
+  t.after(async () => {
+    await app.prisma.workspace.deleteMany({ where: { id: other.id } });
+    await app.prisma.blobCleanup.deleteMany({ where: { storagePath: { startsWith: `${other.id}/` } } });
+  });
+  const otherUpload = uploadResponse("other.png", "image/png", smallPng, token, other.id);
+  while (responded < extra + 1) {
+    assert.ok(Date.now() < deadline, JSON.stringify({ responded, ...thumbnailAdmission.usage }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
   open();
   const files = (await Promise.all(pending)).map((response) => {
     assert.equal(response.statusCode, 201, response.body);
     return response.json().data;
   });
-  assert.equal(files.filter((file) => file.thumbnailPath).length, maxActive + maxQueued);
-  assert.equal(files.filter((file) => !file.thumbnailPath).length, extra);
+  assert.equal(files.filter((file) => file.thumbnailPath).length, maxActive + maxQueued - 1);
+  assert.equal(files.filter((file) => !file.thumbnailPath).length, extra + 1);
+  const otherResponse = await otherUpload;
+  assert.equal(otherResponse.statusCode, 201, otherResponse.body);
+  assert.ok(otherResponse.json().data.thumbnailPath);
   assert.equal(peak, maxActive);
   assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
 });

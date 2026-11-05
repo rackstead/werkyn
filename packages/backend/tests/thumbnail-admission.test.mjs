@@ -54,7 +54,7 @@ test("only fixed allowlisted raster signatures choose a decoder", async () => {
     ["gif", await solid(8, 8).gif().toBuffer()],
     ["gif", Buffer.concat([Buffer.from("GIF87a"), Buffer.alloc(7)])],
     ["avif", await solid(8, 8).avif().toBuffer()],
-    ["avif", isoHeader("avis")],
+    ["avif", isoHeader("avif")],
   ];
   for (const [format, bytes] of allowed) assert.equal(thumbnailFormat(bytes), format, format);
 
@@ -82,13 +82,22 @@ test("only fixed allowlisted raster signatures choose a decoder", async () => {
     ["short gif", Buffer.from("GIF89a")],
     ["empty", Buffer.alloc(0)],
   ];
-  for (const brand of ["heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "mp41", "isom", "jxl "]) {
+  for (const brand of ["avis", "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "mp41", "isom", "jxl "]) {
     refused.push([`ftyp ${brand}`, isoHeader(brand)]);
   }
   for (const [size, length] of [[0, 24], [1, 24], [15, 24], [28, 24], [16, 12]]) {
     refused.push([`avif ftyp size ${size} in ${length} bytes`, isoHeader("avif", size, length)]);
   }
   for (const [name, bytes] of refused) assert.equal(thumbnailFormat(bytes), null, name);
+});
+
+test("the AVIF sequence brand is refused: the detector accepts it but libvips cannot load it", async () => {
+  const sequence = Buffer.from(await solid(64, 32).avif().toBuffer());
+  sequence.write("avis", 8, "latin1");
+  assert.equal((await (await import("file-type")).fileTypeFromBuffer(sequence)).mime, "image/avif");
+  await assert.rejects(sharp(sequence).metadata(), /unsupported image format/);
+  assert.equal(thumbnailFormat(sequence), null);
+  assert.deepEqual((await outcomes(() => thumbnailOf(sequence))).delta, { unsupported: 1 });
 });
 
 test("libvips may use only the allowlisted buffer loaders in this process", async () => {
@@ -296,6 +305,77 @@ test("a transform the upload stops waiting for keeps its turn until libvips sett
   assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, { admission }))).delta, { busy: 1 });
   finish();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+});
+
+test("a stalled source read times out, keeps its turn, and a late read starts no decode", async (t) => {
+  const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
+  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
+  let nativeCalls = 0;
+  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
+  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
+  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
+  let finishRead;
+  const stalled = new Promise((resolve) => { finishRead = () => resolve(smallPng); });
+  const started = performance.now();
+  const { result, delta } = await outcomes(() => createThumbnail(() => stalled, { admission, deadlineMs: 50 }));
+  assert.equal(result, null);
+  assert.deepEqual(delta, { "timed-out": 1 });
+  assert.ok(performance.now() - started < 1000);
+  assert.deepEqual(admission.usage, { active: 1, queued: 0 });
+  finishRead();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+  assert.equal(nativeCalls, 0, "the late read reached no decoder");
+});
+
+test("admission is shared fairly between workspaces", async () => {
+  const admission = new TransformAdmission({ maxActive: 2, maxQueued: 2, queueTimeoutMs: 1000 });
+  const a1 = await admission.acquire("a");
+  const a2 = await admission.acquire("a");
+  const a3 = admission.acquire("a");
+  const a4 = admission.acquire("a");
+  assert.deepEqual(admission.usage, { active: 2, queued: 2 });
+  // Workspace a holds four turns, b none: b takes a's newest place.
+  const b1 = admission.acquire("b");
+  assert.equal(await a4, null);
+  assert.deepEqual(admission.usage, { active: 2, queued: 2 });
+  // a holds three, b one: a's newest place again goes to b.
+  const b2 = admission.acquire("b");
+  assert.equal(await a3, null);
+  // Now a and b hold two each: neither displaces the other.
+  assert.equal(await admission.acquire("b"), null);
+  assert.equal(await admission.acquire("a"), null);
+  // c holds none, b two: c takes b's newest place.
+  const c1 = admission.acquire("c");
+  assert.equal(await b2, null);
+  // Freed turns go to the waiting keys, oldest first among equals.
+  a1();
+  const b1Release = await b1;
+  assert.ok(b1Release);
+  a2();
+  const c1Release = await c1;
+  assert.ok(c1Release);
+  b1Release();
+  c1Release();
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+
+  // With a mixed queue, the oldest waiter of the least active key goes first.
+  const x1 = await admission.acquire("x");
+  const x2 = await admission.acquire("x");
+  const x3 = admission.acquire("x");
+  const y1 = admission.acquire("y");
+  let x3Granted = false;
+  x3.then(() => { x3Granted = true; });
+  x1();
+  const y1Release = await y1;
+  assert.ok(y1Release);
+  assert.equal(x3Granted, false, "x already has an active turn");
+  x2();
+  const x3Release = await x3;
+  assert.ok(x3Release);
+  y1Release();
+  x3Release();
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
 });
 

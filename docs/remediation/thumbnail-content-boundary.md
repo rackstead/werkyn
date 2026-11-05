@@ -13,7 +13,7 @@ its stored MIME or filename.
 Within that cap, thumbnail detection first checks fixed signatures at fixed
 offsets: JPEG, PNG/APNG (signature followed by its IHDR chunk), GIF87a/GIF89a,
 RIFF/WebP with a VP8, VP8L or VP8X chunk, and ISO files whose major brand is
-`avif` or `avis`. ISO candidates also require an ordinary 32-bit box size of at
+`avif`. ISO candidates also require an ordinary 32-bit box size of at
 least 16 bytes that fits the actual buffer and the existing source cap.
 Size-to-EOF, extended-size, short and out-of-buffer forms omit the optional
 thumbnail while preserving the original upload; this does not declare those
@@ -23,9 +23,10 @@ document/archive entry paths out of this upload operation. The existing
 `file-type` detector must then report the same family (JPEG; PNG or APNG; WebP;
 GIF; AVIF), and libvips must read the same format from the header.
 
-TIFF/BigTIFF and the HEIC, HEIF (`mif1`/`msf1`) and HEVC brands were accepted
-here until R19 and are now stored without a thumbnail: the bundled libheif has
-no HEVC decoder, and TIFF is outside the decoder allowlist. AVIF bytes declared
+TIFF/BigTIFF and the HEIC, HEIF (`mif1`/`msf1`), HEVC and AVIF sequence
+(`avis`) brands were accepted here until R19 and are now stored without a
+thumbnail: the bundled libheif has no HEVC decoder, libvips does not load
+`avis`, and TIFF is outside the decoder allowlist. AVIF bytes declared
 HEIC remain eligible. Unknown/disallowed signatures and detection/decoding
 errors leave the thumbnail absent. An ordinary SVG document declared with a
 raster MIME hint is stored without a thumbnail. These checks classify

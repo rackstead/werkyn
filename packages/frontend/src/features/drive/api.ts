@@ -788,19 +788,6 @@ export function useFileShareLinks(wid: string, fileId: string | null) {
   });
 }
 
-export function useFileShareStatus(wid: string, fileIds: string[]) {
-  return useQuery({
-    queryKey: queryKeys.fileShareStatus(wid, fileIds),
-    queryFn: () => {
-      const params = new URLSearchParams();
-      params.set("fileIds", fileIds.join(","));
-      return api
-        .get(`workspaces/${wid}/files/share-status?${params.toString()}`)
-        .json<{ data: string[] }>();
-    },
-    enabled: fileIds.length > 0,
-  });
-}
 
 export function useSharedWithMe(wid: string) {
   return useInfiniteQuery({

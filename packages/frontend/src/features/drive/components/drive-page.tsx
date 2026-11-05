@@ -18,7 +18,6 @@ import {
   useTeamFolders,
   useStarFile,
   useUnstarFile,
-  useFileShareStatus,
   useArchiveFiles,
   type DriveFile,
   type SortBy,
@@ -28,6 +27,7 @@ import { FilePreviewSlideover, UploadProgress } from "./lazy-drive-panels";
 import { DriveBulkActions } from "./drive-bulk-actions";
 import { useFileUpload } from "../hooks/use-file-upload";
 import { useFileSelection } from "../hooks/use-file-selection";
+import { useFileShareStatus } from "../hooks/use-file-share-status";
 import { useRecentFiles } from "../hooks/use-recent-files";
 import { useAuthStore } from "@/stores/auth-store";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -260,11 +260,7 @@ export function DrivePage({
   const fileIds = useMemo(() => files.map((f) => f.id), [files]);
 
   // Share status for indicators
-  const { data: shareStatusData } = useFileShareStatus(workspaceId, fileIds);
-  const sharedFileIds = useMemo(
-    () => new Set(shareStatusData?.data ?? []),
-    [shareStatusData],
-  );
+  const sharedFileIds = useFileShareStatus(workspaceId, fileIds);
 
   const handleShare = useCallback(
     (file: DriveFile) => {

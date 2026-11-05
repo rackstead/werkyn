@@ -1286,7 +1286,8 @@ async function smoke({ browser, origin, fixture, prisma }) {
     }
     if (want("edges")) {
       // 9. The same at the edges: a colleague moving the row at the top of
-      // the view a few places down keeps the rows after it; content above
+      // the view a few places down keeps the rows after it, as does a swap
+      // of the two top rows; content above
       // the table changing height keeps the rows; and at (or just before)
       // the end of the List, deletions above keep the rows and a click
       // where the pointer rests still hits its task.
@@ -1354,6 +1355,28 @@ async function smoke({ browser, origin, fixture, prisma }) {
         secondRow: await shift(second.title, second.top),
         sixthRow: await shift(sixth.title, sixth.top),
       };
+
+      // The two top rows in view swap places (the first moved one place
+      // down): the rows after them stay.
+      view = await rowsInView();
+      const [upper, lower, third] = view;
+      const upperTask = await taskByTitle(upper.title);
+      const thirdTask = await taskByTitle(third.title);
+      const order = (await prisma.task.findMany({
+        where: { projectId: fixture.project.id, statusId: upperTask.statusId },
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+        select: { id: true },
+      })).map((t) => t.id);
+      await api("PATCH", `/tasks/${upperTask.id}/move`, {
+        statusId: upperTask.statusId,
+        position: order.indexOf(upperTask.id) + 1,
+      });
+      await settleOn(upper.title, upperTask.id, "top two rows swapped");
+      result.topRowsSwapped = {
+        thirdRow: await shift(third.title, third.top),
+        swapped: [await shift(upper.title, upper.top), await shift(lower.title, lower.top)],
+      };
+      assert.equal(thirdTask.statusId, upperTask.statusId);
 
       // Content above the table grows by 200 px and shrinks back.
       view = await rowsInView();
@@ -1432,6 +1455,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await page.getByTitle("Clear selection").click().catch(() => {});
       log("edges", JSON.stringify(result));
       assert(Math.abs(result.topRowMovedDown.secondRow) <= 1, "second row stays when the top row moves down");
+      assert(Math.abs(result.topRowsSwapped.thirdRow) <= 1, "third row stays when the top two rows swap");
       assert(Math.abs(result.contentAboveTable.grown200) <= 1, "rows stay when content above the table grows");
       assert(Math.abs(result.contentAboveTable.shrunkBack) <= 1, "rows stay when content above the table shrinks");
       for (const label of ["at the end", "20 px before the end"]) {

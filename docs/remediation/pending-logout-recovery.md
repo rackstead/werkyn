@@ -1,10 +1,15 @@
-# Conditional sign-out recovery prerequisite
+# Failed sign-out recovery
 
-`POST /api/auth/logout/recover` lets a browser retry ending one known sign-in
-session without changing its current cookie. Ordinary logout and refresh keep
-their existing behavior. This endpoint is a server prerequisite for durable
-failed-logout recovery; no browser persistence, hydration, cross-tab ordering,
-or SSO completion behavior changes here. Audit R07 remains open.
+When a sign-out request fails (offline, a 5xx, the tab closed first), the
+server session stays valid and the browser still holds its refresh cookie, so
+a later page load could quietly restore it. The browser therefore records each
+sign-out durably before sending it and, until the server has settled it,
+completes it on the next page load (or sign-in), in any tab, before restoring
+any session.
+
+`POST /api/auth/logout/recover` is the server side: it lets a browser retry
+ending one known sign-in session without changing its current cookie. Ordinary
+logout and refresh keep their existing behavior.
 
 ## Request and credential boundary
 
@@ -72,7 +77,68 @@ waiters in both refresh/recovery orders, and real local socket/API-key behavior.
 The busy test temporarily lowers the existing test-local lock cap to 250 ms;
 it proves classification and rollback, not an elapsed eight-second wait.
 
-Future client integration must separately establish durable explicit sign-out
-intent, safe adoption ordering for new same-account and different-account
-sessions, and SSO completion ordering. This endpoint alone does not guarantee
-sign-out after reload or across tabs.
+## Browser: durable sign-out
+
+`packages/frontend/src/lib/pending-sign-out.ts` keeps the records and
+`packages/frontend/src/stores/auth-store.ts` uses them.
+
+**Record.** Before the sign-out request is sent, the browser writes a
+localStorage entry keyed by the API's absolute base URL and the session id
+(the access token's `sid`, its refresh family). The value is only the account
+id and the time. No token is stored; the id is a selector, as above.
+
+**Completion.** A page load, and a sign-in before it replaces the cookie,
+first completes every record of this API, with `keepalive`:
+
+| Recovery result                | Record    | Session restored by this load?          |
+| ------------------------------ | --------- | --------------------------------------- |
+| `revoked`                      | removed   | No: the cookie's session was just ended |
+| `superseded`                   | removed   | Yes, the newer session the cookie holds |
+| `absent`                       | removed   | Only if a refresh then succeeds         |
+| 503/429                        | kept      | Retried within 10 s, else no            |
+| Network failure or deadline    | kept      | No; the next load tries again           |
+| Any other answer (403/404/5xx) | see below | see below                               |
+
+When the server refuses the request itself (an untrusted Origin, a server
+without the route), the browser asks through the cookie's own session: a
+refresh tells which session the cookie holds. Only if that is a recorded
+session is it signed out with ordinary logout; a 401 means the cookie holds no
+session. Records of other sessions are removed, since the cookie no longer
+belongs to them. These cookie-setting requests are announced like any other
+sign-out, so a sign-in in another tab waits for them.
+
+**The rule that protects a newer sign-in.** A record is removed only when the
+server has settled it: revoked, `superseded` or `absent` from recovery, a 204
+or a 401 from ordinary sign-out and refresh, or a refresh showing that the
+cookie holds a different session. It is never compared by account or by time.
+Every sign-in starts a new family, and the recorded family is revoked only
+when the cookie the browser sends at that moment proves it, so a stale record
+cannot end a sign-in made after it, in this tab or another, even by the same
+account. The sign-out request itself also compares session ids before
+revoking with a renewed token.
+
+**Cross-tab.** Records are shared by every tab of the origin. A tab that
+reloads after another tab's failed sign-out completes it first. A tab that
+missed the sign-out announcement and still holds the session ends it at its
+next refresh instead of renewing it. Completion in several tabs at once is
+safe: each request is settled with `revoked` or `absent`, and none sets a
+cookie. When a sign-in races a completion, the completion carried either the
+old cookie (and revoked only the old session) or the new one (and is told
+`superseded`); the recovery route never touches the cookie, so it cannot
+overwrite the new one.
+
+**Bounds.** At most eight records per API are kept, oldest dropped first:
+signing out again needs a new sign-in, which replaces the cookie, so older
+records can no longer match it. A record expires eight days after it was
+written (the seven-day refresh-token lifetime plus a day). No tab renews a
+recorded session, and the cookie-based fallback renews the record whenever it
+renews the cookie, so an expired record names a session that can no longer be
+used from this browser.
+
+**Limits.** Without localStorage (blocked, or quota exhausted) nothing is
+durable and a failed sign-out behaves as before. While a record cannot be
+settled, page loads stay signed out until the server is reachable or the user
+signs in again. `superseded` and `absent` do not revoke the old family on the
+server; it stays valid until it expires, but this browser no longer holds a
+cookie for it. Tabs still running an earlier build ignore records. OIDC
+completion, invitation redirects and the cookie rules above are unchanged.

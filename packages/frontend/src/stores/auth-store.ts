@@ -1,6 +1,14 @@
 import { create } from "zustand";
 import { apiUrl } from "@/lib/api-url";
 import { changeIdentity, identityGeneration } from "@/lib/identity";
+import {
+  clearPendingSignOut,
+  hasPendingSignOut,
+  pendingSignOuts,
+  recordPendingSignOut,
+  sessionIdOf,
+  type PendingSignOut,
+} from "@/lib/pending-sign-out";
 
 interface User {
   id: string;
@@ -51,7 +59,8 @@ interface AuthState {
   /**
    * Signs out at once, here and in this browser's other tabs, then revokes the
    * session on the server. The returned promise settles when revocation has
-   * finished or given up (bounded); it never rejects.
+   * finished or given up (bounded); it never rejects. A revocation that did not
+   * finish is completed by the next page load or sign-in, in any tab.
    */
   logout: () => Promise<void>;
   /**
@@ -298,10 +307,15 @@ let pendingLogout: Promise<void> | null = null;
  * Settles once no sign-out or refresh, in this tab or another, can still set
  * or clear the session cookie: when those requests have finished or reached
  * their deadline. A new sign-in waits for it, so its cookie is the last set.
+ *
+ * It also completes, while the cookie is still theirs, sign-outs that have
+ * not reached the server: the sign-in that follows replaces the cookie, after
+ * which this browser can no longer revoke those sessions.
  */
 export async function whenLoggedOut(): Promise<void> {
   await (pendingLogout ?? Promise.resolve());
   await whenCookieRequestsSettle();
+  await settlePendingSignOuts();
 }
 
 /** Waits (bounded) until no tab has a cookie-setting request in flight. */
@@ -318,15 +332,26 @@ let signOuts = 0;
 
 const LOGOUT_REFRESH_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 
+/**
+ * Revokes the session being signed out. Its pending record (see
+ * pending-sign-out.ts) is removed once the server has settled the sign-out;
+ * otherwise a later page load completes it.
+ */
 async function revokeSession(
   accessToken: string | null,
   userId: string,
+  sessionId: string | null,
   logoutEpoch: Epoch,
 ) {
   const controller = new AbortController();
   // Another tab announced a newer sign-in or sign-out: the cookie may now
   // belong to that session, which this sign-out must not touch.
   const overtaken = () => compareEpochs(knownEpoch, logoutEpoch) > 0;
+  // A renewed session is the one being signed out: the same session id when
+  // known (a newer sign-in of the same account is another session), else the
+  // same account.
+  const isSignedOutSession = (token: string, renewedUserId: unknown) =>
+    sessionId ? sessionIdOf(token) === sessionId : renewedUserId === userId;
   // keepalive: the UI is already signed out, so the user may close or reload
   // the tab at once; the revocation must still reach the server.
   const signOut = (token: string | null) =>
@@ -344,29 +369,36 @@ async function revokeSession(
       keepalive: true,
       signal: controller.signal,
     });
-  const revoke = async () => {
+  // Resolves true once the server has settled the sign-out: the session was
+  // revoked, or the cookie holds no session or a different one, so this
+  // browser can no longer restore it.
+  const revoke = async (): Promise<boolean> => {
     const res = await signOut(accessToken);
-    if (res.status !== 401 || overtaken()) return;
+    if (res.ok) return true;
+    if (res.status !== 401 || overtaken()) return false;
     // The server only accepts a sign-out with a current access token. When
     // ours has expired, exchange the cookie for one, without signing this
     // tab back in, and sign out with that, unless the cookie now belongs to
-    // another account (signed in from another tab meanwhile). A cookie that
+    // another session (signed in from another tab meanwhile). A cookie that
     // another tab has just rotated (409) or a busy session (503) is retried
     // with the browser's current cookie, within the deadline.
     let refreshed = await refreshCookie();
     for (const delay of LOGOUT_REFRESH_RETRY_DELAYS_MS) {
       if (!retryable(refreshed) || overtaken()) break;
       await new Promise((resolve) => setTimeout(resolve, delay));
-      if (overtaken()) return;
+      if (overtaken()) return false;
       refreshed = await refreshCookie();
     }
-    if (!refreshed.ok || overtaken()) return;
+    if (refreshed.status === 401) return true;
+    if (!refreshed.ok || overtaken()) return false;
     const body = (await refreshed.json()) as {
       data?: { user?: { id?: string }; accessToken?: string };
     };
-    if (body.data?.user?.id !== userId || !body.data.accessToken) return;
-    if (overtaken()) return;
-    await signOut(body.data.accessToken);
+    const renewed = body.data?.accessToken;
+    if (!renewed) return false;
+    if (!isSignedOutSession(renewed, body.data?.user?.id)) return !!sessionId;
+    if (overtaken()) return false;
+    return (await signOut(renewed)).ok;
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Settles at the deadline even if a request ignores its abort signal.
@@ -377,12 +409,194 @@ async function revokeSession(
     }, LOGOUT_TIMEOUT_MS);
   });
   try {
-    await cookieRequest(() => Promise.race([revoke(), deadline]));
+    const settled = await cookieRequest(() =>
+      Promise.race([revoke(), deadline]),
+    );
+    if (settled === true && sessionId) clearPendingSignOut(sessionId);
   } catch {
-    // Local state is already cleared; the network may be unavailable.
+    // Local state is already cleared; the network may be unavailable. The
+    // pending record remains for the next page load.
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ─── Unfinished sign-outs ────────────────────────────────
+//
+// A sign-out is recorded in localStorage before its request is sent and the
+// record is removed once the server has settled it (pending-sign-out.ts).
+// Before restoring a session, a page load (and a sign-in, before it replaces
+// the cookie) completes the sign-outs still recorded, in any tab:
+//
+// - POST auth/logout/recover asks the server to revoke the recorded session
+//   only if the cookie this browser sends now belongs to it. It never sets or
+//   clears the cookie, and it settles the record: "revoked" (the cookie is now
+//   useless, so nothing is restored), "superseded" (the cookie belongs to a
+//   newer sign-in, which is left alone; the recorded session can no longer be
+//   restored from here) or "absent" (the cookie holds no session).
+// - A busy server (503) is retried within the deadline. An unreachable one
+//   leaves the record for the next load, and this load restores nothing.
+// - A server that refuses the request itself (an untrusted Origin, a server
+//   without the route) is asked through the cookie's own session instead: a
+//   refresh tells which session the cookie holds. Only a recorded one is then
+//   signed out with ordinary logout; any other session is left alone.
+
+/**
+ * "clear": nothing is left to complete and a session may be restored;
+ * "revoked": the cookie's session was just revoked; "pending": a sign-out
+ * could not be completed, and no session may be restored now.
+ */
+type Settlement = "clear" | "revoked" | "pending";
+type Recovery = "revoked" | "superseded" | "absent" | "refused" | "unreachable";
+
+const RECOVERY_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+let settling: Promise<Settlement> | null = null;
+
+/** Completes the sign-outs recorded in this browser (bounded; never rejects). */
+function settlePendingSignOuts(): Promise<Settlement> {
+  // One run at a time per tab; a run may still be finishing a record it has
+  // already removed.
+  if (!settling && pendingSignOuts().length === 0)
+    return Promise.resolve("clear");
+  settling ??= (async () => {
+    // A sign-out still running in some tab settles its own record.
+    await whenCookieRequestsSettle();
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<Settlement>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve("pending");
+      }, LOGOUT_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([
+        completeSignOuts(controller.signal),
+        deadline,
+      ]);
+    } catch {
+      return "pending";
+    } finally {
+      clearTimeout(timer);
+    }
+  })().finally(() => {
+    settling = null;
+  });
+  return settling;
+}
+
+async function completeSignOuts(signal: AbortSignal): Promise<Settlement> {
+  let revoked = false;
+  const refused: PendingSignOut[] = [];
+  for (const record of pendingSignOuts()) {
+    const recovery = await recoverSession(record.sessionId, signal);
+    if (recovery === "refused") refused.push(record);
+    else if (recovery !== "unreachable") {
+      clearPendingSignOut(record.sessionId);
+      if (recovery === "revoked") revoked = true;
+    }
+  }
+  if (refused.length > 0 && (await settleThroughCookie(refused, signal))) {
+    revoked = true;
+  }
+  if (revoked) return "revoked";
+  // Includes a sign-out another tab recorded meanwhile.
+  return pendingSignOuts().length === 0 ? "clear" : "pending";
+}
+
+async function recoverSession(
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<Recovery> {
+  // keepalive: the user may close or leave the page meanwhile. A browser that
+  // cannot send it (a cross-origin API needs a preflight) is asked again
+  // without it.
+  const send = async (keepalive: boolean) => {
+    try {
+      return await fetch(apiUrl("auth/logout/recover"), {
+        method: "POST",
+        credentials: "include",
+        keepalive,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Werkyn-Session-Recovery": "1",
+        },
+        body: JSON.stringify({ sessionId }),
+        signal,
+      });
+    } catch {
+      return null;
+    }
+  };
+  for (let attempt = 0; ; attempt++) {
+    const res =
+      (await send(true)) ?? (signal.aborted ? null : await send(false));
+    if (!res) return "unreachable";
+    if (res.ok) {
+      const body = (await res.json().catch(() => null)) as {
+        data?: { status?: unknown };
+      } | null;
+      const status = body?.data?.status;
+      return status === "revoked" ||
+        status === "superseded" ||
+        status === "absent"
+        ? status
+        : "refused";
+    }
+    if (res.status !== 503 && res.status !== 429) return "refused";
+    const delay = RECOVERY_RETRY_DELAYS_MS[attempt];
+    if (delay === undefined) return "unreachable";
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (signal.aborted) return "unreachable";
+  }
+}
+
+/**
+ * Settles records the server would not settle conditionally, by asking which
+ * session the cookie holds. Returns true when it revoked a recorded session.
+ */
+function settleThroughCookie(
+  records: PendingSignOut[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  return cookieRequest(async () => {
+    const refreshed = await fetch(apiUrl("auth/refresh"), {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      signal,
+    });
+    if (refreshed.status === 401) {
+      // The cookie holds no session.
+      for (const record of records) clearPendingSignOut(record.sessionId);
+      return false;
+    }
+    if (!refreshed.ok) return false;
+    const body = (await refreshed.json()) as {
+      data?: { accessToken?: string };
+    };
+    const token = body.data?.accessToken;
+    const held = sessionIdOf(token);
+    if (!token || !held) return false;
+    // Records of other sessions: the cookie no longer belongs to them.
+    for (const record of records) {
+      if (record.sessionId !== held) clearPendingSignOut(record.sessionId);
+    }
+    const target = records.find((record) => record.sessionId === held);
+    if (!target) return false;
+    // The refresh renewed the session's cookie: renew its record with it.
+    recordPendingSignOut(target.sessionId, target.userId);
+    const res = await fetch(apiUrl("auth/logout"), {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: { Authorization: `Bearer ${token}` },
+      signal,
+    });
+    if (!res.ok) return false;
+    clearPendingSignOut(target.sessionId);
+    return true;
+  });
 }
 
 // ─── Store ────────────────────────────────────────────────
@@ -433,9 +647,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
     } else if (message.type === "workspaces" && message.data) {
       const { userId, workspaces } = message.data;
       // Memberships of one account; ignored by tabs signed in as another.
-      set((state) =>
-        state.user?.id === userId ? { workspaces } : state,
-      );
+      set((state) => (state.user?.id === userId ? { workspaces } : state));
     }
   });
 
@@ -475,10 +687,14 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
     logout: () => {
       const { user, accessToken } = get();
+      const sessionId = sessionIdOf(accessToken);
+      // Recorded before anything is sent: if the revocation below fails or
+      // never finishes, the next page load, in any tab, completes it.
+      if (user && sessionId) recordPendingSignOut(sessionId, user.id);
       const epoch = advanceEpoch(Date.now());
       endSession(epoch);
       if (!user) return pendingLogout ?? Promise.resolve();
-      const revoking = revokeSession(accessToken, user.id, epoch);
+      const revoking = revokeSession(accessToken, user.id, sessionId, epoch);
       pendingLogout = revoking;
       void revoking.then(() => {
         if (pendingLogout === revoking) pendingLogout = null;
@@ -496,14 +712,25 @@ export const useAuthStore = create<AuthState>((set, get) => {
     },
 
     refresh: async () => {
+      // Another tab signed this session out, and this tab missed its
+      // announcement: end it here instead of renewing it.
+      if (hasPendingSignOut(sessionIdOf(get().accessToken))) {
+        get().expireSession(identityGeneration());
+        return false;
+      }
       // If another tab refreshed recently, skip
       if (Date.now() - lastRefreshTime < 5000) {
         return !!get().accessToken;
       }
       // Without a session here, a sign-out or refresh still running in another
       // tab decides whether the shared cookie is valid: let it finish first, so
-      // that a cookie about to be revoked does not sign this tab in.
-      if (!get().user) await whenCookieRequestsSettle();
+      // that a cookie about to be revoked does not sign this tab in. A sign-out
+      // that never reached the server is completed first, and while it cannot
+      // be, no session is restored.
+      if (!get().user) {
+        await whenCookieRequestsSettle();
+        if ((await settlePendingSignOuts()) !== "clear") return false;
+      }
 
       const start: RefreshStart = {
         generation: identityGeneration(),
@@ -574,6 +801,11 @@ export const useAuthStore = create<AuthState>((set, get) => {
       // retrying would sign the account back in, in every tab, if that
       // sign-out's revocation has not reached the server yet.
       const signedOutSinceStart = () => signOuts !== signOutsAtStart;
+
+      // A sign-out this browser has not completed comes first. A session is
+      // restored only once none is left: when the cookie's session was just
+      // revoked, or a sign-out cannot be completed now, nothing is.
+      if ((await settlePendingSignOuts()) !== "clear") attempts = maxAttempts;
 
       while (attempts < maxAttempts) {
         const success = await get().refresh();

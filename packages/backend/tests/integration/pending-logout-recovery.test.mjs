@@ -704,3 +704,39 @@ test("retained proof with erased family returns absent without claiming revocati
     null,
   );
 });
+test("current-cookie recovery repeated by several tabs is idempotent and settles each request", async () => {
+  // Several tabs may complete the same recorded sign-out at once, and a
+  // response may be lost and retried. Every attempt is settled, none sets a
+  // cookie, and the family is revoked once.
+  const s = await login(await user());
+  const concurrent = await Promise.all([
+    recover(s.sid, s.cookie),
+    recover(s.sid, s.cookie),
+    recover(s.sid, s.cookie),
+  ]);
+  for (const r of concurrent) {
+    assert.equal(r.status, 200, r.body);
+    noCookie(r);
+    assert.ok(["revoked", "absent"].includes(r.json.data.status), r.body);
+  }
+  assert.ok(concurrent.some((r) => r.json.data.status === "revoked"));
+  const ended = await state(s.sid);
+  assert.ok(ended.family.revokedAt);
+  assert.equal(ended.family.revokedReason, "logout");
+  assert.equal(ended.tokens.length, 0);
+
+  const repeated = await recover(s.sid, s.cookie);
+  assert.equal(repeated.status, 200, repeated.body);
+  noCookie(repeated);
+  assert.deepEqual(repeated.json, { data: { status: "absent" } });
+  assert.deepEqual(await state(s.sid), ended);
+  const refresh = await request("POST", "/api/auth/refresh", {
+    cookie: s.cookie,
+  });
+  assert.equal(refresh.status, 401, refresh.body);
+  const logout = await request("POST", "/api/auth/logout", {
+    token: s.token,
+    cookie: s.cookie,
+  });
+  assert.equal(logout.status, 401, logout.body);
+});

@@ -567,6 +567,37 @@ describe("a newer sign-in", () => {
     expect(tabD.useAuthStore.getState().user?.id).toBe("bob");
   });
 
+  it("signed in and out again by another tab before an earlier sign-in is applied keeps its record", async () => {
+    const { tab: tabA, family: first } = await signedInTab("alice");
+    offline = true;
+    await run(tabA.useAuthStore.getState().logout());
+    offline = false;
+    routes.set("auth/logout/recover", () => json(404, { statusCode: 404 }));
+    // Tab A sends a sign-in; its response is applied only later.
+    await run(tabA.whenLoggedOut());
+    const res = await fetch("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "alice@example.test", password: "x" }),
+    });
+    const { data: late } = await res.json();
+    // Meanwhile tab B signs Bob in (replacing the cookie) and out, offline.
+    const tabB = await openTab();
+    const bob = await signInWithForm(tabB, "bob");
+    offline = true;
+    await run(tabB.useAuthStore.getState().logout());
+    offline = false;
+    routes.delete("auth/logout/recover");
+    // Tab A's sign-in is applied now: only the record that predates it goes.
+    tabA.useAuthStore.getState().setAuth(late.user, late.accessToken, []);
+    expect(pendingKeys().map((key) => key.split("#").pop())).toEqual([bob]);
+
+    const reloaded = await load();
+    expect(reloaded.useAuthStore.getState().user).toBeNull();
+    expect(families.get(bob)!.revoked).toBe(true);
+    expect(first.revoked).toBe(false);
+  });
+
   it("set by a single sign-on callback is restored: recovery reports superseded and leaves it", async () => {
     const { tab, family: first } = await signedInTab("alice");
     offline = true;

@@ -104,16 +104,18 @@ followed by ordinary logout could identify the recorded session and then, if a
 sign-in landed in between (for example a single sign-on callback, which no
 tab can coordinate with), replace or revoke the newer session instead.
 
-A password sign-in or registration replaces the cookie. Its response then
-removes the records of every other session: this browser can no longer
-complete them or restore those sessions, so they must not hold back the new
-one. A record of the session just signed in (signed out from another tab
-meanwhile) is kept.
+A password sign-in or registration replaces the cookie. When its response is
+applied, it removes the records that existed when its request was sent: this
+browser can no longer complete them or restore those sessions, so they must
+not hold back the new one. A record written after the request was sent is
+kept, because it may name the session the cookie holds by then (another tab
+signed in and out again before this response was applied).
 
 **The rule that protects a newer sign-in.** A record is removed only on
 evidence that this browser can no longer restore its session: `revoked`,
 `superseded` or `absent` from recovery; a 204 from the ordinary sign-out
-request; or a sign-in response that replaced the cookie. It is never compared
+request; or a sign-in, sent after the record was written, whose response
+replaced the cookie. It is never compared
 by account or by time. Every sign-in starts a new family, and the recorded
 family is revoked only when the cookie the browser sends at that moment
 proves it, so a stale record cannot end a sign-in made after it, in this tab or

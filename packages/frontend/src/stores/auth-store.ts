@@ -3,7 +3,6 @@ import { apiUrl } from "@/lib/api-url";
 import { changeIdentity, identityGeneration } from "@/lib/identity";
 import {
   clearPendingSignOut,
-  clearPendingSignOutsExcept,
   hasPendingSignOut,
   pendingSignOuts,
   recordPendingSignOut,
@@ -303,6 +302,14 @@ function busyUntil(): number {
 
 let pendingLogout: Promise<void> | null = null;
 
+// The sessions still recorded as signed out (see pending-sign-out.ts) when
+// this tab's sign-in was about to be sent. Its response replaces the cookie,
+// so this browser can no longer restore those sessions, and setAuth removes
+// their records. Only these: a record written later, for example by another
+// tab that signed in and out again meanwhile, may name the session the cookie
+// holds by the time the response is applied.
+let recordedBeforeSignIn: string[] = [];
+
 /**
  * Settles once no sign-out or refresh, in this tab or another, can still set
  * or clear the session cookie: when those requests have finished or reached
@@ -310,12 +317,14 @@ let pendingLogout: Promise<void> | null = null;
  *
  * It also completes, while the cookie is still theirs, sign-outs that have
  * not reached the server: the sign-in that follows replaces the cookie, after
- * which this browser can no longer revoke those sessions.
+ * which this browser can no longer revoke those sessions. Every sign-in calls
+ * it immediately before sending its request.
  */
 export async function whenLoggedOut(): Promise<void> {
   await (pendingLogout ?? Promise.resolve());
   await whenCookieRequestsSettle();
   await settlePendingSignOuts();
+  recordedBeforeSignIn = pendingSignOuts().map((record) => record.sessionId);
 }
 
 /** Waits (bounded) until no tab has a cookie-setting request in flight. */
@@ -440,9 +449,10 @@ async function revokeSession(
 //   this load restores nothing. Nothing that sets or clears the cookie is
 //   sent to settle a record: a refresh or an ordinary logout could replace or
 //   end a sign-in that lands meanwhile (such as a single sign-on callback).
-// - A password sign-in or registration replaces the cookie, so records of any
-//   other session are then removed (see setAuth): this browser can no longer
-//   restore those sessions, and a newer session is never held back by them.
+// - A password sign-in or registration replaces the cookie, so the records
+//   that existed when its request was sent are then removed (see setAuth):
+//   this browser can no longer restore those sessions, and the new session is
+//   not held back by them.
 
 /**
  * "clear": nothing is left to complete and a session may be restored;
@@ -608,11 +618,14 @@ export const useAuthStore = create<AuthState>((set, get) => {
     _refreshPromise: null,
 
     setAuth: (user, accessToken, workspaces) => {
-      // The sign-in's response replaced the cookie: sign-outs still recorded
-      // for other sessions can no longer be completed from this browser, and
-      // those sessions can no longer be restored here.
+      // The sign-in's response replaced the cookie: sign-outs recorded before
+      // its request was sent can no longer be completed from this browser,
+      // and their sessions can no longer be restored here.
       const sessionId = sessionIdOf(accessToken);
-      if (sessionId) clearPendingSignOutsExcept(sessionId);
+      for (const recorded of recordedBeforeSignIn) {
+        if (recorded !== sessionId) clearPendingSignOut(recorded);
+      }
+      recordedBeforeSignIn = [];
       // A sign-in is newer than anything announced before it.
       applySession({ user, accessToken, workspaces }, advanceEpoch(Date.now()));
     },

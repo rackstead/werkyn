@@ -7,10 +7,10 @@ import { apiPrefixUrl } from "./api-url";
 // server session stays valid and this browser still holds its refresh cookie,
 // so a later page load would quietly restore it. The auth store therefore
 // records the sign-out here *before* sending anything, and removes the record
-// once the server has settled it, or once a sign-in has replaced the cookie
-// (this browser can then no longer restore that session). While a record
-// remains, a page load in any tab completes the revocation first and restores
-// no session.
+// once the server has settled it, or once a sign-in sent after it was
+// recorded has replaced the cookie (this browser can then no longer restore
+// that session). While a record remains, a page load in any tab completes the
+// revocation first and restores no session.
 //
 // A record names the session by its id: the `sid` claim of its access tokens,
 // which is the id of its refresh-token family. The id only selects a session;
@@ -166,16 +166,6 @@ export function clearPendingSignOut(sessionId: string): void {
     storage()?.removeItem(scopePrefix() + sessionId);
   } catch {
     // Storage unavailable: the record is settled again on a later load.
-  }
-}
-
-/**
- * Removes the records of every session but `sessionId`, after a sign-in has
- * replaced the cookie they would need.
- */
-export function clearPendingSignOutsExcept(sessionId: string): void {
-  for (const record of pendingSignOuts()) {
-    if (record.sessionId !== sessionId) clearPendingSignOut(record.sessionId);
   }
 }
 

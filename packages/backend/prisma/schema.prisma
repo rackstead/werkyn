@@ -1196,6 +1196,7 @@ model ChatChannelMember {
   @@unique([channelId, userId])
   @@index([userId])
   @@index([channelId])
+  @@index([channelId, joinedAt, id])
 }
 
 model ChatMessage {

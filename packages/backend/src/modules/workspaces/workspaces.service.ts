@@ -344,44 +344,77 @@ export async function getDashboard(
   return { data };
 }
 
-interface MyTasksPosition {
-  projectName: string;
-  projectId: string;
-  position: number;
-  id: string;
-}
+/** The sort values of a my-tasks row; the cursor carries them, not just the ID. */
+type MyTasksPosition =
+  | { sort: "project"; projectName: string; projectId: string; position: number; id: string }
+  | { sort: "dueDate"; dueDate: string | null; id: string };
 
-/** my-tasks cursors carry the sort values of the last row, not just its ID. */
 function encodeMyTasksCursor(row: MyTasksPosition) {
-  return Buffer.from(
-    JSON.stringify([row.projectName, row.projectId, row.position, row.id]),
-  ).toString("base64url");
+  const values =
+    row.sort === "project"
+      ? [row.projectName, row.projectId, row.position, row.id]
+      : [row.dueDate, row.id];
+  return Buffer.from(JSON.stringify(values)).toString("base64url");
 }
 
-function decodeMyTasksCursor(cursor: string): MyTasksPosition {
+function decodeMyTasksCursor(cursor: string, sort: MyTasksQueryInput["sort"]): MyTasksPosition {
   try {
     const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!Array.isArray(value)) throw new Error("not an array");
     if (
-      Array.isArray(value) &&
+      sort === "project" &&
       value.length === 4 &&
       typeof value[0] === "string" &&
       typeof value[1] === "string" &&
       Number.isSafeInteger(value[2]) &&
       typeof value[3] === "string"
     ) {
-      return { projectName: value[0], projectId: value[1], position: value[2], id: value[3] };
+      return { sort, projectName: value[0], projectId: value[1], position: value[2], id: value[3] };
+    }
+    if (
+      sort === "dueDate" &&
+      value.length === 2 &&
+      (value[0] === null || typeof value[0] === "string") &&
+      typeof value[1] === "string"
+    ) {
+      return { sort, dueDate: value[0], id: value[1] };
     }
   } catch {
     // Reported below.
   }
   throw new ValidationError("Validation failed", [
-    { field: "cursor", message: "Invalid cursor: use the nextCursor of the previous page" },
+    { field: "cursor", message: "Invalid cursor: use the nextCursor of the previous page with the same sort" },
   ]);
 }
 
+/** Rows after `at` in its sort order. */
+function myTasksAfter(at: MyTasksPosition): Prisma.TaskWhereInput {
+  if (at.sort === "dueDate") {
+    // Ascending with tasks without a due date last.
+    return at.dueDate === null
+      ? { dueDate: null, id: { gt: at.id } }
+      : {
+          OR: [
+            { dueDate: { gt: at.dueDate } },
+            { dueDate: at.dueDate, id: { gt: at.id } },
+            { dueDate: null },
+          ],
+        };
+  }
+  return {
+    OR: [
+      { project: { name: { gt: at.projectName } } },
+      { project: { name: at.projectName }, projectId: { gt: at.projectId } },
+      { projectId: at.projectId, position: { gt: at.position } },
+      { projectId: at.projectId, position: at.position, id: { gt: at.id } },
+    ],
+  };
+}
+
 /**
- * The caller's assigned, unarchived tasks in visible projects, ordered by
- * project name, then project, board position and ID, one page at a time.
+ * The caller's assigned, unarchived tasks in visible projects, one page at a
+ * time: by project name, then project, board position and ID, or with
+ * sort=dueDate by due date (none last) and ID.
  */
 export async function getMyTasks(
   prisma: PrismaClient,
@@ -417,17 +450,7 @@ export async function getMyTasks(
   if (query.completed !== undefined) {
     filters.push({ status: { isCompletion: query.completed } });
   }
-  if (query.cursor) {
-    const at = decodeMyTasksCursor(query.cursor);
-    filters.push({
-      OR: [
-        { project: { name: { gt: at.projectName } } },
-        { project: { name: at.projectName }, projectId: { gt: at.projectId } },
-        { projectId: at.projectId, position: { gt: at.position } },
-        { projectId: at.projectId, position: at.position, id: { gt: at.id } },
-      ],
-    });
-  }
+  if (query.cursor) filters.push(myTasksAfter(decodeMyTasksCursor(query.cursor, query.sort)));
 
   const tasks = await prisma.task.findMany({
     where: { AND: filters },
@@ -443,12 +466,15 @@ export async function getMyTasks(
         },
       },
     },
-    orderBy: [
-      { project: { name: "asc" } },
-      { projectId: "asc" },
-      { position: "asc" },
-      { id: "asc" },
-    ],
+    orderBy:
+      query.sort === "dueDate"
+        ? [{ dueDate: { sort: "asc", nulls: "last" } }, { id: "asc" }]
+        : [
+            { project: { name: "asc" } },
+            { projectId: "asc" },
+            { position: "asc" },
+            { id: "asc" },
+          ],
     take: query.limit + 1,
   });
 
@@ -459,12 +485,17 @@ export async function getMyTasks(
     data: page.map(scopeTaskRelations),
     nextCursor:
       hasMore && last
-        ? encodeMyTasksCursor({
-            projectName: last.project.name,
-            projectId: last.projectId,
-            position: last.position,
-            id: last.id,
-          })
+        ? encodeMyTasksCursor(
+            query.sort === "dueDate"
+              ? { sort: "dueDate", dueDate: last.dueDate, id: last.id }
+              : {
+                  sort: "project",
+                  projectName: last.project.name,
+                  projectId: last.projectId,
+                  position: last.position,
+                  id: last.id,
+                },
+          )
         : null,
   };
 }

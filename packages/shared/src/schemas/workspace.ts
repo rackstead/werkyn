@@ -44,5 +44,7 @@ export const MyTasksQuerySchema = z.object({
   dueAfter: dateOnly("dueAfter").optional(),
   /** false: only tasks outside completion columns; true: only completed tasks. */
   completed: QueryBooleanSchema.optional(),
+  /** "project" (default): project name, then board position. "dueDate": soonest first, no date last. */
+  sort: z.enum(["project", "dueDate"]).default("project"),
 });
 export type MyTasksQueryInput = z.infer<typeof MyTasksQuerySchema>;

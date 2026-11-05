@@ -349,7 +349,8 @@ when more follows. A request without paging parameters gets the first page:
 | `GET /api/workspaces/:wid/activity` | unchanged pages | `pagination.hasMore`; `pagination.total` counts up to 1,000 rows and sets `totalCapped` above that |
 
 Report totals still cover every matching entry, and the CSV export still lists
-them all. `my-tasks` also accepts `dueAfter`, `dueBefore` and `completed`. Cursor
+them all. `my-tasks` also accepts `dueAfter`, `dueBefore`, `completed` and
+`sort=dueDate`. Cursor
 lists that sort by a value several rows can share (bookmarks, wiki versions,
 shared-with-me, task comments, the drive listing, channel members) break ties by
 ID, so pages neither repeat nor skip rows. See

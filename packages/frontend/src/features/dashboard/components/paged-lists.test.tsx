@@ -112,12 +112,13 @@ describe("my tasks widget", () => {
 });
 
 describe("upcoming dates widget", () => {
-  it("asks the server for open tasks due this week and pages them", async () => {
+  it("asks the server for open tasks due this week, soonest first, and pages them", async () => {
     const today = formatDateISO(new Date());
     transport.respond = (_path, params) => {
       expect(params.dueAfter).toBe(today);
       expect(params.dueBefore).toBe(addDaysISO(today, 7));
       expect(params.completed).toBe("false");
+      expect(params.sort).toBe("dueDate");
       return params.cursor
         ? { data: [task("due later page", "beta", { dueDate: addDaysISO(today, 2) })], nextCursor: null }
         : { data: [task("due today", "alpha", { dueDate: today })], nextCursor: "next" };

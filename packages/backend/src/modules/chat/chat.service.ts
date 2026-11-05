@@ -38,6 +38,12 @@ export async function listChannels(
  * The first CHANNEL_LIST_MEMBER_LIMIT members (by join time, then ID) of each
  * channel. `_count.members` stays the full count; a DM has at most eight
  * members, so its preview is complete.
+ *
+ * The recursive query takes one member per channel and step from the
+ * ("channelId", "joinedAt", "id") index, so it reads at most the limit per
+ * channel. A plain LATERAL ... LIMIT is not enough: PostgreSQL estimates every
+ * channel at the average membership and, next to many small channels, reads
+ * and sorts all members of a large one.
  */
 async function memberPreviews(prisma: PrismaClient, channelIds: string[]) {
   const byChannel = new Map<string, MemberPreview[]>();
@@ -53,18 +59,34 @@ async function memberPreviews(prisma: PrismaClient, channelIds: string[]) {
       avatarUrl: string | null;
     }>
   >`
-    SELECT m."id", m."channelId", m."userId", m."lastReadAt", m."joinedAt",
+    WITH RECURSIVE preview AS (
+      SELECT m.*, 1 AS step
+      FROM unnest(${channelIds}::text[]) AS c("id")
+      CROSS JOIN LATERAL (
+        SELECT cm."id", cm."channelId", cm."userId", cm."lastReadAt", cm."joinedAt"
+        FROM "ChatChannelMember" cm
+        WHERE cm."channelId" = c."id"
+        ORDER BY cm."joinedAt", cm."id"
+        LIMIT 1
+      ) m
+      UNION ALL
+      SELECT m.*, p.step + 1
+      FROM preview p
+      CROSS JOIN LATERAL (
+        SELECT cm."id", cm."channelId", cm."userId", cm."lastReadAt", cm."joinedAt"
+        FROM "ChatChannelMember" cm
+        WHERE cm."channelId" = p."channelId"
+          AND (cm."joinedAt", cm."id") > (p."joinedAt", p."id")
+        ORDER BY cm."joinedAt", cm."id"
+        LIMIT 1
+      ) m
+      WHERE p.step < ${CHANNEL_LIST_MEMBER_LIMIT}
+    )
+    SELECT p."id", p."channelId", p."userId", p."lastReadAt", p."joinedAt",
            u."displayName", u."avatarUrl"
-    FROM (
-      SELECT cm.*, row_number() OVER (
-        PARTITION BY cm."channelId" ORDER BY cm."joinedAt", cm."id"
-      ) AS rank
-      FROM "ChatChannelMember" cm
-      WHERE cm."channelId" = ANY(${channelIds})
-    ) m
-    JOIN "User" u ON u."id" = m."userId"
-    WHERE m.rank <= ${CHANNEL_LIST_MEMBER_LIMIT}
-    ORDER BY m."channelId", m."joinedAt", m."id"`;
+    FROM preview p
+    JOIN "User" u ON u."id" = p."userId"
+    ORDER BY p."channelId", p."joinedAt", p."id"`;
   for (const { displayName, avatarUrl, ...member } of rows) {
     const list = byChannel.get(member.channelId) ?? [];
     list.push({ ...member, user: { id: member.userId, displayName, avatarUrl } });

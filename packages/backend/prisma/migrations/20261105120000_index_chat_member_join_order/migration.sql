@@ -1,0 +1,25 @@
+-- Join-order index for channel members.
+--
+-- The channel list shows each channel's first ten members by join time and
+-- the member list pages a channel's members in the same order
+-- (docs/remediation/p02b.md): WHERE "channelId" = $1 ORDER BY "joinedAt",
+-- "id" LIMIT n. With this index each lookup reads at most n index entries
+-- instead of every member of the channel followed by a sort.
+--
+-- Lock impact: CREATE INDEX holds a SHARE lock on "ChatChannelMember" while it
+-- builds, so joins, leaves and read-marker updates wait (reads do not). The
+-- shipped entrypoint applies migrations before the server starts, so nothing
+-- waits there. Membership tables are small (3,918 rows in the P02 fixture).
+--
+-- CREATE INDEX CONCURRENTLY is not used, for the reasons in
+-- 20261030150000_index_task_board_order. Operators who apply migrations while
+-- an older version keeps writing can build the index first:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatChannelMember_channelId_joinedAt_id_idx"
+--     ON "ChatChannelMember"("channelId", "joinedAt", "id");
+--
+-- and check that pg_index.indisvalid is true for it (drop and rebuild it if
+-- not). IF NOT EXISTS below then makes this migration a no-op.
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "ChatChannelMember_channelId_joinedAt_id_idx" ON "ChatChannelMember"("channelId", "joinedAt", "id");

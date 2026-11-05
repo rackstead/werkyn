@@ -375,7 +375,6 @@ async function buildReport(
   >();
   const summaryCosts = new CostAccumulator();
   const summary = { totalHours: 0, billableHours: 0, nonBillableHours: 0 };
-  let budget = all ? Infinity : Math.min(REPORT_ENTRY_TOTAL_LIMIT, rows.length);
   const perGroup = all ? Infinity : entryLimit;
 
   for (const entry of rows) {
@@ -406,15 +405,19 @@ async function buildReport(
     group.costs.add(entry, priced);
     summaryCosts.add(entry, priced);
     group.entryCount += 1;
-    if (group.shown.length < perGroup && budget > 0) {
-      group.shown.push({ entry, priced });
-      budget -= 1;
-    }
+    if (group.shown.length < perGroup) group.shown.push({ entry, priced });
   }
 
-  // Groups appear in the order of their first entry, as before; the entry
-  // budget is spent in that order too.
+  // Groups appear in the order of their first entry, as before. The response
+  // limit is spent in that order too: each group keeps its first entries
+  // until REPORT_ENTRY_TOTAL_LIMIT is reached, and later groups get fewer or
+  // none, however their entries interleave by date.
   const groups = [...groupMap.values()];
+  let budget = all ? Infinity : REPORT_ENTRY_TOTAL_LIMIT;
+  for (const group of groups) {
+    if (group.shown.length > budget) group.shown.length = budget;
+    budget -= group.shown.length;
+  }
   const keys = groups.map((group) => group.key);
   const names = await entryNames(
     prisma,

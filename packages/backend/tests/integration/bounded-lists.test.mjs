@@ -25,6 +25,15 @@ const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-bounded-lists-")
 process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
+const chat = await import("../../src/modules/chat/chat.service.js");
+const { PrismaClient } = await import("@prisma/client");
+
+// A separate client whose generated SQL is recorded for plan checks.
+const observerUrl = new URL(process.env.TEST_DATABASE_URL);
+observerUrl.searchParams.set("connection_limit", "1");
+const observer = new PrismaClient({ datasourceUrl: observerUrl.toString(), log: [{ level: "query", emit: "event" }] });
+let recorded = null;
+observer.$on("query", (event) => recorded?.push(event));
 
 let app, workspace, requests = 0;
 const users = {}, tokens = {};
@@ -85,6 +94,7 @@ after(async () => {
     if (app && workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } });
     if (app) await app.prisma.user.deleteMany({ where: { id: { in: createdUsers } } });
   } finally {
+    await observer.$disconnect();
     await app?.close();
     await rm(storageDir, { recursive: true, force: true });
   }
@@ -116,7 +126,7 @@ describe("my tasks", () => {
   }
 
   /** The documented order, with the same visibility as the endpoint for a member. */
-  async function expected(extra = "") {
+  async function expected(extra = "", order = `p.name, t."projectId", t.position, t.id`) {
     return (await app.prisma.$queryRawUnsafe(`
       SELECT t.id FROM "Task" t
       JOIN "Project" p ON p.id = t."projectId"
@@ -125,7 +135,7 @@ describe("my tasks", () => {
         AND EXISTS (SELECT 1 FROM "TaskAssignee" a WHERE a."taskId" = t.id AND a."userId" = $2)
         AND EXISTS (SELECT 1 FROM "ProjectMember" m WHERE m."projectId" = p.id AND m."userId" = $2)
         ${extra}
-      ORDER BY p.name, t."projectId", t.position, t.id`, workspace.id, users.me.id)).map((r) => r.id);
+      ORDER BY ${order}`, workspace.id, users.me.id)).map((r) => r.id);
   }
 
   async function walk(url, between) {
@@ -206,6 +216,23 @@ describe("my tasks", () => {
     }
   });
 
+  test("sort=dueDate pages soonest first, tasks without a due date last", async () => {
+    const byDue = `t."dueDate" ASC NULLS LAST, t.id`;
+    const order = await expected("", byDue);
+    for (const limit of [1, 6, 200]) {
+      assert.deepEqual(await walk(`${base()}?sort=dueDate&limit=${limit}`), order, `limit ${limit}`);
+    }
+    const window = await expected(`AND t."dueDate" >= '2026-04-08' AND t."dueDate" <= '2026-04-14' AND NOT s."isCompletion"`, byDue);
+    assert.ok(window.length > 4);
+    assert.deepEqual(await walk(`${base()}?sort=dueDate&dueAfter=2026-04-08&dueBefore=2026-04-14&completed=false&limit=3`), window);
+    // A cursor of one sort is not accepted for the other.
+    const projectPage = await ok("me", `${base()}?limit=1`);
+    assert.equal((await get("me", `${base()}?sort=dueDate&cursor=${projectPage.nextCursor}`)).statusCode, 400);
+    const duePage = await ok("me", `${base()}?sort=dueDate&limit=1`);
+    assert.equal((await get("me", `${base()}?cursor=${duePage.nextCursor}`)).statusCode, 400);
+    assert.equal((await get("me", `${base()}?sort=title`)).statusCode, 400);
+  });
+
   test("a caller without assigned tasks gets an empty last page", async () => {
     const admin = await ok("boss", base());
     assert.deepEqual(admin.data, []);
@@ -231,7 +258,7 @@ describe("my tasks", () => {
 });
 
 describe("time report entries", () => {
-  let project, fewUser, manyUser, bulkUser;
+  let project, fewUser, manyUser;
   const report = (query) => `/api/workspaces/${workspace.id}/time/reports?startDate=2026-01-01&endDate=2026-01-31&${query}`;
   const entries = (query) => `/api/workspaces/${workspace.id}/time/reports/entries?startDate=2026-01-01&endDate=2026-01-31&${query}`;
   const userQuery = () => `userIds=${[manyUser, fewUser].map((u) => u.id).join(",")}`;
@@ -262,13 +289,12 @@ describe("time report entries", () => {
 
   before(async () => {
     const suffix = crypto.randomUUID().slice(0, 8);
-    for (const name of ["few", "many", "bulk"]) {
+    for (const name of ["few", "many"]) {
       const user = await app.prisma.user.create({ data: { email: `bounded-time-${name}-${suffix}@example.test`, displayName: `time ${name}` } });
       createdUsers.push(user.id);
       await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: user.id, role: "MEMBER" } });
       if (name === "few") fewUser = user;
       if (name === "many") manyUser = user;
-      if (name === "bulk") bulkUser = user;
     }
     project = await app.prisma.project.create({ data: { workspaceId: workspace.id, name: "Timed", members: { create: [{ userId: users.boss.id }] } } });
     await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: manyUser.id, rate: 33.33, currency: "USD", effectiveFrom: "2026-01-03" } });
@@ -353,30 +379,43 @@ describe("time report entries", () => {
     assert.equal((await get("me", entries(`groupBy=user&groupKey=${manyUser.id}`))).statusCode, 403);
   });
 
-  test("one response carries at most 5,000 entries; the CSV export stays complete", async () => {
-    // 5,100 entries over twelve days: 425 per date group.
-    await addEntries(bulkUser, 5100, { date: (i) => `2026-01-${String((i % 12) + 10).padStart(2, "0")}`, createdAt: (i) => at(i) });
-    const query = `userIds=${bulkUser.id}&groupBy=date&entryLimit=500`;
+  test("one response carries at most 5,000 entries, spent in group order; the CSV stays complete", async () => {
+    // Twelve members with 430 entries each, interleaved by date and creation
+    // time: every member has entries on every one of twelve dates.
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const bulk = [];
+    for (let u = 0; u < 12; u++) {
+      const user = await app.prisma.user.create({ data: { email: `bounded-bulk-${u}-${suffix}@example.test`, displayName: `bulk ${String(u).padStart(2, "0")}` } });
+      createdUsers.push(user.id);
+      bulk.push(user);
+      await addEntries(user, 430, { date: (i) => `2026-01-${String((i % 12) + 10).padStart(2, "0")}`, createdAt: (i) => at(i * 12 + u) });
+    }
+    const query = `userIds=${bulk.map((u) => u.id).join(",")}&groupBy=user&entryLimit=500`;
     const bounded = (await ok("boss", report(query))).data;
-    const listed = bounded.groups.reduce((n, g) => n + g.entries.length, 0);
-    assert.equal(listed, 5000);
-    assert.equal(bounded.groups.reduce((n, g) => n + g.entryCount, 0), 5100);
+    // Groups keep the order of their first entry: bulk 00 to bulk 11.
+    assert.deepEqual(bounded.groups.map((g) => g.key), bulk.map((u) => u.id));
+    assert.equal(bounded.groups.reduce((n, g) => n + g.entries.length, 0), 5000);
+    for (const group of bounded.groups.slice(0, 11)) {
+      assert.deepEqual([group.entries.length, group.entryCount, group.hasMoreEntries, group.nextEntryCursor], [430, 430, false, null], group.label);
+    }
     const last = bounded.groups.at(-1);
-    assert.equal(last.entryCount, 425);
-    assert.equal(last.entries.length, 325);
+    assert.equal(last.entryCount, 430);
+    assert.equal(last.entries.length, 5000 - 11 * 430);
     assert.equal(last.hasMoreEntries, true);
-    const rest = await walkGroupFor(bulkUser, last.key, last.nextEntryCursor);
-    assert.equal(last.entries.length + rest.length, 425);
+    assert.equal(last.nextEntryCursor, last.entries.at(-1).id);
+    const rest = await walkGroupFor(bulk.map((u) => u.id).join(","), last.key, last.nextEntryCursor);
+    const full = (await ok("boss", report(`userIds=${last.key}&groupBy=user&entryLimit=500`))).data.groups[0].entries;
+    assert.deepEqual([...last.entries, ...rest], full);
     const csv = await get("boss", `/api/workspaces/${workspace.id}/time/reports/export?startDate=2026-01-01&endDate=2026-01-31&${query}`);
     assert.equal(csv.statusCode, 200);
-    assert.equal(values(parseCsv(csv.body.replace(/^﻿/, ""))).length - 1, 5100);
+    assert.equal(values(parseCsv(csv.body.replace(/^\uFEFF/, ""))).length - 1, 12 * 430);
   });
 
-  async function walkGroupFor(user, groupKey, start) {
+  async function walkGroupFor(userIds, groupKey, start) {
     const seen = [];
     let cursor = start ?? undefined;
     do {
-      const body = await ok("boss", withParam(entries(`groupBy=date&groupKey=${groupKey}&userIds=${user.id}&limit=500`), "cursor", cursor));
+      const body = await ok("boss", withParam(entries(`groupBy=user&groupKey=${groupKey}&userIds=${userIds}&limit=500`), "cursor", cursor));
       seen.push(...body.data);
       cursor = body.nextCursor ?? undefined;
     } while (cursor);
@@ -474,5 +513,41 @@ describe("channel list members", () => {
     const secret = await app.prisma.chatChannel.create({ data: { workspaceId: workspace.id, type: "PRIVATE", name: "secret", createdById: users.boss.id, members: { create: { userId: users.boss.id } } } });
     const again = await ok("me", `/api/chat/${workspace.id}/channels`);
     assert.ok(!again.data.some((c) => c.id === secret.id));
+  });
+
+  test("each preview reads at most ten members, also next to one large channel", async () => {
+    const suffix = crypto.randomUUID().slice(0, 8);
+    await app.prisma.user.createMany({ data: Array.from({ length: 600 }, (_, i) => ({ email: `bounded-large-${i}-${suffix}@example.test`, displayName: `large ${i}` })) });
+    const large = await app.prisma.user.findMany({ where: { email: { endsWith: `-${suffix}@example.test` } }, select: { id: true } });
+    createdUsers.push(...large.map((u) => u.id));
+    const big = await app.prisma.chatChannel.create({ data: { workspaceId: workspace.id, type: "PUBLIC", name: "everyone", createdById: users.boss.id } });
+    await app.prisma.chatChannelMember.createMany({ data: large.map((u, i) => ({ channelId: big.id, userId: u.id, joinedAt: at(600 - i) })) });
+    for (let i = 0; i < 40; i++) {
+      const small = await app.prisma.chatChannel.create({ data: { workspaceId: workspace.id, type: "PUBLIC", name: `small ${i}`, createdById: users.boss.id } });
+      await app.prisma.chatChannelMember.createMany({ data: large.slice(i * 2, i * 2 + 2).map((u) => ({ channelId: small.id, userId: u.id })) });
+    }
+    await app.prisma.$executeRawUnsafe('ANALYZE "ChatChannelMember"');
+
+    const events = (recorded = []);
+    const channels = await chat.listChannels(observer, workspace.id, users.me.id).finally(() => { recorded = null; });
+    const listed = channels.find((c) => c.id === big.id);
+    assert.equal(listed._count.members, 600);
+    const order = (await app.prisma.$queryRaw`
+      SELECT id FROM "ChatChannelMember" WHERE "channelId" = ${big.id} ORDER BY "joinedAt", id LIMIT 10`).map((r) => r.id);
+    assert.deepEqual(listed.members.map((m) => m.id), order);
+
+    // The preview statement, run again under EXPLAIN ANALYZE.
+    const preview = events.find((e) => e.query.includes("WITH RECURSIVE preview"));
+    assert.ok(preview, "preview statement");
+    const plan = await app.prisma.$queryRawUnsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${preview.query}`, ...JSON.parse(preview.params));
+    let memberRows = 0;
+    const walkPlan = (node) => {
+      if (node["Relation Name"] === "ChatChannelMember") {
+        memberRows += (node["Actual Rows"] + (node["Rows Removed by Filter"] ?? 0)) * node["Actual Loops"];
+      }
+      for (const child of node.Plans ?? []) walkPlan(child);
+    };
+    walkPlan(plan[0]["QUERY PLAN"][0].Plan);
+    assert.ok(memberRows <= 10 * channels.length, `read ${memberRows} member rows for ${channels.length} channels`);
   });
 });

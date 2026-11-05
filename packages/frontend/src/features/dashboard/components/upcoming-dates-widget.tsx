@@ -26,9 +26,10 @@ function formatDueDate(dateStr: string, todayStr: string): string {
 export function UpcomingDatesWidget({ workspaceId, onTaskClick }: UpcomingDatesWidgetProps) {
   const todayStr = formatDateISO(new Date());
   const weekEnd = addDaysISO(todayStr, 7);
-  // The server returns only open tasks due in the next week, page by page.
+  // The server returns only open tasks due in the next week, soonest first,
+  // page by page: later pages never hold an earlier date.
   const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage } =
-    useMyTasks(workspaceId, { dueAfter: todayStr, dueBefore: weekEnd, completed: false });
+    useMyTasks(workspaceId, { dueAfter: todayStr, dueBefore: weekEnd, completed: false, sort: "dueDate" });
 
   const upcoming = useMemo(() => {
     return tasks

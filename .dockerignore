@@ -5,9 +5,12 @@
 **/*.tsbuildinfo
 *.md
 LICENSE
-.env
-.env.*
+**/.env
+**/.env.*
+# Exceptions must be literal paths. One wildcard exception makes BuildKit walk
+# every excluded directory and re-admit matching files inside node_modules or dist.
 !.env.example
+!packages/backend/.env.example
 storage/
 packages/backend/storage/
 packages/backend/uploads/

@@ -24,6 +24,7 @@
     "overrides": {
       "@fastify/multipart@9.4.0>@fastify/busboy": "3.2.2",
       "@prisma/config@6.19.3>deepmerge-ts": "8.0.2",
+      "readdir-glob@3.0.0>minimatch": "11.0.4",
       "@tiptap/core": "3.31.3",
       "@tiptap/pm": "3.31.3",
       "@tiptap/extensions": "3.31.3",

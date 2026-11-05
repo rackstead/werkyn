@@ -2,11 +2,12 @@ import {
   hasShareGrant,
   updateShareRevision,
 } from "../../utils/share-grants.js";
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import type { StorageProvider } from "../../services/storage.js";
 import type { FastifyInstance } from "fastify";
 import crypto from "crypto";
 import { hashPassword, verifyPassword } from "../../utils/passwords.js";
+import { logger } from "../../utils/logger.js";
 import {
   NotFoundError,
   ForbiddenError,
@@ -298,6 +299,29 @@ export async function listSharedByMe(
 
 // ─── Public Share Links ─────────────────────────────────
 
+// New links get 32 CSPRNG bytes (256 bits) as 43 URL-safe characters. Links
+// issued earlier keep their shorter tokens and are looked up the same way.
+const SHARE_LINK_TOKEN_BYTES = 32;
+const SHARE_LINK_CREATE_ATTEMPTS = 3;
+
+function newShareLinkToken(): string {
+  return crypto.randomBytes(SHARE_LINK_TOKEN_BYTES).toString("base64url");
+}
+
+/** Only a duplicate FileShareLink.token earns a fresh draw. */
+function isShareLinkTokenCollision(error: unknown): boolean {
+  if (
+    !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+    error.code !== "P2002" ||
+    error.meta?.modelName !== "FileShareLink"
+  )
+    return false;
+  const target = error.meta?.target;
+  return Array.isArray(target)
+    ? target.length === 1 && target[0] === "token"
+    : target === "FileShareLink_token_key";
+}
+
 export async function createFileShareLink(
   prisma: PrismaClient,
   workspaceId: string,
@@ -311,36 +335,54 @@ export async function createFileShareLink(
     await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
   }
 
-  const token = crypto.randomBytes(6).toString("base64url");
+  // Hashed once: a token retry must not repeat the password KDF.
   const passwordHash = password ? await hashPassword(password) : undefined;
 
   const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
 
-  return prisma.fileShareLink.create({
-    data: {
-      workspaceId,
-      token,
-      passwordHash,
-      expiresAt: expiresAt ? new Date(expiresAt) : undefined,
-      createdById,
-      files: {
-        create: fileIds.map((fileId) => ({ fileId })),
-      },
-    },
-    include: {
-      files: {
-        where: { file: { AND: [readable], trashedAt: null } },
-        include: {
-          file: {
-            select: { id: true, name: true, mimeType: true, size: true },
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // One nested write: the link and its file rows commit or roll back
+      // together, so a failed attempt leaves nothing behind.
+      return await prisma.fileShareLink.create({
+        data: {
+          workspaceId,
+          token: newShareLinkToken(),
+          passwordHash,
+          expiresAt: expiresAt ? new Date(expiresAt) : undefined,
+          createdById,
+          files: {
+            create: fileIds.map((fileId) => ({ fileId })),
           },
         },
-      },
-      createdBy: {
-        select: { id: true, displayName: true, avatarUrl: true },
-      },
-    },
-  });
+        include: {
+          files: {
+            where: { file: { AND: [readable], trashedAt: null } },
+            include: {
+              file: {
+                select: { id: true, name: true, mimeType: true, size: true },
+              },
+            },
+          },
+          createdBy: {
+            select: { id: true, displayName: true, avatarUrl: true },
+          },
+        },
+      });
+    } catch (error) {
+      if (!isShareLinkTokenCollision(error)) throw error;
+      if (attempt >= SHARE_LINK_CREATE_ATTEMPTS) {
+        // Repeated 256-bit collisions mean the random source is broken.
+        logger.error(
+          { event: "file_share_link_token_exhausted", attempts: attempt },
+          "Share link token collided on every attempt",
+        );
+        throw new ConflictError(
+          "Could not create a unique share link; please try again",
+        );
+      }
+    }
+  }
 }
 
 export async function getFileShareLinks(

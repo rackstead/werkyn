@@ -389,3 +389,116 @@ export function manyScanJpeg(width, height, bands = 63, steps = 13) {
   parts.push(Buffer.from([0xff, 0xd9]));
   return Buffer.concat(parts);
 }
+
+/**
+ * An AVIF assembled from `metas`, each { pitms, items: [{ id, type, data,
+ * hidden }], properties: [box], associations: [[id, [byte]]], references },
+ * with every item's data in one mdat after them. Used to build files whose
+ * structure a parser and libheif could read differently.
+ */
+export function assembleAvif(metas) {
+  const datas = [...new Set(metas.flatMap((m) => m.items.map((item) => item.data)))];
+  const build = (offsets) => metas.map((m) => {
+    const iloc = Buffer.concat([Buffer.from([0x44, 0x00]), u16(m.items.length),
+      ...m.items.map((item) => Buffer.concat([u16(item.id, 0, 0, 1), u32(offsets.get(item.data) ?? 0, item.data.length)]))]);
+    const ipma = fullBox("ipma", 0, 0, u32(m.associations.length),
+      ...m.associations.map(([id, assoc]) => Buffer.concat([u16(id), Buffer.from([assoc.length, ...assoc])])));
+    return fullBox("meta", 0, 0,
+      fullBox("hdlr", 0, 0, u32(0), Buffer.from("pict"), u32(0, 0, 0), Buffer.from([0])),
+      ...(m.pitms ?? [1]).map((id) => fullBox("pitm", 0, 0, u16(id))),
+      fullBox("iloc", 1, 0, iloc),
+      fullBox("iinf", 0, 0, u16(m.items.length),
+        ...m.items.map((item) => fullBox("infe", 2, item.hidden ? 1 : 0, u16(item.id, 0), Buffer.from(item.type, "latin1"), Buffer.from([0])))),
+      ...(m.references ? [m.references] : []),
+      box("iprp", box("ipco", ...m.properties), ipma));
+  });
+  const ftyp = box("ftyp", Buffer.from("avif"), u32(0), Buffer.from("avifmif1miaf"));
+  let at = ftyp.length + Buffer.concat(build(new Map())).length + 8;
+  const offsets = new Map();
+  for (const data of datas) { offsets.set(data, at); at += data.length; }
+  return Buffer.concat([ftyp, ...build(offsets), box("mdat", ...datas)]);
+}
+
+const ispeBox = (w, h) => fullBox("ispe", 0, 0, u32(w, h));
+const alphaAuxC = () => fullBox("auxC", 0, 0, Buffer.from("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0", "latin1"));
+const auxl = (from, to) => fullBox("iref", 0, 0, box("auxl", u16(from, 1, to)));
+
+/**
+ * AVIF structures that a lenient parser and libheif read differently,
+ * built from `big` (the 10000 x 10000 fixture) and `small` (a small AVIF
+ * made by sharp). `big` is never what the parser should take as harmless.
+ */
+export function avifStructureCases(big, small) {
+  const b = avifParts(big), s = avifParts(small);
+  const plain = (parts, extra = [], assoc = []) => ({
+    items: [{ id: 1, type: "av01", data: parts.coded }],
+    properties: [parts.av1C, ispeBox(parts.width, parts.height), parts.pixi, ...extra],
+    associations: [[1, [0x81, 0x02, 0x03, ...assoc]]],
+  });
+  const withAlpha = (alphaProperties, alphaAssoc) => ({
+    items: [{ id: 1, type: "av01", data: s.coded }, { id: 2, type: "av01", data: b.coded, hidden: true }],
+    properties: [s.av1C, ispeBox(s.width, s.height), s.pixi, b.av1C, alphaAuxC(), ...alphaProperties],
+    associations: [[1, [0x81, 0x02, 0x03]], [2, alphaAssoc]],
+    references: auxl(2, 1),
+  });
+  const cropped = plain(b, [box("clap", u32(s.width, 1, s.height, 1, 0, 1, 0, 1))], [0x84]);
+  return {
+    // libheif decodes the last meta box; a parser reading the first sees the small image.
+    twoMetaSmallFirst: assembleAvif([plain(s), cropped]),
+    twoMetaBigFirst: assembleAvif([cropped, plain(s)]),
+    // An alpha plane whose coded size has no ispe, or an understated one.
+    alphaWithoutIspe: assembleAvif([withAlpha([], [0x84, 0x85])]),
+    alphaIspeUnderstated: assembleAvif([withAlpha([ispeBox(s.width, s.height)], [0x84, 0x85, 0x86])]),
+    alphaIspeTrue: assembleAvif([withAlpha([ispeBox(b.width, b.height)], [0x84, 0x85, 0x86])]),
+    // The primary with no ispe, or two.
+    primaryWithoutIspe: assembleAvif([{ ...plain(b), associations: [[1, [0x81, 0x03]]] }]),
+    primaryTwoIspe: assembleAvif([{ ...plain(b, [ispeBox(s.width, s.height)], [0x84]) }]),
+    // Two pitm boxes, and an item ID used twice.
+    twoPitm: assembleAvif([{ ...plain(s), pitms: [1, 1] }]),
+    duplicateItem: assembleAvif([{ ...plain(s), items: [{ id: 1, type: "av01", data: s.coded }, { id: 1, type: "av01", data: b.coded }] }]),
+    // A second, unrelated av01 item (for example a thumbnail or a depth map).
+    extraImage: assembleAvif([{
+      items: [{ id: 1, type: "av01", data: s.coded }, { id: 2, type: "av01", data: b.coded }],
+      properties: [s.av1C, ispeBox(s.width, s.height), s.pixi, b.av1C, ispeBox(b.width, b.height)],
+      associations: [[1, [0x81, 0x02, 0x03]], [2, [0x84, 0x85]]],
+    }]),
+    // Controls rebuilt the same way: a plain image and a crop.
+    plainSmall: assembleAvif([plain(s)]),
+    croppedBig: assembleAvif([cropped]),
+  };
+}
+
+/**
+ * `jpeg` (with more than 100 scans) with bytes inserted before its 100th
+ * scan that libjpeg skips with a warning: one stray byte, or a TEM marker
+ * followed by one.
+ */
+export function jpegWithJunkBeforeScan(jpeg, scan, junk) {
+  let seen = 0;
+  for (let at = jpeg.indexOf(Buffer.from([0xff, 0xda])); at !== -1; at = jpeg.indexOf(Buffer.from([0xff, 0xda]), at + 2)) {
+    if (++seen === scan) return Buffer.concat([jpeg.subarray(0, at), junk, jpeg.subarray(at)]);
+  }
+  throw new Error("scan not found");
+}
+
+/**
+ * An animated WebP of two `width` x `height` frames with a 64-level alpha
+ * gradient, lossy with lossless alpha: each frame is decoded and blended at
+ * full size.
+ */
+export function alphaAnimationWebp(width, height) {
+  const frame = (shift) => {
+    const row = Buffer.alloc(width * 4);
+    for (let x = 0; x < width; x++) {
+      const c = (Math.floor((x * 32) / width) + shift) % 32;
+      row[x * 4] = (c * 37) & 255; row[x * 4 + 1] = (c * 91) & 255; row[x * 4 + 2] = (c * 13 + 7) & 255;
+      row[x * 4 + 3] = (Math.floor((x * 64) / width) * 4 + 3) & 255;
+    }
+    const raw = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y++) row.copy(raw, y * width * 4);
+    return raw;
+  };
+  return sharp(Buffer.concat([frame(0), frame(9)]), { raw: { width, height: height * 2, channels: 4, pageHeight: height } })
+    .webp({ quality: 50, alphaQuality: 100, effort: 0 })
+    .toBuffer();
+}

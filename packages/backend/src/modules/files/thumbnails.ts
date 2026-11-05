@@ -173,10 +173,11 @@ export function estimateDecodeBytes(
       // Frames are drawn onto an RGBA canvas of the whole image.
       return pixels * 7;
     case "webp":
-      // libvips composites animation frames onto a full RGBA canvas;
-      // libwebp decodes lossless (VP8L) images whole as 32-bit ARGB, and
-      // alpha at full size. Plain lossy VP8 decodes scaled.
-      return pixels * (hints.webpAnimated ? 6.5 : hints.webpFullCanvas ? 5.5 : 2);
+      // libvips composites animation frames onto a full RGBA canvas, and a
+      // frame with alpha is decoded and blended at full size too; libwebp
+      // decodes lossless (VP8L) images whole as 32-bit ARGB, and alpha at
+      // full size. Plain lossy VP8 decodes scaled.
+      return pixels * (hints.webpAnimated ? 12.5 : hints.webpFullCanvas ? 5.5 : 2);
     case "heif":
       // AV1 frame buffers, then RGB(A) copies in libheif and libvips.
       return pixels * 16 + bytes * 2;
@@ -228,67 +229,190 @@ function* isoBoxes(buffer: Buffer, start: number, end: number, budget: { left: n
   }
 }
 
-/** Derived image items, whose output libheif composes from other items. */
-const DERIVED_ITEMS = new Set(["grid", "iovl", "iden"]);
+/** The AVIF structures that get a thumbnail: anything else gets none. */
+const AVIF_TOP_BOXES = new Set(["ftyp", "meta", "mdat", "free", "skip"]);
+const AVIF_META_BOXES = new Set(["hdlr", "pitm", "iloc", "iinf", "iref", "iprp", "idat", "dinf"]);
+const AVIF_REQUIRED_META_BOXES = ["hdlr", "pitm", "iloc", "iinf", "iprp"];
+const AVIF_ITEM_TYPES = new Set(["av01", "Exif", "mime"]);
+const AVIF_REFERENCES = new Set(["auxl", "cdsc"]);
+const AVIF_ALPHA_URNS = new Set([
+  "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
+  "urn:mpeg:hevc:2015:auxid:1",
+]);
+
+export type AvifCheck = { codedPixels: number } | { refused: string };
+
+class AvifRefusal extends Error {}
+const refuse = (reason: string): never => {
+  throw new AvifRefusal(reason);
+};
+
+/** Child boxes by type; refuses types outside `allowed` and repeats of any. */
+function uniqueChildren(
+  buffer: Buffer,
+  start: number,
+  end: number,
+  budget: { left: number },
+  allowed: ReadonlySet<string>,
+  repeatable: ReadonlySet<string> = new Set(),
+): Map<string, Box[]> {
+  const found = new Map<string, Box[]>();
+  for (const box of isoBoxes(buffer, start, end, budget)) {
+    if (!allowed.has(box.type)) refuse(`${box.type} box`);
+    const list = found.get(box.type) ?? [];
+    if (list.length && !repeatable.has(box.type)) refuse(`more than one ${box.type} box`);
+    list.push(box);
+    found.set(box.type, list);
+  }
+  return found;
+}
 
 /**
- * The AVIF item structure that decides what libheif decodes: the primary
- * item's type, any derived (grid, overlay or identity) items, and the
- * largest coded image size (`ispe`) of any item. libvips reports the size
- * after `clap` cropping, but the whole coded image is decoded; libheif
- * refuses an image whose coded size differs from its `ispe`. Null when the
- * structure cannot be read.
+ * Whether an AVIF has the one simple shape thumbnails decode, and its coded
+ * size. Rather than model what libheif would decode, only this shape is
+ * accepted:
+ * - one `ftyp` (first) and one `meta`, with only `mdat`/`free`/`skip`
+ *   beside them;
+ * - in `meta`, one each of `hdlr` (`pict`), `pitm`, `iloc`, `iinf` and
+ *   `iprp` (one `ipco` and one `ipma`), and at most one `iref`, `idat` and
+ *   `dinf`;
+ * - items of type `av01`, `Exif` or `mime` only, with unique IDs, and only
+ *   `auxl` and `cdsc` references;
+ * - a primary `av01` item and at most one other `av01` item, its alpha
+ *   plane: an `auxl` reference to the primary with an alpha `auxC`;
+ * - exactly one associated `ispe` on each `av01` item, the alpha's equal to
+ *   the primary's.
+ *
+ * libheif decodes the whole coded image (`ispe`) even when a `clap` crop
+ * makes it report a smaller size, and refuses an image whose coded size
+ * differs from its `ispe`, so the primary's `ispe` is what is decoded.
  */
-export function avifStructure(
-  buffer: Buffer,
-): { primaryType: string; derived: string[]; maxCodedPixels: number } | null {
+export function checkAvif(buffer: Buffer): AvifCheck {
   try {
     const budget = { left: MAX_CONTAINER_ENTRIES };
-    let meta: Box | undefined;
-    for (const box of isoBoxes(buffer, 0, buffer.length, budget)) {
-      if (box.type === "meta") {
-        meta = box;
-        break;
-      }
-    }
-    if (!meta) return null;
-    let primary: number | undefined;
-    const types = new Map<number, string>();
-    let maxCodedPixels = 0;
-    for (const box of isoBoxes(buffer, meta.body + 4, meta.end, budget)) {
-      if (box.type === "pitm" && box.end - box.body >= 6) {
-        primary = buffer[box.body] === 0 ? buffer.readUInt16BE(box.body + 4) : buffer.readUInt32BE(box.body + 4);
-      } else if (box.type === "iinf" && box.end - box.body >= 6) {
-        const first = box.body + 4 + (buffer[box.body] === 0 ? 2 : 4);
-        for (const infe of isoBoxes(buffer, first, box.end, budget)) {
-          const version = buffer[infe.body];
-          if (infe.type !== "infe" || version < 2) continue;
-          const idBytes = version === 2 ? 2 : 4;
-          const typeAt = infe.body + 4 + idBytes + 2;
-          if (typeAt + 4 > infe.end) return null;
-          const id = idBytes === 2 ? buffer.readUInt16BE(infe.body + 4) : buffer.readUInt32BE(infe.body + 4);
-          types.set(id, buffer.toString("latin1", typeAt, typeAt + 4));
-        }
-      } else if (box.type === "iprp") {
-        for (const container of isoBoxes(buffer, box.body, box.end, budget)) {
-          if (container.type !== "ipco") continue;
-          for (const property of isoBoxes(buffer, container.body, container.end, budget)) {
-            if (property.type !== "ispe") continue;
-            if (property.end - property.body < 12) return null;
-            const pixels = buffer.readUInt32BE(property.body + 4) * buffer.readUInt32BE(property.body + 8);
-            maxCodedPixels = Math.max(maxCodedPixels, pixels);
-          }
-        }
-      }
-    }
-    if (primary === undefined || maxCodedPixels === 0) return null;
-    return {
-      primaryType: types.get(primary) ?? "unknown",
-      derived: [...types.values()].filter((type) => DERIVED_ITEMS.has(type)),
-      maxCodedPixels,
+    const top = uniqueChildren(buffer, 0, buffer.length, budget, AVIF_TOP_BOXES, new Set(["mdat", "free", "skip"]));
+    if (buffer.toString("latin1", 4, 8) !== "ftyp" || !top.has("meta")) refuse("no ftyp and meta");
+    const meta = top.get("meta")![0];
+    const boxes = uniqueChildren(buffer, meta.body + 4, meta.end, budget, AVIF_META_BOXES);
+    for (const required of AVIF_REQUIRED_META_BOXES) if (!boxes.has(required)) refuse(`no ${required} box`);
+    const one = (type: string) => boxes.get(type)![0];
+    const fits = (box: Box, at: number, bytes: number) => {
+      if (at + bytes > box.end) refuse(`short ${box.type} box`);
+      return at;
     };
-  } catch {
-    return null;
+
+    const hdlr = one("hdlr");
+    if (buffer.toString("latin1", fits(hdlr, hdlr.body + 8, 4), hdlr.body + 12) !== "pict") refuse("hdlr not pict");
+
+    const pitm = one("pitm");
+    const primary = buffer[pitm.body] === 0
+      ? buffer.readUInt16BE(fits(pitm, pitm.body + 4, 2))
+      : buffer.readUInt32BE(fits(pitm, pitm.body + 4, 4));
+
+    // Items and their types.
+    const iinf = one("iinf");
+    const countBytes = buffer[iinf.body] === 0 ? 2 : 4;
+    const declared = countBytes === 2
+      ? buffer.readUInt16BE(fits(iinf, iinf.body + 4, 2))
+      : buffer.readUInt32BE(fits(iinf, iinf.body + 4, 4));
+    const types = new Map<number, string>();
+    for (const infe of isoBoxes(buffer, iinf.body + 4 + countBytes, iinf.end, budget)) {
+      const version = buffer[fits(infe, infe.body, 1)];
+      if (infe.type !== "infe" || version < 2) refuse("item entry");
+      const idBytes = version === 2 ? 2 : 4;
+      const typeAt = fits(infe, infe.body + 4 + idBytes + 2, 4);
+      const id = idBytes === 2 ? buffer.readUInt16BE(infe.body + 4) : buffer.readUInt32BE(infe.body + 4);
+      const type = buffer.toString("latin1", typeAt, typeAt + 4);
+      if (types.has(id)) refuse(`item ${id} twice`);
+      if (!AVIF_ITEM_TYPES.has(type)) refuse(`${type} item`);
+      types.set(id, type);
+    }
+    if (types.size !== declared) refuse("item count");
+    if (types.get(primary) !== "av01") refuse(`primary ${types.get(primary) ?? "missing"}`);
+
+    // Properties and their associations.
+    const iprp = uniqueChildren(buffer, one("iprp").body, one("iprp").end, budget, new Set(["ipco", "ipma"]));
+    if (!iprp.has("ipco") || !iprp.has("ipma")) refuse("no ipco and ipma");
+    const ipco = iprp.get("ipco")![0];
+    const properties = [...isoBoxes(buffer, ipco.body, ipco.end, budget)];
+    const ipma = iprp.get("ipma")![0];
+    const wideIds = buffer[fits(ipma, ipma.body, 4)] !== 0;
+    const wideIndexes = (buffer.readUInt32BE(ipma.body) & 1) === 1;
+    const associated = new Map<number, Box[]>();
+    let at = ipma.body + 4;
+    const entries = buffer.readUInt32BE(fits(ipma, at, 4));
+    at += 4;
+    for (let entry = 0; entry < entries; entry++) {
+      if (--budget.left < 0) refuse("too many associations");
+      const id = wideIds ? buffer.readUInt32BE(fits(ipma, at, 4)) : buffer.readUInt16BE(fits(ipma, at, 2));
+      at += wideIds ? 4 : 2;
+      if (associated.has(id)) refuse(`item ${id} associated twice`);
+      const count = buffer[fits(ipma, at, 1)];
+      at += 1;
+      const list: Box[] = [];
+      for (let k = 0; k < count; k++) {
+        const raw = wideIndexes ? buffer.readUInt16BE(fits(ipma, at, 2)) : buffer[fits(ipma, at, 1)];
+        at += wideIndexes ? 2 : 1;
+        const index = raw & (wideIndexes ? 0x7fff : 0x7f);
+        if (index === 0) continue;
+        if (index > properties.length) refuse("property index");
+        list.push(properties[index - 1]);
+      }
+      associated.set(id, list);
+    }
+    const codedSize = (id: number) => {
+      const ispes = (associated.get(id) ?? []).filter((box) => box.type === "ispe");
+      if (ispes.length !== 1) refuse(`item ${id} with ${ispes.length} ispe`);
+      const ispe = fits(ispes[0], ispes[0].body + 4, 8);
+      return [buffer.readUInt32BE(ispe), buffer.readUInt32BE(ispe + 4)];
+    };
+
+    // References: auxl (alpha) and cdsc (metadata) only.
+    const auxiliaryOf = new Map<number, number[]>();
+    if (boxes.has("iref")) {
+      const iref = one("iref");
+      const wide = buffer[fits(iref, iref.body, 1)] !== 0;
+      const idBytes = wide ? 4 : 2;
+      const readId = (offset: number) => (wide ? buffer.readUInt32BE(offset) : buffer.readUInt16BE(offset));
+      for (const reference of isoBoxes(buffer, iref.body + 4, iref.end, budget)) {
+        if (!AVIF_REFERENCES.has(reference.type)) refuse(`${reference.type} reference`);
+        const from = readId(fits(reference, reference.body, idBytes));
+        const count = buffer.readUInt16BE(fits(reference, reference.body + idBytes, 2));
+        const targets: number[] = [];
+        for (let k = 0; k < count; k++) {
+          targets.push(readId(fits(reference, reference.body + idBytes + 2 + k * idBytes, idBytes)));
+        }
+        if (reference.type === "auxl") {
+          if (auxiliaryOf.has(from)) refuse(`item ${from} auxiliary twice`);
+          auxiliaryOf.set(from, targets);
+        }
+      }
+    }
+
+    // The primary, and at most one alpha plane of the same coded size.
+    const [width, height] = codedSize(primary);
+    let alphaPlanes = 0;
+    for (const [id, type] of types) {
+      if (auxiliaryOf.has(id) && type !== "av01") refuse(`${type} item ${id} is auxiliary`);
+      if (type !== "av01" || id === primary) continue;
+      const targets = auxiliaryOf.get(id);
+      if (!targets || targets.length !== 1 || targets[0] !== primary) refuse(`av01 item ${id} is not the primary's alpha`);
+      const auxC = (associated.get(id) ?? []).filter((box) => box.type === "auxC");
+      if (auxC.length !== 1) refuse(`item ${id} without one auxC`);
+      const urnStart = fits(auxC[0], auxC[0].body + 4, 1);
+      const urnEnd = buffer.indexOf(0, urnStart);
+      if (urnEnd === -1 || urnEnd >= auxC[0].end || !AVIF_ALPHA_URNS.has(buffer.toString("latin1", urnStart, urnEnd))) {
+        refuse(`item ${id} is not an alpha plane`);
+      }
+      const [alphaWidth, alphaHeight] = codedSize(id);
+      if (alphaWidth !== width || alphaHeight !== height) refuse("alpha size differs");
+      if (++alphaPlanes > 1) refuse("more than one alpha plane");
+    }
+    if (auxiliaryOf.get(primary)) refuse("primary is auxiliary");
+    return { codedPixels: width * height };
+  } catch (err) {
+    if (err instanceof AvifRefusal) return { refused: err.message };
+    return { refused: "unreadable structure" };
   }
 }
 
@@ -332,36 +456,40 @@ export function webpFeatures(
 
 /**
  * Start-of-scan markers in a JPEG, counting no further than `stopAfter + 1`.
- * Entropy-coded data is skipped by searching for the next marker byte.
- * Infinity when the file has more markers or escaped bytes than are read.
+ * Infinity unless the marker walk reaches EOI cleanly: libjpeg skips a
+ * stray byte, a TEM or restart marker between segments with only a warning
+ * and decodes every scan after it, so a count that stopped there would not
+ * be what is decoded. Infinity too for a short segment, a file that ends
+ * first, or more markers or escaped bytes than are read.
  */
 export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return Infinity;
   let scans = 0;
   let pos = 2;
   let markers = 0;
   let escapes = 0;
-  while (pos + 4 <= buffer.length && buffer[pos] === 0xff) {
+  for (;;) {
+    if (pos + 2 > buffer.length || buffer[pos] !== 0xff) return Infinity;
     if (++markers > MAX_CONTAINER_ENTRIES) return Infinity;
     const marker = buffer[pos + 1];
     if (marker === 0xff) {
       pos++; // fill byte
       continue;
     }
-    if (marker === 0xd9) break;
-    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      pos += 2;
-      continue;
-    }
+    if (marker === 0xd9) return scans;
+    // Stuffing, TEM, restart markers and SOI belong nowhere between segments.
+    if (marker <= 0x01 || (marker >= 0xd0 && marker <= 0xd8)) return Infinity;
+    if (pos + 4 > buffer.length) return Infinity;
     const length = buffer.readUInt16BE(pos + 2);
-    if (length < 2) break;
+    if (length < 2) return Infinity;
     pos += 2 + length;
     if (marker !== 0xda) continue;
-    if (++scans > stopAfter) break;
+    if (++scans > stopAfter) return scans;
     // Skip entropy-coded data: stuffed 0xFF00 bytes and restart markers
     // belong to the scan; any other marker ends it.
     for (;;) {
       const at = buffer.indexOf(0xff, pos);
-      if (at === -1 || at + 1 >= buffer.length) return scans;
+      if (at === -1 || at + 1 >= buffer.length) return Infinity;
       if (++escapes > MAX_JPEG_ESCAPES) return Infinity;
       const next = buffer[at + 1];
       if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
@@ -374,7 +502,6 @@ export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
       }
     }
   }
-  return scans;
 }
 
 /** Concurrent transforms in one process. */
@@ -706,22 +833,18 @@ function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
   if (format === "jpeg") {
     const scans = jpegScanCount(source, THUMBNAIL_LIMITS.maxJpegScans);
     if (scans === Infinity) {
-      throw new Skip("unsupported", { format, reason: "too many markers to check" });
+      throw new Skip("unsupported", { format, reason: "marker structure not walked to EOI" });
     }
     if (scans > THUMBNAIL_LIMITS.maxJpegScans) {
       throw new Skip("over-budget", { format, reason: `more than ${THUMBNAIL_LIMITS.maxJpegScans} scans` });
     }
   } else if (format === "avif") {
-    const structure = avifStructure(source);
-    if (!structure) throw new Skip("unsupported", { format, reason: "unreadable item structure" });
-    if (structure.primaryType !== "av01" || structure.derived.length) {
-      const reason = `primary ${structure.primaryType}, derived ${structure.derived.join(",") || "none"}`;
-      throw new Skip("unsupported", { format, reason });
+    const avif = checkAvif(source);
+    if ("refused" in avif) throw new Skip("unsupported", { format, reason: avif.refused });
+    if (avif.codedPixels > THUMBNAIL_LIMITS.maxInputPixels) {
+      throw new Skip("over-budget", { format, reason: `coded ${avif.codedPixels} pixels` });
     }
-    if (structure.maxCodedPixels > THUMBNAIL_LIMITS.maxInputPixels) {
-      throw new Skip("over-budget", { format, reason: `coded ${structure.maxCodedPixels} pixels` });
-    }
-    return { codedPixels: structure.maxCodedPixels };
+    return { codedPixels: avif.codedPixels };
   } else if (format === "webp") {
     const features = webpFeatures(source);
     if (!features) throw new Skip("unsupported", { format, reason: "chunks overrun the file" });

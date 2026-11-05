@@ -9,8 +9,8 @@ import sharp from "sharp";
 import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
 import {
-  avif100Megapixels, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader, largeCanvasWebp,
-  manyScanJpeg, restructuredAvif, rgb16Png,
+  avif100Megapixels, avifStructureCases, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader,
+  jpegWithJunkBeforeScan, largeCanvasWebp, manyScanJpeg, restructuredAvif, rgb16Png,
 } from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
@@ -506,6 +506,8 @@ async function outcomeDelta(run) {
 
 test("disguised formats, polyglots and decompression bombs are stored unchanged without a thumbnail", async () => {
   const tiffBytes = await solid(800, 400, "#abcdef").tiff().toBuffer();
+  const avifCases = avifStructureCases(avif100Megapixels, await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer());
+  const scanBomb = manyScanJpeg(64, 64);
   for (const [name, type, bytes, outcome] of [
     ["scan.png", "image/png", tiffBytes, "unsupported"],
     ["scan.tiff", "image/tiff", tiffBytes, "unsupported"],
@@ -519,7 +521,12 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
     ["grid.avif", "image/avif", restructuredAvif(avif100Megapixels, "grid", 64, 64), "unsupported"],
     ["overlay.avif", "image/avif", restructuredAvif(avif100Megapixels, "overlay", 64, 64), "unsupported"],
     ["canvas.webp", "image/webp", await largeCanvasWebp(16383, 16383), "over-budget"],
-    ["scans.jpg", "image/jpeg", manyScanJpeg(64, 64), "over-budget"],
+    ["scans.jpg", "image/jpeg", scanBomb, "over-budget"],
+    // Read differently by a lenient parser and libheif or libjpeg.
+    ["two-meta.avif", "image/avif", avifCases.twoMetaSmallFirst, "unsupported"],
+    ["hidden-alpha.avif", "image/avif", avifCases.alphaWithoutIspe, "unsupported"],
+    ["stray-byte.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0xfe, 0x00, 0x02, 0x00])), "unsupported"],
+    ["tem.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0x01, 0x00])), "unsupported"],
   ]) {
     const rss = process.memoryUsage().rss;
     const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));

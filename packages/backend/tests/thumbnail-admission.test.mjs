@@ -6,7 +6,7 @@ import sharp from "sharp";
 import {
   THUMBNAIL_LIMITS,
   TransformAdmission,
-  avifStructure,
+  checkAvif,
   bufferSource,
   createThumbnail,
   defaultAdmissionLimits,
@@ -25,6 +25,9 @@ import {
   cmykJpeg,
   gifSvgPolyglot,
   isoHeader,
+  alphaAnimationWebp,
+  avifStructureCases,
+  jpegWithJunkBeforeScan,
   largeCanvasWebp,
   manyScanJpeg,
   restructuredAvif,
@@ -198,8 +201,8 @@ test("decoder memory is estimated from the header and bounded per transform", ()
   assert.ok(estimateDecodeBytes(meta("webp", 16383, 16383)) > budget, "lossy WebP at 2 B/px");
   assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true }) <= budget);
   assert.ok(estimateDecodeBytes(meta("webp", 8700, 8700), { webpFullCanvas: true }) > budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 7800, 7800), { webpFullCanvas: true, webpAnimated: true }) <= budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true, webpAnimated: true }) > budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 5675, 5675), { webpFullCanvas: true, webpAnimated: true }) <= budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 5700, 5700), { webpFullCanvas: true, webpAnimated: true }) > budget);
   assert.ok(estimateDecodeBytes(meta("webp", 1, 1), { codedPixels: 16383 * 16383, webpFullCanvas: true, webpAnimated: true }) > budget);
   for (const m of [meta("svg", 1, 1), meta("tiff", 1, 1), meta("png", 0, 1), meta("png", 1, 1, { depth: "double" }), {}]) {
     assert.equal(estimateDecodeBytes(m), Infinity, JSON.stringify(m));
@@ -279,16 +282,13 @@ test("AVIF is charged for its coded size; crops cannot hide it and grids and ove
     const bytes = restructuredAvif(small, layout, 16, 8);
     const meta = await sharp(bytes).metadata();
     assert.deepEqual([meta.width, meta.height], layout === "plain" ? [64, 32] : [16, 8], layout);
-    assert.deepEqual(avifStructure(bytes), {
-      primaryType: layout === "grid" ? "grid" : layout === "overlay" ? "iovl" : "av01",
-      derived: layout === "grid" ? ["grid"] : layout === "overlay" ? ["iovl"] : [],
-      maxCodedPixels: 64 * 32,
-    }, layout);
+    assert.deepEqual(checkAvif(bytes), layout === "grid" ? { refused: "grid item" }
+      : layout === "overlay" ? { refused: "iovl item" } : { codedPixels: 64 * 32 }, layout);
   }
   for (const layout of ["plain", "clap"]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(restructuredAvif(small, layout, 16, 8)))).delta, { created: 1 }, layout);
   }
-  assert.equal(avifStructure(Buffer.concat([isoHeader("avif"), Buffer.from("not a meta box")])), null);
+  assert.ok("refused" in checkAvif(Buffer.concat([isoHeader("avif"), Buffer.from("not a meta box")])));
 
   const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
   let nativeCalls = 0;
@@ -321,6 +321,54 @@ test("AVIF is charged for its coded size; crops cannot hide it and grids and ove
   assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
 });
 
+test("AVIF outside the one simple shape gets no thumbnail, whatever libheif would decode", async (t) => {
+  const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
+  const cases = avifStructureCases(avif100Megapixels, small);
+  // libheif decodes the last of two meta boxes, and an alpha plane without
+  // an ispe at its coded size: both 10000 x 10000 here, reported as 64 x 32.
+  for (const name of ["twoMetaSmallFirst", "alphaWithoutIspe"]) {
+    assert.deepEqual(await sharp(cases[name]).metadata().then((m) => [m.width, m.height]), [64, 32], name);
+  }
+  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
+  let nativeCalls = 0;
+  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
+  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
+  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
+  for (const [name, refused] of [
+    ["twoMetaSmallFirst", "more than one meta box"],
+    ["twoMetaBigFirst", "more than one meta box"],
+    ["alphaWithoutIspe", "item 2 with 0 ispe"],
+    ["alphaIspeTrue", "alpha size differs"],
+    ["primaryWithoutIspe", "item 1 with 0 ispe"],
+    ["primaryTwoIspe", "item 1 with 2 ispe"],
+    ["twoPitm", "more than one pitm box"],
+    ["duplicateItem", "item 1 twice"],
+    ["extraImage", "av01 item 2 is not the primary's alpha"],
+  ]) {
+    assert.deepEqual(checkAvif(cases[name]), { refused }, name);
+    nativeCalls = 0;
+    const rss = process.memoryUsage().rss;
+    assert.deepEqual((await outcomes(() => thumbnailOf(cases[name]))).delta, { unsupported: 1 }, name);
+    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
+    assert.ok(process.memoryUsage().rss - rss < 64 * MiB, name);
+  }
+  // An alpha ispe that understates the coded size passes the shape check;
+  // libheif then refuses it before decoding, as it does for the primary.
+  const rss = process.memoryUsage().rss, started = performance.now();
+  assert.deepEqual(checkAvif(cases.alphaIspeUnderstated), { codedPixels: 64 * 32 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(cases.alphaIspeUnderstated))).delta, { failed: 1 });
+  assert.ok(performance.now() - started < 1000);
+  assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
+  // The simple shape, with or without alpha, is thumbnailed; a crop is charged its coded size.
+  assert.deepEqual((await outcomes(() => thumbnailOf(cases.plainSmall))).delta, { created: 1 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(cases.croppedBig))).delta, { "over-budget": 1 });
+  for (const [name, options] of [["8-bit", {}], ["10-bit", { bitdepth: 10 }]]) {
+    const rgba = await solid(64, 32, { r: 10, g: 20, b: 30, alpha: 0.5 }, 4).avif({ effort: 0, ...options }).toBuffer();
+    assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32 }, name);
+    assert.deepEqual((await outcomes(() => thumbnailOf(rgba))).delta, { created: 1 }, name);
+  }
+});
+
 test("WebP is charged for a full canvas when lossless, with alpha or animated", async () => {
   const cases = [
     ["lossy", await solid(64, 32).webp().toBuffer(), false],
@@ -349,6 +397,14 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   const withTrailing = Buffer.concat([lossy, trailing]);
   assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(withTrailing))).delta, { created: 1 });
+  // Animations are charged 12.5 B/px of canvas: frames with alpha are
+  // decoded and blended at full size (8.4-10.2 B/px measured).
+  const alphaAnimation = await alphaAnimationWebp(256, 128);
+  assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(alphaAnimation))).delta, { created: 1 });
+  const overCanvas = await largeCanvasWebp(5700, 5700), underCanvas = await largeCanvasWebp(4000, 4000);
+  assert.deepEqual((await outcomes(() => thumbnailOf(overCanvas))).delta, { "over-budget": 1 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(underCanvas))).delta, { created: 1 });
   // Lossless with more than 16 colours is not packed; it still gets a thumbnail at ordinary sizes.
   const stripes = await stripesWebp(2048, 1024, 32);
   assert.equal(webpFeatures(stripes).fullCanvas, true);
@@ -371,6 +427,26 @@ test("JPEGs with more scans than the limit are refused before decoding", async (
   const atLimit = manyScanJpeg(64, 64, 3, 10); // 1 + 3 x 3 x 11 = 100 scans
   assert.equal(jpegScanCount(atLimit, 10_000), 100);
   assert.deepEqual((await outcomes(() => thumbnailOf(bomb))).delta, { "over-budget": 1 });
+  // One stray byte, or a TEM marker and a byte, before scan 100: libjpeg
+  // skips them with a warning and decodes all 2,647 scans, so a walk that
+  // does not reach EOI cleanly refuses the file.
+  for (const [name, junk, count, outcome] of [
+    ["stray byte after a segment", [0xff, 0xfe, 0x00, 0x02, 0x00], Infinity, "unsupported"],
+    ["TEM marker and a byte", [0xff, 0x01, 0x00], Infinity, "unsupported"],
+    // Bytes right after entropy-coded data read as part of it, so every scan is counted.
+    ["stray byte after a scan", [0x00], THUMBNAIL_LIMITS.maxJpegScans + 1, "over-budget"],
+    ["stuffing after a scan", [0xff, 0x00], THUMBNAIL_LIMITS.maxJpegScans + 1, "over-budget"],
+  ]) {
+    const hidden = jpegWithJunkBeforeScan(bomb, 100, Buffer.from(junk));
+    assert.equal((await sharp(hidden, { failOn: "none" }).raw().toBuffer()).length, 64 * 64 * 3, name);
+    assert.equal(jpegScanCount(hidden, THUMBNAIL_LIMITS.maxJpegScans), count, name);
+    assert.deepEqual((await outcomes(() => thumbnailOf(hidden))).delta, { [outcome]: 1 }, name);
+  }
+  const truncated = progressive.subarray(0, progressive.length - 2);
+  assert.equal(jpegScanCount(truncated, 100), Infinity, "no EOI");
+  const trailing = Buffer.concat([progressive, Buffer.from("trailing data after EOI")]);
+  assert.equal(jpegScanCount(trailing, 100), scans);
+  assert.deepEqual((await outcomes(() => thumbnailOf(trailing))).delta, { created: 1 });
   assert.deepEqual((await outcomes(() => thumbnailOf(atLimit))).delta, { created: 1 });
   assert.deepEqual((await outcomes(() => thumbnailOf(progressive))).delta, { created: 1 });
 });
@@ -392,7 +468,7 @@ test("container checks stop after a bounded amount of work on crafted files", as
   Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]).copy(stuffed);
   for (let at = 6; at + 2 <= size; at += 2) stuffed[at] = 0xff;
   for (const [name, check, refused] of [
-    ["avif boxes", () => avifStructure(avif), null],
+    ["avif boxes", () => checkAvif(avif).refused, "unreadable structure"],
     ["webp chunks", () => webpFeatures(webp), null],
     ["jpeg segments", () => jpegScanCount(segments, 100), Infinity],
     ["jpeg stuffing", () => jpegScanCount(stuffed, 100), Infinity],

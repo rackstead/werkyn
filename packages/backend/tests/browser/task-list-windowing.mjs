@@ -95,6 +95,10 @@ const day = (offset) =>
 const taskTitle = (i, phrase) =>
   `Task ${String(i).padStart(5, "0")} ${phrase}`;
 
+// Records what the fixture has written so far, so a failure part-way
+// through setup is cleaned up too.
+const created = { userIds: [], workspaceId: null, projectId: null };
+
 async function createFixture(prisma) {
   const suffix = crypto.randomUUID().slice(0, 8);
   const password = "Task-list-browser-password";
@@ -107,6 +111,7 @@ async function createFixture(prisma) {
       emailVerified: true,
     },
   });
+  created.userIds.push(owner.id);
   const other = await prisma.user.create({
     data: {
       email: `list-other-${suffix}@fixture.invalid`,
@@ -115,6 +120,7 @@ async function createFixture(prisma) {
       emailVerified: true,
     },
   });
+  created.userIds.push(other.id);
   const workspace = await prisma.workspace.create({
     data: {
       name: "List window fixture",
@@ -127,6 +133,7 @@ async function createFixture(prisma) {
       },
     },
   });
+  created.workspaceId = workspace.id;
   const project = await prisma.project.create({
     data: {
       workspaceId: workspace.id,
@@ -134,6 +141,7 @@ async function createFixture(prisma) {
       members: { create: [{ userId: owner.id }, { userId: other.id }] },
     },
   });
+  created.projectId = project.id;
   const statusPlan = [
     { name: "To do", color: "#64748b", share: 0.4 },
     { name: "In progress", color: "#3b82f6", share: 0.25 },
@@ -1196,13 +1204,17 @@ try {
     await writeFile(process.env.TASK_LIST_REPORT, JSON.stringify(report, null, 2));
   await browser?.close();
   await vite?.close();
-  if (fixture) {
+  try {
     // Task status references are RESTRICT, so tasks go before the workspace.
-    await app.prisma.task.deleteMany({ where: { projectId: fixture.project.id } });
-    await app.prisma.workspace.delete({ where: { id: fixture.workspace.id } });
-    await app.prisma.user.deleteMany({
-      where: { id: { in: [fixture.owner.id, fixture.other.id] } },
-    });
+    if (created.projectId)
+      await app.prisma.task.deleteMany({ where: { projectId: created.projectId } });
+    if (created.workspaceId)
+      await app.prisma.workspace.deleteMany({ where: { id: created.workspaceId } });
+    if (created.userIds.length)
+      await app.prisma.user.deleteMany({ where: { id: { in: created.userIds } } });
+  } catch (error) {
+    process.exitCode = 1;
+    log("fixture cleanup failed", error);
   }
   await app?.close();
   await rm(scratch, { recursive: true, force: true });

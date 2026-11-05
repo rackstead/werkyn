@@ -14,7 +14,8 @@
 // TASK_LIST_TASKS  tasks in the fixture project (default 5000)
 // TASK_LIST_RUNS   measured runs, each in a fresh browser context (default 3)
 // TASK_LIST_STEPS  smoke steps to run, comma-separated (aria, scroll,
-//                  keyboard, selection, edit, realtime, collapse, board);
+//                  keyboard, selection, edit, realtime, collapse, anchor,
+//                  board);
 //                  all by default
 // TASK_LIST_REPORT path for the JSON report
 // TASK_LIST_SCREENSHOTS directory for screenshots taken during the smoke
@@ -771,12 +772,11 @@ async function smoke({ browser, origin, fixture, prisma }) {
       // the whole list.
       assert.equal(state.rowCount, total);
       assert(state.mountedTasks > 5 && state.mountedTasks < 80, `${state.mountedTasks} task rows mounted`);
-      assert.deepEqual(
-        state.indexes,
-        state.indexes.map((_, i) => state.indexes[0] + i),
-        "contiguous aria-rowindex at the top",
-      );
-      assert.equal(state.indexes[0], 2);
+      // The rows near the view, then the last row (always rendered, so
+      // Shift+Tab from below the table reaches it).
+      const near = state.indexes.slice(0, -1);
+      assert.deepEqual(near, near.map((_, i) => 2 + i), "contiguous aria-rowindex at the top");
+      assert.equal(state.indexes.at(-1), total, "last row rendered");
       assert.equal(state.inView[0].text.startsWith(bounds[0].status.name), true);
       const heights = [...new Set(state.taskRowHeights.map((h) => h.toFixed(2)))];
       pass("windowed rows and aria", {
@@ -924,7 +924,17 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await page.keyboard.press("Tab");
       active = await activeInfo(page);
       assert.equal(active.rowId, fixture.tasks[bounds[1].start].id);
-      pass("Tab across a status group header", { header: bounds[1].status.name });
+      // Tab from the header checkbox reaches the first row of the List (as
+      // with every row rendered), not the row that last had focus.
+      await page.getByRole("checkbox", { name: "Select all tasks" }).focus();
+      await page.keyboard.press("Tab");
+      active = await activeInfo(page);
+      assert(active.text.startsWith(bounds[0].status.name), `Tab from the header reached: ${active.text}`);
+      assert.equal(active.rowIndex, 2);
+      pass("Tab across a status group header and from the header row", {
+        header: bounds[1].status.name,
+        fromHeaderRow: active.rowIndex,
+      });
 
     }
     if (want("selection")) {
@@ -1087,8 +1097,151 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await waitFor(async () => (await listState(page)).rowCount === before, "expand");
       pass("collapse and expand a group", { groupSize });
     }
+    if (want("anchor")) {
+      // 8. A colleague's changes above the view (created, deleted, moved
+      // in) must not move the rows in view, and a click where the pointer
+      // rests must still hit the same task. Rows are found by title and
+      // positions come from the database, so this also runs on builds that
+      // render every row.
+      const statusOrder = fixture.statuses.map((s) => s.id);
+      const expectedIndex = async (taskId) => {
+        const tasks = await prisma.task.findMany({
+          where: { projectId: fixture.project.id, archived: false },
+          orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+          select: { id: true, statusId: true },
+        });
+        let index = 0;
+        for (const statusId of statusOrder) {
+          index++; // group header row
+          for (const task of tasks.filter((t) => t.statusId === statusId)) {
+            if (task.id === taskId) return index;
+            index++;
+          }
+        }
+        throw new Error(`task ${taskId} not in the List`);
+      };
+      // Index in the List of the rendered row with this title, and its top
+      // relative to <main>'s view.
+      const rowAt = (title) =>
+        page.evaluate((title) => {
+          const main = document.querySelector("main");
+          const rows = [...document.querySelector("table").tBodies[0].rows];
+          let domIndex = -1;
+          const row = rows.find((r) => {
+            if (!r.hasAttribute("aria-hidden")) domIndex++;
+            return r.cells[1]?.textContent === title;
+          });
+          if (!row) return null;
+          const aria = row.getAttribute("aria-rowindex");
+          return {
+            index: aria ? Number(aria) - 2 : domIndex,
+            top: row.getBoundingClientRect().top - main.getBoundingClientRect().top,
+          };
+        }, title);
+      const api = async (method, url, body) => {
+        const response = await fetch(`${fixture.apiOrigin}/api${url}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${fixture.otherToken}`,
+            ...(body ? { "content-type": "application/json" } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const text = await response.text();
+        assert(response.ok, `${method} ${url}: ${response.status} ${text}`);
+        return text ? JSON.parse(text) : null;
+      };
+      const [, inProgress, review, done] = fixture.statuses;
+      const doneTasks = fixture.tasks.filter((t) => t.statusId === done.id);
+      const reference = doneTasks[Math.floor(doneTasks.length * 0.6)];
+      // Earlier edits may have scrolled the table sideways; the checkbox
+      // column must be in view for the click below.
+      await page.evaluate(() => {
+        document.querySelector("main").scrollTop = 0;
+        document.querySelector("table").parentElement.scrollLeft = 0;
+      });
+      await frames(page, 3);
+      // Builds that render every row have no aria-rowindex to steer by.
+      const centred = await page.evaluate((title) => {
+        const row = [...document.querySelector("table").tBodies[0].rows].find(
+          (r) => r.cells[1]?.textContent === title,
+        );
+        row?.scrollIntoView({ block: "center" });
+        return !!row;
+      }, reference.title);
+      if (!centred) await scrollToRow(page, (await expectedIndex(reference.id)) + 2);
+      await frames(page, 6);
+      const start = await rowAt(reference.title);
+      assert(start, "reference row in view");
+      // Each change: wait until the List shows it (the reference row's index
+      // moved as the database says), then compare the reference row's place.
+      const shifts = {};
+      const settle = async (label) => {
+        const index = await expectedIndex(reference.id);
+        await waitFor(async () => (await rowAt(reference.title))?.index === index, label);
+        await frames(page, 6);
+        const now = await rowAt(reference.title);
+        shifts[label] = Math.round((now.top - start.top) * 100) / 100;
+      };
+      for (let i = 0; i < 3; i++)
+        await api("POST", `/projects/${fixture.project.id}/tasks`, {
+          title: `Colleague task above ${i}`,
+          statusId: review.id,
+        });
+      await settle("3 created above");
+      const progressTasks = await prisma.task.findMany({
+        where: { projectId: fixture.project.id, statusId: inProgress.id },
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+        select: { id: true },
+        take: 40,
+      });
+      await api("DELETE", `/tasks/${progressTasks[10].id}`);
+      await api("DELETE", `/tasks/${progressTasks[30].id}`);
+      await settle("2 deleted above");
+      await api("PATCH", `/tasks/${doneTasks.at(-1).id}/move`, { statusId: review.id, position: 0 });
+      await settle("1 moved in from below");
+      log("anchor shifts (from the starting place)", JSON.stringify(shifts));
+
+      // The pointer rests on the reference row's checkbox while a colleague
+      // adds tasks above; the click then lands on the same task.
+      const box = await page.evaluate((title) => {
+        const row = [...document.querySelector("table").tBodies[0].rows].find(
+          (r) => r.cells[1]?.textContent === title,
+        );
+        const b = row.cells[0].querySelector("input").getBoundingClientRect();
+        return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+      }, reference.title);
+      await page.mouse.move(box.x, box.y);
+      for (let i = 0; i < 3; i++)
+        await api("POST", `/projects/${fixture.project.id}/tasks`, {
+          title: `Colleague task before the click ${i}`,
+          statusId: inProgress.id,
+        });
+      await settle("3 created before the click");
+      const underPointer = () =>
+        page.evaluate(({ x, y }) => {
+          const el = document.elementFromPoint(x, y);
+          const row = el?.closest("tr");
+          return `${el?.tagName}:${el?.getAttribute("aria-label") ?? ""}|${row?.cells[1]?.textContent ?? ""}`;
+        }, box);
+      const pointerTarget = await underPointer();
+      await page.mouse.down();
+      await page.mouse.up();
+      await frames(page, 3);
+      const checked = await page.evaluate(() =>
+        [...document.querySelector("table").tBodies[0].rows]
+          .filter((r) => r.cells[0]?.querySelector("input")?.checked)
+          .map((r) => r.cells[1].textContent),
+      );
+      log("anchor click", JSON.stringify({ checked, pointerTarget, after: await underPointer() }));
+      await page.getByTitle("Clear selection").click().catch(() => {});
+      for (const [label, shift] of Object.entries(shifts))
+        assert(Math.abs(shift) <= 1, `rows in view moved ${shift}px after: ${label}`);
+      assert.deepEqual(checked, [reference.title], "click at the resting pointer hit the same task");
+      pass("changes above the view keep rows in view still", { shifts, clickedTask: checked });
+    }
     if (want("board")) {
-      // 8. The List has no drag-and-drop; the Board of the same project (not
+      // 9. The List has no drag-and-drop; the Board of the same project (not
       // windowed, unchanged here) still reorders by drag at this size.
       const opened = Date.now();
       await page.locator(`a[href$="/projects/${fixture.project.id}/board"]`).first().click();
@@ -1097,6 +1250,9 @@ async function smoke({ browser, origin, fixture, prisma }) {
       const [first, second, third] = fixture.tasks.slice(0, 3);
       await cardOf(first.title).waitFor({ timeout: 120_000 });
       const boardMs = Date.now() - opened;
+      // <main> keeps the List's scroll position; bring the cards into view.
+      await cardOf(first.title).scrollIntoViewIfNeeded();
+      await frames(page, 3);
       const from = await cardOf(first.title).boundingBox();
       const to = await cardOf(third.title).boundingBox();
       const move = page.waitForResponse(

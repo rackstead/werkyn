@@ -6,7 +6,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { after, before, test } from "node:test";
 import sharp from "sharp";
-import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
+import { fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
 import {
   avif100Megapixels, avifStructureCases, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader,
@@ -163,6 +163,7 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
     ]) {
       const file = await upload(name, mime, bytes);
       assert.equal(file.thumbnailPath, null, name);
+      assert.equal(state.dispatches, 0, `${name} never reaches a worker`);
       assert.equal(state.detectorCalls, 0, name);
       assert.equal(state.headerCalls, 0, name);
       assert.equal(state.nativeCalls, 0, name);
@@ -170,42 +171,40 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
   });
 });
 
-// Match production's ESM Sharp and core detector class, not the distinct CJS
-// Sharp constructor or the Node detector subclass. Arm both with PNG before
-// interpreting any zero count. Unsupported fixtures never reach native code.
+// Detection and decoding run in the decoder workers, which report how far
+// each file got: the detector, then libvips' header read, then the
+// transform. Count what the upload route dispatched to them, arming the
+// count with an ordinary PNG before interpreting any zero.
+const STAGES = ["read", "signature", "detector", "container", "header", "transform"];
 async function withDispatchSpies(run) {
-  const detector = FileTypeParser.prototype.fromBuffer;
-  const render = sharp.prototype.toBuffer;
-  const header = sharp.prototype.metadata;
-  const state = { detectorCalls: 0, headerCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
-  FileTypeParser.prototype.fromBuffer = async function (...args) {
-    state.detectorCalls++;
-    if (state.detectorMode === "throw") throw new Error("Owned detector failure");
-    if (state.detectorMode === "unknown") return undefined;
-    if (state.detectorMode === "disallowed") return { ext: "svg", mime: "image/svg+xml" };
-    return detector.apply(this, args);
+  const { thumbnailWorkers } = await import("../../src/modules/files/thumbnails.ts");
+  const dispatch = thumbnailWorkers.run;
+  const state = { dispatches: 0, detectorCalls: 0, headerCalls: 0, nativeCalls: 0, results: [] };
+  thumbnailWorkers.run = async function (...args) {
+    state.dispatches++;
+    const result = await dispatch.apply(this, args);
+    state.results.push(result);
+    const reached = STAGES.indexOf(result.details?.stage);
+    if (reached >= STAGES.indexOf("detector")) state.detectorCalls++;
+    if (reached >= STAGES.indexOf("header")) state.headerCalls++;
+    if (reached >= STAGES.indexOf("transform")) state.nativeCalls++;
+    return result;
   };
-  sharp.prototype.toBuffer = function () {
-    state.nativeCalls++;
-    if (state.nativeMode === "throw") return Promise.reject(new Error("Owned transform failure"));
-    return Promise.resolve(smallWebp);
-  };
-  sharp.prototype.metadata = function (...args) {
-    state.headerCalls++;
-    return header.apply(this, args);
+  const reset = () => {
+    state.dispatches = state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
+    state.results = [];
   };
   try {
     const control = await upload("dispatch-control.png", "image/jpeg", smallPng);
     assert.ok(control.thumbnailPath);
-    assert.equal(state.detectorCalls, 1, "Exact ESM detector spy must be armed");
-    assert.equal(state.headerCalls, 1, "Exact ESM header spy must be armed");
-    assert.equal(state.nativeCalls, 1, "Exact ESM transform spy must be armed");
-    state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
-    return await run(state);
+    assert.equal(state.dispatches, 1, "The worker dispatch spy must be armed");
+    assert.equal(state.detectorCalls, 1, "The worker must report the detector");
+    assert.equal(state.headerCalls, 1, "The worker must report the header read");
+    assert.equal(state.nativeCalls, 1, "The worker must report the transform");
+    reset();
+    return await run(state, reset);
   } finally {
-    FileTypeParser.prototype.fromBuffer = detector;
-    sharp.prototype.toBuffer = render;
-    sharp.prototype.metadata = header;
+    thumbnailWorkers.run = dispatch;
   }
 }
 
@@ -316,7 +315,7 @@ function pngChunk(type, data) {
 test("only the AVIF brand reaches detection and decoding; other HEIF brands and TIFF are stored without", async () => {
   // A real AVIF, and the same bytes with each other major brand.
   const avif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
-  await withDispatchSpies(async (state) => {
+  await withDispatchSpies(async (state, reset) => {
     const cases = [];
     for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
       const bytes = Buffer.from(avif);
@@ -330,12 +329,11 @@ test("only the AVIF brand reaches detection and decoding; other HEIF brands and 
       else { bytes.writeUInt16BE(version, 2); bytes.writeUInt32BE(8, 4); }
       cases.push([`${little ? "little" : "big"}-${version}`, bytes, false]);
     }
-    // The armed transform returns a known WebP.
     for (const [name, bytes, dispatched] of cases) {
-      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
+      reset();
       const file = await upload(`${name}.bin`, "image/heic", bytes);
       assert.equal(!!file.thumbnailPath, dispatched, name);
-      for (const calls of [state.detectorCalls, state.headerCalls, state.nativeCalls]) {
+      for (const calls of [state.dispatches, state.detectorCalls, state.headerCalls, state.nativeCalls]) {
         assert.equal(calls, dispatched ? 1 : 0, name);
       }
     }
@@ -343,7 +341,7 @@ test("only the AVIF brand reaches detection and decoding; other HEIF brands and 
 });
 
 test("ordinary ISO envelopes bound detector entry and preserve original uploads", async () => {
-  await withDispatchSpies(async (state) => {
+  await withDispatchSpies(async (state, reset) => {
     const header = (size, length = 24) => {
       const bytes = Buffer.alloc(length);
       bytes.writeUInt32BE(size);
@@ -353,20 +351,22 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
     // Plain headers reach the detector, then stop at the item-structure
     // check: they have no meta box, so nothing native reads them.
     for (const size of [16, 20, 24]) {
-      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
+      reset();
       assert.equal((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath, null);
       assert.equal(state.detectorCalls, 1);
       assert.equal(state.headerCalls, 0);
       assert.equal(state.nativeCalls, 0);
+      assert.equal(state.results[0].details.stage, "container");
     }
     const { THUMBNAIL_SOURCE_MAX_BYTES } = await import("../../src/modules/files/files.service.ts");
     for (const [size, length] of [
       [0, 24], [1, 24], [8, 24], [12, 24], [15, 24],
       [28, 24], [16, 12], [THUMBNAIL_SOURCE_MAX_BYTES + 4, 24],
     ]) {
-      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
+      reset();
       const file = await upload(`omitted-${size}-${length}.avif`, "image/avif", header(size, length));
       assert.equal(file.thumbnailPath, null);
+      assert.equal(state.dispatches, 0);
       assert.equal(state.detectorCalls, 0);
       assert.equal(state.headerCalls, 0);
       assert.equal(state.nativeCalls, 0);
@@ -374,21 +374,23 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
   });
 });
 
-test("detector refusal/failure and transform failure omit only the thumbnail", async () => {
-  await withDispatchSpies(async (state) => {
-    for (const mode of ["unknown", "disallowed", "throw"]) {
-      state.detectorMode = mode;
-      state.detectorCalls = state.nativeCalls = 0;
-      assert.equal((await upload(`${mode}.png`, "image/png", smallPng)).thumbnailPath, null);
-      assert.equal(state.detectorCalls, 1);
-      assert.equal(state.nativeCalls, 0);
-    }
-    state.detectorMode = "real";
-    state.nativeMode = "throw";
-    state.detectorCalls = state.nativeCalls = 0;
-    assert.equal((await upload("transform-failure.png", "image/png", smallPng)).thumbnailPath, null);
+test("detector refusal and transform failure omit only the thumbnail", async () => {
+  await withDispatchSpies(async (state, reset) => {
+    // JPEG-LS starts like JPEG; the detector names it image/jls.
+    const jpegLs = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xf7]), Buffer.alloc(40)]);
+    assert.equal((await upload("disallowed.jpg", "image/jpeg", jpegLs)).thumbnailPath, null);
+    assert.equal(state.detectorCalls, 1);
+    assert.equal(state.headerCalls, 0);
+    assert.deepEqual([state.results[0].outcome, state.results[0].details.stage], ["unsupported", "detector"]);
+    // Damaged pixel data (an IDAT checksum) fails only once decoding starts.
+    reset();
+    const damaged = Buffer.from(smallPng);
+    const idat = damaged.indexOf("IDAT");
+    damaged[idat + 4] ^= 0xff;
+    assert.equal((await upload("transform-failure.png", "image/png", damaged)).thumbnailPath, null);
     assert.equal(state.detectorCalls, 1);
     assert.equal(state.nativeCalls, 1);
+    assert.deepEqual([state.results[0].outcome, state.results[0].details.stage], ["failed", "transform"]);
   });
 });
 
@@ -417,6 +419,7 @@ test("refused upload actors stop before storage, detector and native dispatch", 
         assert.equal(response.statusCode, status, response.body);
       }
       assert.equal(writes, 0); assert.equal(reads, 0);
+      assert.equal(state.dispatches, 0);
       assert.equal(state.detectorCalls, 0); assert.equal(state.headerCalls, 0); assert.equal(state.nativeCalls, 0);
       assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id } }), count);
     } finally { app.storage.saveStream = save; app.storage.read = read; }
@@ -569,19 +572,19 @@ test("CMYK, 16-bit, idat-stored AVIF and many-frame uploads get first-frame sRGB
 });
 
 test("uploads beyond the transform limit all succeed; the excess are stored at once without a thumbnail, and other workspaces keep a share", async (t) => {
-  const { thumbnailAdmission } = await import("../../src/modules/files/thumbnails.ts");
+  const { thumbnailAdmission, thumbnailWorkers } = await import("../../src/modules/files/thumbnails.ts");
   const { maxActive, maxQueued } = thumbnailAdmission.limits;
   const extra = 3, total = maxActive + maxQueued + extra;
   const tiffBytes = await solid(64, 32, "#abcdef").tiff().toBuffer();
-  const render = sharp.prototype.toBuffer;
+  const dispatch = thumbnailWorkers.run;
   let inFlight = 0, peak = 0, open;
   const gate = new Promise((resolve) => { open = resolve; });
-  const held = async function () {
+  // Each admitted upload's decode is held in its worker until the gate opens.
+  thumbnailWorkers.run = async function () {
     inFlight++; peak = Math.max(peak, inFlight);
-    try { await gate; return smallWebp; } finally { inFlight--; }
+    try { await gate; return { ok: true, thumbnail: smallWebp, details: {} }; } finally { inFlight--; }
   };
-  sharp.prototype.toBuffer = held;
-  t.after(() => { open(); sharp.prototype.toBuffer = render; });
+  t.after(() => { open(); thumbnailWorkers.run = dispatch; });
   let responded = 0;
   const pending = Array.from({ length: total }, (_, i) =>
     uploadResponse(`burst-${i}.png`, "image/png", smallPng).then((response) => { responded++; return response; }));

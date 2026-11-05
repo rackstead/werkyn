@@ -32,9 +32,11 @@ errors leave the thumbnail absent. An ordinary SVG document declared with a
 raster MIME hint is stored without a thumbnail. These checks classify
 signatures; they do not fully validate a file.
 
-`r19.md` describes the decoder allowlist that libvips enforces for the whole
-process, the explicit decoder options, the per-transform memory estimate and
-the transform admission queue. The output is unchanged: a 400px-wide WebP at
+`r19.md` describes the memory-limited worker processes that read, check and
+decode the stored file (the server process never loads sharp), the decoder
+allowlist that libvips enforces in each of them, the explicit decoder
+options, the per-transform memory estimate and the transform admission
+queue. The output is unchanged: a 400px-wide WebP at
 quality 80 without enlargement, alpha kept and EXIF orientation unapplied, from
 the first frame or primary image.
 
@@ -45,10 +47,11 @@ failures retain that work for retry, and a live committed File keeps its bytes.
 No permission, schema, upload deadline, dependency or transaction budget
 changes here. Avatar/wiki upload policy is separate.
 
-The thumbnail integration suite checks benign dispatch boundaries with armed
-ESM detector/header/transform spies, real ordinary raster/APNG output, AVIF
-versus HEIF/TIFF header dispatch, source-size behavior, current authorization
-and staged cleanup under actual PostgreSQL faults. Unsupported fixtures do not
+The thumbnail integration suite checks benign dispatch boundaries with the
+stage each decoder worker reports (detector, header read, transform) and an
+armed count of what reaches a worker at all, real ordinary raster/APNG
+output, AVIF versus HEIF/TIFF header dispatch, source-size behavior, current
+authorization and staged cleanup under actual PostgreSQL faults. Unsupported fixtures do not
 execute natively; no external-reference or native vulnerability sample is
 needed. Historical Sharp dependency/advisory/network measurements remain
 historical.

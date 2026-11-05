@@ -137,8 +137,10 @@ export interface DecodeHints {
    * the WebP canvas.
    */
   codedPixels?: number;
-  /** WebP that is lossless, has alpha or is animated. */
+  /** WebP that is lossless or has alpha. */
   webpFullCanvas?: boolean;
+  /** Animated WebP. */
+  webpAnimated?: boolean;
 }
 
 /**
@@ -169,10 +171,10 @@ export function estimateDecodeBytes(
       // Frames are drawn onto an RGBA canvas of the whole image.
       return pixels * 7;
     case "webp":
+      // libvips composites animation frames onto a full RGBA canvas;
       // libwebp decodes lossless (VP8L) images whole as 32-bit ARGB, and
-      // libvips composites alpha and animation onto a full RGBA canvas.
-      // Plain lossy VP8 decodes scaled.
-      return pixels * (hints.webpFullCanvas ? 5.5 : 2);
+      // alpha at full size. Plain lossy VP8 decodes scaled.
+      return pixels * (hints.webpAnimated ? 6.5 : hints.webpFullCanvas ? 5.5 : 2);
     case "heif":
       // AV1 frame buffers, then RGB(A) copies in libheif and libvips.
       return pixels * 16 + bytes * 2;
@@ -266,14 +268,17 @@ export function avifStructure(
 }
 
 /**
- * Whether a WebP decodes onto a full-size canvas (lossless, alpha or
- * animation) and the VP8X canvas size, from its RIFF chunks. Null when the
+ * Whether a WebP decodes at full size (lossless or alpha), whether it is
+ * animated, and its VP8X canvas size, from its RIFF chunks. Null when the
  * chunks overrun the file.
  */
-export function webpFeatures(buffer: Buffer): { fullCanvas: boolean; canvasPixels: number } | null {
+export function webpFeatures(
+  buffer: Buffer,
+): { fullCanvas: boolean; animated: boolean; canvasPixels: number } | null {
   let fullCanvas = false;
+  let animated = false;
   let canvasPixels = 0;
-  for (let pos = 12; pos + 8 <= buffer.length && !fullCanvas; ) {
+  for (let pos = 12; pos + 8 <= buffer.length && !animated; ) {
     const type = buffer.toString("latin1", pos, pos + 4);
     const size = buffer.readUInt32LE(pos + 4);
     const body = pos + 8;
@@ -281,14 +286,17 @@ export function webpFeatures(buffer: Buffer): { fullCanvas: boolean; canvasPixel
     if (type === "VP8X") {
       if (size < 10) return null;
       // Flags: alpha 0x10, animation 0x02.
-      if (buffer[body] & 0x12) fullCanvas = true;
+      if (buffer[body] & 0x10) fullCanvas = true;
+      if (buffer[body] & 0x02) animated = true;
       canvasPixels = (buffer.readUIntLE(body + 4, 3) + 1) * (buffer.readUIntLE(body + 7, 3) + 1);
-    } else if (type === "VP8L" || type === "ALPH" || type === "ANIM" || type === "ANMF") {
+    } else if (type === "VP8L" || type === "ALPH") {
       fullCanvas = true;
+    } else if (type === "ANIM" || type === "ANMF") {
+      animated = true;
     }
     pos = body + size + (size & 1);
   }
-  return { fullCanvas, canvasPixels };
+  return { fullCanvas: fullCanvas || animated, animated, canvasPixels };
 }
 
 /**
@@ -655,7 +663,11 @@ function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
   } else if (format === "webp") {
     const features = webpFeatures(source);
     if (!features) throw new Skip("unsupported", { format, reason: "chunks overrun the file" });
-    return { codedPixels: features.canvasPixels, webpFullCanvas: features.fullCanvas };
+    return {
+      codedPixels: features.canvasPixels,
+      webpFullCanvas: features.fullCanvas,
+      webpAnimated: features.animated,
+    };
   }
   return {};
 }

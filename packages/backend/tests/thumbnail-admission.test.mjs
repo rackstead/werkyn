@@ -198,7 +198,9 @@ test("decoder memory is estimated from the header and bounded per transform", ()
   assert.ok(estimateDecodeBytes(meta("webp", 16383, 16383)) > budget, "lossy WebP at 2 B/px");
   assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true }) <= budget);
   assert.ok(estimateDecodeBytes(meta("webp", 8700, 8700), { webpFullCanvas: true }) > budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 1, 1), { codedPixels: 16383 * 16383, webpFullCanvas: true }) > budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 7800, 7800), { webpFullCanvas: true, webpAnimated: true }) <= budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true, webpAnimated: true }) > budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 1, 1), { codedPixels: 16383 * 16383, webpFullCanvas: true, webpAnimated: true }) > budget);
   for (const m of [meta("svg", 1, 1), meta("tiff", 1, 1), meta("png", 0, 1), meta("png", 1, 1, { depth: "double" }), {}]) {
     assert.equal(estimateDecodeBytes(m), Infinity, JSON.stringify(m));
   }
@@ -326,10 +328,13 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
     ["lossy with alpha", await solid(64, 32, { r: 1, g: 2, b: 3, alpha: 0.5 }, 4).webp().toBuffer(), true],
     ["animated", await animatedWebp(16, 8, 4), true],
   ];
-  for (const [name, bytes, fullCanvas] of cases) assert.equal(webpFeatures(bytes).fullCanvas, fullCanvas, name);
+  for (const [name, bytes, fullCanvas] of cases) {
+    assert.equal(webpFeatures(bytes).fullCanvas, fullCanvas, name);
+    assert.equal(webpFeatures(bytes).animated, name === "animated", name);
+  }
   const canvas = await largeCanvasWebp(16383, 16383);
   assert.ok(canvas.length < 200);
-  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, canvasPixels: 16383 * 16383 });
+  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, animated: true, canvasPixels: 16383 * 16383 });
   const lossy = cases[0][1];
   assert.equal(webpFeatures(lossy.subarray(0, lossy.length - 10)), null, "chunks overrunning the file");
   // A 144-byte animation onto a 16383 x 16383 canvas needed about 1.1 GiB.

@@ -480,15 +480,7 @@ async function measureRun(browser, origin, fixture, run) {
     const first = fixture.tasks[0];
     const renamed = `${first.title} renamed ${run}`;
     const realtimeStart = await page.evaluate(() => performance.now());
-    const response = await fetch(`${fixture.apiOrigin}/api/tasks/${first.id}`, {
-      method: "PATCH",
-      headers: {
-        authorization: `Bearer ${fixture.otherToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ title: renamed }),
-    });
-    assert.equal(response.status, 200, await response.text());
+    await fixture.asColleague("PATCH", `/tasks/${first.id}`, { title: renamed });
     const realtimeAt = await page.waitForFunction(
       (title) => {
         const cell = document.querySelector(
@@ -1043,13 +1035,12 @@ async function smoke({ browser, origin, fixture, prisma }) {
     if (want("realtime")) {
       // 6. Realtime: a colleague adds a task and deletes one in view.
       const before = (await listState(page)).rowCount;
-      const created = await fetch(`${fixture.apiOrigin}/api/projects/${fixture.project.id}/tasks`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${fixture.otherToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ title: "Task created by a colleague", statusId: fixture.statuses[0].id }),
+      const created = await fixture.asColleague("POST", `/projects/${fixture.project.id}/tasks`, {
+        title: "Task created by a colleague",
+        statusId: fixture.statuses[0].id,
       });
-      assert.equal(created.status, 201, await created.clone().text());
-      const createdTask = (await created.json()).data;
+      assert.equal(created.status, 201);
+      const createdTask = created.body.data;
       await waitFor(async () => (await listState(page)).rowCount === before + 1, "realtime insert");
       const firstGroup = await prisma.task.findMany({
         where: { projectId: fixture.project.id, statusId: fixture.statuses[0].id, archived: false },
@@ -1065,11 +1056,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
       state = await listState(page);
       const victim = state.inView.find((r) => r.id && r.index > createdAt - 5 && r.id !== createdTask.id);
       const next = state.inView.find((r) => r.index === victim.index + 1);
-      const deleted = await fetch(`${fixture.apiOrigin}/api/tasks/${victim.id}`, {
-        method: "DELETE",
-        headers: { authorization: `Bearer ${fixture.otherToken}` },
-      });
-      assert(deleted.ok, await deleted.text());
+      await fixture.asColleague("DELETE", `/tasks/${victim.id}`);
       await waitFor(async () => (await listState(page)).rowCount === before, "realtime delete");
       await frames(page, 3);
       assert.equal(await page.locator(`tbody tr[data-task-id="${victim.id}"]`).count(), 0);
@@ -1135,19 +1122,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
           top: row.getBoundingClientRect().top - main.getBoundingClientRect().top,
         };
       }, title);
-    const api = async (method, url, body) => {
-      const response = await fetch(`${fixture.apiOrigin}/api${url}`, {
-        method,
-        headers: {
-          authorization: `Bearer ${fixture.otherToken}`,
-          ...(body ? { "content-type": "application/json" } : {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      const text = await response.text();
-      assert(response.ok, `${method} ${url}: ${response.status} ${text}`);
-      return text ? JSON.parse(text) : null;
-    };
+    const api = async (method, url, body) => (await fixture.asColleague(method, url, body)).body;
     // Task rows in view, top to bottom, relative to <main>'s view.
     const rowsInView = () =>
       page.evaluate(() => {
@@ -1521,6 +1496,26 @@ try {
     sub: fixture.other.id,
     email: fixture.other.email,
   });
+  // The second user's requests go to the app directly, from another client
+  // address, so they do not use up the browser's API rate limit (100 a
+  // minute per address) while the List refetches after each of them.
+  fixture.asColleague = async (method, url, body) => {
+    const response = await app.inject({
+      method,
+      url: `/api${url}`,
+      remoteAddress: "127.0.0.2",
+      headers: {
+        authorization: `Bearer ${fixture.otherToken}`,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      payload: body ? JSON.stringify(body) : undefined,
+    });
+    assert(
+      response.statusCode >= 200 && response.statusCode < 300,
+      `${method} ${url}: ${response.statusCode} ${response.body}`,
+    );
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null };
+  };
   log(`fixture: ${fixture.tasks.length} tasks in ${Date.now() - started} ms`);
 
   distDir = process.env.TASK_LIST_DIST

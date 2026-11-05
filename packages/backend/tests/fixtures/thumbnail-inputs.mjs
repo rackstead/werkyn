@@ -601,3 +601,82 @@ export function manyItemAvif(small, items, mdats) {
   const itemOffsets = [offsets[0], ...offsets.slice(offsets.length - items)];
   return Buffer.concat([ftyp, build(itemOffsets), ...boxes]);
 }
+
+// ---------------------------------------------------------------------------
+// Metadata that libvips inflates or copies while it reads the header.
+
+/** A 64 x 32 grey PNG with `chunks` (already framed by pngChunk) before IDAT; `iend: false` drops IEND. */
+export function pngWithChunks(chunks, { iend = true } = {}) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(64, 0);
+  ihdr.writeUInt32BE(32, 4);
+  ihdr[8] = 8; // 8-bit grey
+  const raw = Buffer.alloc((1 + 64) * 32, 0x80);
+  for (let y = 0; y < 32; y++) raw[y * 65] = 0;
+  return Buffer.concat([
+    PNG_SIGNATURE, pngChunk("IHDR", ihdr), ...chunks,
+    pngChunk("IDAT", zlib.deflateSync(raw)), ...(iend ? [pngChunk("IEND", Buffer.alloc(0))] : []),
+  ]);
+}
+
+/** A zTXt chunk whose text is `stream` (a zlib stream), or `size` bytes of "a" deflated. */
+export function zTxtChunk(keyword, { size = 0, stream = zlib.deflateSync(Buffer.alloc(size, "a"), { level: 9 }) } = {}) {
+  return pngChunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), stream]));
+}
+
+/** A compressed iTXt chunk of `size` bytes of "a". */
+export function compressedITxtChunk(keyword, size) {
+  return pngChunk("iTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 1, 0, 0, 0]),
+    zlib.deflateSync(Buffer.alloc(size, "a"), { level: 9 })]));
+}
+
+/** An ICC profile of `size` bytes: a real profile's header and tags, zero-padded. */
+export function paddedIcc(profile, size) {
+  const icc = Buffer.alloc(Math.max(size, profile.length));
+  profile.copy(icc);
+  icc.writeUInt32BE(icc.length, 0);
+  return icc;
+}
+
+/** An iCCP chunk holding `icc`, deflated. */
+export function iccpChunk(icc, stream = zlib.deflateSync(icc, { level: 9 })) {
+  return pngChunk("iCCP", Buffer.concat([Buffer.from("icc\0\0", "latin1"), stream]));
+}
+
+/** `jpeg` with `icc` in APP2 ICC_PROFILE segments after SOI. */
+export function jpegWithIcc(jpeg, icc) {
+  const parts = [];
+  const per = 65519;
+  const count = Math.ceil(icc.length / per);
+  for (let i = 0; i < count; i++) {
+    const part = icc.subarray(i * per, (i + 1) * per);
+    const head = Buffer.alloc(4 + 14);
+    head[0] = 0xff; head[1] = 0xe2;
+    head.writeUInt16BE(2 + 14 + part.length, 2);
+    head.write("ICC_PROFILE\0", 4, "latin1");
+    head[16] = i + 1; head[17] = count;
+    parts.push(head, part);
+  }
+  return Buffer.concat([jpeg.subarray(0, 2), ...parts, jpeg.subarray(2)]);
+}
+
+/** A still lossy WebP with `icc` in an ICCP chunk (VP8X with the ICC flag). */
+export function webpWithIcc(webp, icc) {
+  if (webp.toString("latin1", 12, 16) !== "VP8 ") throw new Error("expected a simple lossy WebP");
+  const width = webp.readUInt16LE(26) & 0x3fff, height = webp.readUInt16LE(28) & 0x3fff;
+  const vp8x = Buffer.concat([Buffer.from([0x20, 0, 0, 0]), u24le(width - 1), u24le(height - 1)]);
+  const body = Buffer.concat([Buffer.from("WEBP"), riffChunk("VP8X", vp8x), riffChunk("ICCP", icc), webp.subarray(12)]);
+  const size = Buffer.alloc(4);
+  size.writeUInt32LE(body.length);
+  return Buffer.concat([Buffer.from("RIFF"), size, body]);
+}
+
+/** `small` (an AVIF made by sharp) rebuilt with `icc` as a colr 'prof' property on its primary. */
+export function avifWithIcc(small, icc) {
+  const s = avifParts(small);
+  return assembleAvif([{
+    items: [{ id: 1, type: "av01", data: s.coded }],
+    properties: [s.av1C, fullBox("ispe", 0, 0, u32(s.width, s.height)), s.pixi, box("colr", Buffer.from("prof"), icc)],
+    associations: [[1, [0x81, 0x02, 0x03, 0x04]]],
+  }]);
+}

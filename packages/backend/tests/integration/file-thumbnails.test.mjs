@@ -11,6 +11,7 @@ import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive
 import {
   avif100Megapixels, avifStructureCases, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader,
   jpegWithJunkBeforeScan, largeCanvasWebp, locatedAvif, manyScanJpeg, restructuredAvif, rgb16Png,
+  iccpChunk, jpegWithIcc, paddedIcc, pngWithChunks, zTxtChunk,
 } from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
@@ -507,6 +508,8 @@ async function outcomeDelta(run) {
 test("disguised formats, polyglots and decompression bombs are stored unchanged without a thumbnail", async () => {
   const tiffBytes = await solid(800, 400, "#abcdef").tiff().toBuffer();
   const smallAvif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
+  const icc = (await sharp(await solid(8, 8, "#208040").withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  const bigText = zTxtChunk("Comment", { size: 49_000_000 });
   const avifCases = avifStructureCases(avif100Megapixels, smallAvif);
   const scanBomb = manyScanJpeg(64, 64);
   for (const [name, type, bytes, outcome] of [
@@ -532,6 +535,10 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
     ["extents.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, primary: (L) => [[L.frame, L.frameLength], ...Array(30).fill([0, L.size])] }), "unsupported"],
     ["exif.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "Exif", data: Buffer.from("Exif"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
     ["xmp.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "mime", data: Buffer.from("<x/>"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
+    // Metadata libvips inflates or copies while reading the header.
+    ["notes.png", "image/png", pngWithChunks(Array(10).fill(bigText)), "unsupported"],
+    ["profile.png", "image/png", pngWithChunks([iccpChunk(paddedIcc(icc, 49_000_000))]), "unsupported"],
+    ["profile.jpg", "image/jpeg", jpegWithIcc(await solid(64, 32, "#208040").jpeg().toBuffer(), paddedIcc(icc, 5 * 1024 * 1024)), "over-budget"],
   ]) {
     const rss = process.memoryUsage().rss;
     const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
@@ -543,8 +550,11 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
 
 test("CMYK, 16-bit, idat-stored AVIF and many-frame uploads get first-frame sRGB thumbnails", async () => {
   const idatAvif = locatedAvif(await solid(800, 400, "#208040").avif({ effort: 0 }).toBuffer(), { method: 1 });
+  const iccP3 = (await sharp(await solid(8, 8, "#208040").withIccProfile("p3").png().toBuffer()).metadata()).icc;
   for (const [name, type, bytes, size] of [
     ["idat.avif", "image/avif", idatAvif, [400, 200]],
+    ["profiled.png", "image/png", pngWithChunks([iccpChunk(iccP3), pngChunk("tEXt", Buffer.from("Title\0hello")), zTxtChunk("Comment", { size: 2000 })]), [64, 32]],
+    ["cmyk-profiled.jpg", "image/jpeg", await solid(800, 400, "#3366cc").toColourspace("cmyk").withIccProfile("cmyk").jpeg().toBuffer(), [400, 200]],
     ["print.jpg", "image/jpeg", await cmykJpeg(800, 400), [400, 200]],
     ["deep.png", "image/png", await rgb16Png(800, 400), [400, 200]],
     ["loop.gif", "image/gif", blankGif(800, 400, 3000), [400, 200]],

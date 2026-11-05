@@ -1,4 +1,5 @@
 import os from "node:os";
+import zlib from "node:zlib";
 import sharp from "sharp";
 import type { Metadata, SharpOptions } from "sharp";
 import { fileTypeFromBuffer } from "file-type";
@@ -106,6 +107,18 @@ export const THUMBNAIL_LIMITS = Object.freeze({
    * only by time. Encoders write about 10.
    */
   maxJpegScans: 100,
+  /**
+   * An embedded ICC profile, in any format. libvips copies it while reading
+   * the header and lcms builds transforms from it: about 9 bytes of memory
+   * per profile byte were measured, so the estimate also charges that.
+   */
+  maxIccBytes: 4 * 1024 * 1024,
+  /**
+   * PNG zTXt, compressed iTXt and iCCP inflate while libvips reads the
+   * header, before the budget is checked (libpng allows 50 MB per chunk):
+   * their inflated total, and separately the raw tEXt/iTXt/eXIf total.
+   */
+  maxPngMetadataBytes: 4 * 1024 * 1024,
   /** libvips stops a transform after this long... */
   transformTimeoutSeconds: 10,
   /** ...and the upload stops waiting for it a little after that. */
@@ -143,6 +156,8 @@ export interface DecodeHints {
   webpFullCanvas?: boolean;
   /** Animated WebP. */
   webpAnimated?: boolean;
+  /** Bytes of embedded ICC profile. */
+  iccBytes?: number;
 }
 
 /**
@@ -162,6 +177,16 @@ export function estimateDecodeBytes(
   if (!width || !height || !channels || !sampleBytes) return Infinity;
   const pixels = Math.max(width * height, hints.codedPixels ?? 0);
   const bytes = pixels * channels * sampleBytes;
+  return decodeBytes(meta, pixels, bytes, hints) + 9 * (hints.iccBytes ?? 0);
+}
+
+function decodeBytes(
+  meta: Pick<Metadata, "format" | "channels" | "isProgressive">,
+  pixels: number,
+  bytes: number,
+  hints: DecodeHints,
+): number {
+  const channels = meta.channels!;
   switch (meta.format) {
     case "jpeg":
       // Progressive: 16-bit DCT coefficients for every sample, whole image.
@@ -247,7 +272,7 @@ const AVIF_MAX_EXTENTS_PER_ITEM = 4;
  */
 const AVIF_MAX_METADATA_ITEM_BYTES = 1024 * 1024;
 
-export type AvifCheck = { codedPixels: number } | { refused: string };
+export type AvifCheck = { codedPixels: number; iccBytes: number } | { refused: string };
 
 class AvifRefusal extends Error {}
 const refuse = (reason: string): never => {
@@ -518,21 +543,36 @@ export function checkAvif(buffer: Buffer): AvifCheck {
       if (++alphaPlanes > 1) refuse("more than one alpha plane");
     }
     if (auxiliaryOf.get(primary)) refuse("primary is auxiliary");
-    return { codedPixels: width * height };
+    // ICC profiles in colr properties ('prof' or 'rICC').
+    let iccBytes = 0;
+    for (const property of properties) {
+      if (property.type !== "colr" || property.end - property.body < 4) continue;
+      const colourType = buffer.toString("latin1", property.body, property.body + 4);
+      if (colourType === "prof" || colourType === "rICC") iccBytes += property.end - property.body - 4;
+    }
+    return { codedPixels: width * height, iccBytes };
   } catch (err) {
     if (err instanceof AvifRefusal) return { refused: err.message };
     return { refused: "unreadable structure" };
   }
 }
 
+/** Chunks one WebP or PNG walk reads before refusing; real files have far fewer. */
+const MAX_FILE_CHUNKS = 65536;
+
+const fourCC = (text: string) => Buffer.from(text, "latin1").readUInt32BE(0);
+const WEBP_VP8X = fourCC("VP8X"), WEBP_VP8L = fourCC("VP8L"), WEBP_ALPH = fourCC("ALPH");
+const WEBP_ANIM = fourCC("ANIM"), WEBP_ANMF = fourCC("ANMF"), WEBP_ICCP = fourCC("ICCP");
+
 /**
  * Whether a WebP decodes at full size (lossless or alpha), whether it is
- * animated, and its VP8X canvas size, from its RIFF chunks. Null when the
- * container or a chunk overruns the file or there are too many to read.
+ * animated, its VP8X canvas size and its ICC profile bytes, from every
+ * RIFF chunk. Null when the container or a chunk overruns the file or
+ * there are more than MAX_FILE_CHUNKS chunks.
  */
 export function webpFeatures(
   buffer: Buffer,
-): { fullCanvas: boolean; animated: boolean; canvasPixels: number } | null {
+): { fullCanvas: boolean; animated: boolean; canvasPixels: number; iccBytes: number } | null {
   // Only the RIFF container's declared length is image data; libwebp
   // ignores anything after it.
   const end = 8 + buffer.readUInt32LE(4);
@@ -540,27 +580,99 @@ export function webpFeatures(
   let fullCanvas = false;
   let animated = false;
   let canvasPixels = 0;
+  let iccBytes = 0;
   let chunks = 0;
-  for (let pos = 12; pos + 8 <= end && !animated; ) {
-    if (++chunks > MAX_CONTAINER_ENTRIES) return null;
-    const type = buffer.toString("latin1", pos, pos + 4);
+  for (let pos = 12; pos + 8 <= end; ) {
+    if (++chunks > MAX_FILE_CHUNKS) return null;
+    const type = buffer.readUInt32BE(pos);
     const size = buffer.readUInt32LE(pos + 4);
     const body = pos + 8;
     if (body + size > end) return null;
-    if (type === "VP8X") {
+    if (type === WEBP_VP8X) {
       if (size < 10) return null;
       // Flags: alpha 0x10, animation 0x02.
       if (buffer[body] & 0x10) fullCanvas = true;
       if (buffer[body] & 0x02) animated = true;
       canvasPixels = (buffer.readUIntLE(body + 4, 3) + 1) * (buffer.readUIntLE(body + 7, 3) + 1);
-    } else if (type === "VP8L" || type === "ALPH") {
+    } else if (type === WEBP_VP8L || type === WEBP_ALPH) {
       fullCanvas = true;
-    } else if (type === "ANIM" || type === "ANMF") {
+    } else if (type === WEBP_ANIM || type === WEBP_ANMF) {
       animated = true;
+    } else if (type === WEBP_ICCP) {
+      iccBytes += size;
     }
     pos = body + size + (size & 1);
   }
-  return { fullCanvas: fullCanvas || animated, animated, canvasPixels };
+  return { fullCanvas: fullCanvas || animated, animated, canvasPixels, iccBytes };
+}
+
+const PNG_IEND = fourCC("IEND"), PNG_TEXT = fourCC("tEXt"), PNG_ZTXT = fourCC("zTXt");
+const PNG_ITXT = fourCC("iTXt"), PNG_ICCP = fourCC("iCCP"), PNG_EXIF = fourCC("eXIf");
+
+/**
+ * Walks every PNG chunk to IEND before any native call. libpng inflates
+ * zTXt, compressed iTXt and iCCP while libvips reads the header, up to
+ * 50 MB per chunk and before the budget is checked: a 477 KB file with ten
+ * 49 MB zTXt chunks needed 2.3 GiB. Here they are inflated against one
+ * shared limit (maxPngMetadataBytes), raw tEXt, iTXt and eXIf against
+ * another, and a malformed stream, a chunk overrunning the file, a missing
+ * IEND or more than MAX_FILE_CHUNKS chunks refuse the file.
+ */
+export function pngMetadata(buffer: Buffer): { iccBytes: number } | { refused: string } {
+  const limit = THUMBNAIL_LIMITS.maxPngMetadataBytes;
+  let inflated = 0;
+  let raw = 0;
+  let iccBytes = 0;
+  let chunks = 0;
+  const nul = (from: number, to: number) => {
+    const at = buffer.indexOf(0, from);
+    return at === -1 || at >= to ? -1 : at;
+  };
+  const inflate = (from: number, to: number) => {
+    try {
+      const out = zlib.inflateSync(buffer.subarray(from, to), { maxOutputLength: Math.max(1, limit - inflated) });
+      inflated += out.length;
+      return inflated > limit ? -1 : out.length;
+    } catch {
+      return -1; // over the limit or not a zlib stream
+    }
+  };
+  for (let pos = 8; ; ) {
+    if (pos + 12 > buffer.length) return { refused: "chunks end before IEND" };
+    if (++chunks > MAX_FILE_CHUNKS) return { refused: "too many chunks" };
+    const length = buffer.readUInt32BE(pos);
+    const type = buffer.readUInt32BE(pos + 4);
+    const data = pos + 8;
+    const end = data + length;
+    if (end + 4 > buffer.length) return { refused: "chunk overruns the file" };
+    if (type === PNG_IEND) return { iccBytes };
+    if (type === PNG_ZTXT || type === PNG_ICCP) {
+      // keyword or profile name, NUL, compression method 0, zlib stream
+      const at = nul(data, end);
+      if (at === -1 || at + 2 > end || buffer[at + 1] !== 0) return { refused: "compressed chunk header" };
+      const size = inflate(at + 2, end);
+      if (size === -1) return { refused: "compressed metadata over the limit or malformed" };
+      if (type === PNG_ICCP) iccBytes += size;
+    } else if (type === PNG_ITXT) {
+      // keyword, NUL, compression flag, method, language, NUL, translated keyword, NUL, text
+      const keyword = nul(data, end);
+      if (keyword === -1 || keyword + 3 > end) return { refused: "iTXt header" };
+      const language = nul(keyword + 3, end);
+      const translated = language === -1 ? -1 : nul(language + 1, end);
+      if (translated === -1) return { refused: "iTXt header" };
+      if (buffer[keyword + 1] === 1) {
+        if (buffer[keyword + 2] !== 0 || inflate(translated + 1, end) === -1) {
+          return { refused: "compressed metadata over the limit or malformed" };
+        }
+      } else {
+        raw += end - translated - 1;
+      }
+    } else if (type === PNG_TEXT || type === PNG_EXIF) {
+      raw += length;
+    }
+    if (raw > limit) return { refused: "text metadata over the limit" };
+    pos = end + 4;
+  }
 }
 
 /**
@@ -572,34 +684,48 @@ export function webpFeatures(
  * first, or more markers or escaped bytes than are read.
  */
 export function jpegScanCount(buffer: Buffer, stopAfter: number): number {
-  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return Infinity;
+  return jpegMarkers(buffer, stopAfter).scans;
+}
+
+const ICC_PROFILE_TAG = Buffer.from("ICC_PROFILE\0", "latin1");
+
+/** The scan count (see `jpegScanCount`) and the bytes of APP2 ICC profile segments. */
+export function jpegMarkers(buffer: Buffer, stopAfter: number): { scans: number; iccBytes: number } {
+  const refused = { scans: Infinity, iccBytes: 0 };
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return refused;
   let scans = 0;
+  let iccBytes = 0;
   let pos = 2;
   let markers = 0;
   let escapes = 0;
   for (;;) {
-    if (pos + 2 > buffer.length || buffer[pos] !== 0xff) return Infinity;
-    if (++markers > MAX_CONTAINER_ENTRIES) return Infinity;
+    if (pos + 2 > buffer.length || buffer[pos] !== 0xff) return refused;
+    if (++markers > MAX_CONTAINER_ENTRIES) return refused;
     const marker = buffer[pos + 1];
     if (marker === 0xff) {
       pos++; // fill byte
       continue;
     }
-    if (marker === 0xd9) return scans;
+    if (marker === 0xd9) return { scans, iccBytes };
     // Stuffing, TEM, restart markers and SOI belong nowhere between segments.
-    if (marker <= 0x01 || (marker >= 0xd0 && marker <= 0xd8)) return Infinity;
-    if (pos + 4 > buffer.length) return Infinity;
+    if (marker <= 0x01 || (marker >= 0xd0 && marker <= 0xd8)) return refused;
+    if (pos + 4 > buffer.length) return refused;
     const length = buffer.readUInt16BE(pos + 2);
-    if (length < 2) return Infinity;
+    if (length < 2) return refused;
+    // APP2 "ICC_PROFILE\0", sequence number, count, then part of the profile.
+    if (marker === 0xe2 && length >= 2 + 14 && pos + 4 + 14 <= buffer.length &&
+      buffer.subarray(pos + 4, pos + 16).equals(ICC_PROFILE_TAG)) {
+      iccBytes += length - 2 - 14;
+    }
     pos += 2 + length;
     if (marker !== 0xda) continue;
-    if (++scans > stopAfter) return scans;
+    if (++scans > stopAfter) return { scans, iccBytes };
     // Skip entropy-coded data: stuffed 0xFF00 bytes and restart markers
     // belong to the scan; any other marker ends it.
     for (;;) {
       const at = buffer.indexOf(0xff, pos);
-      if (at === -1 || at + 1 >= buffer.length) return Infinity;
-      if (++escapes > MAX_JPEG_ESCAPES) return Infinity;
+      if (at === -1 || at + 1 >= buffer.length) return refused;
+      if (++escapes > MAX_JPEG_ESCAPES) return refused;
       const next = buffer[at + 1];
       if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
         pos = at + 2;
@@ -939,21 +1065,34 @@ async function produce(
  * size, and the WebP features that decide its memory.
  */
 function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
+  const hints = formatHints(source, format);
+  if ((hints.iccBytes ?? 0) > THUMBNAIL_LIMITS.maxIccBytes) {
+    throw new Skip("over-budget", { format, reason: `ICC profile of ${hints.iccBytes} bytes` });
+  }
+  return hints;
+}
+
+function formatHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
   if (format === "jpeg") {
-    const scans = jpegScanCount(source, THUMBNAIL_LIMITS.maxJpegScans);
+    const { scans, iccBytes } = jpegMarkers(source, THUMBNAIL_LIMITS.maxJpegScans);
     if (scans === Infinity) {
       throw new Skip("unsupported", { format, reason: "marker structure not walked to EOI" });
     }
     if (scans > THUMBNAIL_LIMITS.maxJpegScans) {
       throw new Skip("over-budget", { format, reason: `more than ${THUMBNAIL_LIMITS.maxJpegScans} scans` });
     }
+    return { iccBytes };
+  } else if (format === "png") {
+    const png = pngMetadata(source);
+    if ("refused" in png) throw new Skip("unsupported", { format, reason: png.refused });
+    return { iccBytes: png.iccBytes };
   } else if (format === "avif") {
     const avif = checkAvif(source);
     if ("refused" in avif) throw new Skip("unsupported", { format, reason: avif.refused });
     if (avif.codedPixels > THUMBNAIL_LIMITS.maxInputPixels) {
       throw new Skip("over-budget", { format, reason: `coded ${avif.codedPixels} pixels` });
     }
-    return { codedPixels: avif.codedPixels };
+    return { codedPixels: avif.codedPixels, iccBytes: avif.iccBytes };
   } else if (format === "webp") {
     const features = webpFeatures(source);
     if (!features) throw new Skip("unsupported", { format, reason: "chunks overrun the file" });
@@ -961,6 +1100,7 @@ function containerHints(source: Buffer, format: ThumbnailFormat): DecodeHints {
       codedPixels: features.canvasPixels,
       webpFullCanvas: features.fullCanvas,
       webpAnimated: features.animated,
+      iccBytes: features.iccBytes,
     };
   }
   return {};

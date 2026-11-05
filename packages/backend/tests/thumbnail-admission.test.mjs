@@ -12,6 +12,7 @@ import {
   defaultAdmissionLimits,
   estimateDecodeBytes,
   jpegScanCount,
+  pngMetadata,
   thumbnailAdmission,
   thumbnailFormat,
   thumbnailOutcomes,
@@ -31,6 +32,15 @@ import {
   largeCanvasWebp,
   locatedAvif,
   manyItemAvif,
+  avifWithIcc,
+  compressedITxtChunk,
+  iccpChunk,
+  jpegWithIcc,
+  paddedIcc,
+  pngChunk,
+  pngWithChunks,
+  webpWithIcc,
+  zTxtChunk,
   manyScanJpeg,
   restructuredAvif,
   stripesWebp,
@@ -285,7 +295,7 @@ test("AVIF is charged for its coded size; crops cannot hide it and grids and ove
     const meta = await sharp(bytes).metadata();
     assert.deepEqual([meta.width, meta.height], layout === "plain" ? [64, 32] : [16, 8], layout);
     assert.deepEqual(checkAvif(bytes), layout === "grid" ? { refused: "grid item" }
-      : layout === "overlay" ? { refused: "iovl item" } : { codedPixels: 64 * 32 }, layout);
+      : layout === "overlay" ? { refused: "iovl item" } : { codedPixels: 64 * 32, iccBytes: 0 }, layout);
   }
   for (const layout of ["plain", "clap"]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(restructuredAvif(small, layout, 16, 8)))).delta, { created: 1 }, layout);
@@ -357,7 +367,7 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
   // An alpha ispe that understates the coded size passes the shape check;
   // libheif then refuses it before decoding, as it does for the primary.
   const rss = process.memoryUsage().rss, started = performance.now();
-  assert.deepEqual(checkAvif(cases.alphaIspeUnderstated), { codedPixels: 64 * 32 });
+  assert.deepEqual(checkAvif(cases.alphaIspeUnderstated), { codedPixels: 64 * 32, iccBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(cases.alphaIspeUnderstated))).delta, { failed: 1 });
   assert.ok(performance.now() - started < 1000);
   assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
@@ -366,7 +376,7 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
   assert.deepEqual((await outcomes(() => thumbnailOf(cases.croppedBig))).delta, { "over-budget": 1 });
   for (const [name, options] of [["8-bit", {}], ["10-bit", { bitdepth: 10 }]]) {
     const rgba = await solid(64, 32, { r: 10, g: 20, b: 30, alpha: 0.5 }, 4).avif({ effort: 0, ...options }).toBuffer();
-    assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32 }, name);
+    assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32, iccBytes: 0 }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(rgba))).delta, { created: 1 }, name);
   }
 });
@@ -394,7 +404,7 @@ test("AVIF item locations may not repeat, overlap or leave mdat or idat, and met
     ["XMP", { extra: xmpItem((L) => [[L.extra, L.extraLength]]) }],
   ]) {
     const bytes = locatedAvif(small, options);
-    assert.deepEqual(checkAvif(bytes), { codedPixels: 64 * 32 }, name);
+    assert.deepEqual(checkAvif(bytes), { codedPixels: 64 * 32, iccBytes: 0 }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
   }
   const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
@@ -441,7 +451,7 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   }
   const canvas = await largeCanvasWebp(16383, 16383);
   assert.ok(canvas.length < 200);
-  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, animated: true, canvasPixels: 16383 * 16383 });
+  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, animated: true, canvasPixels: 16383 * 16383, iccBytes: 0 });
   const lossy = cases[0][1];
   assert.equal(webpFeatures(lossy.subarray(0, lossy.length - 10)), null, "chunks overrunning the file");
   // A 144-byte animation onto a 16383 x 16383 canvas needed about 1.1 GiB.
@@ -454,12 +464,12 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   trailing.write("JUNK", 0, "latin1");
   trailing.writeUInt32LE(0x7fffffff, 4);
   const withTrailing = Buffer.concat([lossy, trailing]);
-  assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 0 });
+  assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 0, iccBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(withTrailing))).delta, { created: 1 });
   // Animations are charged 12.5 B/px of canvas: frames with alpha are
   // decoded and blended at full size (8.4-10.2 B/px measured).
   const alphaAnimation = await alphaAnimationWebp(256, 128);
-  assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128 });
+  assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128, iccBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(alphaAnimation))).delta, { created: 1 });
   const overCanvas = await largeCanvasWebp(5700, 5700), underCanvas = await largeCanvasWebp(4000, 4000);
   assert.deepEqual((await outcomes(() => thumbnailOf(overCanvas))).delta, { "over-budget": 1 });
@@ -470,6 +480,79 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   const { result, delta } = await outcomes(() => thumbnailOf(stripes));
   assert.deepEqual(delta, { created: 1 });
   assert.deepEqual(await sharp(result).metadata().then((m) => [m.width, m.height]), [400, 200]);
+});
+
+test("PNG compressed and text metadata is bounded before any native call", async (t) => {
+  const icc = (await sharp(await solid(8, 8).withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
+  let nativeCalls = 0;
+  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
+  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
+  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
+  // libpng inflates these while libvips reads the header, up to 50 MB per
+  // chunk: a 477 KB file of ten 49 MB zTXt chunks needed 2.3 GiB.
+  const big = zTxtChunk("Comment", { size: 49_000_000 });
+  const limit = THUMBNAIL_LIMITS.maxPngMetadataBytes;
+  for (const [name, bytes, refused] of [
+    ["ten 49 MB zTXt chunks", pngWithChunks(Array(10).fill(big)), "compressed metadata over the limit or malformed"],
+    ["a 49 MB iCCP profile", pngWithChunks([iccpChunk(paddedIcc(icc, 49_000_000))]), "compressed metadata over the limit or malformed"],
+    ["a 5 MiB compressed iTXt", pngWithChunks([compressedITxtChunk("XML:com.adobe.xmp", 5 * MiB)]), "compressed metadata over the limit or malformed"],
+    ["three 1.9 MB zTXt chunks over the shared limit", pngWithChunks(["a", "b", "c"].map((k) => zTxtChunk(k, { size: 1_900_000 }))), "compressed metadata over the limit or malformed"],
+    ["a zTXt that is not zlib", pngWithChunks([zTxtChunk("a", { stream: Buffer.from("not zlib") })]), "compressed metadata over the limit or malformed"],
+    ["over 4 MiB of tEXt", pngWithChunks([pngChunk("tEXt", Buffer.concat([Buffer.from("Big\0"), Buffer.alloc(limit + 1, 0x61)]))]), "text metadata over the limit"],
+    ["no IEND", pngWithChunks([], { iend: false }), "chunks end before IEND"],
+    ["65,537 chunks", pngWithChunks(Array(65537).fill(pngChunk("prVt", Buffer.alloc(0)))), "too many chunks"],
+  ]) {
+    assert.ok(bytes.length < 5 * MiB, name);
+    assert.deepEqual(pngMetadata(bytes), { refused }, name);
+    nativeCalls = 0;
+    const rss = process.memoryUsage().rss, started = performance.now();
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { unsupported: 1 }, name);
+    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
+    assert.ok(performance.now() - started < 1000, name);
+    assert.ok(process.memoryUsage().rss - rss < 64 * MiB, name);
+  }
+  sharp.prototype.metadata = header;
+  sharp.prototype.toBuffer = render;
+  // Ordinary metadata, and up to the limit in total, keeps the thumbnail.
+  for (const [name, bytes, iccBytes] of [
+    ["iCCP, tEXt, zTXt and compressed XMP", pngWithChunks([iccpChunk(icc), pngChunk("tEXt", Buffer.from("Title\0hello")),
+      zTxtChunk("Comment", { size: 2000 }), compressedITxtChunk("XML:com.adobe.xmp", 3000)]), icc.length],
+    ["two 1.9 MB zTXt chunks", pngWithChunks(["a", "b"].map((k) => zTxtChunk(k, { size: 1_900_000 }))), 0],
+    ["sharp PNG with a P3 profile", await solid(640, 320).withIccProfile("p3").png().toBuffer(), icc.length],
+  ]) {
+    assert.deepEqual(pngMetadata(bytes), { iccBytes }, name);
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
+  }
+});
+
+test("embedded ICC profiles over 4 MiB are refused in every format, and smaller ones are charged", async () => {
+  const icc = (await sharp(await solid(8, 8).withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  const over = paddedIcc(icc, THUMBNAIL_LIMITS.maxIccBytes + 1);
+  const jpeg = await solid(64, 32).jpeg().toBuffer();
+  const webp = await solid(64, 32).webp().toBuffer();
+  const avif = await solid(64, 32).avif({ effort: 0 }).toBuffer();
+  // About 9 bytes of memory per profile byte were measured, so the
+  // estimate charges that; the cap bounds it at 36 MiB.
+  const meta = { format: "jpeg", width: 64, height: 32, channels: 3, depth: "uchar" };
+  assert.equal(estimateDecodeBytes(meta, { iccBytes: 1000 }) - estimateDecodeBytes(meta), 9000);
+  for (const [name, bytes] of [
+    ["JPEG APP2", jpegWithIcc(jpeg, over)],
+    ["WebP ICCP", webpWithIcc(webp, over)],
+    ["AVIF colr", avifWithIcc(avif, over)],
+  ]) {
+    assert.equal((await sharp(bytes).metadata()).icc.length, over.length, `${name}: libvips reads the same profile`);
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { "over-budget": 1 }, name);
+  }
+  // A PNG iCCP over 4 MiB already exceeds the PNG metadata limit (above).
+  for (const [name, bytes] of [
+    ["JPEG with a P3 profile", await solid(640, 320).withIccProfile("p3").jpeg().toBuffer()],
+    ["CMYK JPEG with sharp's 0.9 MiB CMYK profile", await solid(640, 320).toColourspace("cmyk").withIccProfile("cmyk").jpeg().toBuffer()],
+    ["WebP with a P3 profile", await solid(640, 320).withIccProfile("p3").webp().toBuffer()],
+    ["AVIF with a P3 profile", await solid(640, 320).withIccProfile("p3").avif({ effort: 0 }).toBuffer()],
+  ]) {
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
+  }
 });
 
 test("JPEGs with more scans than the limit are refused before decoding", async () => {
@@ -542,7 +625,7 @@ test("container checks stop after a bounded amount of work on crafted files", as
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   const manyItems = manyItemAvif(small, 680, 2000);
   const started = performance.now();
-  assert.deepEqual(checkAvif(manyItems), { codedPixels: 64 * 32 });
+  assert.deepEqual(checkAvif(manyItems), { codedPixels: 64 * 32, iccBytes: 0 });
   assert.ok(performance.now() - started < 20, `many items took ${performance.now() - started} ms`);
   for (const [name, bytes, outcome] of [["avif", avif, "unsupported"], ["webp", webp, "unsupported"], ["jpeg", segments, "unsupported"]]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { [outcome]: 1 }, name);

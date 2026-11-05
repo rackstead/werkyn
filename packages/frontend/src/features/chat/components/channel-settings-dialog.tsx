@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { Trash2, UserPlus } from "lucide-react";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import { LoadMoreButton } from "@/components/shared/load-more-button";
 import {
   useUpdateChannel,
   useDeleteChannel,
@@ -60,10 +61,14 @@ export function ChannelSettingsDialog({
 
   const updateChannel = useUpdateChannel(workspaceId, channel.id);
   const deleteChannel = useDeleteChannel(workspaceId, channel.id);
-  const { data: membersData } = useChannelMembers(workspaceId, channel.id);
+  const {
+    members,
+    hasNextPage: hasMoreMembers,
+    isFetchingNextPage: loadingMoreMembers,
+    fetchNextPage: loadMoreMembers,
+  } = useChannelMembers(workspaceId, channel.id);
   const addMembers = useAddMembers(workspaceId, channel.id);
   const removeMember = useRemoveMember(workspaceId, channel.id);
-  const members = membersData?.data ?? [];
   const canEdit = channel.createdById === currentUserId || isAdmin;
 
   const memberIds = useMemo(
@@ -160,7 +165,7 @@ export function ChannelSettingsDialog({
 
             {/* Members */}
             <div className="mt-6">
-              <Label>Members ({members.length})</Label>
+              <Label>Members ({channel._count?.members ?? members.length})</Label>
               <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
                 {members.map((m) => (
                   <div key={m.id} className="flex items-center gap-2 py-1 px-1">
@@ -185,6 +190,14 @@ export function ChannelSettingsDialog({
                     )}
                   </div>
                 ))}
+                {hasMoreMembers && (
+                  <LoadMoreButton
+                    className="px-1"
+                    label="Load more members"
+                    loading={loadingMoreMembers}
+                    onClick={() => void loadMoreMembers()}
+                  />
+                )}
               </div>
             </div>
 

@@ -78,7 +78,7 @@ vi.mock("./api", () => {
     usePinnedMessages: () => ({ data: { data: [] }, isLoading: false }),
     useBookmarks: () => ({ data: { data: [] }, isLoading: false }),
     useSearchMessages: () => ({ data: undefined, isLoading: false }),
-    useChannelMembers: () => ({ data: { data: [] } }),
+    useChannelMembers: () => ({ members: [], hasNextPage: false, isFetchingNextPage: false, fetchNextPage: async () => undefined }),
     useThreadSubscription: () => ({ data: { data: { subscribed: false } } }),
     useMarkRead: mutation,
     useUpdateMessage: mutation,

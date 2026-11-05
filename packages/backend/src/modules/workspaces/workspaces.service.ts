@@ -6,8 +6,10 @@ import type {
   UpdateWorkspaceSettingsInput,
   WorkspaceSearchInput,
   ActivityLogQueryInput,
+  MyTasksQueryInput,
 } from "@pm/shared";
-import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
+import { ACTIVITY_COUNT_LIMIT } from "@pm/shared";
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
 import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { clearAssignments } from "../../utils/task-references.js";
@@ -342,11 +344,51 @@ export async function getDashboard(
   return { data };
 }
 
+interface MyTasksPosition {
+  projectName: string;
+  projectId: string;
+  position: number;
+  id: string;
+}
+
+/** my-tasks cursors carry the sort values of the last row, not just its ID. */
+function encodeMyTasksCursor(row: MyTasksPosition) {
+  return Buffer.from(
+    JSON.stringify([row.projectName, row.projectId, row.position, row.id]),
+  ).toString("base64url");
+}
+
+function decodeMyTasksCursor(cursor: string): MyTasksPosition {
+  try {
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (
+      Array.isArray(value) &&
+      value.length === 4 &&
+      typeof value[0] === "string" &&
+      typeof value[1] === "string" &&
+      Number.isSafeInteger(value[2]) &&
+      typeof value[3] === "string"
+    ) {
+      return { projectName: value[0], projectId: value[1], position: value[2], id: value[3] };
+    }
+  } catch {
+    // Reported below.
+  }
+  throw new ValidationError("Validation failed", [
+    { field: "cursor", message: "Invalid cursor: use the nextCursor of the previous page" },
+  ]);
+}
+
+/**
+ * The caller's assigned, unarchived tasks in visible projects, ordered by
+ * project name, then project, board position and ID, one page at a time.
+ */
 export async function getMyTasks(
   prisma: PrismaClient,
   workspaceId: string,
   userId: string,
   role: string,
+  query: MyTasksQueryInput,
 ) {
   const projectWhere: Prisma.ProjectWhereInput = {
     workspaceId,
@@ -357,12 +399,38 @@ export async function getMyTasks(
     projectWhere.members = { some: { userId } };
   }
 
-  const tasks = await prisma.task.findMany({
-    where: {
+  const filters: Prisma.TaskWhereInput[] = [
+    {
       archived: false,
       assignees: { some: { userId } },
       project: projectWhere,
     },
+  ];
+  if (query.dueBefore || query.dueAfter) {
+    filters.push({
+      dueDate: {
+        ...(query.dueBefore ? { lte: query.dueBefore } : {}),
+        ...(query.dueAfter ? { gte: query.dueAfter } : {}),
+      },
+    });
+  }
+  if (query.completed !== undefined) {
+    filters.push({ status: { isCompletion: query.completed } });
+  }
+  if (query.cursor) {
+    const at = decodeMyTasksCursor(query.cursor);
+    filters.push({
+      OR: [
+        { project: { name: { gt: at.projectName } } },
+        { project: { name: at.projectName }, projectId: { gt: at.projectId } },
+        { projectId: at.projectId, position: { gt: at.position } },
+        { projectId: at.projectId, position: at.position, id: { gt: at.id } },
+      ],
+    });
+  }
+
+  const tasks = await prisma.task.findMany({
+    where: { AND: filters },
     include: {
       project: { select: { id: true, name: true, color: true } },
       status: true,
@@ -375,10 +443,30 @@ export async function getMyTasks(
         },
       },
     },
-    orderBy: [{ project: { name: "asc" } }, { position: "asc" }],
+    orderBy: [
+      { project: { name: "asc" } },
+      { projectId: "asc" },
+      { position: "asc" },
+      { id: "asc" },
+    ],
+    take: query.limit + 1,
   });
 
-  return { data: tasks.map(scopeTaskRelations) };
+  const hasMore = tasks.length > query.limit;
+  const page = hasMore ? tasks.slice(0, query.limit) : tasks;
+  const last = page.at(-1);
+  return {
+    data: page.map(scopeTaskRelations),
+    nextCursor:
+      hasMore && last
+        ? encodeMyTasksCursor({
+            projectName: last.project.name,
+            projectId: last.projectId,
+            position: last.position,
+            id: last.id,
+          })
+        : null,
+  };
 }
 
 export async function searchTasks(
@@ -506,7 +594,7 @@ export async function listWorkspaceActivity(
     } },
   };
 
-  const [data, total] = await Promise.all([
+  const [rows, counted] = await Promise.all([
     prisma.activityLog.findMany({
       where,
       include: {
@@ -521,20 +609,50 @@ export async function listWorkspaceActivity(
           },
         },
       },
-      orderBy: { createdAt: "desc" },
+      // The ID gives equal timestamps one order, so pages do not overlap.
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       skip: (query.page - 1) * query.limit,
-      take: query.limit,
+      // One extra row tells whether another page follows.
+      take: query.limit + 1,
     }),
-    prisma.activityLog.count({ where }),
+    // Counting stops after ACTIVITY_COUNT_LIMIT + 1 rows: an exact count of
+    // every activity row of the visible projects cost most of the request.
+    // Same rows as `where`; raw SQL because Prisma's count with `take` adds an
+    // ORDER BY that makes PostgreSQL read every row before the LIMIT.
+    prisma.$queryRaw<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM (
+        SELECT 1 FROM "ActivityLog" a
+        WHERE a."taskId" IN (
+          SELECT t."id" FROM "Task" t
+          JOIN "Project" p ON p."id" = t."projectId"
+          WHERE p."workspaceId" = ${workspaceId}
+          ${
+            userRole === "ADMIN"
+              ? Prisma.empty
+              : Prisma.sql`AND EXISTS (
+                  SELECT 1 FROM "ProjectMember" pm
+                  WHERE pm."projectId" = p."id" AND pm."userId" = ${userId})`
+          }
+        )
+        LIMIT ${ACTIVITY_COUNT_LIMIT + 1}
+      ) s`.then(([row]) => row.n),
   ]);
+
+  const hasMore = rows.length > query.limit;
+  const data = hasMore ? rows.slice(0, query.limit) : rows;
+  const totalCapped = counted > ACTIVITY_COUNT_LIMIT;
+  const total = totalCapped ? ACTIVITY_COUNT_LIMIT : counted;
 
   return {
     data,
     pagination: {
       page: query.page,
       limit: query.limit,
+      /** Exact up to ACTIVITY_COUNT_LIMIT; that limit when totalCapped. */
       total,
       totalPages: Math.ceil(total / query.limit),
+      totalCapped,
+      hasMore,
     },
   };
 }

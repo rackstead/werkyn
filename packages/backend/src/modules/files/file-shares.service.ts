@@ -179,12 +179,22 @@ export async function listSharedWithMe(
 ) {
   const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
+  const where: Prisma.FileShareWhereInput = {
+    workspaceId,
+    sharedWithId: userId,
+    file: { AND: [readable], trashedAt: null },
+  };
+  // A cursor must be one of the listed shares; any other ID gives an empty
+  // page, as it did before the ID tie-breaker.
+  if (cursor) {
+    const scopedCursor = await prisma.fileShare.findFirst({
+      where: { AND: [where, { id: cursor }] },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: null };
+  }
   const shares = await prisma.fileShare.findMany({
-    where: {
-      workspaceId,
-      sharedWithId: userId,
-      file: { AND: [readable], trashedAt: null },
-    },
+    where,
     include: {
       file: {
         include: {
@@ -197,7 +207,8 @@ export async function listSharedWithMe(
         select: { id: true, displayName: true, avatarUrl: true },
       },
     },
-    orderBy: { createdAt: "desc" },
+    // The unique ID breaks createdAt ties, so Prisma applies LIMIT to the page.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });

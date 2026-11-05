@@ -9,12 +9,21 @@ import {
 } from "@tanstack/react-table";
 import { ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { TimeReportGroup } from "../api";
+import { LoadMoreButton } from "@/components/shared/load-more-button";
+import {
+  useTimeReportGroupEntries,
+  type TimeReportEntry,
+  type TimeReportFilters,
+  type TimeReportGroup,
+} from "../api";
 import { formatCostLines, formatEntryCost, formatUnratedHours } from "../money";
 
 interface ReportTableProps {
   groups: TimeReportGroup[];
   groupBy: string;
+  /** Where the next entries of a group come from. */
+  workspaceId: string;
+  filters: TimeReportFilters;
 }
 
 function fmt(n: number): string {
@@ -23,7 +32,103 @@ function fmt(n: number): string {
 
 const columnHelper = createColumnHelper<TimeReportGroup>();
 
-export function ReportTable({ groups, groupBy }: ReportTableProps) {
+function EntryRow({ entry }: { entry: TimeReportEntry }) {
+  return (
+    <tr className="border-b bg-muted/30 hover:bg-muted/50 transition-colors">
+      <td className="border-r border-border" />
+      <td className="px-3 py-1.5 border-r border-border">
+        <div className="text-xs text-muted-foreground pl-2">
+          <span>{entry.date}</span>
+          {entry.projectName && (
+            <span> · {entry.projectName}</span>
+          )}
+          {entry.taskTitle && (
+            <span> · {entry.taskTitle}</span>
+          )}
+          {entry.description && (
+            <div className="text-muted-foreground/70 mt-0.5">
+              {entry.description}
+            </div>
+          )}
+        </div>
+      </td>
+      <td className="px-3 py-1.5 text-right text-xs border-r border-border">
+        {fmt(entry.hours)}h
+      </td>
+      <td className="px-3 py-1.5 text-right text-xs border-r border-border">
+        {entry.billable ? "Yes" : "No"}
+      </td>
+      <td className="px-3 py-1.5 text-right text-xs border-r border-border">
+        –
+      </td>
+      <td className="px-3 py-1.5 text-right text-xs">
+        {formatEntryCost(entry.cost, entry.currency, entry.costFractionDigits)}
+      </td>
+    </tr>
+  );
+}
+
+interface GroupEntryRowsProps {
+  group: TimeReportGroup;
+  workspaceId: string;
+  filters: TimeReportFilters;
+}
+
+/** An expanded group's entries. */
+function GroupEntryRows(props: GroupEntryRowsProps) {
+  if (props.group.hasMoreEntries) return <PagedGroupEntryRows {...props} />;
+  return (
+    <>
+      {props.group.entries.map((entry) => (
+        <EntryRow key={entry.id} entry={entry} />
+      ))}
+    </>
+  );
+}
+
+/**
+ * A group the report returned only partly: its first entries, then further
+ * pages from the entries endpoint when the user asks for them.
+ */
+function PagedGroupEntryRows({ group, workspaceId, filters }: GroupEntryRowsProps) {
+  const [requested, setRequested] = useState(false);
+  const more = useTimeReportGroupEntries(workspaceId, filters, group, requested);
+  const entries = [
+    ...group.entries,
+    ...(more.data?.pages.flatMap((page) => page.data) ?? []),
+  ];
+  const exhausted = requested && more.isSuccess && !more.hasNextPage;
+  const remaining = Math.max(0, group.entryCount - entries.length);
+
+  return (
+    <>
+      {entries.map((entry) => (
+        <EntryRow key={entry.id} entry={entry} />
+      ))}
+      {!exhausted && (
+        <tr className="border-b bg-muted/30">
+          <td className="border-r border-border" />
+          <td colSpan={5} className="px-3 py-1.5">
+            <LoadMoreButton
+              className="pl-2"
+              label={
+                remaining > 0
+                  ? `Load more entries (${remaining} more)`
+                  : "Load more entries"
+              }
+              loading={more.isFetching}
+              onClick={() =>
+                requested ? void more.fetchNextPage() : setRequested(true)
+              }
+            />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+export function ReportTable({ groups, groupBy, workspaceId, filters }: ReportTableProps) {
   const [expanded, setExpanded] = useState<ExpandedState>({});
 
   const columns = useMemo(
@@ -182,43 +287,13 @@ export function ReportTable({ groups, groupBy }: ReportTableProps) {
               </tr>
 
               {/* Expanded detail rows */}
-              {row.getIsExpanded() &&
-                row.original.entries.map((entry) => (
-                  <tr
-                    key={entry.id}
-                    className="border-b bg-muted/30 hover:bg-muted/50 transition-colors"
-                  >
-                    <td className="border-r border-border" />
-                    <td className="px-3 py-1.5 border-r border-border">
-                      <div className="text-xs text-muted-foreground pl-2">
-                        <span>{entry.date}</span>
-                        {entry.projectName && (
-                          <span> · {entry.projectName}</span>
-                        )}
-                        {entry.taskTitle && (
-                          <span> · {entry.taskTitle}</span>
-                        )}
-                        {entry.description && (
-                          <div className="text-muted-foreground/70 mt-0.5">
-                            {entry.description}
-                          </div>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-3 py-1.5 text-right text-xs border-r border-border">
-                      {fmt(entry.hours)}h
-                    </td>
-                    <td className="px-3 py-1.5 text-right text-xs border-r border-border">
-                      {entry.billable ? "Yes" : "No"}
-                    </td>
-                    <td className="px-3 py-1.5 text-right text-xs border-r border-border">
-                      –
-                    </td>
-                    <td className="px-3 py-1.5 text-right text-xs">
-                      {formatEntryCost(entry.cost, entry.currency, entry.costFractionDigits)}
-                    </td>
-                  </tr>
-                ))}
+              {row.getIsExpanded() && (
+                <GroupEntryRows
+                  group={row.original}
+                  workspaceId={workspaceId}
+                  filters={filters}
+                />
+              )}
             </Fragment>
           ))}
         </tbody>

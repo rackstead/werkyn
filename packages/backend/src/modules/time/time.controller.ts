@@ -7,6 +7,7 @@ import type {
   UpdateTimeEntryInput,
   TimeEntryQuery,
   TimeReportQuery,
+  TimeReportEntriesQuery,
   SetUserRateInput,
 } from "@pm/shared";
 
@@ -118,6 +119,23 @@ export async function getReportHandler(
   logSkippedEntries(request, wid, query, report.summary.skippedEntries);
 
   return reply.send({ data: report });
+}
+
+export async function listReportEntriesHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const { wid } = request.params as { wid: string };
+  const query = request.query as TimeReportEntriesQuery;
+
+  const page = await timeReportsService.listReportEntries(
+    request.server.prisma,
+    wid,
+    request.user!.id,
+    query,
+  );
+
+  return reply.send(page);
 }
 
 export async function exportCSVHandler(

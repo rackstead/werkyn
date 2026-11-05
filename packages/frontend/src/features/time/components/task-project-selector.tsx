@@ -8,6 +8,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useMyTasks } from "@/features/my-tasks/api";
+import { LoadMoreButton } from "@/components/shared/load-more-button";
 
 interface TaskSelectorProps {
   workspaceId: string;
@@ -20,8 +21,8 @@ export function TaskSelector({
   taskId,
   onChange,
 }: TaskSelectorProps) {
-  const { data: tasksData } = useMyTasks(workspaceId);
-  const tasks = tasksData?.data ?? [];
+  const { tasks, hasNextPage, isFetchingNextPage, fetchNextPage } =
+    useMyTasks(workspaceId);
 
   // Group tasks by project
   const byProject = new Map<string, { projectName: string; color: string | null; tasks: typeof tasks }>();
@@ -74,6 +75,15 @@ export function TaskSelector({
             ))}
           </SelectGroup>
         ))}
+        {hasNextPage && (
+          <div className="px-2 py-1.5">
+            <LoadMoreButton
+              label="Load more tasks"
+              loading={isFetchingNextPage}
+              onClick={() => void fetchNextPage()}
+            />
+          </div>
+        )}
       </SelectContent>
     </Select>
   );

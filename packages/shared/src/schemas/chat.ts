@@ -45,6 +45,22 @@ export const ChatBookmarkQuerySchema = ChatMessageQuerySchema.extend({
 });
 export type ChatBookmarkQueryInput = z.infer<typeof ChatBookmarkQuerySchema>;
 
+/** Members each channel in the channel list carries; `_count.members` is the full count. */
+export const CHANNEL_LIST_MEMBER_LIMIT = 10;
+/** Default page of a channel's member list. */
+export const CHANNEL_MEMBER_PAGE_DEFAULT = 100;
+
+export const ChannelMemberQuerySchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .default(CHANNEL_MEMBER_PAGE_DEFAULT),
+});
+export type ChannelMemberQueryInput = z.infer<typeof ChannelMemberQuerySchema>;
+
 export const ToggleReactionSchema = z.object({
   emoji: z.string().min(1).max(32),
 });

@@ -838,7 +838,8 @@ export async function listTaskActivity(
           select: { id: true, displayName: true, avatarUrl: true },
         },
       },
-      orderBy: { createdAt: "desc" },
+      // The ID gives equal timestamps one order, so pages do not overlap.
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       skip: (query.page - 1) * query.limit,
       take: query.limit,
     }),

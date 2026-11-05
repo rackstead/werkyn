@@ -86,6 +86,9 @@ function percentile(sorted: number[], p: number) {
 
 function itemCount(body: unknown) {
   const data = (body as { data?: unknown })?.data;
+  // A time report counts its entries.
+  const groups = (data as { groups?: { entries?: unknown[] }[] } | undefined)?.groups;
+  if (Array.isArray(groups)) return groups.reduce((n, g) => n + (g.entries?.length ?? 0), 0);
   return Array.isArray(data) ? data.length : Array.isArray(body) ? body.length : undefined;
 }
 
@@ -187,12 +190,21 @@ async function fixture() {
         SELECT "parentId" AS id FROM "WikiPage" WHERE "spaceId" = ${space.id} AND "parentId" IS NOT NULL
         GROUP BY "parentId" ORDER BY count(*) DESC, "parentId" LIMIT 1`
     : [];
+  // Cursor-paged and bounded lists (docs/remediation/p02b.md).
+  const [commented] = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT c."taskId" AS id FROM "Comment" c JOIN "Task" t ON t.id = c."taskId"
+    WHERE t."projectId" = ${big.id} GROUP BY c."taskId" ORDER BY count(*) DESC, c."taskId" LIMIT 1`;
+  const [versioned] = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT v."pageId" AS id FROM "WikiPageVersion" v JOIN "WikiPage" p ON p.id = v."pageId"
+    JOIN "WikiSpace" s ON s.id = p."spaceId" WHERE s."workspaceId" = ${wid}
+    GROUP BY v."pageId" ORDER BY count(*) DESC, v."pageId" LIMIT 1`;
   // Rows a small fixture may lack; their endpoints are skipped.
   const optional = <T>(row: T) => row as T | undefined;
   return {
     wid, admin, member, big, median, statuses, task, general,
     thread: optional(thread), olderPage: optional(olderPage), folder: optional(folder),
     team: optional(team), space: optional(space), wikiParent: optional(wikiParent),
+    commented: optional(commented), versioned: optional(versioned),
   };
 }
 
@@ -222,6 +234,19 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
   /** An endpoint that needs a fixture row, or none when the fixture lacks it. */
   const needs = <T>(row: T | undefined, t: string, path: (row: T) => string) =>
     row ? get(t, path(row)) : undefined;
+  /**
+   * A cursor page `pages` pages deep, reached through the API's own nextCursor
+   * before timing; none when the list ends sooner.
+   */
+  const deep = async (t: string, path: string, pages: number) => {
+    let cursor: string | undefined;
+    for (let i = 0; i < pages; i++) {
+      const res = await check(path, await request("GET", cursor ? `${path}${path.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(cursor)}` : path, t));
+      cursor = (res.body as { nextCursor?: string | null }).nextCursor ?? undefined;
+      if (!cursor) return undefined;
+    }
+    return get(t, `${path}${path.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(cursor!)}`);
+  };
   const week = `startDate=${day(-6)}&endDate=${day(0)}`;
   const quarter = `startDate=${day(-90)}&endDate=${day(0)}`;
   const endpoints: [string, (() => Promise<Response>) | undefined][] = [
@@ -263,10 +288,25 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
       (r) => `/wiki/spaces/${r.space.id}/pages/tree?parentId=${r.parent.id}`)],
     ["time: my entries, week", get(m, `/workspaces/${f.wid}/time/entries?${week}&userId=${f.member.id}`)],
     ["time: report 90 days (admin)", get(a, `/workspaces/${f.wid}/time/reports?${quarter}`)],
+    ["time: report 90 days by date (admin)", get(a, `/workspaces/${f.wid}/time/reports?${quarter}&groupBy=date`)],
+    ["chat: bookmarks", get(m, `/chat/${f.wid}/bookmarks`)],
+    ["chat: bookmarks, page 2 (limit 5)", await deep(m, `/chat/${f.wid}/bookmarks?limit=5`, 1)],
+    ["chat: channel members, general", get(m, `/chat/${f.wid}/channels/${f.general.id}/members`)],
+    ["drive: search, page 1", get(m, `/workspaces/${f.wid}/files?search=report`)],
+    ["drive: search, page 4", await deep(m, `/workspaces/${f.wid}/files?search=report`, 3)],
+    ["drive: search by size, page 4", await deep(m, `/workspaces/${f.wid}/files?search=report&sortBy=size`, 3)],
+    ["drive: search by uploader, page 4", await deep(m, `/workspaces/${f.wid}/files?search=report&sortBy=uploadedBy`, 3)],
+    ["drive: search (admin), page 4", await deep(a, `/workspaces/${f.wid}/files?search=report`, 3)],
+    ["drive: search (admin), page 20", await deep(a, `/workspaces/${f.wid}/files?search=report`, 19)],
+    ["drive: search by size (admin), page 20", await deep(a, `/workspaces/${f.wid}/files?search=report&sortBy=size`, 19)],
+    ["drive: team folder, page 2", f.team ? await deep(m, `/workspaces/${f.wid}/files?teamFolderId=${f.team.id}`, 1) : undefined],
+    ["drive: shared with me, page 2 (limit 10)", await deep(m, `/workspaces/${f.wid}/files/shared-with-me?limit=10`, 1)],
+    ["tasks: comments, page 2 (limit 2)", f.commented ? await deep(m, `/tasks/${f.commented.id}/comments?limit=2`, 1) : undefined],
+    ["wiki: versions, page 2 (limit 1)", f.versioned ? await deep(a, `/wiki/pages/${f.versioned.id}/versions?limit=1`, 1) : undefined],
   ];
   const results: Result[] = [];
   for (const [name, run] of endpoints) {
-    if (ONLY && !name.includes(ONLY)) continue;
+    if (ONLY && !ONLY.split("|").some((part) => name.includes(part))) continue;
     if (!run) {
       console.log(`${name.padEnd(44)} skipped: the fixture has no row for it`);
       continue;

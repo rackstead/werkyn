@@ -8,6 +8,7 @@ import type {
   AddMembersInput,
   ChatMessageQueryInput,
   ChatBookmarkQueryInput,
+  ChannelMemberQueryInput,
   ToggleReactionInput,
   PinMessageInput,
   ArchiveChannelInput,
@@ -158,11 +159,14 @@ export async function listMembersHandler(
   reply: FastifyReply,
 ) {
   const { channelId } = request.params as { channelId: string };
-  const members = await chatService.listMembers(
+  const query = request.query as ChannelMemberQueryInput;
+  const result = await chatService.listMembers(
     request.server.prisma,
     channelId,
+    query.cursor,
+    query.limit,
   );
-  return reply.send({ data: members });
+  return reply.send(result);
 }
 
 export async function addMembersHandler(

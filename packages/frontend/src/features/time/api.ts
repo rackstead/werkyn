@@ -1,4 +1,4 @@
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useMutation } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
@@ -60,29 +60,48 @@ export interface TimeReportCostTotals {
   unratedBillableHours: number;
 }
 
+export interface TimeReportEntry {
+  id: string;
+  date: string;
+  hours: number;
+  billable: boolean;
+  description: string | null;
+  userName: string;
+  projectName: string | null;
+  taskTitle: string | null;
+  /** Rate in effect on the entry's date; null when the member had none. */
+  rate: number | null;
+  currency: string | null;
+  /** null when the entry is billable but has no rate. */
+  cost: number | null;
+  costFractionDigits: number | null;
+}
+
 export interface TimeReportGroup extends TimeReportCostTotals {
   key: string;
   label: string;
   totalHours: number;
   billableHours: number;
   nonBillableHours: number;
-  entries: Array<{
-    id: string;
-    date: string;
-    hours: number;
-    billable: boolean;
-    description: string | null;
-    userName: string;
-    projectName: string | null;
-    taskTitle: string | null;
-    /** Rate in effect on the entry's date; null when the member had none. */
-    rate: number | null;
-    currency: string | null;
-    /** null when the entry is billable but has no rate. */
-    cost: number | null;
-    costFractionDigits: number | null;
-  }>;
+  /** The group's first entries (20 by default); totals cover every entry. */
+  entries: TimeReportEntry[];
+  /** Every entry of the group. */
+  entryCount: number;
+  /** More entries follow; load them with useTimeReportGroupEntries. */
+  hasMoreEntries: boolean;
+  /** Where the next entries start; null with hasMoreEntries means from the first. */
+  nextEntryCursor: string | null;
 }
+
+// A type alias, so it also fits Record<string, unknown> (query keys).
+export type TimeReportFilters = {
+  startDate: string;
+  endDate: string;
+  userIds?: string;
+  projectIds?: string;
+  billable?: string;
+  groupBy?: string;
+};
 
 export interface TimeReport {
   groups: TimeReportGroup[];
@@ -120,14 +139,7 @@ export function useTimeEntries(
 
 export function useTimeReport(
   workspaceId: string,
-  filters: {
-    startDate: string;
-    endDate: string;
-    userIds?: string;
-    projectIds?: string;
-    billable?: string;
-    groupBy?: string;
-  },
+  filters: TimeReportFilters,
 ) {
   return useQuery({
     queryKey: queryKeys.timeReport(workspaceId, filters),
@@ -142,6 +154,48 @@ export function useTimeReport(
       !!workspaceId &&
       isDateOnly(filters.startDate) &&
       isDateOnly(filters.endDate),
+  });
+}
+
+/** Report filters as query parameters, without the unset ones. */
+function reportSearchParams(filters: TimeReportFilters) {
+  const params: Record<string, string> = {};
+  for (const [name, value] of Object.entries(filters)) {
+    if (value !== undefined) params[name] = value;
+  }
+  return params;
+}
+
+/**
+ * The entries of one report group after those the report returned, a page
+ * (100) at a time. Nothing is requested until `enabled`.
+ */
+export function useTimeReportGroupEntries(
+  workspaceId: string,
+  filters: TimeReportFilters,
+  group: Pick<TimeReportGroup, "key" | "nextEntryCursor">,
+  enabled: boolean,
+) {
+  return useInfiniteQuery({
+    queryKey: [
+      ...queryKeys.timeReport(workspaceId, filters),
+      "entries",
+      group.key,
+      group.nextEntryCursor,
+    ],
+    queryFn: ({ pageParam }) =>
+      api
+        .get(`workspaces/${workspaceId}/time/reports/entries`, {
+          searchParams: {
+            ...reportSearchParams(filters),
+            groupKey: group.key,
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+        })
+        .json<{ data: TimeReportEntry[]; nextCursor: string | null }>(),
+    initialPageParam: group.nextEntryCursor ?? undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    enabled,
   });
 }
 

@@ -7,7 +7,10 @@ import { UpcomingDatesWidget } from "./upcoming-dates-widget";
 
 const state = vi.hoisted(() => ({ tasks: [] as MyTask[] }));
 vi.mock("@/features/my-tasks/api", () => ({
-  useMyTasks: () => ({ data: { data: state.tasks }, isLoading: false }),
+  useMyTasks: () => ({
+    tasks: state.tasks, isLoading: false, hasNextPage: false,
+    isFetchingNextPage: false, fetchNextPage: async () => undefined,
+  }),
 }));
 
 const LOCAL_TODAY = {

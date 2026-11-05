@@ -2,9 +2,10 @@ import { useMyTasks, type MyTask } from "@/features/my-tasks/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
+import { LoadMoreButton } from "@/components/shared/load-more-button";
 import { cn } from "@/lib/utils";
 import { AlertTriangle } from "lucide-react";
-import { formatDateISO, parseDateISO } from "@/features/time/utils";
+import { addDaysISO, formatDateISO, parseDateISO } from "@/features/time/utils";
 
 function formatDueDate(value: string): string {
   return parseDateISO(value)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) ?? value;
@@ -23,14 +24,20 @@ interface MyTasksWidgetProps {
 }
 
 export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) {
-  const { data, isLoading } = useMyTasks(workspaceId);
-  const tasks = data?.data ?? [];
+  // The list is paged; overdue tasks come from their own filtered query, so
+  // the overdue box does not depend on how many pages are loaded.
+  const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage } =
+    useMyTasks(workspaceId);
 
   const todayStr = formatDateISO(new Date());
+  const overdue = useMyTasks(workspaceId, {
+    dueBefore: addDaysISO(todayStr, -1),
+    completed: false,
+  });
   const isOverdue = (task: MyTask) => Boolean(
     task.dueDate && task.dueDate < todayStr && !task.status.isCompletion,
   );
-  const overdueTasks = tasks.filter(isOverdue);
+  const overdueTasks = overdue.tasks.filter(isOverdue);
 
   const grouped = tasks.reduce<Record<string, { project: { id: string; name: string; color: string | null }; tasks: MyTask[] }>>(
     (acc, task) => {
@@ -68,7 +75,7 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
                 <div className="flex items-center gap-1.5 pb-0.5">
                   <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
                   <span className="text-xs font-semibold text-destructive">
-                    Overdue ({overdueTasks.length})
+                    Overdue ({overdueTasks.length}{overdue.hasNextPage ? "+" : ""})
                   </span>
                 </div>
                 {overdueTasks.map((task) => (
@@ -87,6 +94,14 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
                     </span>
                   </button>
                 ))}
+                {overdue.hasNextPage && (
+                  <LoadMoreButton
+                    className="px-2 text-destructive"
+                    label="Load more overdue tasks"
+                    loading={overdue.isFetchingNextPage}
+                    onClick={() => void overdue.fetchNextPage()}
+                  />
+                )}
               </div>
             )}
 
@@ -130,6 +145,15 @@ export function MyTasksWidget({ workspaceId, onTaskClick }: MyTasksWidgetProps) 
                 ))}
               </div>
             ))}
+
+            {hasNextPage && (
+              <LoadMoreButton
+                className="px-2"
+                label="Load more tasks"
+                loading={isFetchingNextPage}
+                onClick={() => void fetchNextPage()}
+              />
+            )}
           </div>
         )}
       </CardContent>

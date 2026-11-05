@@ -52,7 +52,15 @@ export function useWorkspaceActivity(wid: string) {
         })
         .json<{
           data: WorkspaceActivityEntry[];
-          pagination: { page: number; limit: number; total: number; totalPages: number };
+          pagination: {
+            page: number;
+            limit: number;
+            /** Exact up to 1,000 rows; 1,000 when totalCapped. */
+            total: number;
+            totalPages: number;
+            totalCapped: boolean;
+            hasMore: boolean;
+          };
         }>(),
     enabled: !!wid,
   });

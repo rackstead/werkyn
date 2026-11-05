@@ -150,20 +150,26 @@ describe("TaskTable windowing", () => {
     expect(table.getAttribute("aria-rowcount")).toBe(String(TOTAL_ROWS));
     expect(taskRows().length).toBeGreaterThan(5);
     expect(taskRows().length).toBeLessThan(30);
-    const rendered = [...table.querySelectorAll("tbody tr:not([aria-hidden])")]
+    const indexes = [...table.querySelectorAll("tbody tr:not([aria-hidden])")]
       .map((row) => Number(row.getAttribute("aria-rowindex")));
+    // The rows near the view, then the last row of the list (kept rendered
+    // so Shift+Tab from below the table reaches it).
+    const rendered = indexes.slice(0, -1);
     expect(rendered).toEqual(rendered.map((_, i) => 2 + i));
-    // The rows after the rendered ones are one spacer, hidden from assistive
-    // technology, holding their height (rows not measured yet are estimated;
-    // the two group rows below use a shorter estimate).
+    expect(indexes.at(-1)).toBe(TOTAL_ROWS);
+    // Between them one spacer, hidden from assistive technology, holds the
+    // height of the rows not rendered (estimated; group rows use a shorter
+    // estimate).
     const spacer = table.querySelector<HTMLElement>("tbody tr[aria-hidden='true']")!;
-    const expected = (TOTAL_ROWS - 1 - rendered.length) * ROW;
+    const expected = (TOTAL_ROWS - 2 - rendered.length) * ROW;
     expect(Math.abs(parseFloat(spacer.style.height) - expected)).toBeLessThan(2 * ROW);
     expect(screen.queryByRole("button", { name: "Task 0999" })).toBeNull();
 
     await scrollToEnd();
     expect(screen.getByRole("button", { name: "Task 0999" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Task 0000" })).toBeNull();
+    // The first row stays rendered, so Tab from the header reaches it.
+    expect(table.querySelector("tbody tr:not([aria-hidden])")!.getAttribute("aria-rowindex")).toBe("2");
     expect(taskRows().length).toBeLessThan(30);
     const last = table.querySelector("tbody tr:not([aria-hidden]):last-of-type")!;
     expect(last.getAttribute("aria-rowindex")).toBe(String(TOTAL_ROWS));

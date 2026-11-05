@@ -35,11 +35,6 @@ const OVERSCAN = 8;
 // The title column takes the width the other columns leave, but no less.
 const TITLE_MIN_WIDTH = 240;
 
-// Browsers with CSS scroll anchoring keep the visible rows in place when rows
-// above them are rendered at a height other than their estimate.
-const scrollAnchoring =
-  typeof CSS !== "undefined" && CSS.supports?.("overflow-anchor", "auto");
-
 interface TaskRowProps {
   row: Row<Task>;
   // Cells read these through the row; they are props so that a memoized row
@@ -248,11 +243,15 @@ export function TaskTable({
   );
   const rangeExtractor = useCallback(
     (range: Range) => {
-      const indexes = defaultRangeExtractor(range);
-      if (focusedIndex < 0) return indexes;
-      const keep = new Set(indexes);
-      const last = Math.min(range.count - 1, focusedIndex + 1);
-      for (let i = Math.max(0, focusedIndex - 1); i <= last; i++) keep.add(i);
+      // The first and last rows are always rendered too, so Tab into the
+      // table from above (the header checkbox) reaches the first row and
+      // Shift+Tab from below reaches the last, as with every row rendered.
+      const keep = new Set(defaultRangeExtractor(range));
+      if (range.count > 0) keep.add(0).add(range.count - 1);
+      if (focusedIndex >= 0) {
+        const last = Math.min(range.count - 1, focusedIndex + 1);
+        for (let i = Math.max(0, focusedIndex - 1); i <= last; i++) keep.add(i);
+      }
       return [...keep].sort((a, b) => a - b);
     },
     [focusedIndex],
@@ -278,12 +277,54 @@ export function TaskTable({
     measureElement: (element) => element.getBoundingClientRect().height,
   });
   // Rows are laid out in normal table flow, so a row that turns out taller
-  // or shorter than its estimate already moves the rows after it; scroll
-  // anchoring then keeps the visible rows still. Correcting the scroll
-  // position as well would make them jump.
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = scrollAnchoring
-    ? () => false
-    : undefined;
+  // or shorter than its estimate already moves the rows after it in the
+  // DOM; keepRowsInView below corrects for that. The virtualizer's own
+  // correction would move them a second time.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+
+  // The rows in view stay where they are when rows above them change: tasks
+  // created, deleted or moved by others or by a bulk action, rows rendered
+  // at a height other than their estimate, an editor above the view
+  // closing. The first rows in view are remembered with their place and the
+  // scroll position; after a change, <main> scrolls by however far they
+  // moved other than by scrolling. The browser's scroll anchoring is off for
+  // the table: it did not apply to these changes, and together they would
+  // move the rows twice. Nothing is kept at the very top of the list.
+  const inView = useRef<{
+    scrollTop: number;
+    rows: Array<{ row: HTMLTableRowElement; top: number }>;
+  } | null>(null);
+  const keepRowsInView = useCallback(() => {
+    const body = bodyRef.current;
+    if (!scroller || !body) return;
+    const viewTop = scroller.getBoundingClientRect().top;
+    const last = inView.current;
+    // Scroll positions are whole pixels; what a correction could not make up
+    // is carried over, so repeated changes do not add up to a visible drift.
+    let remainder = 0;
+    if (last && scroller.scrollTop > 0) {
+      const kept = last.rows.find(({ row }) => row.parentNode === body);
+      if (kept) {
+        const scrolled = scroller.scrollTop - last.scrollTop;
+        const want = kept.top - scrolled;
+        const moved = kept.row.getBoundingClientRect().top - viewTop - want;
+        if (Math.abs(moved) >= 0.5) scroller.scrollTop += moved;
+        remainder = kept.row.getBoundingClientRect().top - viewTop - want;
+      }
+    }
+    const rows: Array<{ row: HTMLTableRowElement; top: number }> = [];
+    const viewBottom = viewTop + scroller.clientHeight;
+    for (const row of body.rows) {
+      if (row.hasAttribute("aria-hidden")) continue;
+      const { top, bottom } = row.getBoundingClientRect();
+      if (bottom <= viewTop) continue;
+      if (top >= viewBottom || rows.length === 3) break;
+      rows.push({ row, top: top - viewTop - remainder });
+    }
+    inView.current = { scrollTop: scroller.scrollTop, rows };
+  }, [scroller]);
+  // After every render of the table, before the browser paints.
+  useLayoutEffect(keepRowsInView);
 
   const hasRows = !isLoading && tasks.length > 0;
   useLayoutEffect(() => {
@@ -313,8 +354,16 @@ export function TaskTable({
       observer.observe(element);
       if (element === main) break;
     }
-    return () => observer.disconnect();
-  }, [hasRows]);
+    // Rows can change height without the table rendering (an inline editor
+    // opening or closing); the body's size then changes.
+    const body = bodyRef.current;
+    const rowsObserver = new ResizeObserver(() => keepRowsInView());
+    if (body) rowsObserver.observe(body);
+    return () => {
+      observer.disconnect();
+      rowsObserver.disconnect();
+    };
+  }, [hasRows, keepRowsInView]);
 
   if (isLoading) {
     return (
@@ -356,10 +405,9 @@ export function TaskTable({
   }
   const measureRow = scroller ? virtualizer.measureElement : undefined;
   const spacer = (height: number, key: string) => (
-    // Spacers are never the scroll anchor and are not part of the table for
-    // assistive technology (aria-rowcount and aria-rowindex describe the
-    // rows that are not rendered).
-    <tr key={key} aria-hidden="true" style={{ height, overflowAnchor: "none" }}>
+    // Spacers are not part of the table for assistive technology
+    // (aria-rowcount and aria-rowindex describe the rows not rendered).
+    <tr key={key} aria-hidden="true" style={{ height }}>
       <td colSpan={columns.length} style={{ height, padding: 0, border: 0 }} />
     </tr>
   );
@@ -373,7 +421,11 @@ export function TaskTable({
       <table
         ref={tableRef}
         className="w-full table-fixed border-collapse text-sm"
-        style={{ minWidth: fixedColumnsWidth + TITLE_MIN_WIDTH }}
+        style={{
+          minWidth: fixedColumnsWidth + TITLE_MIN_WIDTH,
+          // See keepRowsInView.
+          overflowAnchor: scroller ? "none" : undefined,
+        }}
         aria-rowcount={headerRows + listRows.length}
       >
         <thead className="sticky top-0 z-10 bg-background border-b">

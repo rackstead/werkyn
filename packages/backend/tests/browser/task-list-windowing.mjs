@@ -15,7 +15,7 @@
 // TASK_LIST_RUNS   measured runs, each in a fresh browser context (default 3)
 // TASK_LIST_STEPS  smoke steps to run, comma-separated (aria, scroll,
 //                  keyboard, selection, edit, realtime, collapse, anchor,
-//                  board);
+//                  edges, board);
 //                  all by default
 // TASK_LIST_REPORT path for the JSON report
 // TASK_LIST_SCREENSHOTS directory for screenshots taken during the smoke
@@ -1097,60 +1097,75 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await waitFor(async () => (await listState(page)).rowCount === before, "expand");
       pass("collapse and expand a group", { groupSize });
     }
+    // Helpers for the steps below that change tasks as a second user. Rows
+    // are found by title and positions come from the database, so these
+    // steps also run on builds that render every row.
+    const statusOrder = fixture.statuses.map((s) => s.id);
+    const expectedIndex = async (taskId) => {
+      const tasks = await prisma.task.findMany({
+        where: { projectId: fixture.project.id, archived: false },
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+        select: { id: true, statusId: true },
+      });
+      let index = 0;
+      for (const statusId of statusOrder) {
+        index++; // group header row
+        for (const task of tasks.filter((t) => t.statusId === statusId)) {
+          if (task.id === taskId) return index;
+          index++;
+        }
+      }
+      throw new Error(`task ${taskId} not in the List`);
+    };
+    // Index in the List of the rendered row with this title, and its top
+    // relative to <main>'s view.
+    const rowAt = (title) =>
+      page.evaluate((title) => {
+        const main = document.querySelector("main");
+        const rows = [...document.querySelector("table").tBodies[0].rows];
+        let domIndex = -1;
+        const row = rows.find((r) => {
+          if (!r.hasAttribute("aria-hidden")) domIndex++;
+          return r.cells[1]?.textContent === title;
+        });
+        if (!row) return null;
+        const aria = row.getAttribute("aria-rowindex");
+        return {
+          index: aria ? Number(aria) - 2 : domIndex,
+          top: row.getBoundingClientRect().top - main.getBoundingClientRect().top,
+        };
+      }, title);
+    const api = async (method, url, body) => {
+      const response = await fetch(`${fixture.apiOrigin}/api${url}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${fixture.otherToken}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const text = await response.text();
+      assert(response.ok, `${method} ${url}: ${response.status} ${text}`);
+      return text ? JSON.parse(text) : null;
+    };
+    // Task rows in view, top to bottom, relative to <main>'s view.
+    const rowsInView = () =>
+      page.evaluate(() => {
+        const view = document.querySelector("main").getBoundingClientRect();
+        return [...document.querySelector("table").tBodies[0].rows]
+          .filter((r) => {
+            const b = r.getBoundingClientRect();
+            return r.cells.length > 1 && b.bottom > view.top + 1 && b.top < view.bottom;
+          })
+          .map((r) => ({ title: r.cells[1].textContent, top: r.getBoundingClientRect().top - view.top }));
+      });
+    const taskByTitle = (title) =>
+      prisma.task.findFirst({ where: { projectId: fixture.project.id, title }, select: { id: true, statusId: true } });
+
     if (want("anchor")) {
       // 8. A colleague's changes above the view (created, deleted, moved
       // in) must not move the rows in view, and a click where the pointer
-      // rests must still hit the same task. Rows are found by title and
-      // positions come from the database, so this also runs on builds that
-      // render every row.
-      const statusOrder = fixture.statuses.map((s) => s.id);
-      const expectedIndex = async (taskId) => {
-        const tasks = await prisma.task.findMany({
-          where: { projectId: fixture.project.id, archived: false },
-          orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
-          select: { id: true, statusId: true },
-        });
-        let index = 0;
-        for (const statusId of statusOrder) {
-          index++; // group header row
-          for (const task of tasks.filter((t) => t.statusId === statusId)) {
-            if (task.id === taskId) return index;
-            index++;
-          }
-        }
-        throw new Error(`task ${taskId} not in the List`);
-      };
-      // Index in the List of the rendered row with this title, and its top
-      // relative to <main>'s view.
-      const rowAt = (title) =>
-        page.evaluate((title) => {
-          const main = document.querySelector("main");
-          const rows = [...document.querySelector("table").tBodies[0].rows];
-          let domIndex = -1;
-          const row = rows.find((r) => {
-            if (!r.hasAttribute("aria-hidden")) domIndex++;
-            return r.cells[1]?.textContent === title;
-          });
-          if (!row) return null;
-          const aria = row.getAttribute("aria-rowindex");
-          return {
-            index: aria ? Number(aria) - 2 : domIndex,
-            top: row.getBoundingClientRect().top - main.getBoundingClientRect().top,
-          };
-        }, title);
-      const api = async (method, url, body) => {
-        const response = await fetch(`${fixture.apiOrigin}/api${url}`, {
-          method,
-          headers: {
-            authorization: `Bearer ${fixture.otherToken}`,
-            ...(body ? { "content-type": "application/json" } : {}),
-          },
-          body: body ? JSON.stringify(body) : undefined,
-        });
-        const text = await response.text();
-        assert(response.ok, `${method} ${url}: ${response.status} ${text}`);
-        return text ? JSON.parse(text) : null;
-      };
+      // rests must still hit the same task.
       const [, inProgress, review, done] = fixture.statuses;
       const doneTasks = fixture.tasks.filter((t) => t.statusId === done.id);
       const reference = doneTasks[Math.floor(doneTasks.length * 0.6)];
@@ -1269,8 +1284,165 @@ async function smoke({ browser, origin, fixture, prisma }) {
       assert.deepEqual(checked, [reference.title], "click at the resting pointer hit the same task");
       pass("changes above the view keep rows in view still", { shifts, clickedTask: checked });
     }
+    if (want("edges")) {
+      // 9. The same at the edges: a colleague moving the row at the top of
+      // the view a few places down keeps the rows after it; content above
+      // the table changing height keeps the rows; and at (or just before)
+      // the end of the List, deletions above keep the rows and a click
+      // where the pointer rests still hits its task.
+      const [, inProgress, , done] = fixture.statuses;
+      const shift = async (title, from) => {
+        const now = await rowAt(title);
+        return now ? Math.round((now.top - from) * 100) / 100 : null;
+      };
+      const settleOn = async (title, taskId, label) => {
+        const index = await expectedIndex(taskId);
+        await waitFor(async () => (await rowAt(title))?.index === index, label);
+        await frames(page, 6);
+      };
+      const deleteAbove = async (count) => {
+        const above = await prisma.task.findMany({
+          where: { projectId: fixture.project.id, statusId: inProgress.id },
+          orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+          select: { id: true },
+          skip: 50,
+          take: count,
+        });
+        for (const { id } of above) await api("DELETE", `/tasks/${id}`);
+      };
+      const result = {};
+      await page.evaluate(() => (document.querySelector("table").parentElement.scrollLeft = 0));
+
+      // The topmost row, partly in view, moved three places down in its group.
+      const doneTasks = await prisma.task.findMany({
+        where: { projectId: fixture.project.id, statusId: done.id },
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+        select: { id: true, title: true },
+      });
+      const middle = doneTasks[Math.floor(doneTasks.length / 2)];
+      const centred = await page.evaluate((title) => {
+        const row = [...document.querySelector("table").tBodies[0].rows].find((r) => r.cells[1]?.textContent === title);
+        row?.scrollIntoView({ block: "start" });
+        return !!row;
+      }, middle.title);
+      if (!centred) await scrollToRow(page, (await expectedIndex(middle.id)) + 2);
+      await frames(page, 4);
+      await page.evaluate(() => {
+        // Leave the first row in view partly scrolled out.
+        const main = document.querySelector("main");
+        const view = main.getBoundingClientRect();
+        const first = [...document.querySelector("table").tBodies[0].rows].find(
+          (r) => r.cells.length > 1 && r.getBoundingClientRect().bottom > view.top + 1,
+        );
+        main.scrollTop += first.getBoundingClientRect().top - view.top + 15;
+      });
+      await frames(page, 6);
+      let view = await rowsInView();
+      assert(view[0].top < 0, "first row partly in view");
+      const moving = view[0], second = view[1], sixth = view[5];
+      const movingTask = await taskByTitle(moving.title);
+      const secondTask = await taskByTitle(second.title);
+      const group = doneTasks.map((t) => t.id);
+      assert.equal(movingTask.statusId, done.id);
+      await api("PATCH", `/tasks/${movingTask.id}/move`, {
+        statusId: done.id,
+        position: group.indexOf(movingTask.id) + 3,
+      });
+      await settleOn(second.title, secondTask.id, "top row moved down");
+      result.topRowMovedDown = {
+        movedRow: await shift(moving.title, moving.top),
+        secondRow: await shift(second.title, second.top),
+        sixthRow: await shift(sixth.title, sixth.top),
+      };
+
+      // Content above the table grows by 200 px and shrinks back.
+      view = await rowsInView();
+      const steady = view[4];
+      await page.evaluate(() => {
+        const block = document.createElement("div");
+        block.id = "task-list-smoke-above";
+        block.style.height = "200px";
+        document.querySelector("table").parentElement.before(block);
+      });
+      await frames(page, 6);
+      const grown = await shift(steady.title, steady.top);
+      await page.evaluate(() => document.getElementById("task-list-smoke-above").remove());
+      await frames(page, 6);
+      result.contentAboveTable = { grown200: grown, shrunkBack: await shift(steady.title, steady.top) };
+
+      // At the end of the List, and 20 px before it, a colleague deletes
+      // tasks above the view.
+      const toEnd = async (offset = 0) => {
+        for (let i = 0; i < 3; i++) {
+          await page.evaluate(() => {
+            const main = document.querySelector("main");
+            main.scrollTop = main.scrollHeight;
+          });
+          await frames(page, 6);
+        }
+        await page.evaluate((offset) => (document.querySelector("main").scrollTop -= offset), offset);
+        await frames(page, 6);
+      };
+      const spaceBelow = () =>
+        page.evaluate(() => {
+          const main = document.querySelector("main");
+          return Math.round(main.scrollHeight - main.scrollTop - main.clientHeight);
+        });
+      for (const [label, offset, count] of [["at the end", 0, 1], ["20 px before the end", 20, 1]]) {
+        await toEnd(offset);
+        view = await rowsInView();
+        const reference = view.at(-5);
+        const referenceTask = await taskByTitle(reference.title);
+        const below = await spaceBelow();
+        await deleteAbove(count);
+        await settleOn(reference.title, referenceTask.id, label);
+        result[label] = {
+          deletedAbove: count,
+          shift: await shift(reference.title, reference.top),
+          spaceBelowBefore: below,
+          spaceBelowAfter: await spaceBelow(),
+        };
+      }
+
+      // At the end, the pointer rests on a checkbox while two tasks above
+      // the view are deleted, then clicks.
+      await toEnd();
+      view = await rowsInView();
+      const target = view.at(-3);
+      const targetTask = await taskByTitle(target.title);
+      const box = await page.evaluate((title) => {
+        const row = [...document.querySelector("table").tBodies[0].rows].find((r) => r.cells[1]?.textContent === title);
+        const b = row.cells[0].querySelector("input").getBoundingClientRect();
+        return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+      }, target.title);
+      await page.mouse.move(box.x, box.y);
+      await deleteAbove(2);
+      await settleOn(target.title, targetTask.id, "deletes before the click at the end");
+      await page.mouse.down();
+      await page.mouse.up();
+      await frames(page, 3);
+      result.clickAtEnd = {
+        target: target.title,
+        checked: await page.evaluate(() =>
+          [...document.querySelector("table").tBodies[0].rows]
+            .filter((r) => r.cells[0]?.querySelector("input")?.checked)
+            .map((r) => r.cells[1].textContent),
+        ),
+      };
+      await page.getByTitle("Clear selection").click().catch(() => {});
+      log("edges", JSON.stringify(result));
+      assert(Math.abs(result.topRowMovedDown.secondRow) <= 1, "second row stays when the top row moves down");
+      assert(Math.abs(result.contentAboveTable.grown200) <= 1, "rows stay when content above the table grows");
+      assert(Math.abs(result.contentAboveTable.shrunkBack) <= 1, "rows stay when content above the table shrinks");
+      for (const label of ["at the end", "20 px before the end"]) {
+        assert(Math.abs(result[label].shift) <= 1, `rows stay after deletes above ${label}`);
+        assert(Math.abs(result[label].spaceBelowAfter - result[label].spaceBelowBefore) <= 1, `no gap below ${label}`);
+      }
+      assert.deepEqual(result.clickAtEnd.checked, [target.title], "click at the end hit its task");
+      pass("edges: a moved top row, content above the table, the end of the List", result);
+    }
     if (want("board")) {
-      // 9. The List has no drag-and-drop; the Board of the same project (not
+      // 10. The List has no drag-and-drop; the Board of the same project (not
       // windowed, unchanged here) still reorders by drag at this size.
       const opened = Date.now();
       await page.locator(`a[href$="/projects/${fixture.project.id}/board"]`).first().click();

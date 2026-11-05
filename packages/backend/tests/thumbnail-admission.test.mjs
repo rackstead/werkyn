@@ -1,0 +1,331 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import test from "node:test";
+import sharp from "sharp";
+import {
+  THUMBNAIL_LIMITS,
+  TransformAdmission,
+  createThumbnail,
+  defaultAdmissionLimits,
+  estimateDecodeBytes,
+  thumbnailAdmission,
+  thumbnailFormat,
+  thumbnailOutcomes,
+} from "../src/modules/files/thumbnails.ts";
+import {
+  animatedWebp,
+  avif100Megapixels,
+  blankGif,
+  blankPng,
+  cmykJpeg,
+  gifSvgPolyglot,
+  isoHeader,
+  rgb16Png,
+  svg,
+  tiff,
+} from "./fixtures/thumbnail-inputs.mjs";
+import { makePdf, png as smallPng } from "./fixtures/passive-media.mjs";
+
+const solid = (width, height, background = "#3366cc", channels = 3) =>
+  sharp({ create: { width, height, channels, background } });
+const MiB = 1024 * 1024;
+
+/** The outcome counts `run` adds. */
+async function outcomes(run) {
+  const before = { ...thumbnailOutcomes };
+  const result = await run();
+  const delta = {};
+  for (const [key, value] of Object.entries(thumbnailOutcomes)) {
+    if (value !== before[key]) delta[key] = value - before[key];
+  }
+  return { result, delta };
+}
+
+const thumbnailOf = (bytes, options) => createThumbnail(async () => bytes, options);
+
+test("only fixed allowlisted raster signatures choose a decoder", async () => {
+  const allowed = [
+    ["jpeg", await solid(8, 8).jpeg().toBuffer()],
+    ["png", await solid(8, 8).png().toBuffer()],
+    ["webp", await solid(8, 8).webp().toBuffer()],
+    ["webp", await solid(8, 8).webp({ lossless: true }).toBuffer()],
+    ["webp", await solid(8, 8, { r: 1, g: 2, b: 3, alpha: 0.5 }, 4).webp().toBuffer()],
+    ["gif", await solid(8, 8).gif().toBuffer()],
+    ["gif", Buffer.concat([Buffer.from("GIF87a"), Buffer.alloc(7)])],
+    ["avif", await solid(8, 8).avif().toBuffer()],
+    ["avif", isoHeader("avis")],
+  ];
+  for (const [format, bytes] of allowed) assert.equal(thumbnailFormat(bytes), format, format);
+
+  const refused = [
+    ["svg", svg()],
+    ["svg after BOM and whitespace", Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("\n  "), svg()])],
+    ["xml prolog svg", Buffer.from(`<?xml version="1.0"?>${svg()}`)],
+    ["svgz", (await import("node:zlib")).gzipSync(svg())],
+    ["tiff", await tiff(8, 8)],
+    ["big-endian tiff", Buffer.from([0x4d, 0x4d, 0x00, 0x2a, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0])],
+    ["bigtiff", Buffer.from([0x49, 0x49, 0x2b, 0x00, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])],
+    ["pdf", makePdf()],
+    ["bmp", Buffer.concat([Buffer.from("BM"), Buffer.alloc(30)])],
+    ["ico", Buffer.from([0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 32, 0, 0, 0])],
+    ["psd", Buffer.concat([Buffer.from("8BPS"), Buffer.alloc(30)])],
+    ["radiance", Buffer.from("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n")],
+    ["ppm", Buffer.from("P6\n1 1\n255\n\0\0\0")],
+    ["jpeg 2000", Buffer.from([0, 0, 0, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0, 0, 0, 0])],
+    ["jpeg xl", Buffer.from([0xff, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])],
+    ["zip", Buffer.concat([Buffer.from("PK\x03\x04"), Buffer.alloc(30)])],
+    ["html", Buffer.from("<!doctype html><img src=x>")],
+    ["png signature without IHDR", Buffer.concat([smallPng.subarray(0, 8), Buffer.from("\0\0\0\x0dtEXt"), Buffer.alloc(20)])],
+    ["riff but not webp", Buffer.concat([Buffer.from("RIFF\0\0\0\0WAVEfmt "), Buffer.alloc(16)])],
+    ["webp with unknown chunk", Buffer.concat([Buffer.from("RIFF\0\0\0\0WEBPABCD"), Buffer.alloc(16)])],
+    ["short gif", Buffer.from("GIF89a")],
+    ["empty", Buffer.alloc(0)],
+  ];
+  for (const brand of ["heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "mp41", "isom", "jxl "]) {
+    refused.push([`ftyp ${brand}`, isoHeader(brand)]);
+  }
+  for (const [size, length] of [[0, 24], [1, 24], [15, 24], [28, 24], [16, 12]]) {
+    refused.push([`avif ftyp size ${size} in ${length} bytes`, isoHeader("avif", size, length)]);
+  }
+  for (const [name, bytes] of refused) assert.equal(thumbnailFormat(bytes), null, name);
+});
+
+test("libvips may use only the allowlisted buffer loaders in this process", async () => {
+  const decodable = {
+    png: await solid(20, 10).png().toBuffer(),
+    jpeg: await solid(20, 10).jpeg().toBuffer(),
+    webp: await solid(20, 10).webp().toBuffer(),
+    gif: await solid(20, 10).gif().toBuffer(),
+    heif: await solid(20, 10).avif().toBuffer(),
+  };
+  for (const [format, bytes] of Object.entries(decodable)) {
+    assert.equal((await sharp(bytes).metadata()).format, format);
+  }
+  const blocked = { svg: svg(), tiff: await tiff(20, 10) };
+  for (const [format, bytes] of Object.entries(blocked)) {
+    await assert.rejects(sharp(bytes).metadata(), /unsupported image format/, format);
+    await assert.rejects(sharp(bytes).resize(8).webp().toBuffer(), /unsupported image format/, format);
+  }
+  // Control: the same bytes decode in a process that never loaded thumbnails.ts.
+  const control = execFileSync(process.execPath, ["--input-type=module", "-e", `
+    import sharp from "sharp";
+    const input = JSON.parse(process.argv[1]);
+    const formats = [];
+    for (const base64 of input) formats.push((await sharp(Buffer.from(base64, "base64")).metadata()).format);
+    console.log(formats.join(","));
+  `, JSON.stringify(Object.values(blocked).map((bytes) => bytes.toString("base64")))], { encoding: "utf8" });
+  assert.equal(control.trim(), "svg,tiff");
+});
+
+test("disguised and polyglot inputs never reach a non-allowlisted decoder", async () => {
+  const png = await solid(40, 20).png().toBuffer();
+  const jpeg = await solid(40, 20).jpeg().toBuffer();
+  const cases = [
+    // Declared types and names do not reach this layer; only bytes do.
+    ["svg", svg(), "unsupported"],
+    ["tiff", await tiff(40, 20), "unsupported"],
+    ["pdf", makePdf(), "unsupported"],
+    ["heic brand", isoHeader("heic"), "unsupported"],
+    ["mif1 brand", isoHeader("mif1"), "unsupported"],
+    // JPEG-LS starts like JPEG; the detector disagrees, so nothing decodes it.
+    ["jpeg-ls", Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xf7]), Buffer.alloc(40)]), "unsupported"],
+    // A GIF signature followed by SVG markup reaches only the GIF decoder,
+    // which rejects it; the SVG loader is blocked either way.
+    ["gif/svg polyglot", gifSvgPolyglot(), "failed"],
+    // Trailing archives or markup stay data for the raster decoder.
+    ["png + zip", Buffer.concat([png, Buffer.from("PK\x03\x04"), Buffer.alloc(64)]), "created"],
+    ["jpeg + html", Buffer.concat([jpeg, Buffer.from("<html><script>alert(1)</script></html>")]), "created"],
+  ];
+  for (const [name, bytes, expected] of cases) {
+    const { result, delta } = await outcomes(() => thumbnailOf(bytes));
+    assert.deepEqual(delta, { [expected]: 1 }, name);
+    if (expected === "created") {
+      const meta = await sharp(result).metadata();
+      assert.deepEqual([meta.format, meta.width, meta.height], ["webp", 40, 20], name);
+    } else {
+      assert.equal(result, null, name);
+    }
+  }
+});
+
+test("decoder memory is estimated from the header and bounded per transform", () => {
+  const budget = THUMBNAIL_LIMITS.decodeBudgetBytes;
+  const meta = (format, width, height, extra = {}) => ({ format, width, height, channels: 3, depth: "uchar", ...extra });
+  const within = [
+    meta("jpeg", 16000, 16000), // baseline JPEG shrinks on load
+    meta("png", 16000, 16000, { channels: 1 }),
+    meta("png", 8000, 8000, { channels: 4, isProgressive: true }),
+    meta("jpeg", 8000, 6000, { isProgressive: true }),
+    meta("gif", 7000, 7000, { channels: 4 }),
+    meta("webp", 16383, 16383, { channels: 4 }),
+    meta("webp", 8000, 8000, { pages: 2 }),
+    meta("heif", 4032, 3024),
+    meta("heif", 4000, 3000, { channels: 4 }),
+  ];
+  for (const m of within) assert.ok(estimateDecodeBytes(m) <= budget, JSON.stringify(m));
+  const over = [
+    meta("heif", 10000, 10000),
+    meta("heif", 6000, 6000),
+    meta("heif", 4000, 4000, { channels: 4, depth: "ushort" }),
+    meta("png", 10000, 10000, { channels: 4, isProgressive: true }),
+    meta("png", 16000, 16000, { channels: 4, depth: "ushort" }),
+    meta("jpeg", 10000, 10000, { isProgressive: true }),
+    meta("jpeg", 7000, 7000, { channels: 4, isProgressive: true }),
+    meta("gif", 10000, 10000, { channels: 4 }),
+  ];
+  for (const m of over) assert.ok(estimateDecodeBytes(m) > budget, JSON.stringify(m));
+  for (const m of [meta("svg", 1, 1), meta("tiff", 1, 1), meta("png", 0, 1), meta("png", 1, 1, { depth: "double" }), {}]) {
+    assert.equal(estimateDecodeBytes(m), Infinity, JSON.stringify(m));
+  }
+});
+
+test("decompression bombs within the source cap are refused before decoding", async () => {
+  const bombs = [
+    // 2 KiB; main decoded it with about 1.7 GiB of memory.
+    ["100-megapixel AVIF", avif100Megapixels, "over-budget"],
+    ["100-megapixel interlaced RGBA PNG", await blankPng(10000, 10000, { depth: 8, color: 6, interlace: true }), "over-budget"],
+    ["100-megapixel GIF", blankGif(10000, 10000), "over-budget"],
+    ["400-megapixel PNG over the pixel limit", await blankPng(20000, 20000), "failed"],
+  ];
+  for (const [name, bytes, expected] of bombs) {
+    assert.ok(bytes.length < 2 * MiB, `${name}: ${bytes.length}`);
+    const rss = process.memoryUsage().rss;
+    const started = performance.now();
+    const { result, delta } = await outcomes(() => thumbnailOf(bytes));
+    const elapsed = performance.now() - started;
+    assert.equal(result, null, name);
+    assert.deepEqual(delta, { [expected]: 1 }, name);
+    assert.ok(elapsed < 1000, `${name} took ${elapsed} ms`);
+    assert.ok(process.memoryUsage().rss - rss < 64 * MiB, name);
+  }
+  // Large images that stream, or fit the budget, still get thumbnails.
+  for (const [name, bytes, size] of [
+    ["256-megapixel 1-bit PNG", await blankPng(16000, 16000), [400, 400]],
+    ["36-megapixel interlaced RGB PNG", await blankPng(6000, 6000, { depth: 8, color: 2, interlace: true }), [400, 400]],
+    ["16-megapixel GIF", blankGif(4000, 4000), [400, 400]],
+    ["2-megapixel AVIF", await solid(2000, 1000).avif({ effort: 0 }).toBuffer(), [400, 200]],
+  ]) {
+    const { result, delta } = await outcomes(() => thumbnailOf(bytes));
+    assert.deepEqual(delta, { created: 1 }, name);
+    const meta = await sharp(result).metadata();
+    assert.deepEqual([meta.width, meta.height], size, name);
+  }
+});
+
+test("animated GIF and WebP with many frames decode only their first frame", async () => {
+  for (const [name, bytes, size] of [
+    ["5000-frame GIF", blankGif(640, 320, 5000), [400, 200]],
+    ["2000-frame WebP", await animatedWebp(64, 32, 2000), [64, 32]],
+  ]) {
+    assert.ok((await sharp(bytes).metadata()).pages >= 2000, name);
+    const started = performance.now();
+    const { result, delta } = await outcomes(() => thumbnailOf(bytes));
+    const elapsed = performance.now() - started;
+    assert.deepEqual(delta, { created: 1 }, name);
+    assert.ok(elapsed < 2000, `${name} took ${elapsed} ms`);
+    const meta = await sharp(result).metadata();
+    assert.deepEqual([meta.format, meta.width, meta.height, meta.pages ?? 1], ["webp", ...size, 1], name);
+    // The first frame is the dark one.
+    const { data } = await sharp(result).raw().toBuffer({ resolveWithObject: true });
+    assert.ok(data[0] < 0x80, `${name} first pixel ${data[0]}`);
+  }
+});
+
+test("CMYK and 16-bit inputs make ordinary 8-bit sRGB thumbnails", async () => {
+  const cmyk = await cmykJpeg(800, 400);
+  assert.equal((await sharp(cmyk).metadata()).space, "cmyk");
+  const deep = await rgb16Png(800, 400);
+  const deepMeta = await sharp(deep).metadata();
+  assert.deepEqual([deepMeta.depth, deepMeta.space], ["ushort", "rgb16"]);
+  for (const [name, bytes] of [["cmyk jpeg", cmyk], ["16-bit png", deep]]) {
+    const { result, delta } = await outcomes(() => thumbnailOf(bytes));
+    assert.deepEqual(delta, { created: 1 }, name);
+    const meta = await sharp(result).metadata();
+    assert.deepEqual([meta.format, meta.width, meta.height, meta.depth, meta.space, meta.channels], ["webp", 400, 200, "uchar", "srgb", 3], name);
+  }
+});
+
+test("admission bounds active transforms, the queue and the wait", async () => {
+  const admission = new TransformAdmission({ maxActive: 2, maxQueued: 2, queueTimeoutMs: 100 });
+  const first = await admission.acquire();
+  const second = await admission.acquire();
+  assert.ok(first && second);
+  const third = admission.acquire();
+  const fourth = admission.acquire();
+  assert.deepEqual(admission.usage, { active: 2, queued: 2 });
+  assert.equal(await admission.acquire(), null, "a full queue refuses at once");
+
+  first();
+  first(); // releasing twice frees one turn
+  const thirdRelease = await third;
+  assert.ok(thirdRelease, "the oldest waiter is admitted first");
+  assert.deepEqual(admission.usage, { active: 2, queued: 1 });
+  const started = performance.now();
+  assert.equal(await fourth, null, "a waiter gives up after queueTimeoutMs");
+  assert.ok(performance.now() - started >= 80);
+  assert.deepEqual(admission.usage, { active: 2, queued: 0 });
+  second();
+  thirdRelease();
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+});
+
+test("default admission is sized from the CPU count", () => {
+  for (const [cpus, active] of [[1, 1], [2, 1], [3, 1], [4, 2], [8, 2], [64, 2]]) {
+    assert.deepEqual(defaultAdmissionLimits(cpus), { maxActive: active, maxQueued: 8, queueTimeoutMs: 5000 });
+  }
+  assert.deepEqual(thumbnailAdmission.limits, defaultAdmissionLimits());
+  assert.equal(sharp.concurrency(), 1, "one libvips thread per transform");
+  assert.equal(sharp.cache().items.max, 0, "no libvips operation cache");
+});
+
+test("a transform the upload stops waiting for keeps its turn until libvips settles", async (t) => {
+  const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
+  const render = sharp.prototype.toBuffer;
+  let finish;
+  sharp.prototype.toBuffer = function () {
+    return new Promise((resolve) => { finish = () => resolve(smallPng); });
+  };
+  t.after(() => { sharp.prototype.toBuffer = render; });
+  const started = performance.now();
+  const { result, delta } = await outcomes(() => thumbnailOf(smallPng, { admission, deadlineMs: 50 }));
+  assert.equal(result, null);
+  assert.deepEqual(delta, { "timed-out": 1 });
+  assert.ok(performance.now() - started < 1000);
+  assert.deepEqual(admission.usage, { active: 1, queued: 0 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, { admission }))).delta, { busy: 1 });
+  finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+});
+
+test("saturation keeps transforms bounded and the event loop responsive", async (t) => {
+  const { maxActive, maxQueued } = thumbnailAdmission.limits;
+  const render = sharp.prototype.toBuffer;
+  let inFlight = 0, peak = 0;
+  sharp.prototype.toBuffer = function (...args) {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    return render.apply(this, args).finally(() => inFlight--);
+  };
+  t.after(() => { sharp.prototype.toBuffer = render; });
+  // A real decode of about 0.3 s and 170 MiB each: Adam7 PNG is decoded whole.
+  const source = await blankPng(6000, 6000, { depth: 8, color: 6, interlace: true });
+  const requests = maxActive + maxQueued + 4;
+  const delay = monitorEventLoopDelay({ resolution: 10 });
+  delay.enable();
+  const started = performance.now();
+  const { result, delta } = await outcomes(() =>
+    Promise.all(Array.from({ length: requests }, () => thumbnailOf(source))));
+  const elapsed = performance.now() - started;
+  delay.disable();
+  const stats = { requests, maxActive, maxQueued, elapsedMs: Math.round(elapsed), peak, delta, loopMaxMs: delay.max / 1e6, loopP99Ms: delay.percentile(99) / 1e6 };
+  t.diagnostic(JSON.stringify(stats));
+  assert.equal(peak, maxActive, JSON.stringify(stats));
+  assert.equal(result.length, requests);
+  // Waiters beyond the queue go without at once; the queue drains in turn.
+  assert.equal(delta.busy, requests - maxActive - maxQueued, JSON.stringify(stats));
+  assert.equal((delta.created ?? 0) + (delta.busy ?? 0), requests, JSON.stringify(stats));
+  assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
+  assert.ok(stats.loopMaxMs < 250, JSON.stringify(stats));
+});

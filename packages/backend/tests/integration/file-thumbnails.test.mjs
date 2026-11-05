@@ -8,6 +8,9 @@ import { after, before, test } from "node:test";
 import sharp from "sharp";
 import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
+import {
+  avif100Megapixels, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader, rgb16Png,
+} from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -110,7 +113,6 @@ test("raster uploads get a 400-pixel-wide WebP thumbnail without enlargement", a
     ["alpha.png", "image/png", await solid(800, 400, { r: 0, g: 128, b: 0, alpha: 0.5 }, 4).png().toBuffer(), [400, 200]],
     ["photo.jpg", "image/jpeg", await solid(1000, 500, "#999999").jpeg().toBuffer(), [400, 200]],
     ["tall.webp", "image/webp", await solid(300, 900, "#112233").webp().toBuffer(), [300, 900]],
-    ["scan.tiff", "image/tiff", await solid(1600, 1200, "#abcdef").tiff().toBuffer(), [400, 300]],
     ["flat.gif", "image/gif", await solid(640, 320, "#ff0000").gif().toBuffer(), [400, 200]],
   ];
   for (const [name, type, bytes, [width, height]] of cases) {
@@ -144,6 +146,7 @@ test("SVG declared as SVG is never rasterized", async () => {
 });
 
 test("raster entry boundaries preserve originals and exclude unrelated detector/native dispatch", async () => {
+  const tiffBytes = await solid(64, 32, "#abcdef").tiff().toBuffer();
   await withDispatchSpies(async (state) => {
     const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>');
     for (const [name, mime, bytes] of [
@@ -152,10 +155,14 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
       ["passive-document.png", "image/png", makePdf()],
       ["declared.svg", "image/svg+xml", svg],
       ["ordinary.bin", "application/octet-stream", smallPng],
+      ["scan-tiff.png", "image/png", tiffBytes],
+      ["declared.tiff", "image/tiff", tiffBytes],
+      ["photo-heic.png", "image/png", isoHeader("heic")],
     ]) {
       const file = await upload(name, mime, bytes);
       assert.equal(file.thumbnailPath, null, name);
       assert.equal(state.detectorCalls, 0, name);
+      assert.equal(state.headerCalls, 0, name);
       assert.equal(state.nativeCalls, 0, name);
     }
   });
@@ -167,7 +174,10 @@ test("raster entry boundaries preserve originals and exclude unrelated detector/
 async function withDispatchSpies(run) {
   const detector = FileTypeParser.prototype.fromBuffer;
   const render = sharp.prototype.toBuffer;
-  const state = { detectorCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub" };
+  const header = sharp.prototype.metadata;
+  // `fakeHeader`, when set, stands in for libvips' header of container-only
+  // fixtures, which are never presented to a native decoder.
+  const state = { detectorCalls: 0, headerCalls: 0, nativeCalls: 0, detectorMode: "real", nativeMode: "stub", fakeHeader: null };
   FileTypeParser.prototype.fromBuffer = async function (...args) {
     state.detectorCalls++;
     if (state.detectorMode === "throw") throw new Error("Owned detector failure");
@@ -180,16 +190,22 @@ async function withDispatchSpies(run) {
     if (state.nativeMode === "throw") return Promise.reject(new Error("Owned transform failure"));
     return Promise.resolve(smallWebp);
   };
+  sharp.prototype.metadata = function (...args) {
+    state.headerCalls++;
+    return state.fakeHeader ? Promise.resolve(state.fakeHeader) : header.apply(this, args);
+  };
   try {
     const control = await upload("dispatch-control.png", "image/jpeg", smallPng);
     assert.ok(control.thumbnailPath);
     assert.equal(state.detectorCalls, 1, "Exact ESM detector spy must be armed");
+    assert.equal(state.headerCalls, 1, "Exact ESM header spy must be armed");
     assert.equal(state.nativeCalls, 1, "Exact ESM transform spy must be armed");
-    state.detectorCalls = state.nativeCalls = 0;
+    state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
     return await run(state);
   } finally {
     FileTypeParser.prototype.fromBuffer = detector;
     sharp.prototype.toBuffer = render;
+    sharp.prototype.metadata = header;
   }
 }
 
@@ -297,30 +313,32 @@ function pngChunk(type, data) {
   return chunk;
 }
 
-test("HEIF brands and both TIFF byte orders retain detector and transform dispatch", async () => {
+const avifHeader = { format: "heif", width: 2, height: 2, channels: 3, depth: "uchar" };
+
+test("only AVIF brands reach detection and decoding; other HEIF brands and TIFF are stored without", async () => {
   await withDispatchSpies(async (state) => {
+    state.fakeHeader = avifHeader;
     const cases = [];
     for (const brand of ["avif", "avis", "mif1", "msf1", "heic", "heix", "hevc", "hevx"]) {
-      const bytes = Buffer.alloc(24);
-      bytes.writeUInt32BE(24);
-      bytes.write("ftyp" + brand, 4);
-      cases.push([brand, bytes]);
+      cases.push([brand, isoHeader(brand), brand.startsWith("avi")]);
     }
     for (const little of [true, false]) for (const version of [42, 43]) {
       const bytes = Buffer.alloc(16);
       bytes.write(little ? "II" : "MM");
       if (little) { bytes.writeUInt16LE(version, 2); bytes.writeUInt32LE(8, 4); }
       else { bytes.writeUInt16BE(version, 2); bytes.writeUInt32BE(8, 4); }
-      cases.push([`${little ? "little" : "big"}-${version}`, bytes]);
+      cases.push([`${little ? "little" : "big"}-${version}`, bytes, false]);
     }
-    // Container headers exercise dispatch only. The armed transform returns
-    // a known small WebP; these are never presented to a native decoder.
-    for (const [name, bytes] of cases) {
-      state.detectorCalls = state.nativeCalls = 0;
+    // Container headers exercise dispatch only. The armed header read and
+    // transform return known values; these are never presented to a native
+    // decoder.
+    for (const [name, bytes, dispatched] of cases) {
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       const file = await upload(`${name}.bin`, "image/heic", bytes);
-      assert.ok(file.thumbnailPath, name);
-      assert.equal(state.detectorCalls, 1, name);
-      assert.equal(state.nativeCalls, 1, name);
+      assert.equal(!!file.thumbnailPath, dispatched, name);
+      for (const calls of [state.detectorCalls, state.headerCalls, state.nativeCalls]) {
+        assert.equal(calls, dispatched ? 1 : 0, name);
+      }
     }
   });
 });
@@ -333,9 +351,11 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
       bytes.write("ftypavif", 4);
       return bytes;
     };
-    // Plain header controls only; the armed transform returns a known WebP.
+    // Plain header controls only; the armed header read and transform
+    // return known values.
+    state.fakeHeader = avifHeader;
     for (const size of [16, 20, 24]) {
-      state.detectorCalls = state.nativeCalls = 0;
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       assert.ok((await upload(`ordinary-${size}.avif`, "image/avif", header(size))).thumbnailPath);
       assert.equal(state.detectorCalls, 1);
       assert.equal(state.nativeCalls, 1);
@@ -345,10 +365,11 @@ test("ordinary ISO envelopes bound detector entry and preserve original uploads"
       [0, 24], [1, 24], [8, 24], [12, 24], [15, 24],
       [28, 24], [16, 12], [THUMBNAIL_SOURCE_MAX_BYTES + 4, 24],
     ]) {
-      state.detectorCalls = state.nativeCalls = 0;
+      state.detectorCalls = state.headerCalls = state.nativeCalls = 0;
       const file = await upload(`omitted-${size}-${length}.avif`, "image/avif", header(size, length));
       assert.equal(file.thumbnailPath, null);
       assert.equal(state.detectorCalls, 0);
+      assert.equal(state.headerCalls, 0);
       assert.equal(state.nativeCalls, 0);
     }
   });
@@ -397,7 +418,7 @@ test("refused upload actors stop before storage, detector and native dispatch", 
         assert.equal(response.statusCode, status, response.body);
       }
       assert.equal(writes, 0); assert.equal(reads, 0);
-      assert.equal(state.detectorCalls, 0); assert.equal(state.nativeCalls, 0);
+      assert.equal(state.detectorCalls, 0); assert.equal(state.headerCalls, 0); assert.equal(state.nativeCalls, 0);
       assert.equal(await app.prisma.file.count({ where: { workspaceId: workspace.id } }), count);
     } finally { app.storage.saveStream = save; app.storage.read = read; }
   });
@@ -474,4 +495,82 @@ for (const recognized of [true, false]) test(`failed File insert retains durable
   assert.deepEqual(await app.storage.read(guard.storagePath), smallPng);
   assert.ok(await app.prisma.file.findUnique({ where: { id: guard.id } }));
   await app.prisma.blobCleanup.delete({ where: { storagePath: guard.storagePath } });
+});
+
+async function outcomeDelta(run) {
+  const { thumbnailOutcomes } = await import("../../src/modules/files/thumbnails.ts");
+  const before = { ...thumbnailOutcomes };
+  const result = await run();
+  const delta = {};
+  for (const [key, value] of Object.entries(thumbnailOutcomes)) if (value !== before[key]) delta[key] = value - before[key];
+  return { result, delta };
+}
+
+test("disguised formats, polyglots and decompression bombs are stored unchanged without a thumbnail", async () => {
+  const tiffBytes = await solid(800, 400, "#abcdef").tiff().toBuffer();
+  for (const [name, type, bytes, outcome] of [
+    ["scan.png", "image/png", tiffBytes, "unsupported"],
+    ["scan.tiff", "image/tiff", tiffBytes, "unsupported"],
+    ["drawing.gif", "image/gif", gifSvgPolyglot(), "failed"],
+    ["photo.avif", "image/avif", avif100Megapixels, "over-budget"],
+    ["photo.heic", "image/heic", avif100Megapixels, "over-budget"],
+    ["banner.gif", "image/gif", blankGif(10000, 10000), "over-budget"],
+    ["poster.png", "image/png", await blankPng(10000, 10000, { depth: 8, color: 6, interlace: true }), "over-budget"],
+  ]) {
+    const rss = process.memoryUsage().rss;
+    const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
+    assert.equal(file.thumbnailPath, null, name);
+    assert.deepEqual(delta, { [outcome]: 1 }, name);
+    assert.ok(process.memoryUsage().rss - rss < 128 * 1024 * 1024, name);
+  }
+});
+
+test("CMYK, 16-bit and many-frame uploads get first-frame sRGB thumbnails", async () => {
+  for (const [name, type, bytes, size] of [
+    ["print.jpg", "image/jpeg", await cmykJpeg(800, 400), [400, 200]],
+    ["deep.png", "image/png", await rgb16Png(800, 400), [400, 200]],
+    ["loop.gif", "image/gif", blankGif(800, 400, 3000), [400, 200]],
+  ]) {
+    const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
+    assert.deepEqual(delta, { created: 1 }, name);
+    const thumb = await thumbnail(file);
+    assert.deepEqual([thumb.format, thumb.width, thumb.height, thumb.pages], ["webp", ...size, 1], name);
+    const meta = await sharp(thumb.bytes).metadata();
+    assert.deepEqual([meta.space, meta.depth], ["srgb", "uchar"], name);
+  }
+});
+
+test("uploads beyond the transform limit all succeed; the excess are stored at once without a thumbnail", async (t) => {
+  const { thumbnailAdmission } = await import("../../src/modules/files/thumbnails.ts");
+  const { maxActive, maxQueued } = thumbnailAdmission.limits;
+  const extra = 3, total = maxActive + maxQueued + extra;
+  const render = sharp.prototype.toBuffer;
+  let inFlight = 0, peak = 0, open;
+  const gate = new Promise((resolve) => { open = resolve; });
+  sharp.prototype.toBuffer = async function () {
+    inFlight++; peak = Math.max(peak, inFlight);
+    try { await gate; return smallWebp; } finally { inFlight--; }
+  };
+  t.after(() => { open(); sharp.prototype.toBuffer = render; });
+  let responded = 0;
+  const pending = Array.from({ length: total }, (_, i) =>
+    uploadResponse(`burst-${i}.png`, "image/png", smallPng).then((response) => { responded++; return response; }));
+  // While every admitted transform is held, the uploads that found the queue
+  // full are already answered.
+  const deadline = Date.now() + 10_000;
+  while (responded < extra || thumbnailAdmission.usage.queued < maxQueued) {
+    assert.ok(Date.now() < deadline, JSON.stringify({ responded, ...thumbnailAdmission.usage }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(responded, extra);
+  assert.deepEqual(thumbnailAdmission.usage, { active: maxActive, queued: maxQueued });
+  open();
+  const files = (await Promise.all(pending)).map((response) => {
+    assert.equal(response.statusCode, 201, response.body);
+    return response.json().data;
+  });
+  assert.equal(files.filter((file) => file.thumbnailPath).length, maxActive + maxQueued);
+  assert.equal(files.filter((file) => !file.thumbnailPath).length, extra);
+  assert.equal(peak, maxActive);
+  assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
 });

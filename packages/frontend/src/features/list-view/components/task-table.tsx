@@ -310,8 +310,11 @@ export function TaskTable({
     // Scroll positions are whole pixels; what a correction could not make up
     // is carried over, so repeated changes do not add up to a visible drift.
     let remainder = 0;
-    if (last && scroller.scrollTop > 0) {
-      const scrolled = scroller.scrollTop - last.scrollTop;
+    const scrolled = last ? scroller.scrollTop - last.scrollTop : 0;
+    // After a longer scroll (End, the scrollbar, a jump) the rows seen before
+    // are elsewhere and there is nothing to keep; a shorter one keeps them in
+    // the rendered range.
+    if (last && scroller.scrollTop > 0 && Math.abs(scrolled) < scroller.clientHeight / 2) {
       const kept = last.rows.find(({ key }) => rendered.has(key));
       if (kept) {
         const row = rendered.get(kept.key)!;

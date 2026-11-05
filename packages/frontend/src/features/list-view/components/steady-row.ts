@@ -13,7 +13,9 @@ export interface SeenRow {
  * A row moved within the view (by a colleague, say) breaks the order instead:
  * it is not the one to keep in place, or every other row would move with it.
  * The kept order is a longest increasing run of new indexes (not necessarily
- * contiguous); the first seen row that belongs to one is returned.
+ * contiguous). Two rows that swapped places each fit one such run, so the row
+ * returned is the first that is in every longest run; if there is none, the
+ * first in any.
  */
 export function steadyRow(
   seen: readonly SeenRow[],
@@ -38,5 +40,15 @@ export function steadyRow(
     }
   }
   const longest = Math.max(0, ...ending);
-  return rows.find((_, i) => ending[i] + starting[i] - 1 === longest);
+  const onRun = rows.map((_, i) => ending[i] + starting[i] - 1 === longest);
+  // A row is in every longest run when no other row on one shares its place
+  // (its run length so far) in it.
+  const atPlace = new Map<number, number>();
+  rows.forEach((_, i) => {
+    if (onRun[i]) atPlace.set(ending[i], (atPlace.get(ending[i]) ?? 0) + 1);
+  });
+  return (
+    rows.find((_, i) => onRun[i] && atPlace.get(ending[i]) === 1) ??
+    rows.find((_, i) => onRun[i])
+  );
 }

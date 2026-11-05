@@ -29,6 +29,13 @@ describe("steadyRow", () => {
     expect(steadyRow(seen("a", "b"), indexes({}))).toBeUndefined();
   });
 
+  it("keeps the rows after two that swapped places", () => {
+    // The first two rows swapped: either could look in order with the rest.
+    expect(steadyRow(seen("a", "b", "c", "d"), indexes({ a: 2, b: 1, c: 3, d: 4 }))?.key).toBe("c");
+    // Two rows swapped further down: the first row stays.
+    expect(steadyRow(seen("a", "b", "c", "d", "e"), indexes({ a: 1, b: 2, c: 4, d: 3, e: 5 }))?.key).toBe("a");
+  });
+
   it("keeps the first row when a row was moved up into the view from below", () => {
     // A row from below moved to between b and c: c and later moved down by one.
     expect(steadyRow(seen("a", "b", "c", "d"), indexes({ a: 5, b: 6, c: 8, d: 9 }))?.key).toBe("a");

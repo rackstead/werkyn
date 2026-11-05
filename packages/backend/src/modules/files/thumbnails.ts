@@ -239,6 +239,13 @@ const AVIF_ALPHA_URNS = new Set([
   "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
   "urn:mpeg:hevc:2015:auxid:1",
 ]);
+/** Extents one AVIF item may be stored in; encoders write one. */
+const AVIF_MAX_EXTENTS_PER_ITEM = 4;
+/**
+ * Exif and XMP (`mime`) item data, which libvips copies while it reads the
+ * header, before the budget is checked.
+ */
+const AVIF_MAX_METADATA_ITEM_BYTES = 1024 * 1024;
 
 export type AvifCheck = { codedPixels: number } | { refused: string };
 
@@ -268,6 +275,86 @@ function uniqueChildren(
 }
 
 /**
+ * Reads `iloc` and refuses any item location outside the simple shape (see
+ * `checkAvif`). Offsets and lengths of up to 8 bytes are read as BigInt and
+ * compared with the file, so no arithmetic can overflow.
+ */
+function checkAvifItemLocations(
+  buffer: Buffer,
+  iloc: Box,
+  types: ReadonlyMap<number, string>,
+  mdats: readonly Box[],
+  idat: Box | undefined,
+  budget: { left: number },
+): void {
+  const version = buffer[iloc.body];
+  if (version > 2) refuse(`iloc version ${version}`);
+  let at = iloc.body + 4;
+  const take = (bytes: number): bigint => {
+    if (at + bytes > iloc.end) refuse("short iloc box");
+    let value = 0n;
+    for (let i = 0; i < bytes; i++) value = (value << 8n) | BigInt(buffer[at + i]);
+    at += bytes;
+    return value;
+  };
+  const sizes = Number(take(2));
+  const offsetSize = sizes >> 12, lengthSize = (sizes >> 8) & 0xf;
+  const baseOffsetSize = (sizes >> 4) & 0xf, indexSize = version === 0 ? 0 : sizes & 0xf;
+  for (const size of [offsetSize, lengthSize, baseOffsetSize]) if (size !== 0 && size !== 4 && size !== 8) refuse("iloc field size");
+  if (indexSize !== 0) refuse("iloc extent indexes");
+  const itemCount = Number(take(version < 2 ? 2 : 4));
+  const fileEnd = BigInt(buffer.length);
+  const extentsBySpace: Array<Array<[bigint, bigint]>> = [[], []];
+  const located = new Set<number>();
+  for (let item = 0; item < itemCount; item++) {
+    if (--budget.left < 0) refuse("too many iloc items");
+    const id = Number(take(version < 2 ? 2 : 4));
+    const method = version === 0 ? 0 : Number(take(2)) & 0xf;
+    const dataReference = Number(take(2));
+    const baseOffset = take(baseOffsetSize);
+    const extentCount = Number(take(2));
+    const type = types.get(id);
+    if (!type) refuse(`iloc item ${id} without an item entry`);
+    if (located.has(id)) refuse(`iloc item ${id} twice`);
+    located.add(id);
+    if (dataReference !== 0) refuse(`item ${id} data in another file`);
+    if (method > 1) refuse(`item ${id} construction method ${method}`);
+    if (method === 1 && !idat) refuse(`item ${id} in idat without one`);
+    if (extentCount < 1 || extentCount > AVIF_MAX_EXTENTS_PER_ITEM) refuse(`item ${id} with ${extentCount} extents`);
+    // Method 0 data must lie inside an mdat box; method 1 is relative to idat's data.
+    const spaces = method === 0
+      ? mdats.map((box) => [BigInt(box.body), BigInt(box.end)] as const)
+      : [[BigInt(idat!.body), BigInt(idat!.end)] as const];
+    let itemBytes = 0n;
+    for (let extent = 0; extent < extentCount; extent++) {
+      if (--budget.left < 0) refuse("too many iloc extents");
+      const offset = take(offsetSize);
+      const length = take(lengthSize);
+      if (length === 0n) refuse(`item ${id} extent to the end of the file`);
+      const start = baseOffset + offset + (method === 1 ? BigInt(idat!.body) : 0n);
+      const end = start + length;
+      if (end > fileEnd || !spaces.some(([from, to]) => start >= from && end <= to)) {
+        refuse(`item ${id} extent outside its data box`);
+      }
+      extentsBySpace[method].push([start, end]);
+      itemBytes += length;
+    }
+    if ((type === "Exif" || type === "mime") && itemBytes > BigInt(AVIF_MAX_METADATA_ITEM_BYTES)) {
+      refuse(`${type} item ${id} over ${AVIF_MAX_METADATA_ITEM_BYTES} bytes`);
+    }
+  }
+  for (const id of types.keys()) if (!located.has(id)) refuse(`item ${id} without a location`);
+  // No byte may belong to two extents: repeated extents would multiply the
+  // file in memory when libheif concatenates them.
+  for (const extents of extentsBySpace) {
+    extents.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    for (let i = 1; i < extents.length; i++) {
+      if (extents[i][0] < extents[i - 1][1]) refuse("overlapping item extents");
+    }
+  }
+}
+
+/**
  * Whether an AVIF has the one simple shape thumbnails decode, and its coded
  * size. Rather than model what libheif would decode, only this shape is
  * accepted:
@@ -281,9 +368,17 @@ function uniqueChildren(
  * - a primary `av01` item and at most one other `av01` item, its alpha
  *   plane: an `auxl` reference to the primary with an alpha `auxC`;
  * - exactly one associated `ispe` on each `av01` item, the alpha's equal to
- *   the primary's.
+ *   the primary's;
+ * - an `iloc` (version 0 to 2) entry for each item and no other: data in
+ *   the file (construction method 0) inside an `mdat` box, or in `idat`
+ *   (method 1); no external data references or extent indexes; one to four
+ *   non-empty extents per item, none overlapping any other extent, so the
+ *   item data together is never larger than the file; and at most 1 MiB of
+ *   Exif or XMP per item.
  *
- * libheif decodes the whole coded image (`ispe`) even when a `clap` crop
+ * libheif concatenates an item's extents before decoding, and libvips copies
+ * Exif and XMP while reading the header, so repeated extents would multiply
+ * a 32 MiB upload in memory. libheif decodes the whole coded image (`ispe`) even when a `clap` crop
  * makes it report a smaller size, and refuses an image whose coded size
  * differs from its `ispe`, so the primary's `ispe` is what is decoded.
  */
@@ -328,6 +423,7 @@ export function checkAvif(buffer: Buffer): AvifCheck {
       types.set(id, type);
     }
     if (types.size !== declared) refuse("item count");
+    checkAvifItemLocations(buffer, one("iloc"), types, top.get("mdat") ?? [], boxes.get("idat")?.[0], budget);
     if (types.get(primary) !== "av01") refuse(`primary ${types.get(primary) ?? "missing"}`);
 
     // Properties and their associations.

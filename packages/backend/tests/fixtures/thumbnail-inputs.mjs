@@ -502,3 +502,75 @@ export function alphaAnimationWebp(width, height) {
     .webp({ quality: 50, alphaQuality: 100, effort: 0 })
     .toBuffer();
 }
+
+/**
+ * A small AVIF whose item locations (`iloc`) are chosen by the caller, built
+ * from `small` (an AVIF made by sharp). `primary` and `extra.extents` map
+ * the layout L to [offset, length] extents:
+ * - L.frame / L.frameLength: the coded frame (in mdat, or in idat when
+ *   `method` is 1, relative to idat);
+ * - L.extra / L.extraLength: the extra item's data in mdat;
+ * - L.mdat: [start, end] of mdat's data; L.size: the file size.
+ * `extra` adds an Exif or XMP (`mime`) item described by `cdsc`. `padTo`
+ * pads the file with a `free` box, as an upload near the source cap would.
+ */
+export function locatedAvif(small, {
+  primary = (L) => [[L.frame, L.frameLength]],
+  extra = null,
+  method = 0,
+  dataReference = 0,
+  ilocVersion = 1,
+  baseOffsetSize = 0,
+  baseOffset = 0n,
+  padTo = 0,
+} = {}) {
+  const s = avifParts(small);
+  const extraData = extra?.data ?? Buffer.alloc(0);
+  const id = (v) => (ilocVersion < 2 ? u16(v) : u32(v));
+  const base = () => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64BE(BigInt(baseOffset) & ((1n << 64n) - 1n));
+    return b.subarray(8 - baseOffsetSize);
+  };
+  const entry = (itemId, construction, extents) => Buffer.concat([
+    id(itemId), ...(ilocVersion >= 1 ? [u16(construction)] : []), u16(dataReference), base(), u16(extents.length),
+    ...extents.map(([offset, length]) => u32(offset, length)),
+  ]);
+  const build = (L) => {
+    const items = [entry(1, method, primary(L)), ...(extra ? [entry(2, 0, extra.extents(L))] : [])];
+    const sizes = Buffer.from([0x44, baseOffsetSize === 8 ? 0x80 : baseOffsetSize === 4 ? 0x40 : 0x00]);
+    const infeExtra = extra
+      ? [extra.type === "Exif"
+        ? fullBox("infe", 2, 0, u16(2, 0), Buffer.from("Exif"), Buffer.from([0]))
+        : fullBox("infe", 2, 0, u16(2, 0), Buffer.from("mime"), Buffer.from([0]), Buffer.from("application/rdf+xml\0"))]
+      : [];
+    return fullBox("meta", 0, 0,
+      fullBox("hdlr", 0, 0, u32(0), Buffer.from("pict"), u32(0, 0, 0), Buffer.from([0])),
+      fullBox("pitm", 0, 0, u16(1)),
+      fullBox("iloc", ilocVersion, 0, sizes, ilocVersion < 2 ? u16(items.length) : u32(items.length), ...items),
+      fullBox("iinf", 0, 0, u16(1 + infeExtra.length), fullBox("infe", 2, 0, u16(1, 0), Buffer.from("av01"), Buffer.from([0])), ...infeExtra),
+      ...(extra ? [fullBox("iref", 0, 0, box("cdsc", u16(2, 1, 1)))] : []),
+      box("iprp", box("ipco", s.av1C, fullBox("ispe", 0, 0, u32(s.width, s.height)), s.pixi),
+        fullBox("ipma", 0, 0, u32(1), u16(1), Buffer.from([3, 0x81, 0x02, 0x03]))),
+      ...(method === 1 ? [box("idat", s.coded)] : []));
+  };
+  const ftyp = box("ftyp", Buffer.from("avif"), u32(0), Buffer.from("avifmif1miaf"));
+  const assemble = (L) => {
+    const meta = build(L);
+    const mdatData = Buffer.concat([method === 1 ? Buffer.alloc(0) : s.coded, extraData]);
+    const head = Buffer.concat([ftyp, meta, box("mdat", mdatData)]);
+    const pad = padTo > head.length + 8 ? [box("free", Buffer.alloc(padTo - head.length - 8))] : [];
+    return { file: Buffer.concat([head, ...pad]), meta };
+  };
+  const layout = (metaLength, total) => {
+    const mdatStart = ftyp.length + metaLength + 8;
+    const frameLength = s.coded.length;
+    return {
+      frame: method === 1 ? 0 : mdatStart, frameLength,
+      extra: mdatStart + (method === 1 ? 0 : frameLength), extraLength: extraData.length,
+      mdat: [mdatStart, mdatStart + (method === 1 ? 0 : frameLength) + extraData.length], size: total,
+    };
+  };
+  const first = assemble(layout(0, 0));
+  return assemble(layout(first.meta.length, first.file.length)).file;
+}

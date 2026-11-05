@@ -29,6 +29,7 @@ import {
   avifStructureCases,
   jpegWithJunkBeforeScan,
   largeCanvasWebp,
+  locatedAvif,
   manyScanJpeg,
   restructuredAvif,
   stripesWebp,
@@ -366,6 +367,63 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
     const rgba = await solid(64, 32, { r: 10, g: 20, b: 30, alpha: 0.5 }, 4).avif({ effort: 0, ...options }).toBuffer();
     assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32 }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(rgba))).delta, { created: 1 }, name);
+  }
+});
+
+test("AVIF item locations may not repeat, overlap or leave mdat or idat, and metadata items stay small", async (t) => {
+  const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
+  const exif = Buffer.concat([Buffer.from([0, 0, 0, 6]), Buffer.from("Exif\0\0MM\0*\0\0\0\x08\0\0", "latin1")]);
+  const xmp = Buffer.from('<x:xmpmeta xmlns:x="adobe:ns:meta/"/>');
+  const exifItem = (extents, data = exif) => ({ type: "Exif", data, extents });
+  const xmpItem = (extents) => ({ type: "mime", data: xmp, extents });
+  const quarters = (L) => {
+    const q = Math.floor(L.frameLength / 4);
+    return [[L.frame, q], [L.frame + q, q], [L.frame + 2 * q, q], [L.frame + 3 * q, L.frameLength - 3 * q]];
+  };
+  // What encoders write: one extent per item in mdat or idat, any iloc
+  // version and offset width, a few consecutive extents, small Exif/XMP.
+  for (const [name, options] of [
+    ["mdat", {}],
+    ["idat", { method: 1 }],
+    ["iloc version 0", { ilocVersion: 0 }],
+    ["iloc version 2", { ilocVersion: 2 }],
+    ["4-byte base offset", { baseOffsetSize: 4 }],
+    ["four consecutive extents", { primary: quarters }],
+    ["Exif", { extra: exifItem((L) => [[L.extra, L.extraLength]]) }],
+    ["XMP", { extra: xmpItem((L) => [[L.extra, L.extraLength]]) }],
+  ]) {
+    const bytes = locatedAvif(small, options);
+    assert.deepEqual(checkAvif(bytes), { codedPixels: 64 * 32 }, name);
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
+  }
+  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
+  let nativeCalls = 0;
+  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
+  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
+  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
+  // libheif concatenates an item's extents and libvips copies Exif and XMP
+  // while reading the header: at 32 MiB, 31 copies of the file in the
+  // primary, or 15 in an Exif or XMP item, OOM-killed a 1 GiB container.
+  const wholeFile = (copies) => (L) => Array(copies).fill([0, L.size]);
+  for (const [name, options, refused] of [
+    ["primary repeating the file", { padTo: 64 * 1024, primary: (L) => [[L.frame, L.frameLength], ...wholeFile(30)(L)] }, "item 1 with 31 extents"],
+    ["Exif repeating the file", { padTo: 64 * 1024, extra: exifItem(wholeFile(15)) }, "item 2 with 15 extents"],
+    ["XMP repeating the file", { padTo: 64 * 1024, extra: xmpItem(wholeFile(15)) }, "item 2 with 15 extents"],
+    ["primary repeating its frame", { primary: (L) => [[L.frame, L.frameLength], [L.frame, L.frameLength]] }, "overlapping item extents"],
+    ["Exif sharing the frame's bytes", { extra: exifItem((L) => [[L.frame, L.frameLength]]) }, "overlapping item extents"],
+    ["Exif over 1 MiB", { extra: exifItem((L) => [[L.extra, L.extraLength]], Buffer.concat([exif, Buffer.alloc(1024 * 1024)])) }, "Exif item 2 over 1048576 bytes"],
+    ["extent in the padding", { padTo: 64 * 1024, primary: (L) => [[L.mdat[1] + 64, L.frameLength]] }, "item 1 extent outside its data box"],
+    ["extent past the end", { primary: (L) => [[L.frame, L.frameLength + 100000]] }, "item 1 extent outside its data box"],
+    ["extent to the end of the file", { primary: (L) => [[L.frame, 0]] }, "item 1 extent to the end of the file"],
+    ["data in another file", { dataReference: 1 }, "item 1 data in another file"],
+    ["construction method 2", { method: 2 }, "item 1 construction method 2"],
+    ["base offset near 2^63", { baseOffsetSize: 8, baseOffset: (1n << 63n) + 5n }, "item 1 extent outside its data box"],
+  ]) {
+    const bytes = locatedAvif(small, options);
+    assert.deepEqual(checkAvif(bytes), { refused }, name);
+    nativeCalls = 0;
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { unsupported: 1 }, name);
+    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
   }
 });
 

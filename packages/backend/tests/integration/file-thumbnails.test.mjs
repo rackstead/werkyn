@@ -10,7 +10,7 @@ import { FileTypeParser, fileTypeFromBuffer } from "file-type/core";
 import { png as smallPng, webp as smallWebp, makePdf } from "../fixtures/passive-media.mjs";
 import {
   avif100Megapixels, avifStructureCases, blankGif, blankPng, cmykJpeg, gifSvgPolyglot, isoHeader,
-  jpegWithJunkBeforeScan, largeCanvasWebp, manyScanJpeg, restructuredAvif, rgb16Png,
+  jpegWithJunkBeforeScan, largeCanvasWebp, locatedAvif, manyScanJpeg, restructuredAvif, rgb16Png,
 } from "../fixtures/thumbnail-inputs.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
@@ -506,7 +506,8 @@ async function outcomeDelta(run) {
 
 test("disguised formats, polyglots and decompression bombs are stored unchanged without a thumbnail", async () => {
   const tiffBytes = await solid(800, 400, "#abcdef").tiff().toBuffer();
-  const avifCases = avifStructureCases(avif100Megapixels, await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer());
+  const smallAvif = await solid(64, 32, "#208040").avif({ effort: 0 }).toBuffer();
+  const avifCases = avifStructureCases(avif100Megapixels, smallAvif);
   const scanBomb = manyScanJpeg(64, 64);
   for (const [name, type, bytes, outcome] of [
     ["scan.png", "image/png", tiffBytes, "unsupported"],
@@ -527,6 +528,10 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
     ["hidden-alpha.avif", "image/avif", avifCases.alphaWithoutIspe, "unsupported"],
     ["stray-byte.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0xfe, 0x00, 0x02, 0x00])), "unsupported"],
     ["tem.jpg", "image/jpeg", jpegWithJunkBeforeScan(scanBomb, 100, Buffer.from([0xff, 0x01, 0x00])), "unsupported"],
+    // Item extents that repeat the whole upload, which libheif concatenates.
+    ["extents.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, primary: (L) => [[L.frame, L.frameLength], ...Array(30).fill([0, L.size])] }), "unsupported"],
+    ["exif.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "Exif", data: Buffer.from("Exif"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
+    ["xmp.avif", "image/avif", locatedAvif(smallAvif, { padTo: 4 * 1024 * 1024, extra: { type: "mime", data: Buffer.from("<x/>"), extents: (L) => Array(15).fill([0, L.size]) } }), "unsupported"],
   ]) {
     const rss = process.memoryUsage().rss;
     const { result: file, delta } = await outcomeDelta(() => upload(name, type, bytes));
@@ -536,8 +541,10 @@ test("disguised formats, polyglots and decompression bombs are stored unchanged 
   }
 });
 
-test("CMYK, 16-bit and many-frame uploads get first-frame sRGB thumbnails", async () => {
+test("CMYK, 16-bit, idat-stored AVIF and many-frame uploads get first-frame sRGB thumbnails", async () => {
+  const idatAvif = locatedAvif(await solid(800, 400, "#208040").avif({ effort: 0 }).toBuffer(), { method: 1 });
   for (const [name, type, bytes, size] of [
+    ["idat.avif", "image/avif", idatAvif, [400, 200]],
     ["print.jpg", "image/jpeg", await cmykJpeg(800, 400), [400, 200]],
     ["deep.png", "image/png", await rgb16Png(800, 400), [400, 200]],
     ["loop.gif", "image/gif", blankGif(800, 400, 3000), [400, 200]],

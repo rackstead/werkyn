@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { DriveFile } from "../api";
 import { useThumbnailUrl } from "../api";
 import { useFileDragDrop } from "../hooks/use-file-drag-drop";
@@ -16,6 +16,9 @@ import { cn } from "@/lib/utils";
 
 interface FileCardProps {
   file: DriveFile;
+  /** The index of the grid line this card starts; set on a line's first card only. */
+  lineIndex?: number;
+  onCardFocus?: (fileId: string) => void;
   canEdit: boolean;
   selectable?: boolean;
   selected?: boolean;
@@ -34,8 +37,12 @@ interface FileCardProps {
   isShared?: boolean;
 }
 
-export function FileCard({
+// Memoized: scrolling renders the grid again, and only cards coming into
+// view need to render.
+export const FileCard = memo(function FileCard({
   file,
+  lineIndex,
+  onCardFocus,
   canEdit,
   selectable,
   selected,
@@ -63,6 +70,14 @@ export function FileCard({
       ref={setNodeRef}
       {...(canEdit ? { ...listeners, ...attributes } : {})}
       tabIndex={0}
+      data-anchor-key={file.id}
+      data-file-id={file.id}
+      data-drive-card=""
+      data-index={lineIndex}
+      // KeepInView keeps the cards in view in place; the browser's scroll
+      // anchoring must not move them a second time.
+      style={{ overflowAnchor: "none" }}
+      onFocus={onCardFocus && (() => onCardFocus(file.id))}
       className={cn(
         "group/card relative flex flex-col items-center rounded-lg border p-4 hover:bg-accent/50 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary",
         "cursor-pointer",
@@ -159,11 +174,14 @@ export function FileCard({
         )}
       </div>
 
-      {!file.isFolder && (
-        <span className="text-xs text-muted-foreground mt-0.5">
-          {formatFileSize(file.size)}
-        </span>
-      )}
+      {/* Folders keep the line empty: every card has the same height, which
+          the windowed grid relies on. */}
+      <span
+        className={cn("text-xs text-muted-foreground mt-0.5", file.isFolder && "invisible")}
+        aria-hidden={file.isFolder || undefined}
+      >
+        {file.isFolder ? "\u2014" : formatFileSize(file.size)}
+      </span>
     </div>
   );
 
@@ -189,4 +207,4 @@ export function FileCard({
       </ContextMenuContent>
     </ContextMenu>
   );
-}
+});

@@ -148,6 +148,9 @@ export function DrivePage({
   const [activeDrag, setActiveDrag] = useState<DriveFile | null>(null);
   const [showTrashConfirm, setShowTrashConfirm] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Scrolls the folder's entries; the list and grid render only the entries
+  // near its view.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const selection = useFileSelection();
 
   const sensors = useSensors(
@@ -170,7 +173,8 @@ export function DrivePage({
       const { active, over } = event;
       if (!over) return;
 
-      const activeFileId = active.data.current?.id as string;
+      const activeFileId = active.data.current?.id as string | undefined;
+      if (!activeFileId) return;
       const overData = over.data.current;
       if (!overData || overData.type !== "folder") return;
 
@@ -373,6 +377,8 @@ export function DrivePage({
       ) : view === "list" ? (
         <FileListView
           files={files}
+          scrollElement={scroller}
+          draggingId={activeDrag?.id ?? null}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}
@@ -401,6 +407,8 @@ export function DrivePage({
       ) : (
         <FileGridView
           files={files}
+          scrollElement={scroller}
+          draggingId={activeDrag?.id ?? null}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}
@@ -539,7 +547,7 @@ export function DrivePage({
           fileInputRef={fileInputRef}
           disabled={!canEdit}
         >
-          <div className="flex-1 overflow-y-auto">
+          <div ref={setScroller} className="flex-1 overflow-y-auto">
             {/* Starred section — home or starred view */}
             {(showInlineSections || (section === "starred" && isRoot && !isSearching)) && (
               <StarredSection

@@ -13,6 +13,13 @@ patch, Alpine version and multi-platform image digest; the container policy gate
 checks that its Node major matches validation and that test-only `adm-zip` stays
 out of the production dependency importer.
 
+Local build contexts exclude directories named `node_modules` or `dist` and
+TypeScript `*.tsbuildinfo` files at every depth, including workspace packages.
+Source, manifests, the lockfile, TypeScript configuration, Prisma schema and
+migrations, public assets, and container scripts remain available to the build.
+The Dockerfile installs frozen dependencies and compiles artifacts inside its
+own stages; context exclusions operate on local inputs.
+
 `pnpm test` first builds and tests the shared package, then validates the
 workflow's event/permission policy, runs the backend unit suite, and runs the
 frontend regression suite. All three test commands and the backend integration

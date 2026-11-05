@@ -608,6 +608,8 @@ export function webpFeatures(
 
 const PNG_IEND = fourCC("IEND"), PNG_TEXT = fourCC("tEXt"), PNG_ZTXT = fourCC("zTXt");
 const PNG_ITXT = fourCC("iTXt"), PNG_ICCP = fourCC("iCCP"), PNG_EXIF = fourCC("eXIf");
+/** Compressed metadata chunks inflated per PNG; each is a synchronous zlib call. */
+const MAX_PNG_COMPRESSED_CHUNKS = 64;
 
 /**
  * Walks every PNG chunk to IEND before any native call. libpng inflates
@@ -616,7 +618,8 @@ const PNG_ITXT = fourCC("iTXt"), PNG_ICCP = fourCC("iCCP"), PNG_EXIF = fourCC("e
  * 49 MB zTXt chunks needed 2.3 GiB. Here they are inflated against one
  * shared limit (maxPngMetadataBytes), raw tEXt, iTXt and eXIf against
  * another, and a malformed stream, a chunk overrunning the file, a missing
- * IEND or more than MAX_FILE_CHUNKS chunks refuse the file.
+ * IEND, more than MAX_FILE_CHUNKS chunks or more than
+ * MAX_PNG_COMPRESSED_CHUNKS compressed ones refuse the file.
  */
 export function pngMetadata(buffer: Buffer): { iccBytes: number } | { refused: string } {
   const limit = THUMBNAIL_LIMITS.maxPngMetadataBytes;
@@ -624,11 +627,13 @@ export function pngMetadata(buffer: Buffer): { iccBytes: number } | { refused: s
   let raw = 0;
   let iccBytes = 0;
   let chunks = 0;
+  let compressed = 0;
   const nul = (from: number, to: number) => {
     const at = buffer.indexOf(0, from);
     return at === -1 || at >= to ? -1 : at;
   };
   const inflate = (from: number, to: number) => {
+    if (++compressed > MAX_PNG_COMPRESSED_CHUNKS) return -1;
     try {
       const out = zlib.inflateSync(buffer.subarray(from, to), { maxOutputLength: Math.max(1, limit - inflated) });
       inflated += out.length;

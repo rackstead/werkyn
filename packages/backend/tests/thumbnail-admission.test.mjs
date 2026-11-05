@@ -502,6 +502,9 @@ test("PNG compressed and text metadata is bounded before any native call", async
     ["over 4 MiB of tEXt", pngWithChunks([pngChunk("tEXt", Buffer.concat([Buffer.from("Big\0"), Buffer.alloc(limit + 1, 0x61)]))]), "text metadata over the limit"],
     ["no IEND", pngWithChunks([], { iend: false }), "chunks end before IEND"],
     ["65,537 chunks", pngWithChunks(Array(65537).fill(pngChunk("prVt", Buffer.alloc(0)))), "too many chunks"],
+    // Each compressed chunk is a synchronous zlib call: 65,000 one-byte
+    // zTXt streams took 194 ms on the event loop before this limit.
+    ["65 compressed chunks", pngWithChunks(Array(65).fill(zTxtChunk("a", { size: 1 }))), "compressed metadata over the limit or malformed"],
   ]) {
     assert.ok(bytes.length < 5 * MiB, name);
     assert.deepEqual(pngMetadata(bytes), { refused }, name);
@@ -519,6 +522,7 @@ test("PNG compressed and text metadata is bounded before any native call", async
     ["iCCP, tEXt, zTXt and compressed XMP", pngWithChunks([iccpChunk(icc), pngChunk("tEXt", Buffer.from("Title\0hello")),
       zTxtChunk("Comment", { size: 2000 }), compressedITxtChunk("XML:com.adobe.xmp", 3000)]), icc.length],
     ["two 1.9 MB zTXt chunks", pngWithChunks(["a", "b"].map((k) => zTxtChunk(k, { size: 1_900_000 }))), 0],
+    ["64 compressed chunks", pngWithChunks(Array(64).fill(zTxtChunk("a", { size: 100 }))), 0],
     ["sharp PNG with a P3 profile", await solid(640, 320).withIccProfile("p3").png().toBuffer(), icc.length],
   ]) {
     assert.deepEqual(pngMetadata(bytes), { iccBytes }, name);

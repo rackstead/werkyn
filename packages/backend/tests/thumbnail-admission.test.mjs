@@ -1007,6 +1007,9 @@ test("admission is shared fairly between workspaces", async () => {
 
 test("saturation keeps transforms bounded and the event loop responsive", async (t) => {
   const { maxActive, maxQueued } = thumbnailAdmission.limits;
+  // The default limits, but a queue wait long enough for a slow machine to
+  // drain the queue (the 5 s wait itself is tested above).
+  const admission = new TransformAdmission({ ...thumbnailAdmission.limits, queueTimeoutMs: 60_000 });
   const run = thumbnailWorkers.run;
   let inFlight = 0, peak = 0;
   thumbnailWorkers.run = function (...args) {
@@ -1022,7 +1025,7 @@ test("saturation keeps transforms bounded and the event loop responsive", async 
   delay.enable();
   const started = performance.now();
   const { result, delta } = await outcomes(() =>
-    Promise.all(Array.from({ length: requests }, () => thumbnailOf(source))));
+    Promise.all(Array.from({ length: requests }, () => thumbnailOf(source, { admission }))));
   const elapsed = performance.now() - started;
   delay.disable();
   const stats = { requests, maxActive, maxQueued, elapsedMs: Math.round(elapsed), peak, delta, loopMaxMs: delay.max / 1e6, loopP99Ms: delay.percentile(99) / 1e6 };
@@ -1032,6 +1035,6 @@ test("saturation keeps transforms bounded and the event loop responsive", async 
   // Waiters beyond the queue go without at once; the queue drains in turn.
   assert.equal(delta.busy, requests - maxActive - maxQueued, JSON.stringify(stats));
   assert.equal((delta.created ?? 0) + (delta.busy ?? 0), requests, JSON.stringify(stats));
-  assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
   assert.ok(stats.loopMaxMs < 250, JSON.stringify(stats));
 });

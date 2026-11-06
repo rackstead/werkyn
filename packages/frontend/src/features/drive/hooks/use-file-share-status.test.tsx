@@ -44,6 +44,14 @@ describe("shareStatusGroups", () => {
     // A group none of whose entries is listed any more is dropped.
     const removed = shareStatusGroups(added, ["new", ...ids(200, 450)]);
     expect(removed).toEqual(added.slice(1));
+    // An entry that leaves the list leaves its group; when it comes back it
+    // joins the last group, to be asked for afresh.
+    const left = shareStatusGroups(removed, ["new", ...ids(200, 450)].filter((id) => id !== "f205"));
+    expect(left[0]).toEqual(removed[0].filter((id) => id !== "f205"));
+    expect(left[1]).toEqual(removed[1]);
+    const back = shareStatusGroups(left, ["new", ...ids(200, 450)]);
+    expect(back[0]).toEqual(left[0]);
+    expect(back[1]).toEqual([...left[1], "f205"]);
     // Another folder: new groups only.
     expect(shareStatusGroups(removed, ids(1000, 1010))).toEqual([ids(1000, 1010)]);
   });
@@ -67,6 +75,26 @@ describe("useFileShareStatus", () => {
     await waitFor(() => expect(result.current.has("new")).toBe(true));
     expect(net.requests.length).toBe(4);
     expect(net.requests[3]).toEqual([...ids(400, 450), "new"]);
+  });
+
+  it("asks afresh for an entry that comes back to the list", async () => {
+    const all = ids(0, 450);
+    const { result, rerender } = renderHook(({ fileIds }) => useFileShareStatus("w", fileIds), {
+      wrapper,
+      initialProps: { fileIds: all },
+    });
+    await waitFor(() => expect(result.current.size).toBe(45));
+    // f10 is trashed: its group is asked again without it.
+    rerender({ fileIds: all.filter((id) => id !== "f10") });
+    await waitFor(() => expect(net.requests.length).toBe(4));
+    expect(net.requests[3]).not.toContain("f10");
+    // Meanwhile its link is deleted elsewhere (nothing here learns of it),
+    // and the file is restored: it is asked for again, and its icon goes.
+    net.shared.delete("f10");
+    rerender({ fileIds: all });
+    await waitFor(() => expect(net.requests.length).toBe(5));
+    expect(net.requests[4]).toContain("f10");
+    await waitFor(() => expect(result.current.has("f10")).toBe(false));
   });
 
   it("asks nothing for an empty folder", () => {
@@ -100,18 +128,25 @@ describe("useFileShareStatus", () => {
     expect(net.requests.length).toBe(5);
     expect(net.requests[4]).toContain("f450");
 
-    // Deleting a link: its files come from the links on screen.
-    client.setQueryData(queryKeys.fileShareLinks("w", "f450"), {
-      data: [{ id: "l1", files: [{ file: { id: "f450" } }] }],
-    });
+    // Deleting a link the share dialog shows with its files.
     net.shared.delete("f450");
-    await act(() => result.current.unlink.mutateAsync("l1"));
+    await act(() => result.current.unlink.mutateAsync({ linkId: "l2", fileIds: ["f450"] }));
     await waitFor(() => expect(result.current.status.has("f450")).toBe(false));
     expect(net.requests.length).toBe(6);
     expect(net.requests[5]).toContain("f450");
 
-    // A link not on screen: every group is asked again.
-    await act(() => result.current.unlink.mutateAsync("unknown"));
-    await waitFor(() => expect(net.requests.length).toBe(9));
+    // Deleting a link known only from the cached link lists.
+    client.setQueryData(queryKeys.fileShareLinks("w", "f1"), {
+      data: [{ id: "l1", files: [{ file: { id: "f1" } }] }],
+    });
+    net.shared.delete("f1");
+    await act(() => result.current.unlink.mutateAsync({ linkId: "l1" }));
+    await waitFor(() => expect(result.current.status.has("f1")).toBe(false));
+    expect(net.requests.length).toBe(7);
+    expect(net.requests[6]).toContain("f1");
+
+    // A link whose files are unknown: every group is asked again.
+    await act(() => result.current.unlink.mutateAsync({ linkId: "unknown" }));
+    await waitFor(() => expect(net.requests.length).toBe(10));
   });
 });

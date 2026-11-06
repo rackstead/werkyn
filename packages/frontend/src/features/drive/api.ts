@@ -908,10 +908,13 @@ export function useUpdateFileShareLink(wid: string) {
 export function useDeleteFileShareLink(wid: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (linkId: string) =>
+    /** `fileIds`: the link's files, when the caller shows them. */
+    mutationFn: ({ linkId }: { linkId: string; fileIds?: string[] }) =>
       api.delete(`workspaces/${wid}/file-share-links/${linkId}`).then(() => {}),
-    // The link's files, from the links on screen, before it is gone.
-    onMutate: (linkId: string) => {
+    // The link's files, as given or from the cached link lists, before it is
+    // gone.
+    onMutate: ({ linkId, fileIds }: { linkId: string; fileIds?: string[] }) => {
+      if (fileIds) return { fileIds };
       for (const [, data] of qc.getQueriesData<{ data: FileShareLinkDetail[] }>({
         queryKey: ["file-share-links"],
       })) {
@@ -920,7 +923,7 @@ export function useDeleteFileShareLink(wid: string) {
       }
       return { fileIds: undefined };
     },
-    onSuccess: (_result, _linkId, context) => {
+    onSuccess: (_result, _variables, context) => {
       qc.invalidateQueries({ queryKey: ["file-share-links"] });
       invalidateShareStatus(qc, wid, context?.fileIds);
       qc.invalidateQueries({ queryKey: queryKeys.sharedByMe(wid) });

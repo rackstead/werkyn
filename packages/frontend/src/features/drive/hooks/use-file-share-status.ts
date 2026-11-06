@@ -10,17 +10,25 @@ import { queryKeys } from "@/lib/query-keys";
 //
 // A group keeps its entries once formed: entries new to the list (the next
 // page, an upload, an entry moved in) join the last group while it has
-// room, or start a new one. So an entry added near the top of a long folder
-// asks again only for the last group, not for every group after it, and the
-// groups already answered keep their answers. Groups none of whose entries
-// are listed any more are dropped. Share changes ask again only for the
-// groups holding the files changed (invalidateShareStatus in ../api).
+// room, or start a new one, and an entry that leaves the list leaves its
+// group. So an entry added near the top of a long folder asks again only
+// for the last group, not for every group after it, and the groups already
+// answered keep their answers. Share changes ask again only for the groups
+// holding the files changed (invalidateShareStatus in ../api).
 export const SHARE_STATUS_GROUP = 200;
 
-/** Groups for these entries, keeping the previous groups' members. */
+/**
+ * Groups for these entries, keeping the previous groups' members that are
+ * still listed. An entry that leaves the list leaves its group (which is
+ * then asked again), so an entry that comes back later (restored from the
+ * trash, moved back) is asked for afresh rather than shown with its old
+ * answer.
+ */
 export function shareStatusGroups(previous: readonly string[][], fileIds: readonly string[]): string[][] {
   const listed = new Set(fileIds);
-  const groups = previous.filter((group) => group.some((id) => listed.has(id)));
+  const groups = previous
+    .map((group) => (group.every((id) => listed.has(id)) ? group : group.filter((id) => listed.has(id))))
+    .filter((group) => group.length > 0);
   const grouped = new Set(groups.flat());
   let last = groups.length > 0 ? [...groups[groups.length - 1]] : null;
   if (last) groups.pop();

@@ -395,7 +395,9 @@ function LinkTab({
   };
 
   const handleDelete = (linkId: string) => {
-    deleteLink.mutate(linkId, {
+    const link = links.find((l) => l.id === linkId);
+    const fileIds = link?.files.map((f) => f.file.id);
+    deleteLink.mutate({ linkId, fileIds }, {
       onSuccess: () => {
         if (!singleFileId) {
           setLocalLinks((prev) => prev.filter((l) => l.id !== linkId));

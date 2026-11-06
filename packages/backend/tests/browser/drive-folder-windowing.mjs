@@ -896,9 +896,26 @@ async function smoke({ browser, origin, fixture, prisma }) {
           .map((e) => e.name),
       );
       await page.mouse.click(point.x, point.y);
-      await page.waitForFunction(
-        () => ![...document.querySelectorAll("span")].some((x) => /^\d+ selected$/.test(x.textContent)),
-      );
+      await page
+        .waitForFunction(
+          () => ![...document.querySelectorAll("span")].some((x) => /^\d+ selected$/.test(x.textContent)),
+          undefined,
+          { timeout: 10_000 },
+        )
+        .catch(async (error) => {
+          const state = await page.evaluate((point) => {
+            const hit = document.elementFromPoint(point.x, point.y);
+            return {
+              hit: `${hit?.tagName}.${String(hit?.className).slice(0, 60)}`,
+              row: window.__drive.entries().find(({ el }) => el.contains(hit))?.name ?? null,
+              checked: window.__drive
+                .entries()
+                .filter(({ el }) => el.querySelector('input[type="checkbox"]')?.checked)
+                .map((e) => e.name),
+            };
+          }, point);
+          throw new Error(`${error.message}; first click checked ${JSON.stringify(checked)}; now ${JSON.stringify(state)}`);
+        });
       return checked;
     }
     // Entries in view are a run of the listing, in its order, touching each
@@ -1705,7 +1722,13 @@ async function smoke({ browser, origin, fixture, prisma }) {
         };
         report.rate.push(detail);
         assert(!state.failed, `${run.name}: "Failed to load files"`);
-        if (run.kind === "jump") assert(detail.reachedEnd, `${run.name}: the end of the folder was not reached`);
+        if (run.kind === "jump") {
+          // 100 pages within a minute from one address exceed the server's
+          // limit: the jump must have been refused, waited and gone on.
+          assert(detail.refusedListing > 0, `${run.name}: no page was refused, the retry went untested`);
+          assert(detail.noticeSeen, `${run.name}: the inline notice was not shown`);
+          assert(detail.reachedEnd, `${run.name}: the end of the folder was not reached`);
+        }
         pass("rate", run.name, detail);
       } finally {
         await context.close();

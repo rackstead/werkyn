@@ -178,11 +178,11 @@ paced client:
 `tests/env-validation.test.mjs` checks the defaults, empty values, the
 accepted ranges and the refusals of 0, fractions and words.
 
-On main, the integration file fails: the dripping uploads and the stalled
-mid-file upload are never answered (the 60-second test timeout ends them), and
-the upload stalled before its file is cut off by the request deadline with
-Node's generic 408 instead of the rate check. The test of uploads above the
-minimum passes on main, as it should.
+Run against main's server code, the first and third integration tests fail:
+the dripping uploads, and the upload stopped mid-file, are still unanswered
+when the 60-second test timeout ends them. The test of uploads above the
+minimum passes on main, as it should (each test run on its own, since the
+first one leaves the slots held on main).
 
 ## Remaining limits
 

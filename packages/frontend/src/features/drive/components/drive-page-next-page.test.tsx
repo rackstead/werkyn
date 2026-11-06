@@ -10,8 +10,9 @@ import { DrivePage } from "./drive-page";
 // 429 (the server's per-address request limit), asking for a short wait.
 const net = vi.hoisted(() => ({
   listings: [] as string[],
+  forbidden: false,
   refusals: 0,
-  retryAfterMs: 50 as number | undefined,
+  retryAfterMs: 400 as number | undefined,
 }));
 const file = (i: number) => ({
   id: `file-${i}`,
@@ -38,6 +39,7 @@ vi.mock("@/lib/api-client", async () => {
           net.listings.push(cursor ?? "first");
           if (!cursor)
             return Promise.resolve({ data: Array.from({ length: 50 }, (_, i) => file(i + 1)), nextCursor: "c1" });
+          if (net.forbidden) return Promise.reject(new ApiError(403, "Forbidden", "No access to this folder"));
           if (net.refusals > 0) {
             net.refusals--;
             const error = new ApiError(429, "Too Many Requests", "Rate limit exceeded, retry in 1 seconds");
@@ -82,8 +84,9 @@ const renderPage = () =>
 
 beforeEach(() => {
   net.listings = [];
+  net.forbidden = false;
   net.refusals = 1;
-  net.retryAfterMs = 50;
+  net.retryAfterMs = 400;
   observers.clear();
   vi.stubGlobal(
     "IntersectionObserver",
@@ -127,6 +130,21 @@ describe("a next page that fails to load", () => {
     await screen.findByText("File 51.txt");
     expect(net.listings).toEqual(["first", "c1", "c1"]);
     expect(screen.queryByText(/Couldn't load more files/)).toBeNull();
+  });
+
+  it("does not ask again for a page refused for good, however often the end comes into view", async () => {
+    net.forbidden = true;
+    renderPage();
+    await screen.findByText("File 1.txt");
+    endInView();
+    await screen.findByText(/Couldn't load more files\./);
+    expect(screen.queryByText(/Trying again/)).toBeNull();
+    for (let i = 0; i < 3; i++) endInView();
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    expect(net.listings).toEqual(["first", "c1"]);
+    // "Try again" still asks.
+    act(() => screen.getByRole("button", { name: "Try again" }).click());
+    await waitFor(() => expect(net.listings).toEqual(["first", "c1", "c1"]));
   });
 
   it("asks again at once from Try again, and backs off without Retry-After", async () => {

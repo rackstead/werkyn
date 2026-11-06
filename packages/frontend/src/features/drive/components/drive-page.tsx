@@ -27,7 +27,8 @@ import { FilePreviewSlideover, UploadProgress } from "./lazy-drive-panels";
 import { DriveBulkActions } from "./drive-bulk-actions";
 import { useFileUpload } from "../hooks/use-file-upload";
 import { useFileSelection } from "../hooks/use-file-selection";
-import { useFileShareStatus, type EntriesInView } from "../hooks/use-file-share-status";
+import { useFileShareStatus } from "../hooks/use-file-share-status";
+import { useSettledEntries } from "../hooks/use-settled-entries";
 import { useNextPageRetry } from "../hooks/use-next-page-retry";
 import { useRecentFiles } from "../hooks/use-recent-files";
 import { useAuthStore } from "@/stores/auth-store";
@@ -56,11 +57,6 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-
-// Scrolling has settled when the entries in view have not changed for this
-// long, and settles at most this often.
-const SHARE_STATUS_SETTLE_MS = 1000;
-const SHARE_STATUS_GAP_MS = 4000;
 
 interface DrivePageProps {
   workspaceId: string;
@@ -188,10 +184,11 @@ export function DrivePage({
     pages: data?.pages.length ?? 0,
     fetchNextPage,
   });
-  const nextPageWaiting = nextPage.waiting;
+  // After a failed next page only the timer above and "Try again" ask for
+  // it again, not the end of the list coming (or staying) in view.
   const handleLoadMore = useCallback(() => {
-    if (!nextPageWaiting) fetchNextPage();
-  }, [fetchNextPage, nextPageWaiting]);
+    if (!isFetchNextPageError) fetchNextPage();
+  }, [fetchNextPage, isFetchNextPageError]);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const file = event.active.data.current?.file as DriveFile | undefined;
@@ -296,45 +293,10 @@ export function DrivePage({
   const fileIds = useMemo(() => files.map((f) => f.id), [files]);
 
   // Share status for indicators, asked for near the entries in view once
-  // scrolling settles (a second without a change; at once the first time
-  // for a list), so that skimming a long folder does not double the
-  // requests it makes.
-  // Another list starts with no entries in view known; the views report
-  // them again (the callback changes with the list), and the first report
-  // counts at once.
-  const [entriesInView, setEntriesInView] = useState<{ listKey: string; range: EntriesInView } | null>(null);
-  const settleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const reportedFor = useRef<string | null>(null);
-  const settledAt = useRef(0);
-  const onVisibleEntries = useCallback(
-    (first: number, last: number) => {
-      clearTimeout(settleTimer.current);
-      const settle = () => {
-        settledAt.current = Date.now();
-        setEntriesInView((current) =>
-          current?.listKey === listKey && current.range[0] === first && current.range[1] === last
-            ? current
-            : { listKey, range: [first, last] },
-        );
-      };
-      if (reportedFor.current !== listKey) {
-        reportedFor.current = listKey;
-        settle();
-        return;
-      }
-      // Short pauses while skimming settle no more often than every few
-      // seconds, so that they do not ask for share status page by page.
-      const wait = Math.max(SHARE_STATUS_SETTLE_MS, settledAt.current + SHARE_STATUS_GAP_MS - Date.now());
-      settleTimer.current = setTimeout(settle, wait);
-    },
-    [listKey],
-  );
-  useEffect(() => () => clearTimeout(settleTimer.current), []);
-  const sharedFileIds = useFileShareStatus(
-    workspaceId,
-    fileIds,
-    entriesInView?.listKey === listKey ? entriesInView.range : null,
-  );
+  // scrolling settles (see useSettledEntries), so that skimming a long
+  // folder does not double the requests it makes.
+  const { onVisibleEntries, entriesInView } = useSettledEntries(listKey, view);
+  const sharedFileIds = useFileShareStatus(workspaceId, fileIds, entriesInView);
 
   const handleShare = useCallback(
     (file: DriveFile) => {

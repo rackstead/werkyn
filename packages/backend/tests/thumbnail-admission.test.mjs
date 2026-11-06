@@ -714,6 +714,15 @@ test("container checks stop after a bounded amount of work on crafted files", as
   const stuffed = Buffer.alloc(size);
   Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]).copy(stuffed);
   for (let at = 6; at + 2 <= size; at += 2) stuffed[at] = 0xff;
+  // The allowance is measured on this machine, so a slow runner gets a
+  // proportionally larger one: five times a reference loop of 2^20 short
+  // searches (the most escapes a JPEG walk reads), and at least 50 ms. On
+  // the test host the reference takes 8 ms and the slowest bounded walk
+  // 20 ms; before the bound, the WebP walk took 208 ms, about 25 references.
+  const referenceStarted = performance.now();
+  for (let i = 0, at = 6; i < 1 << 20; i++) at = stuffed.indexOf(0xff, at) + 2;
+  const pass = performance.now() - referenceStarted;
+  const allowance = Math.max(50, 5 * pass);
   for (const [name, check, refused] of [
     ["avif boxes", () => checkAvif(avif).refused, "unreadable structure"],
     ["webp chunks", () => webpFeatures(webp), null],
@@ -722,8 +731,8 @@ test("container checks stop after a bounded amount of work on crafted files", as
   ]) {
     const started = performance.now();
     assert.equal(check(), refused, name);
-    // About 20 ms here; a shared CI runner has taken 53. Unbounded, the WebP took 208.
-    assert.ok(performance.now() - started < 100, `${name} took ${performance.now() - started} ms`);
+    const took = performance.now() - started;
+    assert.ok(took < allowance, `${name} took ${took} ms, allowed ${allowance} ms (${pass} ms per pass)`);
   }
   // 680 Exif items in the last of 2,000 mdat boxes stay within the entry
   // limit; locating their extents is a binary search, not a scan of every

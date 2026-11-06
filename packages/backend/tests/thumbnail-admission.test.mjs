@@ -249,9 +249,9 @@ test("decoder memory is estimated from the header and bounded per transform", ()
   assert.ok(estimateDecodeBytes(meta("webp", 16383, 16383)) > budget, "lossy WebP at 2 B/px");
   assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true }) <= budget);
   assert.ok(estimateDecodeBytes(meta("webp", 8700, 8700), { webpFullCanvas: true }) > budget);
-  // Animations: 18 B/px of canvas, so at most 4729 x 4729.
-  assert.ok(estimateDecodeBytes(meta("webp", 4729, 4729), { webpFullCanvas: true, webpAnimated: true }) <= budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 4730, 4730), { webpFullCanvas: true, webpAnimated: true }) > budget);
+  // Animations: 24 B/px of canvas, so at most 4096 x 4096.
+  assert.ok(estimateDecodeBytes(meta("webp", 4096, 4096), { webpFullCanvas: true, webpAnimated: true }) <= budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 4097, 4096), { webpFullCanvas: true, webpAnimated: true }) > budget);
   assert.ok(estimateDecodeBytes(meta("webp", 1, 1), { codedPixels: 16383 * 16383, webpFullCanvas: true, webpAnimated: true }) > budget);
   for (const m of [meta("svg", 1, 1), meta("tiff", 1, 1), meta("png", 0, 1), meta("png", 1, 1, { depth: "double" }), {}]) {
     assert.equal(estimateDecodeBytes(m), Infinity, JSON.stringify(m));
@@ -500,9 +500,9 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { "over-budget": 1 }, name);
     assert.equal(await stageOf(bytes), "container", `${name}: refused before the header read`);
   }
-  // Animations are charged 18 B/px of canvas: frames with alpha are
-  // decoded and blended at full size, in buffers of 15-16.7 B/px that the
-  // worker's data limit counts whether or not they are touched.
+  // Animations are charged 24 B/px of canvas: frames with alpha are
+  // decoded and blended at full size, in buffers of about 19.5 B/px that
+  // the worker's data limit counts whether or not they are touched.
   const alphaAnimation = await alphaAnimationWebp(256, 128);
   assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128, iccBytes: 0, metadataBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(alphaAnimation))).delta, { created: 1 });
@@ -648,9 +648,9 @@ test("metadata libvips keeps while reading the header is charged, and an ICC tag
   const app13 = Array.from({ length: 192 }, () => segment(0xed, Buffer.concat([Buffer.from("Photoshop 3.0\0"), Buffer.alloc(65_519)])));
   assert.deepEqual((await outcomes(() => thumbnailOf(progressive))).delta, { created: 1 });
   assert.deepEqual((await outcomes(() => thumbnailOf(jpegWithSegments(progressive, app13)))).delta, { "over-budget": 1 });
-  // A 4500 x 4500 animated WebP canvas is estimated at 347.6 MiB; 8 MiB of
+  // A 3900 x 3900 animated WebP canvas is estimated at 348.1 MiB; 8 MiB of
   // XMP adds 48 MiB, and 8 MiB of EXIF as much.
-  const canvas = await largeCanvasWebp(4500, 4500);
+  const canvas = await largeCanvasWebp(3900, 3900);
   assert.deepEqual((await outcomes(() => thumbnailOf(canvas))).delta, { created: 1 });
   for (const type of ["XMP ", "EXIF"]) {
     const bytes = webpWithChunk(canvas, type, Buffer.alloc(8 * MiB, 0x20));

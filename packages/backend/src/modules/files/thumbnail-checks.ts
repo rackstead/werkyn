@@ -203,11 +203,11 @@ function decodeBytes(
       return pixels * 7;
     case "webp":
       // libvips composites animation frames onto a full RGBA canvas, and a
-      // frame with alpha is decoded and blended at full size too (with
-      // canvas buffers that are allocated but not all touched); libwebp
+      // frame with alpha is decoded and blended at full size too, in
+      // buffers of about 19.5 B/px of which about 8 are touched; libwebp
       // decodes lossless (VP8L) images whole as 32-bit ARGB, and alpha at
       // full size. Plain lossy VP8 decodes scaled.
-      return pixels * (hints.webpAnimated ? 18 : hints.webpFullCanvas ? 5.5 : 2);
+      return pixels * (hints.webpAnimated ? 24 : hints.webpFullCanvas ? 5.5 : 2);
     case "heif":
       // AV1 frame buffers, then RGB(A) copies in libheif and libvips.
       return pixels * 16 + bytes * 2;

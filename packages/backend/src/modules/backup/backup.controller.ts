@@ -17,14 +17,16 @@ import {
 } from "./backup-concurrency.js";
 import {
   BACKUP_TRANSFER_LIMITS,
+  BackupUploadTooSlowError,
   backupStagingDir,
   onLastByte,
   receiveBackupUpload,
   watchIdle,
+  type MinimumUploadRate,
   type StagedUpload,
 } from "./backup-staging.js";
 import { env } from "../../config/env.js";
-import { liftRequestTimeout } from "../../plugins/request-limits.js";
+import { closeAfterUnreadBody, liftRequestTimeout } from "../../plugins/request-limits.js";
 import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 
@@ -136,6 +138,16 @@ async function logRejection<T>(request: FastifyRequest, run: () => Promise<T>): 
 }
 
 /**
+ * The slowest a backup upload may arrive, from its admission until its file
+ * is staged (docs/remediation/r42-backup-limits.md).
+ */
+export const BACKUP_UPLOAD_MIN_RATE: Readonly<MinimumUploadRate> = Object.freeze({
+  bytesPerSecond: env.BACKUP_UPLOAD_MIN_BYTES_PER_SECOND,
+  windowMs: env.BACKUP_UPLOAD_RATE_WINDOW_SECONDS * 1000,
+  graceMs: env.BACKUP_UPLOAD_RATE_GRACE_SECONDS * 1000,
+});
+
+/**
  * Stage the upload on disk, then read and process it in the exclusive
  * section. The staged file is removed on every path before the response is
  * sent, so a client that receives it can start its next backup request.
@@ -146,14 +158,31 @@ async function handleUpload(
   run: (contents: BackupArchiveContents) => Promise<RestoreSummary>,
 ) {
   const signal = clientAbortSignal(reply);
-  const upload = await receiveBackupUpload(request, {
-    dir: backupStagingDir(env.STORAGE_DIR),
-    maxBytes: Math.min(env.MAX_FILE_SIZE, BACKUP_TRANSFER_LIMITS.maxUploadBytes),
-    // Authorized, admitted and its file started: the upload is bounded by
-    // its own idle timeout and size limit from here on, not by the
-    // whole-request deadline.
-    onFile: () => liftRequestTimeout(request, reply),
-  });
+  // Any answer sent before the body has fully arrived (a refusal, a 408 or a
+  // 413) closes the connection shortly after, whether or not the request
+  // deadline was lifted.
+  closeAfterUnreadBody(request, reply);
+  let upload: StagedUpload;
+  try {
+    upload = await receiveBackupUpload(request, {
+      dir: backupStagingDir(env.STORAGE_DIR),
+      maxBytes: Math.min(env.MAX_FILE_SIZE, BACKUP_TRANSFER_LIMITS.maxUploadBytes),
+      // Admitted: from here a slow-drip client cannot hold the admission.
+      minRate: BACKUP_UPLOAD_MIN_RATE,
+      // Authorized, admitted and its file started: the upload is bounded by
+      // its own idle timeout, minimum rate and size limit from here on, not
+      // by the whole-request deadline.
+      onFile: () => liftRequestTimeout(request, reply),
+    });
+  } catch (error) {
+    if (error instanceof BackupUploadTooSlowError) {
+      request.log.warn(
+        { minBytesPerSecond: error.bytesPerSecond },
+        "Abandoned a backup upload below the minimum rate",
+      );
+    }
+    throw error;
+  }
   let summary: RestoreSummary;
   try {
     summary = await logRejection(request, () =>

@@ -267,3 +267,43 @@ test("password-reset cooldown and per-process ceiling have safe defaults and bou
   for (const value of ["59", "1000001", "lots"])
     rejects({ PASSWORD_RESET_REQUESTS_PER_MINUTE: value }, "PASSWORD_RESET_REQUESTS_PER_MINUTE", /whole number/);
 });
+
+test("backup upload minimum rate settings have safe defaults and bounded ranges", () => {
+  const { data } = accepts({});
+  assert.equal(data.BACKUP_UPLOAD_MIN_BYTES_PER_SECOND, 16384);
+  assert.equal(data.BACKUP_UPLOAD_RATE_WINDOW_SECONDS, 60);
+  assert.equal(data.BACKUP_UPLOAD_RATE_GRACE_SECONDS, 30);
+  const blank = accepts({
+    BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: "",
+    BACKUP_UPLOAD_RATE_WINDOW_SECONDS: " ",
+    BACKUP_UPLOAD_RATE_GRACE_SECONDS: "",
+  }).data;
+  assert.equal(blank.BACKUP_UPLOAD_MIN_BYTES_PER_SECOND, 16384);
+  assert.equal(blank.BACKUP_UPLOAD_RATE_WINDOW_SECONDS, 60);
+  assert.equal(blank.BACKUP_UPLOAD_RATE_GRACE_SECONDS, 30);
+  const ranges = {
+    // The rate cannot be switched off: 1 byte a second is the lowest.
+    BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: ["0", "-1", "1073741825", "1.5", "fast"],
+    BACKUP_UPLOAD_RATE_WINDOW_SECONDS: ["0", "3601", "2.5"],
+    BACKUP_UPLOAD_RATE_GRACE_SECONDS: ["0", "3601", "soon"],
+  };
+  for (const [name, values] of Object.entries(ranges))
+    for (const value of values) rejects({ [name]: value }, name, /whole number/);
+  const custom = accepts({
+    BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: "1",
+    BACKUP_UPLOAD_RATE_WINDOW_SECONDS: "3600",
+    BACKUP_UPLOAD_RATE_GRACE_SECONDS: "1",
+  }).data;
+  assert.deepEqual(
+    [
+      custom.BACKUP_UPLOAD_MIN_BYTES_PER_SECOND,
+      custom.BACKUP_UPLOAD_RATE_WINDOW_SECONDS,
+      custom.BACKUP_UPLOAD_RATE_GRACE_SECONDS,
+    ],
+    [1, 3600, 1],
+  );
+  assert.equal(
+    accepts({ BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: "1073741824" }).data.BACKUP_UPLOAD_MIN_BYTES_PER_SECOND,
+    1073741824,
+  );
+});

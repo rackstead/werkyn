@@ -585,6 +585,206 @@ back to an earlier version after this migration also breaks password sign-in unt
 the old table is recreated; see the upgrade notes in
 [docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
 
+## Backups and restores
+
+Workspace admins export and restore content under **Admin → Backup**. A backup
+is a selective content export of the projects, chat channels and wiki spaces you
+pick, not a copy of the installation: accounts, settings, Drive files and
+attachments are left out (see
+[what a backup contains](docs/remediation/b03-backup-transport.md#what-a-backup-contains)).
+To be able to recover the whole installation, back up PostgreSQL and the storage
+volume.
+
+### Limits per server
+
+Each server process applies these limits. Only the minimum upload rate is
+configurable.
+
+| Limit | Value | When it is exceeded |
+| --- | --- | --- |
+| Backup requests (export, preview, restore) at once, per workspace | 1 | `429` with `Retry-After: 30` |
+| Backup requests at once, per server process | 3 | `503` with `Retry-After: 30` |
+| Uploaded backup file | 1,088 MiB, or `MAX_FILE_SIZE` if smaller | `413` |
+| Archive content | 1 GiB, 10,000 entries, `backup.json` at most 24 MiB | `400`, for exports and uploads alike |
+| Export time, image copy included | 10 minutes | `409`, the export can be retried |
+| Upload or download that moves no bytes | 60 seconds | the connection is closed |
+| Upload slower than the minimum rate (below) | 16 KiB/s on average over 60 s, from 30 s after it starts | `408` |
+
+A backup request takes its slot before it reads anything and keeps it until it
+has answered; an export keeps it until its download has been handed over in
+full. Requests over a limit are refused at once rather than queued, and the
+backup page asks the admin to try again shortly. The admitted requests take turns, one at a
+time per process, for the memory-heavy step: building an export, or reading,
+checking and restoring `backup.json`. A request can therefore wait behind up to
+two others before its own work starts.
+
+Werkyn assumes one server process per storage directory. A process that starts
+removes the staged backup files in `STORAGE_DIR/.tmp/backup`, including any that
+another process is still using. If you run several processes anyway, each one
+has its own three slots, and the one-per-workspace limit does not span them.
+Each slot can stage a file of up to 1,088 MiB in `STORAGE_DIR/.tmp/backup`, so
+keep about 3.5 GiB free on the storage volume. Give the server a heap of at
+least 384 MiB ([SEC-028](docs/remediation/sec-028.md)).
+
+### Minimum upload rate
+
+From the moment a preview or restore is admitted until its file has been
+received, its upload must keep to a minimum average rate, so a client that sends a byte now
+and then cannot hold a backup slot. A slower upload is answered `408 Request
+Timeout`, its partial file is removed and its slot is freed at once. The server
+reads these optional settings at startup; an empty value keeps the default:
+
+| Variable | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `BACKUP_UPLOAD_MIN_BYTES_PER_SECOND` | `16384` | 1–1073741824 | Lowest average rate, in bytes per second |
+| `BACKUP_UPLOAD_RATE_WINDOW_SECONDS` | `60` | 1–3600 | Time the average is taken over; pauses shorter than this are absorbed |
+| `BACKUP_UPLOAD_RATE_GRACE_SECONDS` | `30` | 1–3600 | Time after the upload starts before the rate is checked |
+
+With Docker Compose, add them under the `werkyn` service's `environment`. The
+default, 16 KiB/s (about 130 kbit/s), is below any working broadband or mobile
+uplink. An upload that keeps exactly to the minimum still holds its slot until
+it ends: up to about 19 hours for a 1,088 MiB file at the default. Raise the
+minimum to shorten that, or let your reverse proxy receive whole uploads first
+(below). Exports have no minimum download rate. See
+[R42](docs/remediation/r42-backup-limits.md).
+
+The backup page in the web app waits at most 60 seconds for a preview and 120
+seconds for a restore, upload included. For larger files on slower links, send
+the file to the API, for example with a personal API key:
+
+```bash
+curl -H "Authorization: Bearer $WERKYN_API_KEY" -F "file=@backup.zip" \
+  https://your-werkyn.example/api/workspaces/$WORKSPACE_ID/backup/preview
+```
+
+Use `.../backup/restore` to restore it.
+
+### Large workspaces and the 10-minute export limit
+
+An export is built while its request waits, and must finish within 10 minutes,
+copying images included. The time spent waiting for its turn does not count.
+An export that takes longer stops, removes its partial file and answers "The
+export took longer than allowed". For a large workspace:
+
+- export a few projects, channels or wiki spaces at a time, and restore the
+  archives one after another;
+- clear **Include files** to leave embedded wiki images out, and leave out
+  activity logs;
+- export when the server is quiet, since exports and restores take turns.
+
+An export over the archive limits is refused with a `400` and must be split the
+same way. There are no background export or restore jobs.
+
+### Previews and restores briefly block the server
+
+Preview and restore read and check `backup.json` synchronously. While they do,
+that server process answers no other request. At the limits (24 MiB, 1,100,000
+tokens, 150,000 objects) this takes up to about 0.6 s; the largest export
+measured, 16.6 MiB, takes about 0.15 s. A crafted file whose pages are full of
+image paths can take up to about 8 s to map those paths
+([backup restore](docs/remediation/backup-restore.md)). Run restores of large
+files when the server is quiet, and split content that comes near the limits
+into several exports.
+
+### Reverse proxy settings
+
+Backup routes (`/api/workspaces/<id>/backup/...`) need different proxy settings
+from the rest of the API:
+
+- **Body size.** Allow at least 1,100 MiB on these routes (and `MAX_FILE_SIZE`
+  on Drive uploads).
+- **Waiting for the answer.** A backup request may send nothing back for up to
+  about 30 minutes: up to two 10-minute exports ahead of it, then its own. A
+  proxy that gives up earlier answers `504` while the server carries on.
+- **Receiving whole uploads first.** A proxy that reads the whole upload before
+  passing it on (nginx by default, Traefik's buffering middleware) takes slow
+  clients off the server's backup slots: the slot is taken only once the
+  upload is complete. The proxy needs disk space for it.
+- **Minimum rates.** nginx and Traefik have no minimum transfer rate; Caddy
+  2.11.6 and later do. Werkyn's own minimum applies behind any proxy.
+- **Whole-request deadlines** (Traefik's `readTimeout`, 60 s by default in
+  Traefik 3; Caddy's `read_body`) end any upload that takes longer. Set them to
+  the longest upload you accept.
+
+**nginx.** In the `server` block that proxies Werkyn (here on port 3000):
+
+```nginx
+location ~ ^/api/workspaces/[^/]+/backup/ {
+    proxy_pass http://127.0.0.1:3000;
+    client_max_body_size 1100m;
+    # The default: nginx stores the whole upload (in client_body_temp_path)
+    # before passing it on, so a slow client never holds a backup slot.
+    proxy_request_buffering on;
+    client_body_timeout 60s;         # a client that sends nothing for 60 s gets 408
+    proxy_read_timeout 35m;          # the answer may take up to about 30 minutes
+    proxy_send_timeout 60s;
+    # Take a whole export (up to about 1.1 GiB) from Werkyn at once, so a slow
+    # download does not hold its backup slot.
+    proxy_buffering on;
+    proxy_max_temp_file_size 2048m;
+    send_timeout 60s;
+}
+```
+
+nginx's timeouts apply between two reads or writes, not to the whole transfer,
+and it has no minimum rate setting.
+
+**Caddy** 2.11.8 or later:
+
+```caddy
+werkyn.example.com {
+	@backup path_regexp ^/api/workspaces/[^/]+/backup/
+	request_body @backup {
+		max_size 1100MiB
+	}
+	# Abort uploads that stall for 60 s or average under 16 KiB/s.
+	timeouts @backup {
+		read_timeout 60s 16384
+	}
+	reverse_proxy 127.0.0.1:3000
+}
+```
+
+Caddy streams uploads to Werkyn as they arrive, and by default sets no time
+limit on waiting for Werkyn's answer. Do not set the global `read_body` or
+`write` timeouts, which limit the whole upload or download, below your largest
+transfer. `write_timeout 60s 16384` in the same `timeouts` block would also end
+export downloads that average under 16 KiB/s, which frees their slot.
+
+**Traefik** 3. The entry point's `readTimeout` limits how long the whole request,
+upload included, may take (60 s by default), so raise it:
+
+```yaml
+# Static configuration
+entryPoints:
+  websecure:
+    address: ":443"
+    transport:
+      respondingTimeouts:
+        readTimeout: 1h
+```
+
+```yaml
+# Dynamic configuration (file provider)
+http:
+  routers:
+    werkyn-backup:
+      rule: "Host(`werkyn.example.com`) && PathRegexp(`^/api/workspaces/[^/]+/backup/`)"
+      entryPoints: [websecure]
+      service: werkyn
+      middlewares: [werkyn-backup-buffer]
+  middlewares:
+    werkyn-backup-buffer:
+      buffering:
+        maxRequestBodyBytes: 1153433600   # 1,100 MiB
+        maxResponseBodyBytes: 0           # unlimited, so exports are not refused
+```
+
+The buffering middleware reads the whole upload, on disk above 1 MiB, before
+passing it on. Traefik waits for Werkyn's answer without a time limit by
+default (`responseHeaderTimeout: 0s`). It has no minimum rate setting; its
+`readTimeout` caps the time any upload may take instead.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

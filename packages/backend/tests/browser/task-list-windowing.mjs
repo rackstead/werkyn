@@ -1532,6 +1532,9 @@ async function smoke({ browser, origin, fixture, prisma }) {
       const ids = [];
       for (const row of moving) ids.push((await taskByTitle(row.title)).id);
       await api("POST", `/projects/${fixture.project.id}/tasks/bulk-update`, { taskIds: ids, statusId: done.id });
+      const movedToDone = async (taskIds) =>
+        prisma.task.count({ where: { id: { in: taskIds }, statusId: done.id } });
+      assert.equal(await movedToDone(ids), ids.length, "the colleague's bulk change moved every selected task");
       await settleOn(stay.title, "colleague's bulk change");
       result.colleague = {
         moved: count,
@@ -1550,6 +1553,8 @@ async function smoke({ browser, origin, fixture, prisma }) {
       moving = view.slice(0, count);
       stay = view[count + 2];
       firstStaying = view[count];
+      const ownIds = [];
+      for (const row of moving) ownIds.push((await taskByTitle(row.title)).id);
       for (const row of moving) {
         await pointAt(row.title);
         await page.mouse.down();
@@ -1560,6 +1565,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
       const bulk = page.waitForResponse((r) => r.url().includes("/tasks/bulk-update"));
       await page.locator("select").filter({ hasText: "Change status" }).selectOption(done.id);
       assert.equal((await bulk).status(), 200);
+      assert.equal(await movedToDone(ownIds), ownIds.length, "the own bulk change moved every selected task");
       await settleOn(stay.title, "own bulk change");
       result.own = {
         moved: count,

@@ -60,6 +60,14 @@ jobs:
           docker exec "$POSTGRES_CONTAINER" psql -v ON_ERROR_STOP=1 -U audit -d postgres -c 'CREATE DATABASE werkyn_ci_account_links_upgrade'
           MIGRATION_TEST_DATABASE_URL="postgresql://audit:ci-disposable-only@127.0.0.1:${POSTGRES_PORT}/werkyn_ci_account_links_upgrade" \
             pnpm --filter @pm/backend exec node --import tsx --test tests/migrations/account-link-hashes.test.mjs
+      - name: Structural constraint upgrade
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          POSTGRES_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          docker exec "$POSTGRES_CONTAINER" psql -v ON_ERROR_STOP=1 -U audit -d postgres -c 'CREATE DATABASE werkyn_ci_structural_constraints'
+          MIGRATION_TEST_DATABASE_URL="postgresql://audit:ci-disposable-only@127.0.0.1:${POSTGRES_PORT}/werkyn_ci_structural_constraints" \
+            pnpm --filter @pm/backend exec node --import tsx --test tests/migrations/structural-constraints.test.mjs
       - name: Unit and frontend regression tests
         run: pnpm test
       - name: PostgreSQL integration tests

@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { withoutConstraints } from "./support/legacy-rows.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -218,15 +219,18 @@ test("recurrence edits keep the day each frequency requires", async () => {
   assert.deepEqual([row.frequency, row.dayOfWeek], ["WEEKLY", 5]);
 
   // A row saved before this check without its day can still be paused, and
-  // supplying the day repairs it.
-  const legacy = await app.prisma.recurringTaskConfig.create({ data: {
-    projectId: project.id, templateId: template.id, frequency: "MONTHLY", startDate: "2026-03-02", nextRunDate: "2026-04-01",
-  } });
-  row = assertStatus(await req("PATCH", recurringUrl(legacy.id), { isActive: false }), 200);
-  assert.equal(row.isActive, false);
-  assertRejected(await req("PATCH", recurringUrl(legacy.id), { frequency: "MONTHLY" }), "dayOfMonth");
-  row = assertStatus(await req("PATCH", recurringUrl(legacy.id), { dayOfMonth: 20 }), 200);
-  assert.equal(row.dayOfMonth, 20);
+  // supplying the day repairs it. The database refuses such rows since R35, so
+  // the check is lifted while the row exists.
+  await withoutConstraints(app.prisma, ["RecurringTaskConfig.RecurringTaskConfig_required_day"], async () => {
+    const legacy = await app.prisma.recurringTaskConfig.create({ data: {
+      projectId: project.id, templateId: template.id, frequency: "MONTHLY", startDate: "2026-03-02", nextRunDate: "2026-04-01",
+    } });
+    row = assertStatus(await req("PATCH", recurringUrl(legacy.id), { isActive: false }), 200);
+    assert.equal(row.isActive, false);
+    assertRejected(await req("PATCH", recurringUrl(legacy.id), { frequency: "MONTHLY" }), "dayOfMonth");
+    row = assertStatus(await req("PATCH", recurringUrl(legacy.id), { dayOfMonth: 20 }), 200);
+    assert.equal(row.dayOfMonth, 20);
+  });
 });
 
 // ─── SEC-020: text and number limits ───────────────────────────────────
@@ -309,45 +313,49 @@ test("time reports skip legacy non-finite hours and treat non-finite rates as un
   const other = await app.prisma.user.create({ data: {
     email: `contract-legacy-${crypto.randomUUID()}@example.test`, displayName: "Legacy member", emailVerified: true,
   } });
-  try {
-    await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: other.id, role: "MEMBER" } });
-    await app.prisma.projectMember.create({ data: { projectId: project.id, userId: other.id } });
-    await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: other.id, rate: 100, currency: "USD", effectiveFrom: "2027-05-01" } });
-    const legacyRate = await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: other.id, rate: 1, currency: "USD", effectiveFrom: "2027-05-10" } });
-    const make = (date, hours, description) => app.prisma.timeEntry.create({ data: {
-      workspaceId: workspace.id, userId: other.id, projectId: project.id, date, hours, billable: true, description,
-    } });
-    await make("2027-05-04", 2, "finite");
-    const nan = await make("2027-05-05", 1, "nan");
-    const inf = await make("2027-05-06", 1, "inf");
-    const negInf = await make("2027-05-07", 1, "neg-inf");
-    await make("2027-05-12", 1.5, "after-bad-rate");
-    await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = 'NaN'::float8 WHERE id = ${nan.id}`;
-    await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = 'Infinity'::float8 WHERE id = ${inf.id}`;
-    await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = '-Infinity'::float8 WHERE id = ${negInf.id}`;
-    await app.prisma.$executeRaw`UPDATE "UserRate" SET rate = 'NaN'::float8 WHERE id = ${legacyRate.id}`;
+  // The database refuses non-finite values since R35; the checks are lifted
+  // while these rows exist.
+  await withoutConstraints(app.prisma, ["TimeEntry.TimeEntry_hours_range", "UserRate.UserRate_rate_finite"], async () => {
+    try {
+      await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: other.id, role: "MEMBER" } });
+      await app.prisma.projectMember.create({ data: { projectId: project.id, userId: other.id } });
+      await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: other.id, rate: 100, currency: "USD", effectiveFrom: "2027-05-01" } });
+      const legacyRate = await app.prisma.userRate.create({ data: { workspaceId: workspace.id, userId: other.id, rate: 1, currency: "USD", effectiveFrom: "2027-05-10" } });
+      const make = (date, hours, description) => app.prisma.timeEntry.create({ data: {
+        workspaceId: workspace.id, userId: other.id, projectId: project.id, date, hours, billable: true, description,
+      } });
+      await make("2027-05-04", 2, "finite");
+      const nan = await make("2027-05-05", 1, "nan");
+      const inf = await make("2027-05-06", 1, "inf");
+      const negInf = await make("2027-05-07", 1, "neg-inf");
+      await make("2027-05-12", 1.5, "after-bad-rate");
+      await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = 'NaN'::float8 WHERE id = ${nan.id}`;
+      await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = 'Infinity'::float8 WHERE id = ${inf.id}`;
+      await app.prisma.$executeRaw`UPDATE "TimeEntry" SET hours = '-Infinity'::float8 WHERE id = ${negInf.id}`;
+      await app.prisma.$executeRaw`UPDATE "UserRate" SET rate = 'NaN'::float8 WHERE id = ${legacyRate.id}`;
 
-    const query = { startDate: "2027-05-01", endDate: "2027-05-31", userIds: other.id };
-    for (const groupBy of ["user", "project", "date"]) {
-      const data = assertStatus(await req("GET", reportUrl({ ...query, groupBy })), 200);
-      const entries = data.groups.flatMap((group) => group.entries);
-      assert.deepEqual(entries.map((e) => [e.description, e.hours, e.rate, e.cost, e.costFractionDigits]), [
-        ["finite", 2, 100, 200, 2], ["after-bad-rate", 1.5, null, null, null],
-      ], groupBy);
-      assert.equal(data.summary.totalHours, 3.5);
-      assert.equal(data.summary.skippedEntries, 3);
-      assert.equal(data.summary.unratedBillableHours, 1.5);
-      assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 200, fractionDigits: 2 }]);
+      const query = { startDate: "2027-05-01", endDate: "2027-05-31", userIds: other.id };
+      for (const groupBy of ["user", "project", "date"]) {
+        const data = assertStatus(await req("GET", reportUrl({ ...query, groupBy })), 200);
+        const entries = data.groups.flatMap((group) => group.entries);
+        assert.deepEqual(entries.map((e) => [e.description, e.hours, e.rate, e.cost, e.costFractionDigits]), [
+          ["finite", 2, 100, 200, 2], ["after-bad-rate", 1.5, null, null, null],
+        ], groupBy);
+        assert.equal(data.summary.totalHours, 3.5);
+        assert.equal(data.summary.skippedEntries, 3);
+        assert.equal(data.summary.unratedBillableHours, 1.5);
+        assert.deepEqual(data.summary.costByCurrency, [{ currency: "USD", amount: 200, fractionDigits: 2 }]);
+      }
+      const csv = await req("GET", exportUrl(query));
+      assert.equal(csv.statusCode, 200, csv.body);
+      assert.equal(csv.headers["x-skipped-entries"], "3");
+      const rows = csv.body.replace(/^﻿/, "").trim().split("\r\n");
+      assert.equal(rows.length, 3, csv.body);
+      assert.doesNotMatch(csv.body, /NaN|Infinity/);
+    } finally {
+      await app.prisma.timeEntry.deleteMany({ where: { userId: other.id } });
+      await app.prisma.userRate.deleteMany({ where: { userId: other.id } });
+      await app.prisma.user.delete({ where: { id: other.id } }).catch(() => {});
     }
-    const csv = await req("GET", exportUrl(query));
-    assert.equal(csv.statusCode, 200, csv.body);
-    assert.equal(csv.headers["x-skipped-entries"], "3");
-    const rows = csv.body.replace(/^﻿/, "").trim().split("\r\n");
-    assert.equal(rows.length, 3, csv.body);
-    assert.doesNotMatch(csv.body, /NaN|Infinity/);
-  } finally {
-    await app.prisma.timeEntry.deleteMany({ where: { userId: other.id } });
-    await app.prisma.userRate.deleteMany({ where: { userId: other.id } });
-    await app.prisma.user.delete({ where: { id: other.id } }).catch(() => {});
-  }
+  });
 });

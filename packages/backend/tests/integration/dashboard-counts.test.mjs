@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { writeLegacyRows } from "./support/legacy-rows.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -91,13 +92,15 @@ before(async () => {
     task(projects.main.id, open.id, "unpadded due date", { dueDate: `${today().slice(0, 5)}${today()[5]}-9` }),
     task(projects.main.id, open.id, "lowercase sorts after digits", { dueDate: "x" }),
     task(projects.main.id, done.id, "done but past due", { dueDate: dayFrom(-3) }),
-    // A legacy row whose column belongs to another project still counts by that column.
-    task(projects.main.id, hiddenDone.id, "foreign completion column", { dueDate: dayFrom(-2) }),
     task(projects.main.id, open.id, "archived and past due", { dueDate: dayFrom(-5), archived: true }),
     task(projects.hidden.id, hiddenDone.id, "hidden done"),
     task(projects.hidden.id, hiddenDone.id, "hidden archived", { archived: true }),
     task(projects.archived.id, archivedOpen.id, "in archived project", { dueDate: dayFrom(-10) }),
   ] });
+  // A legacy row whose column belongs to another project still counts by that column.
+  await writeLegacyRows(app.prisma, (tx) => tx.task.create({
+    data: task(projects.main.id, hiddenDone.id, "foreign completion column", { dueDate: dayFrom(-2) }),
+  }));
 });
 
 after(async () => {

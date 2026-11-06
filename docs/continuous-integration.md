@@ -3,10 +3,11 @@
 Pull requests targeting `main`, including forks, run the `Tests and build` and
 `Container build` checks with a read-only token. Validation installs the frozen
 lockfile, validates/generates Prisma, applies all migrations to an ephemeral
-PostgreSQL 16 service, runs the unit/frontend and PostgreSQL integration suites,
-checks TypeScript, and builds production assets. The container check builds the
-Dockerfile without logging into a registry or pushing an image. No application
-database or deployment secret is required.
+PostgreSQL 16 service, runs the migration upgrade gates (`tests/migrations`,
+each in its own empty database of that service), runs the unit/frontend and
+PostgreSQL integration suites, checks TypeScript, and builds production assets.
+The container check builds the Dockerfile without logging into a registry or
+pushing an image. No application database or deployment secret is required.
 
 Validation and the container both use Node 22. The container pins the full Node
 patch, Alpine version and multi-platform image digest; the container policy gate

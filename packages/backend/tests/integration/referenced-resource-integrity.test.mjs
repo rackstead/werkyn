@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { writeLegacyRows } from "./support/legacy-rows.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -335,19 +336,22 @@ test("rates can only be set for current workspace members", async () => {
 
 test("legacy cross-project links are neither exposed nor copied", async () => {
   // Rows written before reference validation existed: P task pointing into Q.
-  const corrupt = await app.prisma.task.create({ data: {
-    projectId: P.id, statusId: status.Q.id, title: "Corrupted P task", position: 9,
-    assignees: { create: [{ userId: users.ADMIN.id }, { userId: users.FOREIGN.id }] },
-    labels: { create: [{ labelId: label.P.id }, { labelId: label.Q.id }] },
-    customFieldValues: { create: [{ fieldId: field.P.id, value: "visible" }, { fieldId: field.Q.id, value: `${SECRET} value` }] },
-    subtasks: { create: [{ title: "Copied subtask", assigneeId: users.FOREIGN.id }] },
-  } });
-  const sameProject = await app.prisma.task.create({ data: { projectId: P.id, statusId: status.Q.id, title: "Same-project blocker", position: 10 } });
-  await app.prisma.taskDependency.createMany({ data: [
-    { blockedTaskId: corrupt.id, blockingTaskId: task.Q.id },
-    { blockedTaskId: task.Q.id, blockingTaskId: corrupt.id },
-    { blockedTaskId: corrupt.id, blockingTaskId: sameProject.id },
-  ] });
+  const [corrupt, sameProject] = await writeLegacyRows(app.prisma, async (tx) => {
+    const corrupt = await tx.task.create({ data: {
+      projectId: P.id, statusId: status.Q.id, title: "Corrupted P task", position: 9,
+      assignees: { create: [{ userId: users.ADMIN.id }, { userId: users.FOREIGN.id }] },
+      labels: { create: [{ labelId: label.P.id }, { labelId: label.Q.id }] },
+      customFieldValues: { create: [{ fieldId: field.P.id, value: "visible" }, { fieldId: field.Q.id, value: `${SECRET} value` }] },
+      subtasks: { create: [{ title: "Copied subtask", assigneeId: users.FOREIGN.id }] },
+    } });
+    const sameProject = await tx.task.create({ data: { projectId: P.id, statusId: status.Q.id, title: "Same-project blocker", position: 10 } });
+    await tx.taskDependency.createMany({ data: [
+      { blockedTaskId: corrupt.id, blockingTaskId: task.Q.id },
+      { blockedTaskId: task.Q.id, blockingTaskId: corrupt.id },
+      { blockedTaskId: corrupt.id, blockingTaskId: sameProject.id },
+    ] });
+    return [corrupt, sameProject];
+  });
 
   const reads = [
     `/api/tasks/${corrupt.id}`,
@@ -378,7 +382,7 @@ test("legacy cross-project links are neither exposed nor copied", async () => {
   const moved = await req("ADMIN", "PATCH", `/api/tasks/${corrupt.id}/move`, { statusId: status.Pdone.id, position: 0 });
   assert.equal(moved.statusCode, 200, moved.body);
   assert(!moved.body.includes(SECRET), moved.body);
-  await app.prisma.task.update({ where: { id: corrupt.id }, data: { statusId: status.Q.id } });
+  await writeLegacyRows(app.prisma, (tx) => tx.task.update({ where: { id: corrupt.id }, data: { statusId: status.Q.id } }));
 
   const copy = await req("ADMIN", "POST", `/api/tasks/${corrupt.id}/duplicate`);
   assert.equal(copy.statusCode, 201, copy.body);
@@ -391,7 +395,8 @@ test("legacy cross-project links are neither exposed nor copied", async () => {
 });
 
 test("deleting a status never relinks another project's task", async () => {
-  const intruder = await app.prisma.task.create({ data: { projectId: Q.id, statusId: status.P3.id, title: `${SECRET} intruder` } });
+  const intruder = await writeLegacyRows(app.prisma, (tx) =>
+    tx.task.create({ data: { projectId: Q.id, statusId: status.P3.id, title: `${SECRET} intruder` } }));
   await assertRejectedAtomically([["ADMIN", "DELETE", `/api/projects/${P.id}/statuses/${status.P3.id}`]], [409]);
   await app.prisma.task.delete({ where: { id: intruder.id } });
   const deleted = await req("ADMIN", "DELETE", `/api/projects/${P.id}/statuses/${status.P3.id}`);
@@ -400,16 +405,21 @@ test("deleting a status never relinks another project's task", async () => {
 
 test("the integrity report finds legacy relationships without writing", async () => {
   const { findReferenceIntegrityIssues } = await import("../../src/scripts/reference-integrity-report.js");
-  const legacy = await app.prisma.task.create({ data: {
-    projectId: P.id, statusId: status.Q.id, title: "Report target", position: 20,
-    assignees: { create: [{ userId: users.FOREIGN.id }, { userId: users.SIBLING.id }] },
-    labels: { create: { labelId: label.R.id } },
-    customFieldValues: { create: { fieldId: field.Q.id, value: 1 } },
-    subtasks: { create: { title: "Foreign subtask", assigneeId: users.STALE.id } },
-  } });
-  const dependency = await app.prisma.taskDependency.create({ data: { blockedTaskId: legacy.id, blockingTaskId: task.R.id } });
-  const mismatched = await app.prisma.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.P.id, projectId: Q.id } });
-  const foreignEntry = await app.prisma.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.R.id, projectId: R.id } });
+  const [legacy, dependency, mismatched, foreignEntry] = await writeLegacyRows(app.prisma, async (tx) => {
+    const legacy = await tx.task.create({ data: {
+      projectId: P.id, statusId: status.Q.id, title: "Report target", position: 20,
+      assignees: { create: [{ userId: users.FOREIGN.id }, { userId: users.SIBLING.id }] },
+      labels: { create: { labelId: label.R.id } },
+      customFieldValues: { create: { fieldId: field.Q.id, value: 1 } },
+      subtasks: { create: { title: "Foreign subtask", assigneeId: users.STALE.id } },
+    } });
+    return [
+      legacy,
+      await tx.taskDependency.create({ data: { blockedTaskId: legacy.id, blockingTaskId: task.R.id } }),
+      await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.P.id, projectId: Q.id } }),
+      await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.R.id, projectId: R.id } }),
+    ];
+  });
   const rate = await app.prisma.userRate.create({ data: { workspaceId: W.id, userId: users.FOREIGN.id, rate: 1, effectiveFrom: "2026-01-01" } });
   const badTemplate = await app.prisma.taskTemplate.create({ data: { projectId: P.id, name: "Bad template", title: "Bad", statusId: status.R.id, labelIds: [label.Q.id], assigneeIds: [users.FOREIGN.id] } });
   const before = await snapshot();

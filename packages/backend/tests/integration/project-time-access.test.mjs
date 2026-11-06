@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { writeLegacyRows } from "./support/legacy-rows.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
 Object.assign(process.env, {
@@ -54,13 +55,16 @@ before(async () => {
   visible = await makeProject(workspace.id, "Visible time", [users.MEMBER.id, users.VIEWER.id]);
   hidden = await makeProject(workspace.id, "Hidden time", [users.PEER.id]);
   foreign = await makeProject(foreignWorkspace.id, "Foreign time", [users.FOREIGN.id]);
-  const makeEntry = (projectId, taskId, description) => app.prisma.timeEntry.create({ data: {
+  const makeEntry = (projectId, taskId, description, db = app.prisma) => db.timeEntry.create({ data: {
     workspaceId: workspace.id, userId: users.MEMBER.id, date: "2026-10-25", hours: 1, projectId, taskId, description,
   } });
   entry = await makeEntry(visible.project.id, visible.task.id, "Visible entry");
   hiddenEntry = await makeEntry(hidden.project.id, hidden.task.id, "Hidden time entry");
-  mixedEntry = await makeEntry(visible.project.id, hidden.task.id, "Hidden time mixed entry");
-  foreignEntry = await makeEntry(foreign.project.id, foreign.task.id, "Foreign time entry");
+  // Legacy rows: a task of another project, and a project of another workspace.
+  [mixedEntry, foreignEntry] = await writeLegacyRows(app.prisma, async (tx) => [
+    await makeEntry(visible.project.id, hidden.task.id, "Hidden time mixed entry", tx),
+    await makeEntry(foreign.project.id, foreign.task.id, "Foreign time entry", tx),
+  ]);
 });
 after(async () => {
   try {

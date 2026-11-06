@@ -1,6 +1,9 @@
 import { env } from "./config/env.js";
 import { buildApp } from "./app.js";
-import { cleanupExpiredTokensAndAttempts } from "./modules/auth/auth.service.js";
+import {
+  cleanupExpiredTokensAndAttempts,
+  setPasswordResetDrainDeadline,
+} from "./modules/auth/auth.service.js";
 import { startChatMessageDeliveryWorker } from "./modules/chat/chat-delivery.js";
 import { startNotificationDeliveryWorker } from "./modules/notifications/notification-delivery.js";
 import { processDueDateReminders } from "./schedulers/due-date-reminders.js";
@@ -94,7 +97,15 @@ async function start() {
         { name: "blob cleanup", run: () => blobCleanup.stop(), timeoutMs: 1_000 },
         { name: "chat deliveries", run: () => chatDeliveries.stop(), timeoutMs: 500 },
         { name: "dex", run: () => dexManager.stop(), timeoutMs: 5_500 },
-        { name: "http server", run: () => app.close() },
+        {
+          name: "http server",
+          // Closing waits for password-reset work answered before it ran
+          // (auth.routes.ts), until shortly before the overall deadline.
+          run: (remainingMs) => {
+            setPasswordResetDrainDeadline(Date.now() + Math.max(0, remainingMs - 500));
+            return app.close();
+          },
+        },
       ],
     });
     process.on("SIGTERM", () => void shutdown("SIGTERM"));

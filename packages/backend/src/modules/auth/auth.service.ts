@@ -5,6 +5,7 @@ import { admitWithInvite } from "../invites/admission.service.js";
 import { logger } from "../../utils/logger.js";
 import { hashPassword, verifyLoginPassword } from "../../utils/passwords.js";
 import { loginThrottle } from "./login-throttle.js";
+import { deviceCookieAfterSignIn, trustedDevice } from "./login-device.js";
 import {
   signAccessToken,
   generateSecureToken,
@@ -232,6 +233,8 @@ async function passwordSignInUser(
 export async function login(
   prisma: PrismaClient,
   data: { email: string; password: string },
+  /** The login_device cookie the browser sent, if any (login-device.ts). */
+  deviceCookie?: string,
 ) {
   const email = data.email.toLowerCase();
 
@@ -246,11 +249,18 @@ export async function login(
     );
   }
 
-  // Failed-attempt backoff (login-throttle.ts). Every address, with or
-  // without an account, is counted and answered alike, so neither the
-  // refusal nor its Retry-After tells whether an account exists.
+  // Failed-attempt backoff (login-throttle.ts). Without a device token, every
+  // address, with or without an account, is counted and answered alike, so
+  // neither the refusal nor its Retry-After tells whether an account exists.
+  // A browser holding a valid token for this address (it signed in to it
+  // before; only an account's password can mint one) is counted in its own
+  // lane, so failures others send for the address do not hold it off.
   const throttle = loginThrottle();
-  const admission = await throttle.admit(prisma, email);
+  const device = trustedDevice(deviceCookie, email);
+  const addressMark = device ? await throttle.addressMark(prisma, email) : null;
+  const admission = device
+    ? await throttle.admitDevice(prisma, device)
+    : await throttle.admit(prisma, email);
   if (!admission.admitted) {
     throw new TooManyRequestsError(
       `Too many sign-in attempts. Try again in ${admission.retryAfter} ${admission.retryAfter === 1 ? "second" : "seconds"}.`,
@@ -295,10 +305,12 @@ export async function login(
   // The replaced sessions' sockets close now that their revocation committed.
   endSessions(signIn.replaced);
   // Only a completed sign-in clears failures, and only those admitted up to
-  // it; the session stands even if clearing them fails.
-  await throttle.succeeded(prisma, ticket).catch((clearError) => {
-    logger.warn({ err: clearError }, "Could not clear failed sign-ins after a sign-in");
-  });
+  // it (for a trusted device, also the address's failures admitted before it
+  // started); the session stands even if clearing them fails.
+  for (const cleared of addressMark ? [ticket, addressMark] : [ticket])
+    await throttle.succeeded(prisma, cleared).catch((clearError) => {
+      logger.warn({ err: clearError }, "Could not clear failed sign-ins after a sign-in");
+    });
   const { refreshToken, familyId } = signIn.session;
 
   const accessToken = signAccessToken({
@@ -310,7 +322,13 @@ export async function login(
 
   const { passwordHash: _, ...userWithoutPassword } = user;
 
-  return { user: userWithoutPassword, accessToken, refreshToken, workspaces };
+  return {
+    user: userWithoutPassword,
+    accessToken,
+    refreshToken,
+    workspaces,
+    deviceCookie: deviceCookieAfterSignIn(deviceCookie, email),
+  };
 }
 
 export async function refresh(prisma: PrismaClient, rawToken: string) {
@@ -383,50 +401,24 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
 // response takes the same time whether or not the address has an account:
 // looking the account up, replacing its link and waiting for the mail server
 // all happen afterwards. A request for an address whose earlier request is
-// still in progress adds nothing: that one sends the newest link. Work in
-// progress is bounded per process and per client address, so one client
-// cannot hold the whole bound; past either bound a request is dropped and
-// logged, which the requester cannot tell from an unknown address (the link
-// does not arrive and can be requested again). Work for an address without
-// an account ends after one lookup, so only mail to existing accounts can
-// hold the bound for long. The work is not durable (see
-// docs/remediation/r31-login-backoff.md).
-const MAX_PENDING_RESET_REQUESTS = 100;
-const MAX_PENDING_RESET_REQUESTS_PER_CLIENT = 3;
+// still in progress adds nothing: that one sends the newest link. Nothing
+// else is refused here: how long work stays in progress depends on whether
+// the account exists (mail is sent only then), so a bound on work in
+// progress would be an account oracle and would drop other users' requests
+// behind a shared proxy address. The route's per-client request limit
+// bounds the work instead. Work in progress is drained when the server
+// closes (drainPasswordResetRequests); it is not durable.
 const pendingResetRequests = new Map<string, Promise<void>>();
-const pendingResetClients = new Map<string, number>();
 
-export function requestPasswordReset(
-  prisma: PrismaClient,
-  email: string,
-  client: string,
-) {
+export function requestPasswordReset(prisma: PrismaClient, email: string) {
   const address = email.toLowerCase();
   if (pendingResetRequests.has(address)) return;
-  const fromClient = pendingResetClients.get(client) ?? 0;
-  if (
-    pendingResetRequests.size >= MAX_PENDING_RESET_REQUESTS ||
-    fromClient >= MAX_PENDING_RESET_REQUESTS_PER_CLIENT
-  ) {
-    logger.warn(
-      {
-        event: "password_reset_request_dropped",
-        bound: fromClient >= MAX_PENDING_RESET_REQUESTS_PER_CLIENT ? "client" : "process",
-      },
-      "Too many password reset requests in progress; one was dropped",
-    );
-    return;
-  }
-  pendingResetClients.set(client, fromClient + 1);
   const work: Promise<void> = forgotPassword(prisma, address)
     .catch((error) => {
       logger.error({ err: error }, "Password reset request failed");
     })
     .finally(() => {
       pendingResetRequests.delete(address);
-      const left = (pendingResetClients.get(client) ?? 1) - 1;
-      if (left > 0) pendingResetClients.set(client, left);
-      else pendingResetClients.delete(client);
     });
   pendingResetRequests.set(address, work);
 }
@@ -435,6 +427,46 @@ export function requestPasswordReset(
 export async function settlePasswordResetRequests() {
   while (pendingResetRequests.size > 0)
     await Promise.allSettled([...pendingResetRequests.values()]);
+}
+
+// When closing the server must be done; set by the shutdown handler from
+// its overall deadline (server.ts). Other closes (tests) allow 5 seconds.
+const DEFAULT_RESET_DRAIN_MS = 5_000;
+let resetDrainDeadline: number | undefined;
+
+export function setPasswordResetDrainDeadline(deadline: number) {
+  resetDrainDeadline = deadline;
+}
+
+export function passwordResetDrainDeadline() {
+  return resetDrainDeadline ?? Date.now() + DEFAULT_RESET_DRAIN_MS;
+}
+
+/**
+ * Waits for password-reset work in progress until `deadline` (epoch ms), so
+ * the database stays open for it while the server closes. Work still running
+ * then is logged with its count and abandoned: its links may not arrive.
+ */
+export async function drainPasswordResetRequests(deadline: number) {
+  if (pendingResetRequests.size === 0) return;
+  logger.info(
+    { event: "password_reset_requests_draining", pending: pendingResetRequests.size },
+    "Waiting for password reset requests in progress",
+  );
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+  });
+  try {
+    await Promise.race([settlePasswordResetRequests(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (pendingResetRequests.size > 0)
+    logger.warn(
+      { event: "password_reset_requests_abandoned", abandoned: pendingResetRequests.size },
+      "Shutdown abandoned password reset requests in progress; their links may not arrive",
+    );
 }
 
 export async function forgotPassword(prisma: PrismaClient, email: string) {

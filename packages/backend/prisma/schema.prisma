@@ -126,7 +126,8 @@ model RotatedRefreshToken {
 
 /// Consecutive failed password sign-ins per slot. Every submitted address,
 /// with or without an account, maps to one of LOGIN_BACKOFF_SLOTS slots by a
-/// keyed hash, so the table is bounded and stores no address. Written only by
+/// keyed hash, and a trusted browser to one of as many device lanes, so the
+/// table is bounded and stores no address. Written only by
 /// modules/auth/login-throttle.ts (docs/remediation/r31-login-backoff.md).
 model LoginThrottle {
   slot           Int      @id

@@ -493,16 +493,35 @@ across server processes. After 5 consecutive failures for an email address, the
 next attempt must wait 2 seconds. The wait doubles with each further failure, up to
 60 seconds. During a wait, sign-in answers `429 Too Many Requests` with a
 `Retry-After` header and checks no password; the sign-in form counts the wait
-down. The account is never locked: once the wait passes, the correct password
-signs in. A successful sign-in clears the count, and so does an hour without
+down. A successful sign-in clears the count, and so does an hour without
 attempts.
 
-Email addresses with and without an account are counted and answered alike.
-Unknown addresses and accounts without a password (SSO only) do the same Argon2id work as
-a wrong password. Password-reset requests are answered before the account lookup
-or mail delivery runs. So neither answers nor timing tell whether an account
-exists. The count table has a fixed maximum size and stores no addresses, so
-requests for many made-up addresses cannot grow it without limit. See
+**Trusted browsers.** A successful password sign-in marks the browser with an
+HttpOnly `login_device` cookie, sent only to the sign-in route, valid for 30 days
+and bound to that email address. Later sign-ins from that browser for that address
+use the browser's own failure count, with the same waits, instead of the address's
+shared one. Someone who keeps sending wrong passwords for the address therefore
+cannot hold off a browser that has signed in before. The cookie grants no access by
+itself: the password is still checked. Signing out keeps it; clearing the
+browser's cookies or rotating `COOKIE_SECRET` removes it.
+
+**What an attacker can still do.** Waits are first come, first served when they
+end. Someone who sends a wrong password for an address each time its wait ends
+can keep a browser that has never signed in to that address from signing in with
+a password, for as long as they keep going. That covers a new device, a cleared
+browser, or the first sign-in after 30 days. They get one guess per wait (about one
+a minute). Existing sessions, trusted browsers and SSO sign-in are not affected.
+There is no lockout in the stored state: once the sending stops, the next wait
+ends and the correct password signs in.
+
+Email addresses with and without an account are counted and answered alike when no
+`login_device` cookie is sent, which is always the case for someone probing other
+people's addresses. Unknown addresses and accounts without a password (SSO only)
+do the same Argon2id work as a wrong password. Password-reset requests are
+answered before the account lookup or mail delivery runs. So neither answers nor
+timing tell whether an account exists. The count table has a fixed maximum size
+and stores no addresses, so requests for many made-up addresses cannot grow it
+without limit. See
 [docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
 
 The server reads these optional settings at startup. An empty value keeps the
@@ -514,18 +533,23 @@ default:
 | `LOGIN_BACKOFF_BASE_SECONDS` | `2` | 1–900 | First wait; doubles per further failure |
 | `LOGIN_BACKOFF_MAX_SECONDS` | `60` | 1–900 | Longest wait (at least the base) |
 | `LOGIN_BACKOFF_RESET_SECONDS` | `3600` | 60–604800 | Quiet time after which failures are forgotten (at least the longest wait) |
-| `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Most rows the count table holds |
+| `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Rows for email addresses; trusted browsers use as many again |
 
 With Docker Compose, add them under the `werkyn` service's `environment`, for
-example `LOGIN_BACKOFF_MAX_SECONDS: 30`. Addresses share a row only when their
-keyed hashes collide. With more rows, collisions are rarer, and the table can
-grow larger under a flood (about 100 bytes per row). The hash key is derived from
+example `LOGIN_BACKOFF_MAX_SECONDS: 30`. The table holds at most twice
+`LOGIN_BACKOFF_SLOTS` rows (about 100 bytes each). Addresses share a row when their
+keyed hashes collide. At the default size, the chance that a given account shares
+its row with another is about 0.15% with 100 accounts, 1.5% with 1,000 and 14% with
+10,000. Raise the setting for large installations. The hash key is derived from
 `JWT_SECRET`, so rotating that secret also forgets every count.
 
 The migration `20261105150000_bounded_login_backoff` replaces the
 `LoginAttempt` table with `LoginThrottle`. Recent failure counts and any
 remaining lockouts are dropped. Stop older servers before applying it, as for
-other migrations: they still use `LoginAttempt` and would fail sign-ins.
+other migrations: they still use `LoginAttempt` and would fail sign-ins. Rolling
+back to an earlier version after this migration also breaks password sign-in until
+the old table is recreated; see the upgrade notes in
+[docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
 
 ## Contributing
 

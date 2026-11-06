@@ -117,17 +117,22 @@ test("two thousand more unique addresses admitted directly still leave at most t
   assert.ok(admitted < 2000, `${admitted}`);
 });
 
-test("cleanup removes forgotten rows and rows outside the slot range, keeping recent ones", async () => {
+test("cleanup removes forgotten rows and rows outside the address and device ranges, keeping recent ones", async () => {
   await app.prisma.loginThrottle.deleteMany();
   const recent = loginSlot(`recent-${suffix}@example.test`, SLOTS);
   const forgotten = (recent + 1) % SLOTS;
+  const device = SLOTS + 10;
   await app.prisma.$executeRaw`
     INSERT INTO "LoginThrottle" ("slot", "failures", "lastFailureAt") VALUES
       (${recent}::integer, 7, (clock_timestamp() AT TIME ZONE 'UTC') - interval '59 minutes'),
       (${forgotten}::integer, 7, (clock_timestamp() AT TIME ZONE 'UTC') - interval '61 minutes'),
-      (${SLOTS + 10}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC')
+      (${device}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC'),
+      (${2 * SLOTS + 10}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC')
   `;
   await cleanupExpiredTokensAndAttempts(app.prisma);
-  const left = await app.prisma.loginThrottle.findMany({ select: { slot: true } });
-  assert.deepEqual(left.map((r) => r.slot), [recent]);
+  const left = await app.prisma.loginThrottle.findMany({
+    select: { slot: true },
+    orderBy: { slot: "asc" },
+  });
+  assert.deepEqual(left.map((r) => r.slot), [recent, device]);
 });

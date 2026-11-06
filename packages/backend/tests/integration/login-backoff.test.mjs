@@ -39,7 +39,10 @@ const { loginSlot, loginThrottle } = await import(
 const { settlePasswordResetRequests } = await import(
   "../../src/modules/auth/auth.service.ts"
 );
-const { resetTransporter } = await import("../../src/utils/mailer.ts");
+const { resetTransporter, setPrisma } = await import("../../src/utils/mailer.ts");
+const { deviceCookieAfterSignIn } = await import(
+  "../../src/modules/auth/login-device.ts"
+);
 
 const PASSWORD = "Correct-password-123";
 const WRONG = "Wrong-password-123";
@@ -76,8 +79,9 @@ after(async () => {
     await app.prisma.user.deleteMany({
       where: { email: { endsWith: `@${domain}` } },
     });
+    // This run's address slots, and the device lanes its sign-ins used.
     await app.prisma.loginThrottle.deleteMany({
-      where: { slot: { in: [...usedSlots] } },
+      where: { OR: [{ slot: { in: [...usedSlots] } }, { slot: { gte: DEFAULT_SLOTS } }] },
     });
   } finally {
     nodemailer.createTransport = originalTransport;
@@ -391,6 +395,151 @@ test("a correct password whose sign-in is refused because the password changed s
   assert.equal(await failures(email), 2);
 });
 
+/** Sign-in from a browser holding `cookie` (login_device), if any. */
+async function browserLogin(email, password, cookie) {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/auth/login",
+    payload: { email, password },
+    headers: cookie ? { cookie: `login_device=${cookie}` } : {},
+    remoteAddress: nextAddress(),
+  });
+  return {
+    status: response.statusCode,
+    retryAfter: response.headers["retry-after"],
+    body: response.json(),
+    device: response.cookies.find((c) => c.name === "login_device"),
+  };
+}
+
+const deviceIds = (cookie) => cookie.split("~").map((token) => token.split(".")[0]);
+const deviceSlot = (id) => {
+  const slot = DEFAULT_SLOTS + loginSlot(`device ${id}`, DEFAULT_SLOTS);
+  usedSlots.add(slot);
+  return slot;
+};
+const holdAtCap = (email) => app.prisma.$executeRaw`
+  INSERT INTO "LoginThrottle" ("slot", "failures", "lastFailureAt", "admissions")
+  VALUES (${slotOf(email)}::integer, 11, clock_timestamp() AT TIME ZONE 'UTC', 11)
+  ON CONFLICT ("slot") DO UPDATE SET "failures" = 11,
+    "lastFailureAt" = clock_timestamp() AT TIME ZONE 'UTC', "admissions" = 11, "clearedThrough" = 0
+`;
+
+test("a browser that signed in before is not held off by failures others send for the address", async () => {
+  const email = await account("real");
+  const first = await browserLogin(email, PASSWORD);
+  assert.equal(first.status, 200);
+  assert.ok(first.device, "a sign-in marks the browser");
+  assert.equal(first.device.httpOnly, true);
+  assert.equal(first.device.path, "/api/auth/login");
+  assert.equal(first.device.sameSite, "Lax");
+  assert.equal(first.device.maxAge, 30 * 24 * 60 * 60);
+  // Someone else keeps the address at its longest wait.
+  for (let i = 0; i < 5; i++) await login(email, WRONG);
+  await holdAtCap(email);
+  assert.deepEqual(await login(email, PASSWORD), waiting(60));
+  // The browser that signed in before is checked at once and signs in.
+  const trusted = await browserLogin(email, PASSWORD, first.device.value);
+  assert.equal(trusted.status, 200, JSON.stringify(trusted.body));
+  // Its token is renewed for the same device.
+  assert.deepEqual(deviceIds(trusted.device.value), deviceIds(first.device.value));
+  // A completed sign-in clears the address's failures admitted before it.
+  assert.equal(await failures(email), 0);
+});
+
+test("a trusted browser has its own small budget, separate from the address", async () => {
+  const email = await account("real");
+  const { device } = await browserLogin(email, PASSWORD);
+  const lane = deviceSlot(deviceIds(device.value)[0]);
+  const laneFailures = async () =>
+    (await app.prisma.loginThrottle.findUnique({ where: { slot: lane } }))?.failures ?? 0;
+  for (let i = 0; i < 5; i++)
+    assert.deepEqual(
+      (({ status, retryAfter, body }) => ({ status, retryAfter, body }))(
+        await browserLogin(email, WRONG, device.value),
+      ),
+      invalid,
+    );
+  const refused = await browserLogin(email, PASSWORD, device.value);
+  assert.equal(refused.status, 429);
+  assert.equal(refused.retryAfter, "2");
+  assert.equal(refused.device, undefined);
+  assert.equal(await laneFailures(), 5);
+  // The address itself counted none of them.
+  assert.equal(await failures(email), 0);
+  // The lane backs off like an address: after its wait, it signs in.
+  await app.prisma.$executeRaw`
+    UPDATE "LoginThrottle" SET "lastFailureAt" = "lastFailureAt" - interval '2 seconds'
+    WHERE "slot" = ${lane}::integer
+  `;
+  assert.equal((await browserLogin(email, PASSWORD, device.value)).status, 200);
+  assert.equal(await laneFailures(), 0);
+});
+
+test("a device token counts only for its own address, unexpired and unaltered", async () => {
+  const owner = await account("real");
+  const other = await account("real");
+  const { device } = await browserLogin(owner, PASSWORD);
+  await holdAtCap(other);
+  // Another address's token, an altered one and an expired one are ignored.
+  const minted = deviceCookieAfterSignIn(undefined, other);
+  const altered = minted.slice(0, -1) + (minted.endsWith("A") ? "B" : "A");
+  const expired = deviceCookieAfterSignIn(
+    undefined,
+    other,
+    Date.now() - 31 * 24 * 60 * 60 * 1000,
+  );
+  for (const cookie of [device.value, altered, expired, "garbage"]) {
+    const result = await browserLogin(other, PASSWORD, cookie);
+    assert.equal(result.status, 429, cookie);
+    assert.equal(result.retryAfter, "60");
+  }
+  // A token minted for this address is accepted.
+  const accepted = await browserLogin(other, PASSWORD, minted);
+  assert.equal(accepted.status, 200);
+  // The browser keeps one token per address that signed in from it, five at most.
+  let cookie = accepted.device.value;
+  const signedIn = [other];
+  for (let i = 0; i < 5; i++) {
+    const email = await account("real");
+    const result = await browserLogin(email, PASSWORD, cookie);
+    assert.equal(result.status, 200);
+    cookie = result.device.value;
+    signedIn.unshift(email);
+  }
+  assert.equal(cookie.split("~").length, 5);
+  // The oldest address's token was dropped; the newest five are kept.
+  await holdAtCap(signedIn[0]);
+  await holdAtCap(signedIn[5]);
+  assert.equal((await browserLogin(signedIn[0], PASSWORD, cookie)).status, 200);
+  assert.equal((await browserLogin(signedIn[5], PASSWORD, cookie)).status, 429);
+});
+
+test("without a device token, answers do not depend on whether some browser holds one for the address", async () => {
+  const trustedSomewhere = await account("real");
+  assert.equal((await browserLogin(trustedSomewhere, PASSWORD)).status, 200);
+  const transcripts = {};
+  for (const [kind, email] of [
+    ["trusted elsewhere", trustedSomewhere],
+    ["never signed in", await account("real")],
+    ["password-less", await account("sso")],
+    ["unknown", await account("unknown")],
+  ]) {
+    const seen = [];
+    for (let i = 0; i < 6; i++) {
+      const result = await browserLogin(email, WRONG);
+      seen.push({ status: result.status, retryAfter: result.retryAfter, body: result.body, device: result.device });
+    }
+    transcripts[kind] = seen;
+  }
+  const expected = [
+    ...Array(5).fill({ ...invalid, device: undefined }),
+    { ...waiting(2), device: undefined },
+  ];
+  for (const [kind, seen] of Object.entries(transcripts))
+    assert.deepEqual(seen, expected, kind);
+});
+
 test("the tracking table holds counters only, no addresses", async () => {
   const columns = await app.prisma.$queryRaw`
     SELECT column_name FROM information_schema.columns
@@ -513,12 +662,7 @@ test("a password-reset request is answered alike for every address before any ac
   assert.equal((await login(real, "Reset-password-456")).status, 200);
 });
 
-test("pending reset requests are bounded per client and per process; repeats for one address add nothing", async () => {
-  const accounts = [];
-  for (let i = 0; i < 102; i++) accounts.push(await account("real"));
-  let release;
-  mailGate = new Promise((resolve) => (release = resolve));
-  const sent = mail.length;
+test("reset requests from one client address are all delivered, whether or not other addresses exist; repeats add nothing", async () => {
   const forgot = async (email, client) => {
     const response = await app.inject({
       method: "POST",
@@ -528,31 +672,101 @@ test("pending reset requests are bounded per client and per process; repeats for
     });
     assert.equal(response.statusCode, 200, response.body);
   };
-  let delivered;
-  try {
-    // One client: three requests in progress at most; its fourth is dropped
-    // and a repeat for a pending address adds nothing.
-    for (const email of accounts.slice(0, 4)) await forgot(email, "10.70.0.1");
-    await forgot(accounts[0], "10.70.0.2");
-    // Other clients fill the process bound of 100 (97 more).
-    for (let i = 4; i < 101; i++)
-      await forgot(accounts[i], `10.70.1.${Math.floor(i / 3)}`);
-    // The 101st distinct address, from a fresh client, is over the bound.
-    await forgot(accounts[101], "10.70.2.1");
-  } finally {
+  const delivered = async (send) => {
+    let release;
+    mailGate = new Promise((resolve) => (release = resolve));
+    const sent = mail.length;
+    try {
+      await send();
+    } finally {
+      release();
+      mailGate = Promise.resolve();
+    }
+    await settlePasswordResetRequests();
+    return mail.slice(sent).map((message) => message.to).sort();
+  };
+  // Everyone behind one proxy shares its address: eight users' resets are
+  // all delivered while the mail server holds every message.
+  const users = [];
+  for (let i = 0; i < 8; i++) users.push(await account("real"));
+  assert.deepEqual(
+    await delivered(() => Promise.all(users.map((email) => forgot(email, "10.71.0.1")))),
+    [...users].sort(),
+  );
+  // The reviewer's probe: whether a third address exists must not change
+  // whether the prober's own (fourth) link arrives.
+  for (const kind of ["real", "unknown"]) {
+    const [k1, k2, y] = [await account("real"), await account("real"), await account("real")];
+    const x = await account(kind);
+    const client = kind === "real" ? "10.71.1.1" : "10.71.1.2";
+    const got = await delivered(async () => {
+      await Promise.all([k1, k2, x].map((email) => forgot(email, client)));
+      await forgot(y, client);
+    });
+    assert.deepEqual(got, [k1, k2, y, ...(kind === "real" ? [x] : [])].sort(), kind);
+  }
+  // A repeat for an address whose request is still running adds nothing.
+  const repeated = await account("real");
+  assert.deepEqual(
+    await delivered(async () => {
+      await forgot(repeated, "10.71.2.1");
+      await forgot(repeated, "10.71.2.2");
+    }),
+    [repeated],
+  );
+});
+
+test("closing the server waits for reset work in progress, and logs work it abandons at the deadline", async (t) => {
+  const { logger } = await import("../../src/utils/logger.ts");
+  const { setPasswordResetDrainDeadline } = await import(
+    "../../src/modules/auth/auth.service.ts"
+  );
+  const warnings = [];
+  t.mock.method(logger, "warn", (...args) => warnings.push(args));
+  const closing = async (deadlineMs, releaseAfterMs) => {
+    const other = await buildApp();
+    await other.ready();
+    const email = await account("real");
+    let release;
+    mailGate = new Promise((resolve) => (release = resolve));
+    const sent = mail.length;
+    const response = await other.inject({
+      method: "POST",
+      url: "/api/auth/forgot-password",
+      payload: { email },
+      remoteAddress: nextAddress(),
+    });
+    assert.equal(response.statusCode, 200);
+    setPasswordResetDrainDeadline(Date.now() + deadlineMs);
+    const timer = setTimeout(release, releaseAfterMs);
+    const started = Date.now();
+    await other.close();
+    const tookMs = Date.now() - started;
+    const deliveredAtClose = mail.length - sent;
+    clearTimeout(timer);
     release();
     mailGate = Promise.resolve();
-  }
-  await settlePasswordResetRequests();
-  delivered = mail.slice(sent).map((message) => message.to);
-  const expected = [...accounts.slice(0, 3), ...accounts.slice(4, 101)];
-  assert.deepEqual([...delivered].sort(), [...expected].sort());
-  // Once work drains, a dropped address can ask again.
-  await forgot(accounts[101], "10.70.2.1");
-  await forgot(accounts[3], "10.70.0.1");
-  await settlePasswordResetRequests();
+    await settlePasswordResetRequests();
+    // The mailer follows the most recently built app; give it back.
+    setPrisma(app.prisma);
+    await other.prisma.$disconnect();
+    return { tookMs, deliveredAtClose };
+  };
+  // Mail that takes longer than the old fixed 2 s budget is still delivered
+  // before close returns (and before the database connection closes).
+  const slow = await closing(10_000, 2_500);
+  assert.ok(slow.tookMs >= 2_400, `${slow.tookMs}`);
+  assert.equal(slow.deliveredAtClose, 1);
+  const abandoned = () =>
+    warnings.filter(([fields]) => fields?.event === "password_reset_requests_abandoned");
+  assert.deepEqual(abandoned(), []);
+  // Past the deadline the work is abandoned and logged with its count.
+  const stuck = await closing(200, 5_000);
+  assert.ok(stuck.tookMs < 2_000, `${stuck.tookMs}`);
+  assert.equal(stuck.deliveredAtClose, 0);
   assert.deepEqual(
-    mail.slice(sent + delivered.length).map((m) => m.to).sort(),
-    [accounts[3], accounts[101]].sort(),
+    abandoned().map(([fields]) => fields),
+    [{ event: "password_reset_requests_abandoned", abandoned: 1 }],
   );
+  setPasswordResetDrainDeadline(Date.now() + 5_000);
 });

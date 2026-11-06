@@ -156,8 +156,8 @@ const envSchema = z.object({
   // Failed password sign-in backoff (docs/remediation/r31-login-backoff.md).
   // After THRESHOLD consecutive failures for one address, each further
   // attempt waits BASE seconds, doubling per failure up to MAX. Failures are
-  // forgotten after RESET quiet seconds or a successful sign-in. SLOTS bounds
-  // the tracking table's rows.
+  // forgotten after RESET quiet seconds or a successful sign-in. The tracking
+  // table holds at most SLOTS address rows and SLOTS trusted-browser rows.
   LOGIN_BACKOFF_THRESHOLD: wholeNumber("LOGIN_BACKOFF_THRESHOLD", 5, 1, 100),
   LOGIN_BACKOFF_BASE_SECONDS: wholeNumber("LOGIN_BACKOFF_BASE_SECONDS", 2, 1, 900),
   LOGIN_BACKOFF_MAX_SECONDS: wholeNumber("LOGIN_BACKOFF_MAX_SECONDS", 60, 1, 900),

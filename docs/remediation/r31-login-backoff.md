@@ -47,7 +47,9 @@ checked:
    read it. The sign-in form shows the wait counting down and does not send
    until it has passed.
 3. After the wait, the next attempt is checked. A correct password signs in,
-   however many failures came before. There is no lockout.
+   however many failures came before. Nothing in the stored state locks the
+   account; but see "Trusted browsers" for what someone who keeps failing can
+   still do to a browser that has never signed in.
 4. A completed sign-in clears the count. An hour without counted attempts
    also clears it. A correct password whose sign-in is then refused, because a
    concurrent password change or reset replaced it, stays a counted failure.
@@ -80,10 +82,80 @@ again. Each of these rules can leave the count too high, never too low. For
 example, an overlapping later attempt that was uncounted before an earlier
 sign-in finished still counts.
 
+### Trusted browsers (device cookies)
+
+Admission is first come when a wait ends. Someone who sends a wrong password
+for an address each time its wait ends, about once a minute, would otherwise
+win every window. The account's owner would then be refused every time, even
+when following the form's countdown exactly. The independent review measured
+exactly that: 0 of 21 owner attempts got in over 7 minutes, against a timed
+attacker and against a plain loop sending every 6 seconds from one IP. So a
+browser that has signed in before is exempt from the address's shared wait,
+following OWASP's "device cookies" (`login-device.ts`):
+
+- A successful password sign-in sets the cookie `login_device` with these
+  attributes:
+  - HttpOnly;
+  - `Path=/api/auth/login`, so it is sent only to sign-in;
+  - Secure, SameSite and Domain from `COOKIE_SECURE`, `COOKIE_SAMESITE` and
+    `COOKIE_DOMAIN`, like the refresh cookie;
+  - `Max-Age` 30 days.
+- The cookie holds one token per address signed in from that browser, at most
+  5. A token is `<device id>.<expiry>.<HMAC>`. The HMAC is keyed from
+  `COOKIE_SECRET` and binds the random device id and the expiry to the
+  normalized address. Each sign-in renews the token and keeps its device id.
+- A sign-in that presents an unexpired, unaltered token for its address is
+  counted in that device's own lane instead of the address's slot. The lane is
+  a second set of `LOGIN_BACKOFF_SLOTS` rows, keyed by the device id. It has
+  the same rules: 5 failures, then 2, 4, … 60-second waits. Someone holding a
+  stolen cookie therefore gets one more lane at the same rate, not unlimited
+  guesses. The password is always checked.
+- A trusted sign-in clears its lane's failures. It also clears the address
+  failures admitted before it started, as an ordinary sign-in does. Failures
+  admitted while it was being checked keep their count.
+- The token is checked against the submitted address with a constant-time
+  HMAC comparison, without the database. Tokens exist only for addresses whose
+  password has signed in, so unknown addresses never have one. Someone probing
+  other people's addresses has no valid token for them. Every answer they get
+  goes through the shared, account-independent path, whatever browsers
+  elsewhere hold. A token for one's own address is ignored for any other
+  address.
+- Signing out keeps the cookie, by design. Clearing the browser's cookies, its
+  expiry, or rotating `COOKIE_SECRET` removes the trust.
+
+**Remaining risk.** A browser without a valid token can still be held off by
+someone targeting that address. That covers a new device, a cleared or private
+browser, a different browser, and the first sign-in after 30 days. The
+attacker must send a wrong password each time the wait ends (about once a
+minute) for as long as they want to keep it out. They get one guess per wait
+for it. Existing sessions, trusted browsers and SSO sign-in are unaffected. A
+password reset does not help a new browser, because the address's slot stays
+held. Signing in from a trusted browser, or stopping the attacker's traffic,
+does.
+
+The reviewer's starvation probe ran again after the change, for 300 seconds
+against one production server. Each address started at the capped wait, and
+the attackers were the same as before:
+
+| scenario | owner | owner attempts | signed in |
+| --- | --- | --- | --- |
+| timed attacker, owner reacts after 300 ms | trusted | 1 | at once (47 ms) |
+| timed attacker, owner retries the instant the countdown ends | trusted | 1 | at once (48 ms) |
+| plain loop every 6 s from one IP | trusted | 1 | at once (52 ms) |
+| no attacker (control) | new browser | 2 | after 57.4 s |
+| timed attacker | new browser | 5 | never (each refused 429, wait 60 s) |
+
+Before this change, the three attacked owners were refused all 21 attempts
+over 7 minutes. The last row is the remaining risk described above. The
+trusted sign-ins also cleared the addresses' counts, so each attacker then got
+5 more checked guesses before the waits started again. That follows from
+"reset on success".
+
 ### Bounded tracking without addresses
 
-The `LoginThrottle` table has at most `LOGIN_BACKOFF_SLOTS` rows (default
-65,536). Each submitted address maps to a slot number:
+The `LoginThrottle` table has at most twice `LOGIN_BACKOFF_SLOTS` rows (default
+65,536 each): address slots, then trusted-device lanes. Each submitted address
+maps to a slot number:
 
 ```
 HMAC-SHA256(key, lowercase address), first 8 bytes, modulo LOGIN_BACKOFF_SLOTS
@@ -94,22 +166,35 @@ The slot number is the primary key. A row holds only the slot, the failure
 count, the time of the last counted attempt and the two admission numbers, so
 the table stores no address.
 However many distinct addresses are sent, the table cannot hold more rows than
-there are slots. The daily cleanup deletes rows quiet for longer than the reset
-period, and rows outside the configured slot range after
-`LOGIN_BACKOFF_SLOTS` is lowered.
+there are slots. A device lane is
+`LOGIN_BACKOFF_SLOTS + (HMAC-SHA256(key, "device " + device id) mod slots)`.
+The daily cleanup deletes rows quiet for longer than the reset period, and rows
+outside both ranges after `LOGIN_BACKOFF_SLOTS` is lowered.
 
 Addresses whose slots collide share a count. A collision can only make a wait
 start sooner; it never lets an address skip one. Without `JWT_SECRET`, nobody
-can choose an address that collides with a given account. With the default size
-and a few thousand accounts, collisions between real accounts are rare, and
-they matter only while one of them is failing.
+can choose an address that collides with a given account. At the default
+65,536 slots:
+
+| accounts | chance a given account shares its slot | expected colliding pairs |
+| --- | --- | --- |
+| 100 | 0.15% | 0.08 |
+| 1,000 | 1.5% | 7.6 |
+| 10,000 | 14% | 763 |
+
+A collision matters only while the pair's combined failures reach 5 within the
+quiet period. The review reproduced one: 5 failures on one account made
+another's correct password wait 2 seconds, and that account's success then
+cleared the first one's count. Installations with many thousands of accounts
+should raise `LOGIN_BACKOFF_SLOTS`.
 
 ### No account oracle
 
-- Every address is counted and answered the same way, with or without an
-  account: the same `401` body for a wrong password, then the same `429`, the
-  same `Retry-After` and the same message. Unknown addresses back off exactly
-  like real accounts.
+- Without a device token, every address is counted and answered the same way,
+  with or without an account: the same `401` body for a wrong password, then
+  the same `429`, the same `Retry-After` and the same message. Unknown
+  addresses back off exactly like real accounts. The device cookie is set only
+  on a successful sign-in, so no `401` or `429` answer carries one.
 - If no stored hash can be checked, sign-in verifies the password against an
   Argon2id hash of random bytes, made with the current parameters when the
   server starts. This covers an unknown address, an account without a
@@ -124,17 +209,22 @@ they matter only while one of them is failing.
   account up. Replacing the reset link and sending the mail run afterwards
   (`requestPasswordReset` in `auth.service.ts`). A repeated request for an
   address whose earlier one is still running adds nothing, because the running
-  one sends the newest link. Each process runs at most 100 requests at a
-  time, and at most 3 from one client IP address, so one client cannot take
-  the whole bound. Further requests are logged
-  (`password_reset_request_dropped`) and dropped. The requester sees the same
-  answer as for an unknown address and can ask again. Work for an address
-  without an account ends after one lookup, so only mail to existing accounts
-  can hold the bound for long. When the server closes,
-  it waits up to 2 seconds for requests in progress before closing the
-  database connection. A failure in this work (database or mail) is logged and
-  no longer reaches the requester. Mail failures were already logged and never
-  shown to the requester.
+  one sends the newest link. No other request is refused. Work for an
+  existing account lasts until its mail is sent, but work for an unknown
+  address ends after one lookup. So any cap on work in progress would itself
+  show which accounts exist, and behind a shared proxy address it would drop
+  other users' links. An earlier revision capped work at 3 per client IP. The
+  review measured that cap as an oracle: the prober's own link arrived 0/15
+  times when the probed account existed and 15/15 when it did not. It also
+  dropped 2 of 5 users' links behind one IP. The route's request limit
+  (10 a minute per client) bounds the work instead, as it bounded concurrent
+  requests before.
+- When the server closes, it keeps the database open for reset work in
+  progress until shortly before the shutdown deadline (8 seconds overall).
+  Work still running then is logged (`password_reset_requests_abandoned`,
+  with the count) before the connection closes. A failure in this work
+  (database or mail) is logged and no longer reaches the requester. Mail
+  failures were already logged and never shown to the requester.
 - Reset-password is keyed by the secret link token, not by an address. Its
   answers (`404` unknown link, `410` used or expired, `200`) show only the
   state of the link that was presented. They never show whether an address has
@@ -186,6 +276,30 @@ lifts any lockout in place. Stop older servers before applying it. They still
 read `LoginAttempt` and would answer sign-ins with `500` until replaced. The
 shipped container entrypoint applies migrations before starting the server.
 
+**Rolling back.** An earlier version run against the migrated database also
+answers every password sign-in with `500` (its `LoginAttempt` table is gone).
+Before starting an earlier version, recreate the table it expects. It starts
+empty; only counters are lost.
+
+```sql
+CREATE TABLE "LoginAttempt" (
+    "id" TEXT NOT NULL,
+    "email" TEXT NOT NULL,
+    "failedCount" INTEGER NOT NULL DEFAULT 0,
+    "lastFailedAt" TIMESTAMP(3),
+    "lockedUntil" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "LoginAttempt_pkey" PRIMARY KEY ("id")
+);
+CREATE UNIQUE INDEX "LoginAttempt_email_key" ON "LoginAttempt"("email");
+CREATE INDEX "LoginAttempt_email_idx" ON "LoginAttempt"("email");
+```
+
+Leave `LoginThrottle` in place while rolled back: Prisma's migration history
+still lists the migration as applied, so upgrading again needs no further step.
+After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
+
 ## Tests
 
 - `tests/integration/login-backoff.test.mjs` (real PostgreSQL) covers:
@@ -211,21 +325,37 @@ shipped container entrypoint applies migrations before starting the server.
   - a correct password whose sign-in is refused, because the password was
     replaced while it waited for the account row, stays a counted failure;
   - a cross-origin frontend can read `Retry-After`, because CORS exposes it;
-  - while mail is held, pending reset requests stop at 3 per client and 100
-    per process, a repeat for a pending address adds nothing, every accepted
-    request delivers its link, and a dropped address can ask again once the
-    work drains.
+  - trusted browsers:
+    - a browser that signed in before signs in at once while the address is
+      held at its longest wait;
+    - the cookie's attributes;
+    - a trusted browser has its own small budget, separate from the address;
+    - another address's token, an altered or expired token and garbage are
+      ignored;
+    - at most 5 tokens per browser;
+    - without a token, answers are identical for an address trusted elsewhere,
+      one never signed in, a password-less one and an unknown one;
+  - with mail held, 8 users' resets from one client address are all delivered;
+  - the reviewer's oracle sequence delivers the prober's own link whether or
+    not the probed address exists;
+  - a repeat for a pending address adds nothing;
+  - closing the server waits for reset mail slower than 2 seconds and
+    delivers it;
+  - work still running at the drain deadline is logged with its count.
 - `tests/integration/login-backoff-bounds.test.mjs` runs with 256 slots:
   - 600 unique unknown addresses through the sign-in route leave at most 256
     rows and only `401` or `429` answers;
   - 2,000 more addresses admitted directly still leave at most 256 rows;
-  - cleanup removes rows past the quiet period and rows outside the slot range.
+  - cleanup removes rows past the quiet period and rows outside the address
+    and device ranges.
 - `tests/argon2id-passwords.test.mjs` checks that sign-in without a usable
   hash is refused and uses the same native admission (`503` while two jobs
   run). It also checks that the stand-in check costs between half and twice a
   real one.
 - `tests/env-validation.test.mjs` covers defaults, ranges and ordering.
 - `tests/error-response-headers.test.mjs` covers `429` with `Retry-After`.
+- `tests/shutdown.test.mjs` checks that each shutdown step learns the time left
+  before the overall deadline. The reset drain uses it.
 - In the frontend, `login-form.test.tsx` checks:
   - the countdown (3, 2, 1, then the form is usable again);
   - that nothing is sent during the wait;
@@ -235,14 +365,12 @@ shipped container entrypoint applies migrations before starting the server.
 
 ## Limitations
 
-- **A determined attacker can hold an account in its longest wait.** If an
-  attacker sends a wrong password for an address each time its wait ends, the
-  account stays in its capped wait. Its user can still sign in by trying after
-  the stated wait, but must get that attempt in before the attacker's next one.
-  This is never a lock: each wait is at most `LOGIN_BACKOFF_MAX_SECONDS`, and
-  the attacker gets one guess per wait. Exempting trusted devices (a cookie set
-  at successful sign-in) would remove the race. That is a separate feature and
-  was not part of this decision.
+- **A browser that has never signed in can be held off.** Someone who sends a
+  wrong password for an address each time its wait ends keeps every browser
+  without a valid device token for that address from signing in with a
+  password, for as long as they keep sending. That covers new devices, cleared
+  or private browsers, and the first sign-in after 30 days. See "Trusted
+  browsers". Trusted browsers, existing sessions and SSO are unaffected.
 - **Success visibly clears the count.** An attacker who has made four failures
   for an address can see whether its owner signed in successfully before the
   attacker's next attempt: the count would be cleared, so no wait starts. That
@@ -264,19 +392,16 @@ shipped container entrypoint applies migrations before starting the server.
   attempt. At the default size and the route limit, that takes several
   thousand client IP addresses. The two-job password check limit is a cheaper
   way to deny service.
-- **Process-local limits.** The route limit, the password-check admission and
-  the pending reset-request bounds are counted per server process. Only the
-  backoff is shared.
-- **Reset requests are best effort, not durable.** An answered request lives
-  only in the process that answered it:
-  - it is dropped past the 100-request or 3-per-client bound;
-  - it is lost if the process stops;
-  - the server waits at most 2 seconds for it on a clean shutdown.
-
-  In each case the requester sees the usual answer, but no link arrives, and
-  must ask again. Before this change, such a request either was answered with
-  an error or held the request open. A durable outbox for account mail would
-  remove this; it is a separate feature.
+- **Process-local limits.** The route limit and the password-check admission
+  are counted per server process. The route limit keys on the connection's
+  address: the app does not trust proxy headers, so behind a reverse proxy it
+  counts all users together, as before this change. Only the backoff is
+  shared.
+- **Reset requests are not durable.** An answered request lives only in the
+  process that answered it. It is lost if the process is killed, or if its
+  mail is still being sent at the shutdown deadline; that case is logged. The
+  requester saw the usual answer and must ask again. A durable outbox for
+  account mail would remove this; it is a separate feature.
 - **Measured in-process only.** The timing evidence was measured in-process on
   one machine. It is not a remote measurement or a production load test
   (R39/R42).

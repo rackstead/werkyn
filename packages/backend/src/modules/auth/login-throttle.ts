@@ -7,10 +7,13 @@ import { env } from "../../config/env.js";
  * sees the same state (docs/remediation/r31-login-backoff.md).
  *
  * Every submitted address, with or without an account, maps by a keyed hash
- * to one of `slots` rows, so attacker-chosen addresses cannot grow the table
- * beyond `slots` rows and no address is stored. Addresses that share a slot
- * share its count; the key keeps anyone without the server secret from
- * choosing addresses that collide with a given one.
+ * to one of `slots` address rows (0 to slots - 1), so attacker-chosen
+ * addresses cannot grow the table beyond `slots` rows and no address is
+ * stored. Addresses that share a slot share its count; the key keeps anyone
+ * without the server secret from choosing addresses that collide with a given
+ * one. A browser that signed in to the address before (login-device.ts) is
+ * counted in its device's own lane instead, one of `slots` device rows
+ * (slots to 2 * slots - 1), so the table holds at most 2 * slots rows.
  *
  * An attempt is counted as a failure when it is admitted, before its password
  * is checked, and the count is cleared when it signs in. So parallel attempts
@@ -20,8 +23,10 @@ import { env } from "../../config/env.js";
  * `baseSeconds * 2^(failures - threshold)` seconds, at most `maxSeconds`,
  * after the previous admitted one. A refused attempt is answered at once
  * (429 with Retry-After), checks no password and is not counted, so the wait
- * never grows while refused and the account is never locked: after the
- * stated wait the correct password signs in. Failures are forgotten after
+ * never grows while refused. Admission is first come at the end of a wait,
+ * so someone who keeps sending wrong passwords for an address can keep a
+ * browser that never signed in to it from getting in first; a trusted
+ * device's own lane is not affected by them. Failures are forgotten after
  * `resetSeconds` without an admitted attempt.
  *
  * Each admitted attempt gets the slot's next admission number (its ticket).
@@ -80,16 +85,43 @@ export function loginSlot(email: string, slots: number): number {
 export function createLoginThrottle(policy: LoginBackoffPolicy) {
   const { threshold, baseSeconds, maxSeconds, resetSeconds, slots } = policy;
 
+  /** Counts an attempt for `email` in its address slot (see admitSlot). */
+  function admit(prisma: PrismaClient, email: string) {
+    return admitSlot(prisma, loginSlot(email, slots));
+  }
+
+  /** Counts an attempt from a trusted device in that device's own lane. */
+  function admitDevice(prisma: PrismaClient, deviceId: string) {
+    return admitSlot(prisma, slots + loginSlot(`device ${deviceId}`, slots));
+  }
+
   /**
-   * Counts an attempt for `email` and admits it, or refuses it with the
-   * whole seconds until the next attempt is admitted. One statement, so
-   * concurrent attempts on a slot (from any process) are decided in turn.
+   * The address slot's admissions so far, as a ticket: a sign-in from a
+   * trusted device clears the address's failures up to this point (and keeps
+   * those admitted while it was checked). Null when the slot has no row.
    */
-  async function admit(
+  async function addressMark(
     prisma: PrismaClient,
     email: string,
-  ): Promise<LoginAdmission> {
+  ): Promise<AdmissionTicket | null> {
     const slot = loginSlot(email, slots);
+    const [row] = await prisma.$queryRaw<Array<{ admissions: bigint }>>`
+      SELECT "admissions" FROM "LoginThrottle" WHERE "slot" = ${slot}::integer
+    `;
+    return row
+      ? { slot, number: BigInt(row.admissions), at: performance.now() }
+      : null;
+  }
+
+  /**
+   * Counts an attempt in `slot` and admits it, or refuses it with the whole
+   * seconds until the next attempt is admitted. One statement, so concurrent
+   * attempts on a slot (from any process) are decided in turn.
+   */
+  async function admitSlot(
+    prisma: PrismaClient,
+    slot: number,
+  ): Promise<LoginAdmission> {
     // The delay owed after the row's current count; the proposed row's time
     // (EXCLUDED) is the one clock reading of this statement.
     const admitted = await prisma.$queryRaw<Array<{ admissions: bigint }>>`
@@ -183,16 +215,24 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     `;
   }
 
-  /** Removes rows whose failures are forgotten or outside the slot range. */
+  /** Removes rows whose failures are forgotten or outside the slot ranges. */
   async function prune(prisma: PrismaClient) {
     await prisma.$executeRaw`
       DELETE FROM "LoginThrottle"
       WHERE "lastFailureAt" <= (clock_timestamp() AT TIME ZONE 'UTC') - ${resetSeconds}::integer * interval '1 second'
-        OR "slot" >= ${slots}::integer
+        OR "slot" >= ${2 * slots}::integer
     `;
   }
 
-  return { policy, admit, succeeded, unchecked, prune };
+  return {
+    policy,
+    admit,
+    admitDevice,
+    addressMark,
+    succeeded,
+    unchecked,
+    prune,
+  };
 }
 
 export type LoginThrottle = ReturnType<typeof createLoginThrottle>;

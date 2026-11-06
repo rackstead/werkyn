@@ -2,6 +2,11 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import type { ResendVerificationInput } from "@pm/shared";
 import * as authService from "./auth.service.js";
 import { env } from "../../config/env.js";
+import {
+  LOGIN_DEVICE_COOKIE,
+  LOGIN_DEVICE_COOKIE_PATH,
+  LOGIN_DEVICE_MAX_AGE_SECONDS,
+} from "./login-device.js";
 
 function setRefreshCookie(reply: FastifyReply, token: string) {
   reply.setCookie("refresh_token", token, {
@@ -55,9 +60,23 @@ export async function loginHandler(
 ) {
   const body = request.body as { email: string; password: string };
 
-  const result = await authService.login(request.server.prisma, body);
+  const result = await authService.login(
+    request.server.prisma,
+    body,
+    request.cookies[LOGIN_DEVICE_COOKIE],
+  );
 
   setRefreshCookie(reply, result.refreshToken);
+  // Marks this browser as trusted for the address (login-device.ts). Sent
+  // only to the sign-in route; it outlives sign-out by design.
+  reply.setCookie(LOGIN_DEVICE_COOKIE, result.deviceCookie, {
+    httpOnly: true,
+    secure: env.COOKIE_SECURE,
+    sameSite: env.COOKIE_SAMESITE,
+    domain: env.COOKIE_DOMAIN || undefined,
+    path: LOGIN_DEVICE_COOKIE_PATH,
+    maxAge: LOGIN_DEVICE_MAX_AGE_SECONDS,
+  });
 
   return reply.send({
     data: {
@@ -117,11 +136,7 @@ export async function forgotPasswordHandler(
 
   // Answered without waiting for the account lookup or the mail, so every
   // address gets the same response at the same speed.
-  authService.requestPasswordReset(
-    request.server.prisma,
-    body.email,
-    request.ip,
-  );
+  authService.requestPasswordReset(request.server.prisma, body.email);
 
   return reply.send({
     message: "If an account exists, a reset link has been sent.",

@@ -8,8 +8,9 @@
 --
 -- "LoginThrottle" keeps at most one row per slot. The server maps every
 -- submitted address (with or without an account) to a slot with a keyed
--- hash, modulo LOGIN_BACKOFF_SLOTS, so the table never holds more rows than
--- that setting and never stores an address. Slot numbers are non-negative.
+-- hash, modulo LOGIN_BACKOFF_SLOTS, and a trusted browser's device id to a
+-- second range of as many lanes, so the table never holds more rows than
+-- twice that setting and never stores an address. Slots are non-negative.
 -- "admissions" numbers the slot's admitted attempts; a sign-in's outcome
 -- clears or uncounts only its own and earlier admissions ("clearedThrough"),
 -- so attempts admitted after it keep their count.

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { DriveFile, SortBy, SortOrder } from "../api";
 import { useInfiniteScroll } from "../hooks/use-infinite-scroll";
 import { useDriveWindow } from "../hooks/use-drive-window";
@@ -27,6 +27,10 @@ interface FileGridViewProps {
   scrollElement: HTMLElement | null;
   /** The entry being dragged, which stays rendered while the view scrolls. */
   draggingId?: string | null;
+  /** Told the index of the first and last entry in view whenever they change. */
+  onVisibleEntries?: (first: number, last: number) => void;
+  /** Shown below the entries (a page that failed to load). */
+  footer?: ReactNode;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   canEdit: boolean;
@@ -62,6 +66,8 @@ export function FileGridView({
   files,
   scrollElement,
   draggingId,
+  onVisibleEntries,
+  footer,
   hasNextPage,
   isFetchingNextPage,
   canEdit,
@@ -101,12 +107,45 @@ export function FileGridView({
       }),
     [focusedId, draggingId, indexById, columns],
   );
-  const { segments, rowHeight, onCorrected } = useDriveWindow({
+  const onVisibleLines = useCallback(
+    (first: number, last: number) =>
+      onVisibleEntries?.(first * columns, Math.min(files.length, (last + 1) * columns) - 1),
+    [onVisibleEntries, columns, files.length],
+  );
+  const { segments, rowHeight, scrollMargin, onCorrected } = useDriveWindow({
     count: Math.ceil(files.length / columns),
     scroller: scrollElement,
     container: gridRef,
     estimate: ROW_ESTIMATE,
     keep,
+    onVisible: onVisibleLines,
+  });
+
+  // A change of the column count (the window crossed a breakpoint) keeps
+  // the first line in view where it was: its first entry's new line is put
+  // at the same place. The browser reflows the cards to the new columns as
+  // soon as the window resizes, before this view renders them again, so the
+  // places of the cards on screen no longer say which were in view
+  // (KeepInView stands aside for this change); the line in view follows
+  // from the scroll position and the layout before the change instead.
+  const layoutBefore = useRef({ columns, rowHeight, scrollMargin });
+  const columnChange = useRef<{ from: typeof layoutBefore.current; scrollTop: number } | null>(null);
+  if (layoutBefore.current.columns !== columns && scrollElement && !columnChange.current)
+    columnChange.current = { from: layoutBefore.current, scrollTop: scrollElement.scrollTop };
+  useLayoutEffect(() => {
+    const change = columnChange.current;
+    columnChange.current = null;
+    layoutBefore.current = { columns, rowHeight, scrollMargin };
+    if (!change || !scrollElement) return;
+    const { from, scrollTop } = change;
+    if (scrollTop <= from.scrollMargin) return;
+    const line = Math.floor((scrollTop - from.scrollMargin) / from.rowHeight);
+    const offset = from.scrollMargin + line * from.rowHeight - scrollTop;
+    const first = line * from.columns;
+    const want = scrollMargin + Math.floor(first / columns) * rowHeight - offset;
+    if (Math.abs(scrollElement.scrollTop - want) < 0.5) return;
+    scrollElement.scrollTop = want;
+    onCorrected(scrollElement.scrollTop);
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
   // Space held below the entries while they are kept in place at the end of
@@ -175,6 +214,7 @@ export function FileGridView({
           offsetOf={offsetOf}
           onCorrected={onCorrected}
           onShort={hasNextPage ? onShort : undefined}
+          layoutKey={columns}
         >
           {segments.flatMap((segment) => {
             if (segment.kind === "gap")
@@ -225,6 +265,7 @@ export function FileGridView({
           )}
         </div>
       )}
+      {footer}
       {holdHeight > 0 && <div aria-hidden="true" style={{ height: holdHeight }} />}
     </div>
   );

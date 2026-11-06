@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import type { DriveFile, SortBy, SortOrder } from "../api";
 import { useInfiniteScroll } from "../hooks/use-infinite-scroll";
 import { useDriveWindow } from "../hooks/use-drive-window";
@@ -18,6 +18,10 @@ interface FileListViewProps {
   scrollElement: HTMLElement | null;
   /** The entry being dragged, which stays rendered while the view scrolls. */
   draggingId?: string | null;
+  /** Told the index of the first and last entry in view whenever they change. */
+  onVisibleEntries?: (first: number, last: number) => void;
+  /** Shown below the entries (a page that failed to load). */
+  footer?: ReactNode;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   canEdit: boolean;
@@ -55,6 +59,8 @@ export function FileListView({
   files,
   scrollElement,
   draggingId,
+  onVisibleEntries,
+  footer,
   hasNextPage,
   isFetchingNextPage,
   canEdit,
@@ -102,6 +108,7 @@ export function FileListView({
     container: bodyRef,
     estimate: ROW_ESTIMATE,
     keep,
+    onVisible: onVisibleEntries,
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
   // Space held below the entries while they are kept in place at the end of
@@ -247,6 +254,7 @@ export function FileListView({
           )}
         </div>
       )}
+      {footer}
       {holdHeight > 0 && <div aria-hidden="true" style={{ height: holdHeight }} />}
     </div>
   );

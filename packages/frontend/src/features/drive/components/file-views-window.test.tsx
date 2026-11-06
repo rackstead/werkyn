@@ -15,7 +15,9 @@ const HEAD = 33;
 const ROW = 41;
 const SORT_BAR = 40;
 const LINE = 140;
-const COLUMNS = 5;
+// Columns of the grid as the browser lays them out (CSS media queries follow
+// the window width at once, before the view renders again).
+let columns = 5;
 
 function driveFile(i: number, name = `File ${String(i).padStart(4, "0")}.txt`): DriveFile {
   return {
@@ -76,7 +78,7 @@ function gridLayout(grid: Element): Map<Element, number> {
       continue;
     }
     tops.set(child, y);
-    if (++column === COLUMNS) {
+    if (++column === columns) {
       column = 0;
       y += LINE;
     }
@@ -131,7 +133,11 @@ function Harness({
         configurable: true,
         get: () => Math.max(0, Math.min(scrollTop, contentHeight() - VIEW)),
         set: (value: number) => {
+          const before = scrollTop;
           scrollTop = Math.max(0, Math.min(value, contentHeight() - VIEW));
+          // A browser reports a scroll position set by script with a scroll
+          // event, after the change.
+          if (scrollTop !== before) queueMicrotask(() => node.dispatchEvent(new Event("scroll")));
         },
       });
       Object.defineProperty(node, "clientHeight", { configurable: true, get: () => VIEW });
@@ -188,6 +194,7 @@ function topOf(id: string): number {
 beforeEach(() => {
   scroller = null;
   scrollTop = 0;
+  columns = 5;
   vi.stubGlobal(
     "IntersectionObserver",
     class {
@@ -305,6 +312,27 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     expect(entryAt(HEAD + 1)).toBe("f-1");
   });
 
+  it("does not follow a block of entries in view that now sorts far away", async () => {
+    const files = range(0, 1000);
+    const { rerender } = render(<Harness files={files} />);
+    await scrollTo(HEAD + 500 * ROW);
+    // About 10 rows in view: the top 7 are renamed so that they sort at the
+    // end (more entries moved together than stayed).
+    const block = files.slice(500, 507);
+    const stayed = files[507].id;
+    const top = topOf(stayed);
+    const at = scrollTop;
+    rerender(<Harness files={[...files.filter((f) => !block.includes(f)), ...block]} />);
+    expect(topOf(stayed)).toBe(top);
+    expect(Math.abs(scroller!.scrollTop - at)).toBeLessThan(VIEW);
+    // The same block sorting far above the view.
+    rerender(<Harness files={files} />);
+    await scrollTo(HEAD + 500 * ROW);
+    const above = [...files.slice(0, 100), ...block, ...files.slice(100).filter((f) => !block.includes(f))];
+    rerender(<Harness files={above} />);
+    expect(topOf(stayed)).toBe(top);
+  });
+
   it("keeps the focused row and its neighbours rendered, and arrow keys move through rows", async () => {
     render(<Harness files={range(0, 1000)} />);
     await scrollTo(HEAD + 300 * ROW);
@@ -359,6 +387,39 @@ describe("windowed Drive grid", { timeout: 30_000 }, () => {
     // A card keeps its column: cards of a line share its top.
     expect(topOf("f504")).toBe(topOf("f500"));
     expect(topOf("f505")).toBe(topOf("f500") + LINE);
+  });
+
+  it("keeps the first line in view in place when the window crosses a column breakpoint", async () => {
+    // Tailwind's sm, md and lg breakpoints, as useGridColumns asks for them.
+    let width = 1200;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: width >= Number(/([\d.]+)rem/.exec(query)![1]) * 16,
+      addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+    }));
+    const resize = (to: number) =>
+      act(() => {
+        width = to;
+        columns = to >= 1024 ? 5 : to >= 768 ? 4 : to >= 640 ? 3 : 2;
+        for (const listener of listeners) listener();
+      });
+    render(<Harness view="grid" files={range(0, 1000)} />);
+    await scrollTo(SORT_BAR + 100 * LINE + 30);
+    expect(entryAt(1)).toBe("f500");
+    expect(topOf("f500")).toBe(-30);
+    for (const [to, first] of [
+      [900, "f500"], // 4 columns: f500 starts line 125
+      [700, "f498"], // 3 columns: the first line in view starts with f498
+      [560, "f498"], // 2 columns: line 249
+      [1440, "f495"], // 5 columns again: line 99
+    ] as const) {
+      await resize(to);
+      // The first line in view starts with the same entry as before, or the
+      // one that starts its line now, at the same place.
+      expect(topOf(first)).toBe(-30);
+      expect(entryAt(1)).toBe(first);
+    }
   });
 
   it("keeps the cards in view still when a line of entries is added or removed above them", async () => {

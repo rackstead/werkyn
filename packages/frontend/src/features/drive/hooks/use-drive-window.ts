@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useReducer,
@@ -30,6 +31,8 @@ interface DriveWindowOptions {
   estimate: number;
   /** Rows that stay rendered wherever the view is: the focused and the dragged entry's. */
   keep: readonly number[];
+  /** Told the first and last row in view whenever they change. */
+  onVisible?: (first: number, last: number) => void;
 }
 
 /**
@@ -44,7 +47,7 @@ interface DriveWindowOptions {
  * from above reaches its first entry and Shift+Tab from below its last, as
  * with every row rendered.
  */
-export function useDriveWindow({ count, scroller, container, estimate, keep }: DriveWindowOptions) {
+export function useDriveWindow({ count, scroller, container, estimate, keep, onVisible }: DriveWindowOptions) {
   const [rowHeight, setRowHeight] = useState(estimate);
   // Offset of the first row from the top of the scroller's content.
   const [scrollMargin, setScrollMargin] = useState(0);
@@ -87,6 +90,13 @@ export function useDriveWindow({ count, scroller, container, estimate, keep }: D
   }, [virtualizer, rowHeight]);
 
   const items = virtualizer.getVirtualItems();
+  // The rows in view (the range computed with the items above; without a
+  // laid-out view, the first rows rendered).
+  const firstVisible = virtualizer.range?.startIndex ?? (count > 0 ? 0 : null);
+  const lastVisible = virtualizer.range?.endIndex ?? (count > 0 ? Math.min(count, UNSIZED_ROWS) - 1 : null);
+  useEffect(() => {
+    if (onVisible && firstVisible !== null && lastVisible !== null) onVisible(firstVisible, lastVisible);
+  }, [onVisible, firstVisible, lastVisible]);
   const segments = useMemo(() => {
     const indexes =
       items.length > 0
@@ -161,5 +171,5 @@ export function useDriveWindow({ count, scroller, container, estimate, keep }: D
     [virtualizer],
   );
 
-  return { virtualizer, segments, rowHeight, onCorrected };
+  return { virtualizer, segments, rowHeight, scrollMargin, onCorrected };
 }

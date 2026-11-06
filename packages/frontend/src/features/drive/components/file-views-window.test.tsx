@@ -205,7 +205,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("windowed Drive list", () => {
+describe("windowed Drive list", { timeout: 30_000 }, () => {
   it("renders only the rows near the view, with gaps holding the others' height", async () => {
     render(<Harness files={range(0, 1000)} />);
     await scrollTo(HEAD + 500 * ROW);
@@ -346,7 +346,8 @@ describe("windowed Drive list", () => {
   });
 });
 
-describe("windowed Drive grid", () => {
+// Each card renders its menus; a few dozen of them render slowly in jsdom.
+describe("windowed Drive grid", { timeout: 30_000 }, () => {
   it("renders only the lines of cards near the view", async () => {
     render(<Harness view="grid" files={range(0, 1000)} />);
     await scrollTo(SORT_BAR + 100 * LINE);

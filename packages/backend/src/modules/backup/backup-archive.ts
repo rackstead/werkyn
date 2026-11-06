@@ -3,6 +3,7 @@ import { open } from "node:fs/promises";
 import { pipeline, Readable, Transform } from "node:stream";
 import zlib from "node:zlib";
 import { ValidationError } from "../../utils/errors.js";
+import { READ_NO_FOLLOW } from "../../services/storage-paths.js";
 import {
   BACKUP_JSON_LIMITS,
   BackupJsonError,
@@ -111,8 +112,27 @@ function bufferSource(buffer: Buffer): ArchiveSource {
   };
 }
 
+/**
+ * Bytes `start` to `end` (inclusive) of `file`, which is opened on the first
+ * read and never through a link (R33).
+ */
+function fileRange(file: string, start: number, end: number): Readable {
+  return Readable.from(
+    (async function* () {
+      const handle = await open(file, READ_NO_FOLLOW);
+      try {
+        yield* createReadStream(file, { fd: handle, start, end, autoClose: false });
+      } finally {
+        await handle.close();
+      }
+    })(),
+    { objectMode: false },
+  );
+}
+
+/** A staged archive; it is never read through a link (R33). */
 async function fileSource(file: string): Promise<ArchiveSource> {
-  const handle = await open(file, "r");
+  const handle = await open(file, READ_NO_FOLLOW);
   try {
     const { size } = await handle.stat();
     return {
@@ -130,7 +150,7 @@ async function fileSource(file: string): Promise<ArchiveSource> {
       // Each stream opens the file itself, so assets stay readable after the
       // inspection has closed its handle.
       stream: (start, end) =>
-        start === end ? emptyStream() : createReadStream(file, { start, end: end - 1 }),
+        start === end ? emptyStream() : fileRange(file, start, end - 1),
       close: () => handle.close(),
     };
   } catch (error) {

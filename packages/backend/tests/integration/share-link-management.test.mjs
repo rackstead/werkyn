@@ -165,6 +165,8 @@ before(async () => {
   for (const [method, counter] of [
     ["read", "reads"],
     ["readStream", "reads"],
+    ["openReadStream", "reads"],
+    ["open", "reads"],
     ["save", "writes"],
     ["saveStream", "writes"],
     ["delete", "deletes"],

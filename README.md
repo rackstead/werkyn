@@ -64,6 +64,17 @@ one-off `werkyn-permissions` service gives the root-owned files in the storage a
 Dex volumes to that user before the app starts. See `docs/remediation/ops-004.md`
 for `docker run`, host directories and other setups.
 
+The storage folder (`STORAGE_DIR`, `/app/storage` in Compose) may itself be a
+symbolic link, a volume or a mount point; to move storage to another disk, point
+`STORAGE_DIR` or that link at the new disk, or mount the disk there, and restart.
+The server resolves it once at startup and logs the real path. Below it, every
+symbolic link is refused for reads (`403`), writes and deletes, so do not link
+a workspace folder or file to somewhere else: mount the other disk at that path
+instead. Before upgrading an installation whose storage may hold links, list them
+with `docker compose exec werkyn node packages/backend/dist/scripts/storage-link-report.js`
+(read-only) and replace each with what it points to. See
+[docs/remediation/r33-storage-symlinks.md](docs/remediation/r33-storage-symlinks.md).
+
 When upgrading an existing installation, back up the database and storage first.
 Set new JWT and cookie secrets to invalidate credentials signed with the published
 sample secrets. Changing `POSTGRES_PASSWORD` in `.env` does not change the password

@@ -295,10 +295,12 @@ test("the fixed JSON contract handles early stream failures and preserves succes
     );
     for (const name of ["file", "inline", "archive"]) {
       const response = await app.inject(`/missing-${name}`);
-      assert.equal(response.statusCode, 500);
+      // readStream reports a missing blob as MissingBlobError (410), as
+      // openReadStream does; the response is still the JSON contract.
+      assert.equal(response.statusCode, 410);
       assert.match(response.headers["content-type"], /^application\/json/);
       assert.equal(response.headers["content-disposition"], undefined);
-      assert.equal(response.json().statusCode, 500);
+      assert.equal(response.json().statusCode, 410);
       assert.equal(response.headers["cache-control"], "private, no-store");
       assert.equal(response.headers["content-security-policy"], "sandbox");
       assert.equal(response.headers["x-content-type-options"], "nosniff");

@@ -122,7 +122,9 @@ Repair the rows as docs/remediation/dat-005.md describes, then run
 and deploy again. See docs/remediation/r35-constraints.md.
 ```
 
-Nothing is created or changed. `prisma migrate deploy` exits with P3018 and
+Nothing is created or changed (the precheck runs before any change, and the
+migration is one transaction, so a later failure also undoes everything
+before it). `prisma migrate deploy` exits with P3018 and
 the container does not start; later deploys stop with P3009 until the
 migration is marked rolled back. Repair the rows, run the `resolve` command
 the message names and deploy again.
@@ -189,6 +191,11 @@ Both migrations run before the server starts in the shipped entrypoint.
 its own migration (Prisma runs a migration as one transaction), which is not
 worth it at these durations.
 
+Afterwards, deleting the fixture's largest project (11,733 tasks, 2,847 time
+entries, rolled back) took 1.12-1.27 s against 1.07-1.27 s before, plus
+167-175 ms at commit for the deferred time-entry keys (one index probe per
+deleted task and cleared entry).
+
 ## Tests
 
 `packages/backend/tests/migrations/structural-constraints.test.mjs` (CI step
@@ -200,6 +207,12 @@ other, in an empty database migrated to the migration before these two:
   ten IDs, and the schema and data are unchanged; the report it names lists
   the same rows. With those rows repaired, the first migration applies and
   the second refuses in the same way. With everything repaired both apply.
+- Each migration is one transaction: Prisma sends the file as one
+  multi-statement query (PostgreSQL refuses `LOCK TABLE` outside a
+  transaction block, so these migrations could not run otherwise). The gate
+  makes the last statement of each migration fail, after every other one has
+  run, by creating its trigger or check beforehand; the catalog and data are
+  unchanged afterwards and the migration applies once that object is gone.
 - A clean populated fixture migrates with identical row data.
 - After the migration, raw SQL that breaks each constraint (46 statements)
   is refused with the constraint's name, deferred keys also at commit, and

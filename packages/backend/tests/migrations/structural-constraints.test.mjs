@@ -275,6 +275,28 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
     /** The database error part of Prisma's output, for the test log. */
     const databaseError = (output) => output.slice(output.indexOf("Database error:"), output.indexOf("DbError {")).trim();
 
+    /**
+     * Each migration runs as one transaction (Prisma sends the file as one
+     * multi-statement query; LOCK TABLE outside a transaction block would
+     * fail). An object that already exists under the name the migration's
+     * last statement creates makes that statement fail after every other
+     * one has run; nothing they created may remain.
+     */
+    async function assertLateFailureLeavesNothing(st, { schema, migration, conflict, drop, failure }) {
+      for (const statement of conflict) await legacy.$executeRawUnsafe(statement);
+      const catalog = await catalogSnapshot(legacy);
+      const data = await dataSnapshot(legacy);
+      const deploy = await prismaCli(["migrate", "deploy", "--schema", schema]);
+      assert.equal(deploy.ok, false, deploy.output);
+      st.diagnostic(databaseError(deploy.output));
+      assert.match(deploy.output, new RegExp(`Migration name: ${migration}`));
+      assert.match(deploy.output, failure);
+      assert.deepEqual(await catalogSnapshot(legacy), catalog);
+      assert.deepEqual(await dataSnapshot(legacy), data);
+      for (const statement of drop) await legacy.$executeRawUnsafe(statement);
+      assert((await prismaCli(["migrate", "resolve", "--rolled-back", migration, "--schema", currentSchema])).ok);
+    }
+
     await t.test("legacy fixture: the first migration refuses, reports every rule and changes nothing", async (st) => {
       await insertCleanRows(legacy);
       referenceRows = await insertReferenceViolations(legacy);
@@ -318,9 +340,23 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
       }
     });
 
-    await t.test("with those rows repaired, the first applies and the second refuses and reports", async (st) => {
+    await t.test("with those rows repaired, a failure at the first migration's last statement leaves nothing behind", async (st) => {
       await repairReferenceViolations(legacy, referenceRows);
       assert((await prismaCli(["migrate", "resolve", "--rolled-back", FIRST, "--schema", currentSchema])).ok);
+      // Its indexes, keys, check, functions and other triggers come first.
+      await assertLateFailureLeavesNothing(st, {
+        schema: withFirstOnly,
+        migration: FIRST,
+        conflict: [
+          `CREATE FUNCTION r35_fixture_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$`,
+          `CREATE TRIGGER "CustomField_projectId_fixed" AFTER UPDATE ON "CustomField" FOR EACH ROW EXECUTE FUNCTION r35_fixture_noop()`,
+        ],
+        drop: [`DROP TRIGGER "CustomField_projectId_fixed" ON "CustomField"`, "DROP FUNCTION r35_fixture_noop()"],
+        failure: /trigger "CustomField_projectId_fixed" for relation "CustomField" already exists/,
+      });
+    });
+
+    await t.test("then the first applies and the second refuses and reports", async (st) => {
       const first = await prismaCli(["migrate", "deploy", "--schema", withFirstOnly]);
       assert(first.ok, first.output);
       const catalog = await catalogSnapshot(legacy);
@@ -338,10 +374,21 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
       assert.deepEqual(await dataSnapshot(legacy), data);
     });
 
-    await t.test("with every row repaired both migrations apply", async () => {
+    await t.test("with every row repaired, a failure at the second migration's last statement leaves nothing behind", async (st) => {
       for (const [, table, rows] of valueRows)
         await legacy.$executeRawUnsafe(`DELETE FROM "${table}" WHERE id = ANY($1::text[])`, rows);
       assert((await prismaCli(["migrate", "resolve", "--rolled-back", SECOND, "--schema", currentSchema])).ok);
+      // Its fifteen other checks come first.
+      await assertLateFailureLeavesNothing(st, {
+        schema: currentSchema,
+        migration: SECOND,
+        conflict: [`ALTER TABLE "WikiPage" ADD CONSTRAINT "WikiPage_position_non_negative" CHECK ("position" >= 0)`],
+        drop: [`ALTER TABLE "WikiPage" DROP CONSTRAINT "WikiPage_position_non_negative"`],
+        failure: /constraint "WikiPage_position_non_negative" for relation "WikiPage" already exists/,
+      });
+    });
+
+    await t.test("then both migrations apply", async () => {
       const deploy = await prismaCli(["migrate", "deploy", "--schema", currentSchema]);
       assert(deploy.ok, deploy.output);
       const rows = await migrationRows(legacy);

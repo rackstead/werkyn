@@ -39,7 +39,15 @@ interface Snapshot {
   scrollTop: number;
   seen: SeenEntry[];
   around: AroundEntry[];
+  // The list before the change, to find the entry nearest above the view
+  // that is still listed when none of the entries seen is.
+  listTop: number;
+  keyAt: (index: number) => string | undefined;
+  offsetOf: (index: number) => number;
 }
+
+// How far above the view to look for an entry still listed.
+const NEAREST_LISTED = 500;
 
 /** An element's top in the scroller's content (independent of its scroll position). */
 function contentTop(element: Element, scroller: HTMLElement): number {
@@ -72,6 +80,26 @@ function contentTop(element: Element, scroller: HTMLElement): number {
  * Nothing is kept while the top of the list is in view: entries added at the
  * top show there, as they do without windowing.
  */
+/**
+ * When none of the entries seen is listed now (at the end of the list, a
+ * refresh can leave every one of them, and those just above them, for the
+ * next page), the nearest entry above the view that is still listed keeps
+ * its place instead, at the place its index gave it before the change.
+ */
+function nearestListedAbove(
+  snapshot: Snapshot,
+  indexOf: (key: string) => number | undefined,
+): (SeenEntry & { now: number }) | undefined {
+  const first = Math.min(...snapshot.seen.map((entry) => entry.index));
+  for (let index = first - 1; index >= Math.max(0, first - NEAREST_LISTED); index--) {
+    const key = snapshot.keyAt(index);
+    const now = key === undefined ? undefined : indexOf(key);
+    if (key !== undefined && now !== undefined)
+      return { key, index, now, top: snapshot.listTop + snapshot.offsetOf(index) };
+  }
+  return undefined;
+}
+
 export class KeepInView extends Component<KeepInViewProps> {
   // A scroll position to apply once the list holds the space it was short of.
   private retry: number | null = null;
@@ -83,7 +111,8 @@ export class KeepInView extends Component<KeepInViewProps> {
     const view = scroller.getBoundingClientRect();
     const viewTop = view.top + scroller.clientTop;
     const viewBottom = viewTop + scroller.clientHeight;
-    if (container.getBoundingClientRect().top >= viewTop) return null;
+    const listTop = container.getBoundingClientRect().top;
+    if (listTop >= viewTop) return null;
     const scrollTop = scroller.scrollTop;
     const seen: SeenEntry[] = [];
     for (const element of container.querySelectorAll<HTMLElement>("[data-anchor-key]")) {
@@ -102,7 +131,14 @@ export class KeepInView extends Component<KeepInViewProps> {
       const key = index >= 0 ? previous.keyAt(index) : undefined;
       if (key !== undefined) around.push({ key, index });
     }
-    return { scrollTop, seen, around };
+    return {
+      scrollTop,
+      seen,
+      around,
+      listTop: listTop - viewTop + scrollTop,
+      keyAt: previous.keyAt,
+      offsetOf: previous.offsetOf,
+    };
   }
 
   componentDidUpdate(_props: KeepInViewProps, _state: unknown, snapshot: Snapshot | null) {
@@ -121,7 +157,9 @@ export class KeepInView extends Component<KeepInViewProps> {
     const rendered = new Map<string, HTMLElement>();
     for (const element of container.querySelectorAll<HTMLElement>("[data-anchor-key]"))
       rendered.set(element.dataset.anchorKey!, element);
-    const kept = steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key), snapshot.around);
+    const kept =
+      steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key), snapshot.around) ??
+      nearestListedAbove(snapshot, indexOf);
     if (!kept) return;
     const element = rendered.get(kept.key);
     const top = element

@@ -50,13 +50,14 @@ function contentHeight(): number {
   const body = scroller?.querySelector("tbody");
   if (body) return HEAD + [...body.children].reduce((sum, row) => sum + height(row), 0) + below();
   const grid = scroller?.querySelector<HTMLElement>(".grid.gap-3");
-  return grid ? SORT_BAR + gridHeight(grid) : 0;
+  return grid ? SORT_BAR + gridHeight(grid) + below() : 0;
 }
-// Below the table: the next page's sentinel (32 px) and any space held.
+// Below the table or grid: the next page's sentinel (32 px) and any space
+// held.
 function below(): number {
-  const table = scroller?.querySelector("table");
+  const list = scroller?.querySelector("table") ?? scroller?.querySelector(".grid.gap-3");
   let sum = 0;
-  for (let e = table?.nextElementSibling; e; e = e.nextElementSibling)
+  for (let e = list?.nextElementSibling; e; e = e.nextElementSibling)
     sum += (e as HTMLElement).style.height ? parseFloat((e as HTMLElement).style.height) : 32;
   return sum;
 }
@@ -292,6 +293,21 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     expect(contentHeight()).toBe(HEAD + 1003 * ROW);
   });
 
+  it("keeps the view at the end when a refresh leaves every entry in view for the next page", async () => {
+    const files = range(0, 1000);
+    const { rerender } = render(<Harness files={files} />);
+    await scrollTo(contentHeight() - VIEW);
+    const under = entryAt(200)!;
+    const top = topOf(under);
+    // 30 added above the view; the refreshed pages hold 1,000 entries, so
+    // the last 30 (all those in view) are on the next page.
+    rerender(<Harness files={[...range(-30, 0), ...files.slice(0, 970)]} hasNextPage />);
+    // The next page arrives: the entries are back where they were.
+    rerender(<Harness files={[...range(-30, 0), ...files]} />);
+    expect(topOf(under)).toBe(top);
+    expect(entryAt(200)).toBe(under);
+  });
+
   it("does not move the view for an entry renamed out of it, nor at the top of the list", async () => {
     const files = range(0, 1000);
     const { rerender } = render(<Harness files={files} />);
@@ -453,6 +469,17 @@ describe("windowed Drive grid", { timeout: 30_000 }, () => {
     expect(document.querySelector('[data-anchor-key="f504"]')).toBe(card);
     expect(document.activeElement).toBe(card);
     rerender(<Harness view="grid" files={files.slice(10)} />);
+
+    // At the end: 30 added above and the refreshed pages leave every card
+    // in view for the next page; when it arrives they are where they were.
+    await scrollTo(contentHeight() - VIEW);
+    const end = entryAt(200)!;
+    const endTop = topOf(end);
+    const rest = files.slice(10);
+    rerender(<Harness view="grid" files={[...range(-30, 0), ...rest.slice(0, rest.length - 30)]} hasNextPage />);
+    rerender(<Harness view="grid" files={[...range(-30, 0), ...rest]} />);
+    expect(topOf(end)).toBe(endTop);
+    rerender(<Harness view="grid" files={rest} />);
 
     // At the end, where the scroll position is clamped.
     await scrollTo(contentHeight() - VIEW);

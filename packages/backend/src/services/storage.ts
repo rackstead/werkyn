@@ -45,6 +45,8 @@ export interface StorageProvider {
     options?: { maxSize?: number },
   ): Promise<{ storagePath: string; size: number }>;
   read(storagePath: string): Promise<Buffer>;
+  /** The blob's absolute path on the local filesystem (for a decoder process to read). */
+  localPath(storagePath: string): string;
   /** `range` selects bytes `start` to `end` inclusive, as in `fs.createReadStream`. */
   readStream(storagePath: string, range?: ByteRange): fss.ReadStream;
   /** Opens the blob first; a missing blob rejects with MissingBlobError. */
@@ -186,6 +188,10 @@ export class LocalStorageProvider implements StorageProvider {
   async read(storagePath: string): Promise<Buffer> {
     const fullPath = this.safePath(storagePath);
     return fs.readFile(fullPath);
+  }
+
+  localPath(storagePath: string): string {
+    return this.safePath(storagePath);
   }
 
   readStream(storagePath: string, range?: ByteRange): fss.ReadStream {

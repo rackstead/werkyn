@@ -1,23 +1,33 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import test from "node:test";
+import test, { after } from "node:test";
 import sharp from "sharp";
 import {
+  CrashBackoff,
+  THUMBNAIL_HEAD_BYTES,
   THUMBNAIL_LIMITS,
   TransformAdmission,
-  checkAvif,
-  bufferSource,
   createThumbnail,
   defaultAdmissionLimits,
+  thumbnailAdmission,
+  thumbnailOutcomes,
+  thumbnailWorkers,
+} from "../src/modules/files/thumbnails.ts";
+import {
+  checkAvif,
   estimateDecodeBytes,
+  jpegMarkers,
   jpegScanCount,
   pngMetadata,
-  thumbnailAdmission,
   thumbnailFormat,
-  thumbnailOutcomes,
   webpFeatures,
-} from "../src/modules/files/thumbnails.ts";
+} from "../src/modules/files/thumbnail-checks.ts";
+// Configures sharp in this process as each decoder worker configures it.
+import "../src/modules/files/thumbnail-decode.ts";
 import {
   animatedWebp,
   avif100Megapixels,
@@ -48,7 +58,8 @@ import {
   svg,
   tiff,
 } from "./fixtures/thumbnail-inputs.mjs";
-import { makePdf, png as smallPng } from "./fixtures/passive-media.mjs";
+import { makePdf, png as smallPng, webp as smallWebp } from "./fixtures/passive-media.mjs";
+import { ThumbnailWorkerPool } from "../src/modules/files/thumbnail-workers.ts";
 
 const solid = (width, height, background = "#3366cc", channels = 3) =>
   sharp({ create: { width, height, channels, background } });
@@ -65,7 +76,32 @@ async function outcomes(run) {
   return { result, delta };
 }
 
-const thumbnailOf = (bytes, options) => createThumbnail(bufferSource(bytes), options);
+// Decodes run in worker processes, which read the stored file by path.
+const scratch = mkdtempSync(path.join(os.tmpdir(), "werkyn-thumbnail-admission-"));
+let files = 0;
+after(async () => {
+  await thumbnailWorkers.close();
+  rmSync(scratch, { recursive: true, force: true });
+});
+
+/** A stored file holding `bytes`, as files.service.ts hands it to createThumbnail. */
+function storedSource(bytes) {
+  const file = path.join(scratch, `${++files}.bin`);
+  writeFileSync(file, bytes);
+  return { size: bytes.length, head: async () => bytes.subarray(0, THUMBNAIL_HEAD_BYTES), path: file };
+}
+
+const thumbnailOf = (bytes, options) => createThumbnail(storedSource(bytes), options);
+
+/**
+ * How far a worker got with `bytes`: only "header" and "transform" run
+ * native code; the stages before are the JavaScript checks.
+ */
+async function stageOf(bytes) {
+  const result = await thumbnailWorkers.run(storedSource(bytes).path);
+  return result.details.stage;
+}
+const NATIVE_STAGES = new Set(["header", "transform"]);
 
 test("only fixed allowlisted raster signatures choose a decoder", async () => {
   const allowed = [
@@ -213,8 +249,9 @@ test("decoder memory is estimated from the header and bounded per transform", ()
   assert.ok(estimateDecodeBytes(meta("webp", 16383, 16383)) > budget, "lossy WebP at 2 B/px");
   assert.ok(estimateDecodeBytes(meta("webp", 8000, 8000), { webpFullCanvas: true }) <= budget);
   assert.ok(estimateDecodeBytes(meta("webp", 8700, 8700), { webpFullCanvas: true }) > budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 5675, 5675), { webpFullCanvas: true, webpAnimated: true }) <= budget);
-  assert.ok(estimateDecodeBytes(meta("webp", 5700, 5700), { webpFullCanvas: true, webpAnimated: true }) > budget);
+  // Animations: 24 B/px of canvas, so at most 4096 x 4096.
+  assert.ok(estimateDecodeBytes(meta("webp", 4096, 4096), { webpFullCanvas: true, webpAnimated: true }) <= budget);
+  assert.ok(estimateDecodeBytes(meta("webp", 4097, 4096), { webpFullCanvas: true, webpAnimated: true }) > budget);
   assert.ok(estimateDecodeBytes(meta("webp", 1, 1), { codedPixels: 16383 * 16383, webpFullCanvas: true, webpAnimated: true }) > budget);
   for (const m of [meta("svg", 1, 1), meta("tiff", 1, 1), meta("png", 0, 1), meta("png", 1, 1, { depth: "double" }), {}]) {
     assert.equal(estimateDecodeBytes(m), Infinity, JSON.stringify(m));
@@ -287,7 +324,7 @@ test("CMYK and 16-bit inputs make ordinary 8-bit sRGB thumbnails", async () => {
   }
 });
 
-test("AVIF is charged for its coded size; crops cannot hide it and grids and overlays are refused", async (t) => {
+test("AVIF is charged for its coded size; crops cannot hide it and grids and overlays are refused", async () => {
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   // The rebuilt files are valid: libheif reports the crop, grid or overlay output size.
   for (const layout of ["plain", "clap", "grid", "overlay"]) {
@@ -295,29 +332,23 @@ test("AVIF is charged for its coded size; crops cannot hide it and grids and ove
     const meta = await sharp(bytes).metadata();
     assert.deepEqual([meta.width, meta.height], layout === "plain" ? [64, 32] : [16, 8], layout);
     assert.deepEqual(checkAvif(bytes), layout === "grid" ? { refused: "grid item" }
-      : layout === "overlay" ? { refused: "iovl item" } : { codedPixels: 64 * 32, iccBytes: 0 }, layout);
+      : layout === "overlay" ? { refused: "iovl item" } : { codedPixels: 64 * 32, iccBytes: 0, metadataBytes: 0 }, layout);
   }
   for (const layout of ["plain", "clap"]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(restructuredAvif(small, layout, 16, 8)))).delta, { created: 1 }, layout);
   }
   assert.ok("refused" in checkAvif(Buffer.concat([isoHeader("avif"), Buffer.from("not a meta box")])));
 
-  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
-  let nativeCalls = 0;
-  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
-  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
-  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
   // The 2 KiB 10000 x 10000 AVIF reports 64 x 64 when cropped, gridded or
   // overlaid; main and the first version of this change decoded each with
   // about 1.7 GiB.
-  for (const [layout, expected, native] of [["clap", "over-budget", 1], ["grid", "unsupported", 0], ["overlay", "unsupported", 0]]) {
+  for (const [layout, expected, stage] of [["clap", "over-budget", "header"], ["grid", "unsupported", "container"], ["overlay", "unsupported", "container"]]) {
     const bytes = restructuredAvif(avif100Megapixels, layout, 64, 64);
-    nativeCalls = 0;
     const rss = process.memoryUsage().rss, started = performance.now();
     const { result, delta } = await outcomes(() => thumbnailOf(bytes));
     assert.equal(result, null, layout);
     assert.deepEqual(delta, { [expected]: 1 }, layout);
-    assert.equal(nativeCalls, native, `${layout}: only the header read for clap, nothing for derived items`);
+    assert.equal(await stageOf(bytes), stage, `${layout}: only the header read for clap, nothing native for derived items`);
     assert.ok(performance.now() - started < 1000, layout);
     assert.ok(process.memoryUsage().rss - rss < 64 * MiB, layout);
   }
@@ -333,7 +364,7 @@ test("AVIF is charged for its coded size; crops cannot hide it and grids and ove
   assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
 });
 
-test("AVIF outside the one simple shape gets no thumbnail, whatever libheif would decode", async (t) => {
+test("AVIF outside the one simple shape gets no thumbnail, whatever libheif would decode", async () => {
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   const cases = avifStructureCases(avif100Megapixels, small);
   // libheif decodes the last of two meta boxes, and an alpha plane without
@@ -341,11 +372,6 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
   for (const name of ["twoMetaSmallFirst", "alphaWithoutIspe"]) {
     assert.deepEqual(await sharp(cases[name]).metadata().then((m) => [m.width, m.height]), [64, 32], name);
   }
-  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
-  let nativeCalls = 0;
-  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
-  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
-  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
   for (const [name, refused] of [
     ["twoMetaSmallFirst", "more than one meta box"],
     ["twoMetaBigFirst", "more than one meta box"],
@@ -358,16 +384,15 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
     ["extraImage", "av01 item 2 is not the primary's alpha"],
   ]) {
     assert.deepEqual(checkAvif(cases[name]), { refused }, name);
-    nativeCalls = 0;
     const rss = process.memoryUsage().rss;
     assert.deepEqual((await outcomes(() => thumbnailOf(cases[name]))).delta, { unsupported: 1 }, name);
-    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
+    assert.equal(await stageOf(cases[name]), "container", `${name} reaches no native call`);
     assert.ok(process.memoryUsage().rss - rss < 64 * MiB, name);
   }
   // An alpha ispe that understates the coded size passes the shape check;
   // libheif then refuses it before decoding, as it does for the primary.
   const rss = process.memoryUsage().rss, started = performance.now();
-  assert.deepEqual(checkAvif(cases.alphaIspeUnderstated), { codedPixels: 64 * 32, iccBytes: 0 });
+  assert.deepEqual(checkAvif(cases.alphaIspeUnderstated), { codedPixels: 64 * 32, iccBytes: 0, metadataBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(cases.alphaIspeUnderstated))).delta, { failed: 1 });
   assert.ok(performance.now() - started < 1000);
   assert.ok(process.memoryUsage().rss - rss < 64 * MiB);
@@ -376,12 +401,12 @@ test("AVIF outside the one simple shape gets no thumbnail, whatever libheif woul
   assert.deepEqual((await outcomes(() => thumbnailOf(cases.croppedBig))).delta, { "over-budget": 1 });
   for (const [name, options] of [["8-bit", {}], ["10-bit", { bitdepth: 10 }]]) {
     const rgba = await solid(64, 32, { r: 10, g: 20, b: 30, alpha: 0.5 }, 4).avif({ effort: 0, ...options }).toBuffer();
-    assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32, iccBytes: 0 }, name);
+    assert.deepEqual(checkAvif(rgba), { codedPixels: 64 * 32, iccBytes: 0, metadataBytes: 0 }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(rgba))).delta, { created: 1 }, name);
   }
 });
 
-test("AVIF item locations may not repeat, overlap or leave mdat or idat, and metadata items stay small", async (t) => {
+test("AVIF item locations may not repeat, overlap or leave mdat or idat, and metadata items stay small", async () => {
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   const exif = Buffer.concat([Buffer.from([0, 0, 0, 6]), Buffer.from("Exif\0\0MM\0*\0\0\0\x08\0\0", "latin1")]);
   const xmp = Buffer.from('<x:xmpmeta xmlns:x="adobe:ns:meta/"/>');
@@ -393,25 +418,21 @@ test("AVIF item locations may not repeat, overlap or leave mdat or idat, and met
   };
   // What encoders write: one extent per item in mdat or idat, any iloc
   // version and offset width, a few consecutive extents, small Exif/XMP.
-  for (const [name, options] of [
-    ["mdat", {}],
-    ["idat", { method: 1 }],
-    ["iloc version 0", { ilocVersion: 0 }],
-    ["iloc version 2", { ilocVersion: 2 }],
-    ["4-byte base offset", { baseOffsetSize: 4 }],
-    ["four consecutive extents", { primary: quarters }],
-    ["Exif", { extra: exifItem((L) => [[L.extra, L.extraLength]]) }],
-    ["XMP", { extra: xmpItem((L) => [[L.extra, L.extraLength]]) }],
+  // The largest Exif and XMP items are charged as metadata.
+  for (const [name, options, metadataBytes] of [
+    ["mdat", {}, 0],
+    ["idat", { method: 1 }, 0],
+    ["iloc version 0", { ilocVersion: 0 }, 0],
+    ["iloc version 2", { ilocVersion: 2 }, 0],
+    ["4-byte base offset", { baseOffsetSize: 4 }, 0],
+    ["four consecutive extents", { primary: quarters }, 0],
+    ["Exif", { extra: exifItem((L) => [[L.extra, L.extraLength]]) }, exif.length],
+    ["XMP", { extra: xmpItem((L) => [[L.extra, L.extraLength]]) }, xmp.length],
   ]) {
     const bytes = locatedAvif(small, options);
-    assert.deepEqual(checkAvif(bytes), { codedPixels: 64 * 32, iccBytes: 0 }, name);
+    assert.deepEqual(checkAvif(bytes), { codedPixels: 64 * 32, iccBytes: 0, metadataBytes }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
   }
-  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
-  let nativeCalls = 0;
-  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
-  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
-  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
   // libheif concatenates an item's extents and libvips copies Exif and XMP
   // while reading the header: at 32 MiB, 31 copies of the file in the
   // primary, or 15 in an Exif or XMP item, OOM-killed a 1 GiB container.
@@ -432,9 +453,8 @@ test("AVIF item locations may not repeat, overlap or leave mdat or idat, and met
   ]) {
     const bytes = locatedAvif(small, options);
     assert.deepEqual(checkAvif(bytes), { refused }, name);
-    nativeCalls = 0;
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { unsupported: 1 }, name);
-    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
+    assert.equal(await stageOf(bytes), "container", `${name} reaches no native call`);
   }
 });
 
@@ -451,7 +471,7 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   }
   const canvas = await largeCanvasWebp(16383, 16383);
   assert.ok(canvas.length < 200);
-  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, animated: true, canvasPixels: 16383 * 16383, iccBytes: 0 });
+  assert.deepEqual(webpFeatures(canvas), { fullCanvas: true, animated: true, canvasPixels: 16383 * 16383, iccBytes: 0, metadataBytes: 0 });
   const lossy = cases[0][1];
   assert.equal(webpFeatures(lossy.subarray(0, lossy.length - 10)), null, "chunks overrunning the file");
   // A 144-byte animation onto a 16383 x 16383 canvas needed about 1.1 GiB.
@@ -464,12 +484,27 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   trailing.write("JUNK", 0, "latin1");
   trailing.writeUInt32LE(0x7fffffff, 4);
   const withTrailing = Buffer.concat([lossy, trailing]);
-  assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 0, iccBytes: 0 });
+  assert.deepEqual(webpFeatures(withTrailing), { fullCanvas: false, animated: false, canvasPixels: 64 * 32, iccBytes: 0, metadataBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(withTrailing))).delta, { created: 1 });
-  // Animations are charged 12.5 B/px of canvas: frames with alpha are
-  // decoded and blended at full size (8.4-10.2 B/px measured).
+  // A still image's own size is read from its VP8 or VP8L header, so a
+  // WebP over the budget is refused before libvips reads the header (which
+  // already allocates the whole image: 1 GiB for 16383 x 16383).
+  const lossless = cases[1][1];
+  const bigLossless = Buffer.from(lossless);
+  bigLossless.writeUInt32LE((bigLossless.readUInt32LE(21) & ~0x0fffffff) | 0x3fff | (0x3fff << 14), 21);
+  const bigLossy = Buffer.from(lossy);
+  bigLossy.writeUInt16LE(16383, 26);
+  bigLossy.writeUInt16LE(16383, 28);
+  for (const [name, bytes, fullCanvas] of [["lossless", bigLossless, true], ["lossy", bigLossy, false]]) {
+    assert.deepEqual(webpFeatures(bytes), { fullCanvas, animated: false, canvasPixels: 16384 * 16384 - (fullCanvas ? 0 : 2 * 16384 - 1), iccBytes: 0, metadataBytes: 0 }, name);
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { "over-budget": 1 }, name);
+    assert.equal(await stageOf(bytes), "container", `${name}: refused before the header read`);
+  }
+  // Animations are charged 24 B/px of canvas: frames with alpha are
+  // decoded and blended at full size, in buffers of about 19.5 B/px that
+  // the worker's data limit counts whether or not they are touched.
   const alphaAnimation = await alphaAnimationWebp(256, 128);
-  assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128, iccBytes: 0 });
+  assert.deepEqual(webpFeatures(alphaAnimation), { fullCanvas: true, animated: true, canvasPixels: 256 * 128, iccBytes: 0, metadataBytes: 0 });
   assert.deepEqual((await outcomes(() => thumbnailOf(alphaAnimation))).delta, { created: 1 });
   const overCanvas = await largeCanvasWebp(5700, 5700), underCanvas = await largeCanvasWebp(4000, 4000);
   assert.deepEqual((await outcomes(() => thumbnailOf(overCanvas))).delta, { "over-budget": 1 });
@@ -482,13 +517,8 @@ test("WebP is charged for a full canvas when lossless, with alpha or animated", 
   assert.deepEqual(await sharp(result).metadata().then((m) => [m.width, m.height]), [400, 200]);
 });
 
-test("PNG compressed and text metadata is bounded before any native call", async (t) => {
+test("PNG compressed and text metadata is bounded before any native call", async () => {
   const icc = (await sharp(await solid(8, 8).withIccProfile("p3").png().toBuffer()).metadata()).icc;
-  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
-  let nativeCalls = 0;
-  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
-  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
-  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
   // libpng inflates these while libvips reads the header, up to 50 MB per
   // chunk: a 477 KB file of ten 49 MB zTXt chunks needed 2.3 GiB.
   const big = zTxtChunk("Comment", { size: 49_000_000 });
@@ -508,24 +538,22 @@ test("PNG compressed and text metadata is bounded before any native call", async
   ]) {
     assert.ok(bytes.length < 5 * MiB, name);
     assert.deepEqual(pngMetadata(bytes), { refused }, name);
-    nativeCalls = 0;
     const rss = process.memoryUsage().rss, started = performance.now();
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { unsupported: 1 }, name);
-    assert.equal(nativeCalls, 0, `${name} reaches no native call`);
+    assert.equal(await stageOf(bytes), "container", `${name} reaches no native call`);
     assert.ok(performance.now() - started < 1000, name);
     assert.ok(process.memoryUsage().rss - rss < 64 * MiB, name);
   }
-  sharp.prototype.metadata = header;
-  sharp.prototype.toBuffer = render;
   // Ordinary metadata, and up to the limit in total, keeps the thumbnail.
-  for (const [name, bytes, iccBytes] of [
+  // Text and eXIf, inflated where compressed, are charged as metadata.
+  for (const [name, bytes, iccBytes, metadataBytes] of [
     ["iCCP, tEXt, zTXt and compressed XMP", pngWithChunks([iccpChunk(icc), pngChunk("tEXt", Buffer.from("Title\0hello")),
-      zTxtChunk("Comment", { size: 2000 }), compressedITxtChunk("XML:com.adobe.xmp", 3000)]), icc.length],
-    ["two 1.9 MB zTXt chunks", pngWithChunks(["a", "b"].map((k) => zTxtChunk(k, { size: 1_900_000 }))), 0],
-    ["64 compressed chunks", pngWithChunks(Array(64).fill(zTxtChunk("a", { size: 100 }))), 0],
-    ["sharp PNG with a P3 profile", await solid(640, 320).withIccProfile("p3").png().toBuffer(), icc.length],
+      zTxtChunk("Comment", { size: 2000 }), compressedITxtChunk("XML:com.adobe.xmp", 3000)]), icc.length, 11 + 2000 + 3000],
+    ["two 1.9 MB zTXt chunks", pngWithChunks(["a", "b"].map((k) => zTxtChunk(k, { size: 1_900_000 }))), 0, 3_800_000],
+    ["64 compressed chunks", pngWithChunks(Array(64).fill(zTxtChunk("a", { size: 100 }))), 0, 6400],
+    ["sharp PNG with a P3 profile", await solid(640, 320).withIccProfile("p3").png().toBuffer(), icc.length, 0],
   ]) {
-    assert.deepEqual(pngMetadata(bytes), { iccBytes }, name);
+    assert.deepEqual(pngMetadata(bytes), { iccBytes, metadataBytes }, name);
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
   }
 });
@@ -556,6 +584,79 @@ test("embedded ICC profiles over 4 MiB are refused in every format, and smaller 
     ["AVIF with a P3 profile", await solid(640, 320).withIccProfile("p3").avif({ effort: 0 }).toBuffer()],
   ]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { created: 1 }, name);
+  }
+});
+
+/** A JPEG marker segment. */
+const segment = (marker, payload) => {
+  const head = Buffer.from([0xff, marker, 0, 0]);
+  head.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([head, payload]);
+};
+/** `jpeg` with `segments` after SOI. */
+const jpegWithSegments = (jpeg, segments) => Buffer.concat([jpeg.subarray(0, 2), ...segments, jpeg.subarray(2)]);
+/** `webp` (a RIFF/WEBP file) with one more chunk at the end. */
+function webpWithChunk(webp, type, data) {
+  const head = Buffer.alloc(8);
+  head.write(type, 0, "latin1");
+  head.writeUInt32LE(data.length, 4);
+  const out = Buffer.concat([webp, head, data, Buffer.alloc(data.length & 1)]);
+  out.writeUInt32LE(out.length - 8, 4);
+  return out;
+}
+
+test("metadata libvips keeps while reading the header is charged, and an ICC tag without its NUL is a profile", async () => {
+  const jpeg = await solid(64, 32).jpeg().toBuffer();
+  const kept = [
+    segment(0xe1, Buffer.concat([Buffer.from("Exif\0\0"), Buffer.alloc(1000)])),
+    segment(0xe1, Buffer.concat([Buffer.from("http://ns.adobe.com/xap/1.0/\0"), Buffer.alloc(2000, 0x20)])),
+    segment(0xe2, Buffer.concat([Buffer.from("MPF\0"), Buffer.alloc(300)])),
+    segment(0xed, Buffer.concat([Buffer.from("Photoshop 3.0\0"), Buffer.alloc(400)])),
+  ];
+  // libjpeg does not keep COM, APP0 or APP14 for libvips (measured: no memory).
+  const ignored = [segment(0xfe, Buffer.alloc(5000)), segment(0xe0, Buffer.from("JFXX\0")), segment(0xe5, Buffer.alloc(100))];
+  const keptBytes = kept.reduce((sum, seg) => sum + seg.length - 4, 0);
+  assert.deepEqual(jpegMarkers(jpegWithSegments(jpeg, [...kept, ...ignored]), 100), { scans: 1, iccBytes: 0, metadataBytes: keptBytes });
+
+  // Bytes of memory per byte of metadata, by format (measured 2.3, 5.2,
+  // 9 and 10 at most, on glibc and musl), plus 9 per ICC byte.
+  const meta = (format) => ({ format, width: 64, height: 32, channels: 3, depth: "uchar" });
+  for (const [format, perByte] of [["jpeg", 3], ["webp", 6], ["png", 10], ["heif", 12], ["gif", 0]]) {
+    assert.equal(estimateDecodeBytes(meta(format), { metadataBytes: 1000 }) - estimateDecodeBytes(meta(format)), perByte * 1000, format);
+  }
+
+  // libvips takes any APP2 starting "ICC_PROFILE" as the profile, with or
+  // without the NUL that ends the tag; so does the check.
+  const icc = (await sharp(await solid(8, 8).withIccProfile("p3").png().toBuffer()).metadata()).icc;
+  const withoutNul = (profile) => {
+    const bytes = jpegWithIcc(jpeg, profile);
+    for (let at = bytes.indexOf("ICC_PROFILE\0"); at !== -1; at = bytes.indexOf("ICC_PROFILE\0", at + 1)) bytes[at + 11] = 0x20;
+    return bytes;
+  };
+  const small = withoutNul(paddedIcc(icc, 100_000));
+  assert.equal((await sharp(small).metadata()).icc.length, 100_000, "libvips reads the profile");
+  assert.deepEqual(jpegMarkers(small, 100), { scans: 1, iccBytes: 100_000, metadataBytes: 0 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(small))).delta, { created: 1 });
+  const big = withoutNul(paddedIcc(icc, 6_551_900)); // the review's 100 segments
+  assert.equal(jpegMarkers(big, 100).iccBytes, 6_551_900);
+  assert.deepEqual((await outcomes(() => thumbnailOf(big))).delta, { "over-budget": 1 });
+
+  // Near the budget, metadata tips an image over it: a 7000 x 7000
+  // progressive 4:4:4 JPEG is estimated at 350.5 MiB, and 12 MiB of APP13
+  // adds 36 MiB.
+  const progressive = await solid(7000, 7000).jpeg({ progressive: true, chromaSubsampling: "4:4:4" }).toBuffer();
+  const app13 = Array.from({ length: 192 }, () => segment(0xed, Buffer.concat([Buffer.from("Photoshop 3.0\0"), Buffer.alloc(65_519)])));
+  assert.deepEqual((await outcomes(() => thumbnailOf(progressive))).delta, { created: 1 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(jpegWithSegments(progressive, app13)))).delta, { "over-budget": 1 });
+  // A 3900 x 3900 animated WebP canvas is estimated at 348.1 MiB; 8 MiB of
+  // XMP adds 48 MiB, and 8 MiB of EXIF as much.
+  const canvas = await largeCanvasWebp(3900, 3900);
+  assert.deepEqual((await outcomes(() => thumbnailOf(canvas))).delta, { created: 1 });
+  for (const type of ["XMP ", "EXIF"]) {
+    const bytes = webpWithChunk(canvas, type, Buffer.alloc(8 * MiB, 0x20));
+    assert.equal(webpFeatures(bytes).metadataBytes, 8 * MiB, type);
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { "over-budget": 1 }, type);
+    assert.equal(await stageOf(bytes), "container", `${type}: refused before the header read`);
   }
 });
 
@@ -613,6 +714,22 @@ test("container checks stop after a bounded amount of work on crafted files", as
   const stuffed = Buffer.alloc(size);
   Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]).copy(stuffed);
   for (let at = 6; at + 2 <= size; at += 2) stuffed[at] = 0xff;
+  // The allowance is measured on this machine, so a slow runner gets a
+  // proportionally larger one: five times a reference loop of 2^20 short
+  // searches (the most escapes a JPEG walk reads), and at least 50 ms. On
+  // the test host the reference takes 8 ms and the slowest bounded walk
+  // 20 ms; before the bound, the WebP walk took 208 ms, about 25 references.
+  // The loop runs once untimed so the timed runs measure compiled code, not
+  // warm-up; the fastest of three is the reference.
+  const reference = () => { for (let i = 0, at = 6; i < 1 << 20; i++) at = stuffed.indexOf(0xff, at) + 2; };
+  reference();
+  let pass = Infinity;
+  for (let run = 0; run < 3; run++) {
+    const started = performance.now();
+    reference();
+    pass = Math.min(pass, performance.now() - started);
+  }
+  const allowance = Math.max(50, 5 * pass);
   for (const [name, check, refused] of [
     ["avif boxes", () => checkAvif(avif).refused, "unreadable structure"],
     ["webp chunks", () => webpFeatures(webp), null],
@@ -621,7 +738,8 @@ test("container checks stop after a bounded amount of work on crafted files", as
   ]) {
     const started = performance.now();
     assert.equal(check(), refused, name);
-    assert.ok(performance.now() - started < 50, `${name} took ${performance.now() - started} ms`);
+    const took = performance.now() - started;
+    assert.ok(took < allowance, `${name} took ${took} ms, allowed ${allowance} ms (${pass} ms per pass)`);
   }
   // 680 Exif items in the last of 2,000 mdat boxes stay within the entry
   // limit; locating their extents is a binary search, not a scan of every
@@ -629,27 +747,36 @@ test("container checks stop after a bounded amount of work on crafted files", as
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   const manyItems = manyItemAvif(small, 680, 2000);
   const started = performance.now();
-  assert.deepEqual(checkAvif(manyItems), { codedPixels: 64 * 32, iccBytes: 0 });
+  const checked = checkAvif(manyItems);
+  assert.deepEqual([checked.codedPixels, checked.iccBytes], [64 * 32, 0]);
   assert.ok(performance.now() - started < 20, `many items took ${performance.now() - started} ms`);
   for (const [name, bytes, outcome] of [["avif", avif, "unsupported"], ["webp", webp, "unsupported"], ["jpeg", segments, "unsupported"]]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { [outcome]: 1 }, name);
   }
 });
 
-test("content outside the allowlisted signatures never takes a turn", async (t) => {
+/** Workers whose decodes wait until `finish()`, then return a thumbnail. */
+function heldWorkers() {
+  const held = { started: 0, finish: null };
+  held.run = () => new Promise((resolve) => {
+    held.started++;
+    held.finish = () => resolve({ ok: true, thumbnail: smallWebp, details: {} });
+  });
+  return held;
+}
+
+test("content outside the allowlisted signatures never takes a turn", async () => {
   const junk = [svg(), await tiff(8, 8), makePdf(), Buffer.alloc(0), Buffer.from("text")];
   const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
-  const render = sharp.prototype.toBuffer;
-  let finish;
-  sharp.prototype.toBuffer = function () { return new Promise((resolve) => { finish = () => resolve(smallPng); }); };
-  t.after(() => { sharp.prototype.toBuffer = render; });
-  const held = thumbnailOf(smallPng, { admission });
-  while (admission.usage.active === 0 || !finish) await new Promise((resolve) => setImmediate(resolve));
+  const workers = heldWorkers();
+  const held = thumbnailOf(smallPng, { admission, workers });
+  while (admission.usage.active === 0 || !workers.finish) await new Promise((resolve) => setImmediate(resolve));
   for (const bytes of junk) {
-    assert.deepEqual((await outcomes(() => thumbnailOf(bytes, { admission }))).delta, { unsupported: 1 });
+    assert.deepEqual((await outcomes(() => thumbnailOf(bytes, { admission, workers }))).delta, { unsupported: 1 });
   }
-  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, { admission }))).delta, { busy: 1 });
-  finish();
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, { admission, workers }))).delta, { busy: 1 });
+  assert.equal(workers.started, 1, "only the PNG reached a worker");
+  workers.finish();
   assert.ok(await held);
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
 });
@@ -683,50 +810,146 @@ test("default admission is sized from the CPU count", () => {
     assert.deepEqual(defaultAdmissionLimits(cpus), { maxActive: active, maxQueued: 8, queueTimeoutMs: 5000 });
   }
   assert.deepEqual(thumbnailAdmission.limits, defaultAdmissionLimits());
+  // One worker per turn, each with the data limit.
+  assert.equal(thumbnailWorkers.options.size, thumbnailAdmission.limits.maxActive);
+  assert.equal(thumbnailWorkers.options.dataLimitBytes, THUMBNAIL_LIMITS.workerDataBytes);
+  // As configured in each worker by thumbnail-decode.ts.
   assert.equal(sharp.concurrency(), 1, "one libvips thread per transform");
   assert.equal(sharp.cache().items.max, 0, "no libvips operation cache");
 });
 
-test("a transform the upload stops waiting for keeps its turn until libvips settles", async (t) => {
+test("at the deadline the worker is killed, and the turn returns once it has exited", async (t) => {
   const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
-  const render = sharp.prototype.toBuffer;
-  let finish;
-  sharp.prototype.toBuffer = function () {
-    return new Promise((resolve) => { finish = () => resolve(smallPng); });
-  };
-  t.after(() => { sharp.prototype.toBuffer = render; });
+  const workers = new ThumbnailWorkerPool({ size: 1, dataLimitBytes: THUMBNAIL_LIMITS.workerDataBytes });
+  t.after(() => workers.close());
+  assert.ok(await thumbnailOf(smallPng, { admission, workers }), "the worker is up");
+  const pid = workers.stats.workers[0].pid;
+  // Within the budget and the scan limit, but about 0.5 s of decoding.
+  const slow = manyScanJpeg(7000, 7000, 11, 2);
   const started = performance.now();
-  const { result, delta } = await outcomes(() => thumbnailOf(smallPng, { admission, deadlineMs: 50 }));
+  const { result, delta } = await outcomes(() => thumbnailOf(slow, { admission, workers, deadlineMs: 50 }));
   assert.equal(result, null);
   assert.deepEqual(delta, { "timed-out": 1 });
   assert.ok(performance.now() - started < 1000);
+  // Killed, not left decoding: the turn is held only until it has exited.
   assert.deepEqual(admission.usage, { active: 1, queued: 0 });
-  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, { admission }))).delta, { busy: 1 });
-  finish();
-  await new Promise((resolve) => setImmediate(resolve));
+  while (admission.usage.active) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(performance.now() - started < 1000, "the turn returned without waiting for the decode");
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "the worker is gone and reaped");
+  assert.equal(workers.stats.timedOut, 1);
+  // A new worker serves the next upload.
+  assert.ok(await thumbnailOf(smallPng, { admission, workers }));
+  assert.notEqual(workers.stats.workers[0].pid, pid);
+  assert.equal(workers.stats.workers[0].failures, 0, "a timeout is not a worker failure");
+});
+
+test("a workspace whose uploads end decoder workers waits, and no other workspace does", async () => {
+  const backoff = new CrashBackoff(1000, 4000, 2);
+  assert.equal(backoff.remaining("a", 0), 0);
+  backoff.crashed("a", 0);
+  assert.equal(backoff.remaining("a", 0), 1000);
+  backoff.crashed("a", 0);
+  backoff.crashed("a", 0);
+  assert.equal(backoff.remaining("a", 0), 4000, "doubling up to the maximum");
+  assert.equal(backoff.remaining("b", 0), 0);
+  backoff.succeeded("a");
+  assert.equal(backoff.remaining("a", 0), 0, "a thumbnail clears it");
+  backoff.crashed("a", 0); backoff.crashed("b", 0); backoff.crashed("c", 0);
+  assert.equal(backoff.remaining("a", 0), 0, "the longest-unseen workspace is forgotten first");
+  assert.ok(backoff.remaining("c", 0) > 0);
+
+  // Through createThumbnail, with workers whose every decode crashes.
+  const crashBackoff = new CrashBackoff(200, 1000);
+  const admission = new TransformAdmission({ maxActive: 2, maxQueued: 2, queueTimeoutMs: 100 });
+  let runs = 0, crash = true;
+  const workers = {
+    run: async () => {
+      runs++;
+      return crash
+        ? { ok: false, outcome: "crashed", details: { signal: "SIGABRT", reason: "worker killed by SIGABRT" } }
+        : { ok: true, thumbnail: smallWebp, details: {} };
+    },
+  };
+  const options = (workspaceId) => ({ workspaceId, admission, workers, crashBackoff });
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { crashed: 1 });
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { busy: 1 }, "held back");
+  assert.equal(runs, 1, "no worker was asked");
+  crash = false;
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("b")))).delta, { created: 1 }, "another workspace is not");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.deepEqual((await outcomes(() => thumbnailOf(smallPng, options("a")))).delta, { created: 1 });
+  assert.equal(crashBackoff.remaining("a"), 0);
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
 });
 
-test("a stalled source read times out, keeps its turn, and a late read starts no decode", async (t) => {
-  const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
-  const header = sharp.prototype.metadata, render = sharp.prototype.toBuffer;
-  let nativeCalls = 0;
-  sharp.prototype.metadata = function (...args) { nativeCalls++; return header.apply(this, args); };
-  sharp.prototype.toBuffer = function (...args) { nativeCalls++; return render.apply(this, args); };
-  t.after(() => { sharp.prototype.metadata = header; sharp.prototype.toBuffer = render; });
-  let finishRead;
-  const stalled = new Promise((resolve) => { finishRead = () => resolve(smallPng); });
-  const started = performance.now();
-  const source = { size: smallPng.length, head: async () => smallPng, read: () => stalled };
-  const { result, delta } = await outcomes(() => createThumbnail(source, { admission, deadlineMs: 50 }));
-  assert.equal(result, null);
-  assert.deepEqual(delta, { "timed-out": 1 });
-  assert.ok(performance.now() - started < 1000);
-  assert.deepEqual(admission.usage, { active: 1, queued: 0 });
-  finishRead();
-  await new Promise((resolve) => setImmediate(resolve));
+test("a crash holds back uploads already waiting, and an older success does not lift it", async () => {
+  // Decodes that finish when told to, crashing or not.
+  const finishers = [];
+  const workers = {
+    run: () => new Promise((resolve) => finishers.push((crashed) => resolve(crashed
+      ? { ok: false, outcome: "crashed", details: { signal: "SIGABRT" } }
+      : { ok: true, thumbnail: smallWebp, details: {} }))),
+  };
+  const nextTick = () => new Promise((resolve) => setImmediate(resolve));
+
+  // One turn: the second upload waits, then finds its workspace held back.
+  let crashBackoff = new CrashBackoff(60_000, 60_000);
+  let admission = new TransformAdmission({ maxActive: 1, maxQueued: 4, queueTimeoutMs: 5000 });
+  const options = () => ({ workspaceId: "a", admission, workers, crashBackoff });
+  let { result, delta } = await outcomes(async () => {
+    const crashing = thumbnailOf(smallPng, options());
+    while (finishers.length < 1) await nextTick();
+    const queued = thumbnailOf(smallPng, options());
+    while (admission.usage.queued < 1) await nextTick();
+    finishers.shift()(true);
+    return Promise.all([crashing, queued]);
+  });
+  assert.deepEqual(result, [null, null]);
+  assert.deepEqual(delta, { crashed: 1, busy: 1 }, "rechecked once admitted");
+  assert.equal(finishers.length, 0, "the queued upload reached no worker");
   assert.deepEqual(admission.usage, { active: 0, queued: 0 });
-  assert.equal(nativeCalls, 0, "the late read reached no decoder");
+
+  // Two turns: a success that started before a crash leaves the crash's wait.
+  crashBackoff = new CrashBackoff(60_000, 60_000);
+  admission = new TransformAdmission({ maxActive: 2, maxQueued: 0, queueTimeoutMs: 100 });
+  ({ result, delta } = await outcomes(async () => {
+    const slow = thumbnailOf(smallPng, options());
+    const fast = thumbnailOf(smallPng, options());
+    while (finishers.length < 2) await nextTick();
+    const [finishSlow, finishFast] = finishers.splice(0);
+    finishFast(true);
+    await fast;
+    finishSlow(false);
+    return Promise.all([slow, fast]);
+  }));
+  assert.ok(result[0] && result[1] === null);
+  assert.deepEqual(delta, { crashed: 1, created: 1 });
+  assert.ok(crashBackoff.remaining("a") > 0, "the crash's wait stands");
+
+  // A success that started after the crash lifts it; other workspaces' crashes do not matter.
+  crashBackoff = new CrashBackoff(0, 0);
+  crashBackoff.crashed("a");
+  const later = thumbnailOf(smallPng, options());
+  while (finishers.length < 1) await nextTick();
+  crashBackoff.crashed("b");
+  finishers.shift()(false);
+  assert.ok(await later);
+  assert.equal(crashBackoff.remaining("a", 0), 0);
+});
+
+test("a path that is not a regular file is refused without stalling the worker", async () => {
+  // Opening a FIFO for reading would block until a writer appears.
+  const fifo = path.join(scratch, "stalled.fifo");
+  execFileSync("mkfifo", [fifo]);
+  const admission = new TransformAdmission({ maxActive: 1, maxQueued: 0, queueTimeoutMs: 100 });
+  const source = { size: smallPng.length, head: async () => smallPng, path: fifo };
+  const started = performance.now();
+  const { result, delta } = await outcomes(() => createThumbnail(source, { admission }));
+  assert.equal(result, null);
+  assert.deepEqual(delta, { unsupported: 1 });
+  assert.ok(performance.now() - started < 2000);
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
+  assert.ok(await thumbnailOf(smallPng, { admission }), "the worker still serves");
 });
 
 test("a stalled read of the first bytes is abandoned before admission", async () => {
@@ -735,7 +958,7 @@ test("a stalled read of the first bytes is abandoned before admission", async ()
   const source = {
     size: smallPng.length,
     head: (signal) => { seen = signal; return new Promise((resolve) => signal.addEventListener("abort", () => resolve(smallPng))); },
-    read: async () => smallPng,
+    path: storedSource(smallPng).path,
   };
   const started = performance.now();
   const { result, delta } = await outcomes(() => createThumbnail(source, { admission, headTimeoutMs: 50 }));
@@ -801,22 +1024,25 @@ test("admission is shared fairly between workspaces", async () => {
 
 test("saturation keeps transforms bounded and the event loop responsive", async (t) => {
   const { maxActive, maxQueued } = thumbnailAdmission.limits;
-  const render = sharp.prototype.toBuffer;
+  // The default limits, but a queue wait long enough for a slow machine to
+  // drain the queue (the 5 s wait itself is tested above).
+  const admission = new TransformAdmission({ ...thumbnailAdmission.limits, queueTimeoutMs: 60_000 });
+  const run = thumbnailWorkers.run;
   let inFlight = 0, peak = 0;
-  sharp.prototype.toBuffer = function (...args) {
+  thumbnailWorkers.run = function (...args) {
     inFlight++;
     peak = Math.max(peak, inFlight);
-    return render.apply(this, args).finally(() => inFlight--);
+    return run.apply(this, args).finally(() => inFlight--);
   };
-  t.after(() => { sharp.prototype.toBuffer = render; });
-  // A real decode of about 0.3 s and 170 MiB each: Adam7 PNG is decoded whole.
+  t.after(() => { thumbnailWorkers.run = run; });
+  // A real decode of about 0.3 s and 170 MiB each, in a worker: Adam7 PNG is decoded whole.
   const source = await blankPng(6000, 6000, { depth: 8, color: 6, interlace: true });
   const requests = maxActive + maxQueued + 4;
   const delay = monitorEventLoopDelay({ resolution: 10 });
   delay.enable();
   const started = performance.now();
   const { result, delta } = await outcomes(() =>
-    Promise.all(Array.from({ length: requests }, () => thumbnailOf(source))));
+    Promise.all(Array.from({ length: requests }, () => thumbnailOf(source, { admission }))));
   const elapsed = performance.now() - started;
   delay.disable();
   const stats = { requests, maxActive, maxQueued, elapsedMs: Math.round(elapsed), peak, delta, loopMaxMs: delay.max / 1e6, loopP99Ms: delay.percentile(99) / 1e6 };
@@ -826,6 +1052,6 @@ test("saturation keeps transforms bounded and the event loop responsive", async 
   // Waiters beyond the queue go without at once; the queue drains in turn.
   assert.equal(delta.busy, requests - maxActive - maxQueued, JSON.stringify(stats));
   assert.equal((delta.created ?? 0) + (delta.busy ?? 0), requests, JSON.stringify(stats));
-  assert.deepEqual(thumbnailAdmission.usage, { active: 0, queued: 0 });
+  assert.deepEqual(admission.usage, { active: 0, queued: 0 });
   assert.ok(stats.loopMaxMs < 250, JSON.stringify(stats));
 });

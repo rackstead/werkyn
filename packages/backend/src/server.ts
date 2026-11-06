@@ -5,6 +5,7 @@ import { startChatMessageDeliveryWorker } from "./modules/chat/chat-delivery.js"
 import { startNotificationDeliveryWorker } from "./modules/notifications/notification-delivery.js";
 import { processDueDateReminders } from "./schedulers/due-date-reminders.js";
 import { startPeriodicJob } from "./schedulers/periodic-job.js";
+import { thumbnailWorkers } from "./modules/files/thumbnails.js";
 import { processRecurringTasks } from "./schedulers/recurring-tasks.js";
 import { processTrashPurge } from "./schedulers/trash-purge.js";
 import { startBlobCleanupWorker } from "./services/blob-cleanup.js";
@@ -68,6 +69,10 @@ async function start() {
     // every 30s
     const chatDeliveries = startChatMessageDeliveryWorker(app);
 
+    // Thumbnail decoder processes, so the first image upload does not wait
+    // for them to start
+    thumbnailWorkers.start();
+
     // Start embedded Dex (SSO identity provider)
     dexManager.start(app.prisma, app.log).catch((err) => {
       app.log.error(err, "Failed to start Dex");
@@ -77,15 +82,19 @@ async function start() {
     // Each step has its own budget inside the 8 s overall deadline, so a
     // stalled cleanup batch cannot keep Dex from being signalled. Dex's own
     // stop sends SIGKILL 5 s after SIGTERM, inside its 5.5 s budget. The
-    // scheduled jobs and the notification delivery worker stop first, all at
-    // once, so none starts new work against a closing database; each returns
-    // at its next unit of work (an occurrence, a reminder batch, a delivery, a
-    // trash candidate). Work cut off by a budget is safe: occurrences,
-    // reminder batches and purges are single transactions that roll back, and
-    // chat and notification deliveries are retried after their lease expires.
+    // thumbnail workers stop first: they hold no state, and an upload still
+    // waiting for one is stored without a thumbnail at once rather than
+    // holding up the HTTP server's close. The scheduled jobs and the
+    // notification delivery worker stop next, all at once, so none starts new
+    // work against a closing database; each returns at its next unit of work
+    // (an occurrence, a reminder batch, a delivery, a trash candidate). Work
+    // cut off by a budget is safe: occurrences, reminder batches and purges
+    // are single transactions that roll back, and chat and notification
+    // deliveries are retried after their lease expires.
     const shutdown = createShutdownHandler({
       log: app.log,
       steps: [
+        { name: "thumbnail workers", run: () => thumbnailWorkers.close(), timeoutMs: 500 },
         {
           name: "scheduled jobs",
           run: () => Promise.all(scheduledJobs.map((job) => job.stop())),

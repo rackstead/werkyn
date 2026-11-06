@@ -22,8 +22,16 @@ async function start() {
     // by disabling them (see plugins/request-limits.ts).
     // One warning when the search indexes are absent or must not be used
     // (an ICU database); checked before serving, so no search reads indexes
-    // that would drop matches.
-    await checkSearchIndexes(app.prisma, app.log, new URL(env.DATABASE_URL).searchParams.get("schema") ?? "public");
+    // that would drop matches. If the check cannot run, searches avoid the
+    // indexes and the check is retried every minute until it succeeds.
+    const searchSchema = new URL(env.DATABASE_URL).searchParams.get("schema") ?? "public";
+    if ((await checkSearchIndexes(app.prisma, app.log, searchSchema)) === "failed") {
+      const retry = setInterval(() => {
+        void checkSearchIndexes(app.prisma, app.log, searchSchema, { reportFailure: false })
+          .then((result) => { if (result !== "failed") clearInterval(retry); });
+      }, 60_000);
+      retry.unref();
+    }
 
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
 

@@ -42,8 +42,13 @@ export async function withSearchPlans<const P extends readonly Prisma.PrismaProm
   return results.slice(before.length) as { -readonly [K in keyof P]: Awaited<P[K]> };
 }
 
-/** Clients whose database has trigram indexes it must not use. */
+/** Clients whose database has trigram indexes they must not use. */
 const avoidTrigramIndexes = new WeakSet<object>();
+
+/** Whether withSearchPlans keeps this client's searches off trigram indexes. */
+export function searchAvoidsTrigramIndexes(prisma: object): boolean {
+  return avoidTrigramIndexes.has(prisma);
+}
 
 /**
  * The indexes of migration 20261105180000_search_trigram_indexes: name,
@@ -57,79 +62,102 @@ export const SEARCH_TRIGRAM_INDEXES = [
   ["File_name_trgm_idx", "File", "name"],
 ] as const;
 
+export type SearchIndexCheck = "ok" | "warned" | "failed";
+
 /**
- * Checks the search trigram indexes once, at startup, and logs one warning
- * when something is off. Never throws; returns whether it warned.
+ * Checks the search trigram indexes, at startup, and logs one warning when
+ * something is off. Never throws.
  *
  * - libc database: warns when any index is missing, invalid, or has an
  *   expected name but another definition (table, column, access method or
  *   operator class); the migration's IF NOT EXISTS would have skipped it.
- * - ICU or builtin database without the indexes (what the migration leaves
- *   there): warns that search reads whole tables.
- * - ICU or builtin database WITH trigram indexes (a libc dump restored into
- *   it): pg_trgm cannot follow its case folding and the indexes would drop
- *   matches. Warns with the DROP INDEX statements, and makes withSearchPlans
- *   avoid the indexes for this client until they are dropped and the server
- *   restarted.
+ * - ICU or builtin database without trigram indexes (what the migration
+ *   leaves there): warns that search reads whole tables.
+ * - ICU or builtin database WITH a GIN trigram index on a searched column,
+ *   whatever its name (a libc dump restored into it): pg_trgm cannot follow
+ *   its case folding and the index would drop matches. Warns with
+ *   schema-qualified DROP INDEX statements, and makes withSearchPlans avoid
+ *   trigram indexes for this client.
+ * - The catalog query fails: warns (unless `reportFailure` is false) and
+ *   makes withSearchPlans avoid trigram indexes for this client until a
+ *   check succeeds, since the state is unknown. Returns "failed".
  *
- * `schema` is the schema of Werkyn's tables (DATABASE_URL's `schema`
+ * A successful check on a libc database lets the client use the indexes
+ * again. `schema` is the schema of Werkyn's tables (DATABASE_URL's `schema`
  * parameter, `public` by default), not the role's current schema.
  */
 export async function checkSearchIndexes(
-  prisma: PrismaClient,
+  prisma: Pick<PrismaClient, "$queryRaw">,
   log: { warn(details: object, message: string): void },
   schema = "public",
-): Promise<boolean> {
+  { reportFailure = true }: { reportFailure?: boolean } = {},
+): Promise<SearchIndexCheck> {
+  type Index = { name: string; table: string; valid: boolean; plain: boolean; method: string; columns: (string | null)[] };
+  let indexes: Index[];
+  let provider: string;
   try {
-    const expected = Prisma.join(
-      SEARCH_TRIGRAM_INDEXES.map(([name, table, column]) => Prisma.sql`(${name}, ${table}, ${column})`),
-    );
-    const [row] = await prisma.$queryRaw<{ valid: string[]; trigram: string[]; provider: string | null }[]>`
-      WITH found AS (
-        SELECT c.relname::text AS name,
-               i.indisvalid AND i.indnatts = 1 AND i.indexprs IS NULL AND i.indpred IS NULL
-                 AND (c.relname::text, t.relname::text, a.attname::text) IN (${expected}) AS exact,
-               o.opcname = 'gin_trgm_ops' AS trigram
-        FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indexrelid
-        JOIN pg_class t ON t.oid = i.indrelid
-        JOIN pg_am am ON am.oid = c.relam
-        JOIN pg_opclass o ON o.oid = ANY(i.indclass)
-        LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
-        WHERE c.relnamespace = to_regnamespace(${schema}) AND am.amname = 'gin'
-          AND c.relname = ANY(${SEARCH_TRIGRAM_INDEXES.map(([name]) => name)}::text[])
-      )
-      SELECT
-        ARRAY(SELECT DISTINCT name FROM found WHERE exact AND trigram) AS valid,
-        ARRAY(SELECT DISTINCT name FROM found WHERE trigram) AS trigram,
-        (SELECT to_jsonb(d) ->> 'datlocprovider' FROM pg_database d
-          WHERE d.datname = current_database()) AS provider`;
-    const provider = { c: "libc", i: "icu", b: "builtin" }[row.provider ?? "c"] ?? row.provider;
-    const quoted = (name: string) => `"${schema.replaceAll('"', '""')}"."${name}"`;
-    if (provider !== "libc") {
-      if (row.trigram.length > 0) {
-        avoidTrigramIndexes.add(prisma);
-        const drops = row.trigram.map((name) => `DROP INDEX ${quoted(name)};`);
-        log.warn(
-          { collationProvider: provider, trigramIndexes: row.trigram, drop: drops },
-          `Search trigram indexes exist on a database whose default collation provider is ${provider}: pg_trgm cannot follow its case folding, so they would drop matches (e.g. after restoring a libc dump). Search avoids them until they are dropped; run ${drops.join(" ")} and restart (docs/remediation/p02c.md)`,
-        );
-      } else {
-        log.warn(
-          { collationProvider: provider },
-          `Search trigram indexes are not created on a database whose default collation provider is ${provider}; text search reads whole tables (docs/remediation/p02c.md)`,
-        );
-      }
-      return true;
-    }
-    const missing = SEARCH_TRIGRAM_INDEXES.map(([name]) => name).filter((name) => !row.valid.includes(name));
-    if (missing.length === 0) return false;
-    log.warn(
-      { missing, collationProvider: provider },
-      "Search trigram indexes are missing, invalid or defined differently; text search reads whole tables (docs/remediation/p02c.md)",
-    );
-    return true;
-  } catch {
-    return false;
+    const tables = [...new Set(SEARCH_TRIGRAM_INDEXES.map(([, table]) => table))];
+    indexes = await prisma.$queryRaw<Index[]>`
+      SELECT c.relname::text AS name, t.relname::text AS "table", i.indisvalid AS valid,
+             (i.indexprs IS NULL AND i.indpred IS NULL) AS plain, am.amname::text AS method,
+             ARRAY(SELECT a.attname::text || ':' || o.opcname::text
+                   FROM unnest(i.indkey::int2[], i.indclass::oid[]) WITH ORDINALITY AS k(attnum, opclass, n)
+                   LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+                   JOIN pg_opclass o ON o.oid = k.opclass
+                   ORDER BY k.n) AS columns
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_class t ON t.oid = i.indrelid
+      JOIN pg_am am ON am.oid = c.relam
+      WHERE t.relnamespace = to_regnamespace(${schema}) AND t.relname = ANY(${tables}::text[])`;
+    const [row] = await prisma.$queryRaw<{ provider: string | null }[]>`
+      SELECT to_jsonb(d) ->> 'datlocprovider' AS provider FROM pg_database d
+      WHERE d.datname = current_database()`;
+    provider = { c: "libc", i: "icu", b: "builtin" }[row?.provider ?? "c"] ?? String(row?.provider);
+  } catch (error) {
+    avoidTrigramIndexes.add(prisma);
+    if (reportFailure)
+      log.warn(
+        { err: error instanceof Error ? error.message : String(error) },
+        "Could not check the search trigram indexes; search avoids them until a check succeeds (docs/remediation/p02c.md)",
+      );
+    return "failed";
   }
+
+  const quoted = (name: string) => `"${schema.replaceAll('"', '""')}"."${name.replaceAll('"', '""')}"`;
+  if (provider !== "libc") {
+    // Any GIN index with gin_trgm_ops on a searched column, whatever its name.
+    const searched = new Set(SEARCH_TRIGRAM_INDEXES.map(([, table, column]) => `${table}.${column}:gin_trgm_ops`));
+    const unsafe = indexes
+      .filter((index) => index.method === "gin" && index.columns.some((column) => column !== null && searched.has(`${index.table}.${column}`)))
+      .map((index) => index.name)
+      .sort();
+    if (unsafe.length > 0) {
+      avoidTrigramIndexes.add(prisma);
+      const drop = unsafe.map((name) => `DROP INDEX ${quoted(name)};`);
+      log.warn(
+        { collationProvider: provider, trigramIndexes: unsafe, drop },
+        `Search trigram indexes exist on a database whose default collation provider is ${provider}: pg_trgm cannot follow its case folding, so they would drop matches (e.g. after restoring a libc dump). Search avoids them; run ${drop.join(" ")} (docs/remediation/p02c.md)`,
+      );
+    } else {
+      avoidTrigramIndexes.delete(prisma);
+      log.warn(
+        { collationProvider: provider },
+        `Search trigram indexes are not created on a database whose default collation provider is ${provider}; text search reads whole tables (docs/remediation/p02c.md)`,
+      );
+    }
+    return "warned";
+  }
+
+  avoidTrigramIndexes.delete(prisma);
+  const exact = (name: string, table: string, column: string) =>
+    indexes.some((index) => index.name === name && index.table === table && index.valid && index.plain &&
+      index.method === "gin" && index.columns.length === 1 && index.columns[0] === `${column}:gin_trgm_ops`);
+  const missing = SEARCH_TRIGRAM_INDEXES.filter(([name, table, column]) => !exact(name, table, column)).map(([name]) => name);
+  if (missing.length === 0) return "ok";
+  log.warn(
+    { missing, collationProvider: provider },
+    "Search trigram indexes are missing, invalid or defined differently; text search reads whole tables (docs/remediation/p02c.md)",
+  );
+  return "warned";
 }

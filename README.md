@@ -94,10 +94,12 @@ creates neither the extension nor the indexes, search works as before, and the
 server logs a warning at startup; check with `SELECT datlocprovider FROM
 pg_database WHERE datname = current_database();` (`c` is libc). A dump of a
 libc database restored into an ICU or builtin database keeps the indexes:
-drop them after the restore (`DROP INDEX "Task_title_trgm_idx",
-"Task_description_trgm_idx", "ChatMessage_content_trgm_idx",
-"WikiPage_title_trgm_idx", "File_name_trgm_idx";`). Until then the server
-warns at startup with these statements and its searches avoid the indexes. See
+drop them after the restore with the schema-qualified `DROP INDEX` statements
+the server prints at startup (for the default schema: `DROP INDEX
+"public"."Task_title_trgm_idx", "public"."Task_description_trgm_idx",
+"public"."ChatMessage_content_trgm_idx", "public"."WikiPage_title_trgm_idx",
+"public"."File_name_trgm_idx";`; use `DATABASE_URL`'s `schema` instead of
+`public` if it sets one). Until then the server's searches avoid them. See
 [P02c](docs/remediation/p02c.md), including how to recover a failed migration
 and how to build the indexes beforehand without blocking writes.
 

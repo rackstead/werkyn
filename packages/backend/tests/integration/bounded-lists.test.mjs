@@ -255,6 +255,54 @@ describe("my tasks", () => {
       assert.equal(res.statusCode, 400, `${query}: ${res.body}`);
     }
   });
+
+  test("crafted cursors with values the columns cannot hold are rejected, not failed", async () => {
+    const cursor = (values) => Buffer.from(JSON.stringify(values)).toString("base64url");
+    const [name, projectId] = ["apple", projects.apple1.id];
+    const [taskId] = await expected();
+    // Positions outside INT4 (Task.position) and strings PostgreSQL or Prisma
+    // cannot take (NUL, a lone surrogate) used to reach the query: 500.
+    const rejected = {
+      "position 2^31": [name, projectId, 2 ** 31, taskId],
+      "position -2^31-1": [name, projectId, -(2 ** 31) - 1, taskId],
+      "position 2^53-1": [name, projectId, Number.MAX_SAFE_INTEGER, taskId],
+      "NUL in the project name": [`${name}\u0000`, projectId, 0, taskId],
+      "NUL in the project ID": [name, `${projectId}\u0000`, 0, taskId],
+      "NUL in the task ID": [name, projectId, 0, `${taskId}\u0000`],
+      "lone surrogate in the project name": ["\ud800", projectId, 0, taskId],
+      "lone surrogate in the task ID": [name, projectId, 0, "\udfff"],
+    };
+    for (const [label, values] of Object.entries(rejected)) {
+      const res = await get("me", `${base()}?cursor=${cursor(values)}`);
+      assert.equal(res.statusCode, 400, `${label}: ${res.body}`);
+      assert.match(res.json().details?.[0]?.message ?? res.body, /Invalid cursor/, label);
+    }
+    for (const [label, values] of Object.entries({
+      "NUL in the due date": ["2026-04-01\u0000", taskId],
+      "lone surrogate in the due date": ["\udc00", taskId],
+      "NUL in the task ID": [null, `${taskId}\u0000`],
+    })) {
+      const res = await get("me", `${base()}?sort=dueDate&cursor=${cursor(values)}`);
+      assert.equal(res.statusCode, 400, `sort=dueDate, ${label}: ${res.body}`);
+    }
+    // The INT4 bounds themselves are valid positions: the page continues
+    // after every task of the project, or with all of them.
+    const order = await expected();
+    const inProject = await expected(`AND t."projectId" = '${projectId}'`);
+    const first = order.indexOf(inProject[0]);
+    const last = order.indexOf(inProject.at(-1));
+    for (const [label, position, from] of [
+      ["the largest position", 2 ** 31 - 1, last + 1],
+      ["the smallest position", -(2 ** 31), first],
+    ]) {
+      const res = await get("me", `${base()}?limit=200&cursor=${cursor([name, projectId, position, taskId])}`);
+      assert.equal(res.statusCode, 200, `${label}: ${res.body}`);
+      assert.deepEqual(res.json().data.map((task) => task.id), order.slice(from, from + 200), label);
+    }
+    // A surrogate pair is valid text.
+    const pair = await get("me", `${base()}?cursor=${cursor(["\u{1D49C}", projectId, 0, taskId])}`);
+    assert.equal(pair.statusCode, 200, pair.body);
+  });
 });
 
 describe("time report entries", () => {

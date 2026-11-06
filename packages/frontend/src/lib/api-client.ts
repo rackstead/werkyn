@@ -5,6 +5,7 @@ import {
   ApiError,
   IdentityChangedError,
   isIdentityChangedError,
+  retryAfterSeconds,
 } from "./api-error";
 import { apiPrefixUrl } from "./api-url";
 import { identityGeneration, identitySignal } from "./identity";
@@ -29,6 +30,13 @@ export function mapApiErrorToForm(
 }
 
 async function parseErrorResponse(response: KyResponse): Promise<ApiError> {
+  const error = await parseErrorBody(response);
+  const retryAfter = retryAfterSeconds(response.headers.get("retry-after"));
+  if (retryAfter !== undefined) error.retryAfter = retryAfter;
+  return error;
+}
+
+async function parseErrorBody(response: KyResponse): Promise<ApiError> {
   try {
     const body = (await response.json()) as {
       statusCode?: number;

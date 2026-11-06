@@ -7,7 +7,7 @@ import Fastify from "fastify";
 import { ZodError } from "zod";
 import { LocalStorageProvider } from "../src/services/storage.ts";
 import {
-  LockedError,
+  TooManyRequestsError,
   NotFoundError,
   ValidationError,
 } from "../src/utils/errors.ts";
@@ -122,13 +122,13 @@ const cases = [
     },
   ],
   [
-    "locked resource",
-    new LockedError("Locked fixture", 12),
-    423,
+    "retry later",
+    new TooManyRequestsError("Retry fixture", 12),
+    429,
     {
-      statusCode: 423,
-      error: "Locked",
-      message: "Locked fixture",
+      statusCode: 429,
+      error: "Too Many Requests",
+      message: "Retry fixture",
     },
   ],
   [
@@ -169,7 +169,7 @@ for (const [name, error, status, expected] of cases) {
     assert.equal(reply.headers.get("cache-control"), "private, no-store");
     assert.equal(reply.headers.get("content-security-policy"), "sandbox");
     assert.equal(reply.headers.get("x-content-type-options"), "nosniff");
-    if (error instanceof LockedError)
+    if (error instanceof TooManyRequestsError)
       assert.equal(reply.headers.get("retry-after"), "12");
     if (error instanceof ValidationError)
       assert.deepEqual(reply.payload.details, error.details);

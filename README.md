@@ -511,6 +511,80 @@ inserted link observed during invalidation, makes the password operation return
 its retryable busy 503 without changing anything. See
 [docs/remediation/sec-027.md](docs/remediation/sec-027.md).
 
+## Sign-in protection
+
+The sign-in route allows 10 requests per minute from one client IP address. Each
+email address also has a failed sign-in count, kept in the database, so it holds
+across server processes. After 5 consecutive failures for an email address, the
+next attempt must wait 2 seconds. The wait doubles with each further failure, up to
+60 seconds. During a wait, sign-in answers `429 Too Many Requests` with a
+`Retry-After` header and checks no password; the sign-in form counts the wait
+down. A successful sign-in clears the count, and so does an hour without
+attempts.
+
+**Trusted browsers.** A successful password sign-in marks the browser with an
+HttpOnly `login_device` cookie, sent only to the sign-in route, valid for 30 days
+and bound to that email address. Later sign-ins from that browser for that address
+use the browser's own failure count, with the same waits, instead of the address's
+shared one. Someone who keeps sending wrong passwords for the address therefore
+cannot hold off a browser that has signed in before. The cookie grants no access by
+itself: the password is still checked. Signing out keeps it. A password change
+or reset, clearing the browser's cookies, or rotating `COOKIE_SECRET` ends it.
+
+**What an attacker can still do.** Waits are first come, first served when they
+end. Someone who sends a wrong password for an address each time its wait ends
+can keep a browser that has never signed in to that address from signing in with
+a password, for as long as they keep going. That covers a new device, a cleared
+browser, or the first sign-in after 30 days. They get one guess per wait (about one
+a minute). Existing sessions, trusted browsers and SSO sign-in are not affected.
+There is no lockout in the stored state: once the sending stops, the next wait
+ends and the correct password signs in.
+
+Email addresses with and without an account are counted and answered alike when no
+`login_device` cookie is sent, which is always the case for someone probing other
+people's addresses. Unknown addresses and accounts without a password (SSO only)
+do the same Argon2id work as a wrong password. Password-reset requests are
+answered before the account lookup or mail delivery runs. So neither answers nor
+timing tell whether an account exists. An account gets at most one new reset link
+per `PASSWORD_RESET_COOLDOWN_SECONDS`. Further requests get the same answer and add
+nothing. As a memory guard, each server process starts at most
+`PASSWORD_RESET_REQUESTS_PER_MINUTE` reset requests, counted by request alone;
+past that, every reset request is answered `429` with `Retry-After` until the minute
+ends. At the default of 6,000, reaching it takes about 600 client IP addresses at
+the route limit. The count table has a fixed maximum size
+and stores no addresses, so requests for many made-up addresses cannot grow it
+without limit. See
+[docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
+
+The server reads these optional settings at startup. An empty value keeps the
+default:
+
+| Variable | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `LOGIN_BACKOFF_THRESHOLD` | `5` | 1–100 | Consecutive failures before the first wait |
+| `LOGIN_BACKOFF_BASE_SECONDS` | `2` | 1–900 | First wait; doubles per further failure |
+| `LOGIN_BACKOFF_MAX_SECONDS` | `60` | 1–900 | Longest wait (at least the base) |
+| `LOGIN_BACKOFF_RESET_SECONDS` | `3600` | 60–604800 | Quiet time after which failures are forgotten (at least the longest wait) |
+| `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Rows for email addresses; trusted browsers use as many again |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | `60` | 0–3600 | Shortest time between two reset links for one account (0: no cooldown; at most the link's 1-hour lifetime) |
+| `PASSWORD_RESET_REQUESTS_PER_MINUTE` | `6000` | 60–1000000 | Reset requests one server process starts per minute before answering `429` |
+
+With Docker Compose, add them under the `werkyn` service's `environment`, for
+example `LOGIN_BACKOFF_MAX_SECONDS: 30`. The table holds at most twice
+`LOGIN_BACKOFF_SLOTS` rows (about 100 bytes each). Addresses share a row when their
+keyed hashes collide. At the default size, the chance that a given account shares
+its row with another is about 0.15% with 100 accounts, 1.5% with 1,000 and 14% with
+10,000. Raise the setting for large installations. The hash key is derived from
+`JWT_SECRET`, so rotating that secret also forgets every count.
+
+The migration `20261105150000_bounded_login_backoff` replaces the
+`LoginAttempt` table with `LoginThrottle`. Recent failure counts and any
+remaining lockouts are dropped. Stop older servers before applying it, as for
+other migrations: they still use `LoginAttempt` and would fail sign-ins. Rolling
+back to an earlier version after this migration also breaks password sign-in until
+the old table is recreated; see the upgrade notes in
+[docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

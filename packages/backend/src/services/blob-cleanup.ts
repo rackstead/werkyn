@@ -65,6 +65,13 @@ export async function processBlobCleanup(
   const only = options.paths
     ? Prisma.sql`AND "storagePath" = ANY(${options.paths}::text[])`
     : Prisma.empty;
+  // "availableAt" is TIMESTAMP(3). A row made due with CURRENT_TIMESTAMP is
+  // stored rounded to the millisecond, up to half a millisecond after the
+  // clock that wrote it, so the claim rounds its own clock the same way: a
+  // row made due by an earlier statement is due here, however soon this claim
+  // follows it (a failed restore's cleanup, for one). The clock stays an
+  // absolute instant, so leases still compare correctly across a
+  // daylight-saving fall-back in a non-UTC session.
   const claimed = await prisma.$queryRaw<
     Array<{ storagePath: string; attempts: number; availableAt: Date }>
   >`
@@ -73,7 +80,7 @@ export async function processBlobCleanup(
       "availableAt" = CURRENT_TIMESTAMP + ${LEASE_SECONDS}::integer * interval '1 second'
     WHERE "storagePath" IN (
       SELECT "storagePath" FROM "BlobCleanup"
-      WHERE "availableAt" <= CURRENT_TIMESTAMP ${only}
+      WHERE "availableAt" <= CURRENT_TIMESTAMP::timestamptz(3) ${only}
       ORDER BY "availableAt", "storagePath"
       LIMIT ${options.limit ?? BATCH_SIZE}
       FOR UPDATE SKIP LOCKED

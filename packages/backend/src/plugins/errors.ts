@@ -5,7 +5,7 @@ import {
   AppError,
   EditConflictError,
   ValidationError,
-  LockedError,
+  TooManyRequestsError,
 } from "../utils/errors.js";
 import { ZodError } from "zod";
 import { validationDetails } from "../utils/validation-details.js";
@@ -135,7 +135,7 @@ export default fp(async (fastify: FastifyInstance) => {
           response.code = error.code;
           response.current = error.current;
         }
-        if (error instanceof LockedError) {
+        if (error instanceof TooManyRequestsError) {
           reply.header("Retry-After", String(error.retryAfter));
         }
         return reply.status(error.statusCode).send(response);

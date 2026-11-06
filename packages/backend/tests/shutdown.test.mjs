@@ -129,3 +129,53 @@ test("a duplicate signal does not change a clean exit", async () => {
   await first;
   assert.deepEqual(exits, [0]);
 });
+
+test("each step learns the time left before the overall deadline", async () => {
+  const { log, exits, exit } = recorder();
+  const seen = [];
+  // A clock the steps advance, so the expected times are exact.
+  let clock = 50_000;
+  const shutdown = createShutdownHandler({
+    log,
+    exit,
+    timeoutMs: 1000,
+    now: () => clock,
+    steps: [
+      { name: "slow", run: (left) => { seen.push(left); clock += 120; } },
+      { name: "budgeted", run: (left) => { seen.push(left); clock += 30; }, timeoutMs: 300 },
+      { name: "http", run: (left) => seen.push(left) },
+      { name: "late", run: (left) => { seen.push(left); clock += 5_000; } },
+      { name: "after the deadline", run: (left) => seen.push(left) },
+    ],
+  });
+  await shutdown("SIGTERM");
+  assert.deepEqual(exits, [0]);
+  // A step with its own budget gets the smaller of the two; time past the
+  // deadline is reported as none left.
+  assert.deepEqual(seen, [1000, 300, 850, 850, 0]);
+});
+
+test("the duplicate-signal window uses the same clock as the shutdown", async () => {
+  const { log, exits, exit } = recorder();
+  let clock = 0;
+  let release;
+  const shutdown = createShutdownHandler({
+    log,
+    exit,
+    forceAfterMs: 1000,
+    now: () => clock,
+    steps: [{ name: "http", run: () => new Promise((resolve) => { release = resolve; }) }],
+  });
+  const first = shutdown("SIGTERM");
+  // Within the window by the injected clock: a duplicate, ignored.
+  clock = 999;
+  await shutdown("SIGTERM");
+  assert.deepEqual(exits, []);
+  // Past it by the injected clock (wall time has barely moved): forces exit.
+  clock = 1000;
+  await shutdown("SIGTERM");
+  assert.deepEqual(exits, [1]);
+  release();
+  await first;
+  assert.deepEqual(exits, [1]);
+});

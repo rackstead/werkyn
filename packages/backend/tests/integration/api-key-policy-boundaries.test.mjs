@@ -382,7 +382,10 @@ test(
               where: { familyId: { in: [...familyIds] } },
             });
             await app.prisma.user.deleteMany({ where: { id: user.id } });
-            await app.prisma.loginAttempt.deleteMany({ where: { email } });
+            const { forgetSignInFailures } = await import(
+              "./support/login-throttle.mjs"
+            );
+            await forgetSignInFailures(app.prisma, [email]);
           }
         } finally {
           try {

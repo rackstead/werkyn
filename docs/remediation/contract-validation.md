@@ -19,7 +19,9 @@ The web client only saves a date input once it holds a complete date (or is
 cleared). While a year is typed, Chromium reports partial years such as
 `0002-03-15`, `0020-03-15` and `0202-03-15`; the task detail and custom field
 date pickers, the list view's inline due date and custom field date cells, the
-bulk due date, the task list filters and the time pages hold those back.
+bulk due date, the task list filters and the time pages hold those back. Typed
+dates, half-typed parts and clearing are covered in
+[typed-date-inputs.md](typed-date-inputs.md).
 
 ## Recurring schedules
 

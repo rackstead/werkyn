@@ -54,6 +54,7 @@ function DialogContent({
   showCloseButton = true,
   onFocusCapture,
   onCloseAutoFocus,
+  onEscapeKeyDown,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
@@ -67,6 +68,15 @@ function DialogContent({
         aria-modal="true"
         onFocusCapture={returnFocus.onFocusCapture}
         onCloseAutoFocus={returnFocus.onCloseAutoFocus}
+        onEscapeKeyDown={(event) => {
+          // Radix sees Escape before the focused control. A control that uses
+          // this Escape to discard its edit (a date being typed) keeps the
+          // dialog open; the next Escape closes it.
+          if (event.target instanceof Element && event.target.closest("[data-pending-edit]")) {
+            event.preventDefault()
+          }
+          onEscapeKeyDown?.(event)
+        }}
         className={cn(
           "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 outline-none sm:max-w-lg",
           className

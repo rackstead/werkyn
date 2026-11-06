@@ -170,8 +170,13 @@ export async function listTasks(
     take: query.limit,
   });
   const countQuery = prisma.task.count({ where });
+  // A title search is planned for its term (utils/text-search.ts); the page
+  // and the count still run in parallel, each in its own transaction.
   const [tasks, total] = query.search
-    ? await withSearchPlans(prisma, [pageQuery, countQuery])
+    ? await Promise.all([
+        withSearchPlans(prisma, [pageQuery]).then(([page]) => page),
+        withSearchPlans(prisma, [countQuery]).then(([count]) => count),
+      ])
     : await Promise.all([pageQuery, countQuery]);
 
   return {

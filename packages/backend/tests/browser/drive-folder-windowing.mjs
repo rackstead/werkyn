@@ -1741,6 +1741,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
         proxyAddress = null;
       }
     }
+    expect429 = false;
   }
   return checks;
 }

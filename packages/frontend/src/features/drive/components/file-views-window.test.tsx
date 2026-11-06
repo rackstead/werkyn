@@ -287,9 +287,13 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     rerender(<Harness files={refreshed} hasNextPage />);
     expect(topOf(under)).toBe(top);
     expect(entryAt(200)).toBe(under);
-    // The next page's sentinel is at the end of the content, in view.
+    // The next page's sentinel (32 px) is the last thing in the content and
+    // within the view, so it asks for that page.
     const sentinel = scroller!.querySelector("table ~ .py-4")!;
     expect(sentinel.nextElementSibling).toBeNull();
+    const sentinelTop = contentHeight() - 32;
+    expect(sentinelTop).toBeGreaterThanOrEqual(scroller!.scrollTop);
+    expect(sentinelTop + 32).toBeLessThanOrEqual(scroller!.scrollTop + VIEW);
     // The next page arrives: the space held goes, nothing moves.
     rerender(<Harness files={[...range(-3, 0), ...files]} />);
     expect(topOf(under)).toBe(top);
@@ -305,6 +309,12 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     // 30 added above the view; the refreshed pages hold 1,000 entries, so
     // the last 30 (all those in view) are on the next page.
     rerender(<Harness files={[...range(-30, 0), ...files.slice(0, 970)]} hasNextPage />);
+    // The space held is taller than the view; the next page's sentinel
+    // still ends the content, within the view, so that page is asked for.
+    const sentinel = scroller!.querySelector("table ~ .py-4")!;
+    expect(sentinel.nextElementSibling).toBeNull();
+    expect(contentHeight() - 32).toBeGreaterThanOrEqual(scroller!.scrollTop);
+    expect(contentHeight()).toBeLessThanOrEqual(scroller!.scrollTop + VIEW);
     // The next page arrives: the entries are back where they were.
     rerender(<Harness files={[...range(-30, 0), ...files]} />);
     expect(topOf(under)).toBe(top);

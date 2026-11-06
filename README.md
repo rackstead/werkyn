@@ -92,7 +92,12 @@ not wait. On a database whose default collation uses ICU (or the builtin
 provider), where pg_trgm cannot match `ILIKE`'s case folding, the migration
 creates neither the extension nor the indexes, search works as before, and the
 server logs a warning at startup; check with `SELECT datlocprovider FROM
-pg_database WHERE datname = current_database();` (`c` is libc). See
+pg_database WHERE datname = current_database();` (`c` is libc). A dump of a
+libc database restored into an ICU or builtin database keeps the indexes:
+drop them after the restore (`DROP INDEX "Task_title_trgm_idx",
+"Task_description_trgm_idx", "ChatMessage_content_trgm_idx",
+"WikiPage_title_trgm_idx", "File_name_trgm_idx";`). Until then the server
+warns at startup with these statements and its searches avoid the indexes. See
 [P02c](docs/remediation/p02c.md), including how to recover a failed migration
 and how to build the indexes beforehand without blocking writes.
 

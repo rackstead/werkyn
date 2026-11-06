@@ -43,7 +43,7 @@ process.env.STORAGE_DIR = storage;
 const { buildApp } = await import("../../src/app.js");
 const { searchTasks, searchWikiPages } = await import("../../src/modules/workspaces/workspaces.service.js");
 const { searchMessages, chatSearchPlan } = await import("../../src/modules/chat/chat.service.js");
-const { warnIfSearchIndexesMissing } = await import("../../src/utils/text-search.js");
+const { checkSearchIndexes } = await import("../../src/utils/text-search.js");
 const { listFiles } = await import("../../src/modules/files/files.service.js");
 const { listTasks } = await import("../../src/modules/tasks/tasks.service.js");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
@@ -720,7 +720,7 @@ describe("case folding", () => {
     assert.equal(sweep.extra, 0);
     // The startup check is quiet when the indexes are there.
     const warnings = [];
-    assert.equal(await warnIfSearchIndexesMissing(app.prisma, { warn: (...a) => warnings.push(a) }), false);
+    assert.equal(await checkSearchIndexes(app.prisma, { warn: (...a) => warnings.push(a) }), false);
     assert.deepEqual(warnings, []);
     // It reports an index with an expected name but another definition (the
     // migration's IF NOT EXISTS would skip it), and a missing one.
@@ -730,7 +730,7 @@ describe("case folding", () => {
         await app.prisma.$transaction(async (tx) => {
           await tx.$executeRawUnsafe(`DROP INDEX "WikiPage_title_trgm_idx"`);
           if (replacement) await tx.$executeRawUnsafe(replacement);
-          assert.equal(await warnIfSearchIndexesMissing(tx, { warn: (...a) => found.push(a) }), true);
+          assert.equal(await checkSearchIndexes(tx, { warn: (...a) => found.push(a) }), true);
           throw new Error("rollback");
         });
       } catch (error) {
@@ -738,6 +738,21 @@ describe("case folding", () => {
       }
       assert.deepEqual(found.map(([details]) => details), [{ missing: ["WikiPage_title_trgm_idx"], collationProvider: "libc" }]);
       assert.match(found[0][1], /missing, invalid or defined differently/);
+    }
+    // The check looks in the tables' schema, not the role's current schema:
+    // another existing schema first on the search_path is no reason to warn.
+    const first = `r18b_first_${suffix.replaceAll("-", "")}`;
+    await app.prisma.$executeRawUnsafe(`CREATE SCHEMA "${first}"`);
+    const pathed = client(`-c search_path=${first},public`);
+    try {
+      const [{ schema }] = await pathed.$queryRaw`SELECT current_schema() AS schema`;
+      assert.equal(schema, first);
+      const quiet = [];
+      assert.equal(await checkSearchIndexes(pathed, { warn: (...a) => quiet.push(a) }), false);
+      assert.deepEqual(quiet, []);
+    } finally {
+      await pathed.$disconnect();
+      await app.prisma.$executeRawUnsafe(`DROP SCHEMA "${first}"`);
     }
   });
 
@@ -828,7 +843,7 @@ describe("case folding", () => {
                    WHERE migration_name = '20261105180000_search_trigram_indexes' AND finished_at IS NOT NULL) AS applied`;
         assert.deepEqual(state, { provider: "i", extensions: 0, indexes: 0, applied: 1 }, db.key);
         const warnings = [];
-        assert.equal(await warnIfSearchIndexesMissing(db.prisma, { warn: (...a) => warnings.push(a) }), true);
+        assert.equal(await checkSearchIndexes(db.prisma, { warn: (...a) => warnings.push(a) }), true);
         assert.equal(warnings.length, 1);
         assert.equal(warnings[0][0].collationProvider, "icu");
         assert.match(warnings[0][1], /collation provider is icu/);
@@ -892,6 +907,63 @@ describe("case folding", () => {
       const found = async (term) => (await searchMessages(tr.prisma, tr.workspace.id, tr.user.id, term, undefined, undefined, 50)).data.map((m) => m.content);
       assert.ok((await found("ışık")).includes("IŞIK lamba"));
       assert.ok((await found("ıstanbul")).includes("ISTANBUL ofis"));
+    });
+
+    test("a libc dump restored into an ICU database: the check warns with the drop statements and search avoids the indexes", async (t) => {
+      if (skip) return t.skip(skip);
+      const und = databases.find((db) => db.key === "und");
+      // What a restore of a libc database brings along: the extension and
+      // the five indexes, built as the migration builds them on libc.
+      await und.prisma.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+      for (const [name, table, column] of [
+        ["Task_title_trgm_idx", "Task", "title"], ["Task_description_trgm_idx", "Task", "description"],
+        ["ChatMessage_content_trgm_idx", "ChatMessage", "content"], ["WikiPage_title_trgm_idx", "WikiPage", "title"],
+        ["File_name_trgm_idx", "File", "name"],
+      ]) await und.prisma.$executeRawUnsafe(`CREATE INDEX "${name}" ON "${table}" USING GIN ("${column}" gin_trgm_ops)`);
+      // Sessions in which every row read costs far more than an index page,
+      // so the planner takes the trigram index wherever bitmap scans are
+      // allowed. The checked client keeps sequential scans, its fallback;
+      // the unchecked one has none, so it shows what the index returns.
+      const sessions = "-c enable_indexscan=off -c enable_nestloop=off -c cpu_tuple_cost=10 -c cpu_operator_cost=10";
+      const url = (options) => {
+        const u = new URL(und.url);
+        u.searchParams.set("options", options);
+        return u.toString();
+      };
+      const unchecked = new PrismaClient({ datasourceUrl: url(`${sessions} -c enable_seqscan=off`) });
+      const checked = new PrismaClient({ datasourceUrl: url(sessions) });
+      try {
+        const warnings = [];
+        assert.equal(await checkSearchIndexes(checked, { warn: (...a) => warnings.push(a) }), true);
+        assert.equal(warnings.length, 1);
+        const [details, message] = warnings[0];
+        assert.equal(details.collationProvider, "icu");
+        assert.deepEqual([...details.trigramIndexes].sort(), [
+          "ChatMessage_content_trgm_idx", "File_name_trgm_idx", "Task_description_trgm_idx", "Task_title_trgm_idx", "WikiPage_title_trgm_idx",
+        ]);
+        assert.deepEqual([...details.drop].sort(), [
+          'DROP INDEX "public"."ChatMessage_content_trgm_idx";', 'DROP INDEX "public"."File_name_trgm_idx";',
+          'DROP INDEX "public"."Task_description_trgm_idx";', 'DROP INDEX "public"."Task_title_trgm_idx";',
+          'DROP INDEX "public"."WikiPage_title_trgm_idx";',
+        ]);
+        for (const statement of details.drop) assert.ok(message.includes(statement), statement);
+        const contents = async (db) =>
+          (await searchMessages(db, und.workspace.id, und.user.id, "οδος", undefined, undefined, 50)).data.map((m) => m.content).sort();
+        // The checked client avoids the indexes and returns ILIKE's rows.
+        assert.deepEqual(await contents(checked), ["ΟΔΟΣ", "ΟΔΟΣ Α", "οδος κεντρική"].sort());
+        const [{ version }] = await und.prisma.$queryRaw`SELECT current_setting('server_version_num')::int AS version`;
+        const lost = await contents(unchecked);
+        t.diagnostic(`"οδος" through the restored index: ${JSON.stringify(lost)}`);
+        if (version < 180000) assert.ok(lost.length < 3, `the restored index drops matches without the check: ${JSON.stringify(lost)}`);
+        // After the drop statements, the check reports the plain ICU state.
+        for (const statement of details.drop) await und.prisma.$executeRawUnsafe(statement);
+        const after = [];
+        assert.equal(await checkSearchIndexes(und.prisma, { warn: (...a) => after.push(a) }), true);
+        assert.match(after[0][1], /are not created on a database whose default collation provider is icu/);
+      } finally {
+        await Promise.allSettled([unchecked.$disconnect(), checked.$disconnect()]);
+        await und.prisma.$executeRawUnsafe(`DROP EXTENSION IF EXISTS pg_trgm CASCADE`);
+      }
     });
 
     test("an ICU database's own trigram index would miss matches (why the migration skips it)", async (t) => {

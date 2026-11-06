@@ -35,7 +35,7 @@ Object.assign(process.env, {
 // they show it is still lifted once their file starts.
 const LIMITS = {
   headersTimeoutMs: 800,
-  requestTimeoutMs: 8_000,
+  requestTimeoutMs: 6_000,
   socketIdleTimeoutMs: 1_200,
   keepAliveTimeoutMs: 1_000,
   connectionsCheckingIntervalMs: 100,
@@ -336,10 +336,10 @@ test("slow-drip uploads get a 408 and free their slots, so other admins' backups
 
 test("uploads just above the minimum rate, or pausing for half the window, succeed however long they take", { timeout: 60_000 }, async (t) => {
   const { a, b } = workspaces;
-  // About 11 s at 1.25 times the rate: longer than the request deadline and
-  // five windows.
+  // About 8 s at 1.25 times the rate: longer than the request deadline and
+  // three windows.
   const steadyLabel = `Steady ${suffix}`;
-  const steadyArchive = archiveFor(steadyLabel, Math.round(1.25 * MIN_RATE * 11));
+  const steadyArchive = archiveFor(steadyLabel, Math.round(1.25 * MIN_RATE * 8));
   const steady = await openUpload(a.id, "restore", steadyArchive.zip, tokens.dripper);
   // Three times the rate with a pause of half the window, after the grace
   // period.
@@ -403,7 +403,7 @@ test("a client that stops sending, or drips the part header, is cut off before o
       response.at >= GRACE_MS && response.at < WINDOW_MS + 2 * CHECK_MS + SLACK_MS,
       `${name}: answered after ${response.at} ms`,
     );
-    // Cut off by the minimum rate, ahead of the 8 s request deadline (which
+    // Cut off by the minimum rate, ahead of the 6 s request deadline (which
     // applies before the file starts, and again once the response is sent)
     // and the 60 s transfer idle limit, and closed shortly after the answer.
     assert.ok(closedAt !== undefined && closedAt - response.at < UNREAD_BODY_GRACE_MS + SLACK_MS, `${name}: closed ${closedAt} ms`);

@@ -394,6 +394,54 @@ test("an aborted staging copy stops with the abort reason and leaves no file", a
   assert.deepEqual(await readdir(dir), []);
 });
 
+test("a stop while the staged file is still being opened is thrown, never left unhandled", async (t) => {
+  const fsp = (await import("node:fs/promises")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { CREATE_NO_FOLLOW } = await import("../src/services/storage-paths.ts");
+  // Hold the open of the staged file (R33's no-follow create) while a test
+  // step runs, after the file has been created.
+  let duringOpen;
+  const original = fsp.open;
+  fsp.open = async function (file, flags, ...rest) {
+    const handle = await original.call(this, file, flags, ...rest);
+    if (flags === CREATE_NO_FOLLOW && /upload-[0-9a-f-]{36}\.part$/.test(String(file))) await duringOpen?.();
+    return handle;
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    fsp.open = original;
+    syncBuiltinESMExports();
+  });
+  const dir = freshDir();
+
+  // Aborted (too slow) during the open.
+  const controller = new AbortController();
+  const reason = new BackupUploadTooSlowError(1);
+  duringOpen = async () => {
+    controller.abort(reason);
+    await sleep(20);
+  };
+  const aborted = new PassThrough();
+  await assert.rejects(
+    stageStream(aborted, { dir, maxBytes: MiB, idleTimeoutMs: 5_000, signal: controller.signal }),
+    (error) => error === reason,
+  );
+  assert.ok(aborted.destroyed, "the source is released");
+  assert.deepEqual(await readdir(dir), []);
+
+  // Idle for longer than the idle timeout during the open.
+  duringOpen = () => sleep(100);
+  const idle = new PassThrough();
+  await assert.rejects(stageStream(idle, { dir, maxBytes: MiB, idleTimeoutMs: 20 }), (error) => {
+    assert.ok(error instanceof BackupTransferStalledError);
+    return true;
+  });
+  assert.ok(idle.destroyed, "the source is released");
+  assert.deepEqual(await readdir(dir), []);
+  // An error emitted with no listener would fail this test as uncaught.
+  await sleep(50);
+});
+
 test("a request whose body arrives below the minimum rate gets a 408, before or during its file", async (t) => {
   const Fastify = (await import("fastify")).default;
   const multipart = (await import("@fastify/multipart")).default;

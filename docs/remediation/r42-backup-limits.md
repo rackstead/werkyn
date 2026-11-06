@@ -152,8 +152,8 @@ paced client:
   checked) and preview are admitted at once with 200. Each client, still
   dripping, is disconnected about 2 seconds after its answer. The refused
   restores and preview wrote no space, file or cleanup-queue entry.
-- A restore at 1.25 times the minimum for about 11 seconds (longer than the
-  8-second request deadline used in this test) and a preview at three times
+- A restore at 1.25 times the minimum for about 8 seconds (longer than the
+  6-second request deadline used in this test) and a preview at three times
   the minimum with a pause of half the window both succeed.
 - A client that sends 16 KiB of its file and stops, one that stops halfway
   through the file part's header, and one that drips that header a byte a
@@ -173,6 +173,11 @@ paced client:
   followed by silence is reported about one window later;
 - a staging copy stopped through its signal rejects with the signal's reason,
   releases its source and leaves no file, also when stopped before it starts;
+- a copy stopped by the signal or the idle timeout while the staged file is
+  still being opened rejects with that reason, releases its source and leaves
+  no file. Before this was handled, the stop destroyed the stream before
+  anything listened for its error, which crashed the process (reproduced at
+  the earlier head);
 - over a real socket, a file at a tenth of the minimum and a part header
   dripped before the file are answered 408, and a file at 1.5 times the
   minimum is staged;

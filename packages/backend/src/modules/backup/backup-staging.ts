@@ -253,21 +253,29 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
       callback(null, chunk);
     },
   });
-  const idle = setTimeout(
-    () => meter.destroy(new BackupTransferStalledError()),
-    options.idleTimeoutMs,
-  );
-  const abort = () => meter.destroy(signal?.reason);
-  signal?.addEventListener("abort", abort, { once: true });
+  // A stop (idle, or `signal`) destroys the meter only once the pipeline is
+  // listening for its error; one that comes while the file is still being
+  // opened is thrown when the open returns.
+  let stopped: unknown;
+  let piping = false;
+  const stopWith = (reason: unknown) => {
+    if (stopped !== undefined) return;
+    stopped = reason;
+    if (piping) meter.destroy(reason as Error);
+  };
+  const idle = setTimeout(() => stopWith(new BackupTransferStalledError()), options.idleTimeoutMs);
+  const abort = () => stopWith(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
   let handle: FileHandle | undefined;
   let output: WriteStream | undefined;
   try {
-    signal?.throwIfAborted();
+    if (stopped !== undefined) throw stopped;
     // A new file; a link planted at its name is never followed (R33).
     handle = await open(file, CREATE_NO_FOLLOW, 0o600);
-    // Stopped while the file was being opened.
-    signal?.throwIfAborted();
+    if (stopped !== undefined) throw stopped;
     output = handle.createWriteStream();
+    piping = true;
     await pipeStreams(source, meter, output);
   } catch (error) {
     // Release the source, and close the file before removing it.

@@ -276,9 +276,10 @@ try {
     async function type(keys) {
       for (const key of keys) await page.keyboard.press(key, { delay: 20 });
     }
-    // Tab until focus leaves the input and its clear button (the first Tab
-    // after the last part may stop on the browser's calendar button inside the
-    // input; focus on the clear button keeps the edit for that button).
+    // Tab until focus is past the input and its clear button, so the typed
+    // date is saved by that blur. (The first Tab after the last part may stop
+    // on the browser's calendar button inside the input; panel-clear-tab
+    // checks the stop on the clear button, which keeps the edit pending.)
     async function tabOut(input) {
       const inside = () => input.evaluate((el) => el.parentElement.contains(document.activeElement));
       for (let i = 0; i < 5 && (await inside()); i++) await page.keyboard.press("Tab");
@@ -388,10 +389,13 @@ try {
     // and pressed: only null is sent, not the typed date first.
     for (const [name, use] of [
       ["panel-clear-click", async (clear) => clear.click()],
-      ["panel-clear-tab", async (clear) => {
+      ["panel-clear-tab", async (clear, check, from) => {
         for (let i = 0; i < 3 && !(await clear.evaluate((el) => el === document.activeElement)); i++) {
           await page.keyboard.press("Tab");
         }
+        await settle();
+        check("focus on Clear", await clear.evaluate((el) => el === document.activeElement), null);
+        check("nothing sent on reaching Clear", writesFor(from, ids[name]).length === 0, writesFor(from, ids[name]));
         await page.keyboard.press("Enter");
       }],
     ]) {
@@ -400,7 +404,7 @@ try {
         const from = writes.length;
         await panel.getByLabel("Due date", { exact: true }).focus();
         await type(typing);
-        await use(panel.getByRole("button", { name: "Clear due date" }));
+        await use(panel.getByRole("button", { name: "Clear due date" }), check, from);
         await settle();
         check("cleared", (await saved(ids[name])).dueDate === null, await saved(ids[name]));
         check("only null sent", JSON.stringify(writesFor(from, ids[name]).map((w) => w.body)) === '[{"dueDate":null}]', writesFor(from, ids[name]));

@@ -57,7 +57,8 @@ export interface RouteTimeouts {
    * false: the route may wait its turn or work for minutes before it answers
    * (backup exports, previews and restores), so the socket idle timeout is
    * suspended until its response starts. The backup module bounds those
-   * phases itself (60 s transfer idle, 10-minute export deadline).
+   * phases itself (60 s transfer idle, minimum upload rate, 10-minute export
+   * deadline).
    */
   idleBeforeResponse?: false;
 }
@@ -102,8 +103,9 @@ function serverSocket(request: IncomingMessage): Socket | undefined {
  * authenticated and its file part has started: a refused request, or one
  * whose file never starts, keeps the deadline, so a client cannot hold the
  * connection by dripping a body nobody reads. The deadline applies again once
- * the response has been sent. The header deadline and the socket idle
- * timeout are not affected.
+ * the response has been sent, and a response sent before the body has fully
+ * arrived closes the connection shortly after (closeAfterUnreadBody). The
+ * header deadline and the socket idle timeout are not affected.
  */
 export function liftRequestTimeout(request: FastifyRequest, reply: FastifyReply) {
   const socket = serverSocket(request.raw);
@@ -112,10 +114,23 @@ export function liftRequestTimeout(request: FastifyRequest, reply: FastifyReply)
   reply.raw.once("close", () => {
     if (exemptRequests.get(socket) === request.raw) exemptRequests.delete(socket);
   });
-  // A response sent before the body has fully arrived (a refusal, a 413, or
-  // a file stored before the closing boundary) leaves a connection that can
-  // serve nothing else. It is closed shortly after, so a client cannot keep
-  // it by trickling the rest of the body once the deadline has passed.
+  closeAfterUnreadBody(request, reply);
+}
+
+const closingAfterUnreadBody = new WeakSet<FastifyReply>();
+
+/**
+ * Close the connection UNREAD_BODY_GRACE_MS after `reply` is sent if
+ * `request`'s body has not fully arrived by then. A response sent before the
+ * body has fully arrived (a refusal, a 408 or 413, or a file stored before
+ * the closing boundary) leaves a connection that can serve nothing else, so a
+ * client cannot keep it by trickling the rest of the body. The grace lets the
+ * client read the response first. Calling it again for a reply does nothing.
+ */
+export function closeAfterUnreadBody(request: FastifyRequest, reply: FastifyReply) {
+  const socket = serverSocket(request.raw);
+  if (!socket || reply.raw.writableEnded || closingAfterUnreadBody.has(reply)) return;
+  closingAfterUnreadBody.add(reply);
   reply.raw.once("finish", () => {
     if (request.raw.complete) return;
     const timer = setTimeout(() => {

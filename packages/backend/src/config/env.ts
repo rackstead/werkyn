@@ -173,6 +173,15 @@ const envSchema = z.object({
   // send.
   PASSWORD_RESET_COOLDOWN_SECONDS: wholeNumber("PASSWORD_RESET_COOLDOWN_SECONDS", 60, 0, 3600),
   PASSWORD_RESET_REQUESTS_PER_MINUTE: wholeNumber("PASSWORD_RESET_REQUESTS_PER_MINUTE", 6000, 60, 1000000),
+
+  // Backup preview and restore uploads (docs/remediation/r42-backup-limits.md).
+  // From GRACE seconds after an upload is admitted until its file is staged,
+  // its body must average at least MIN_BYTES_PER_SECOND over the last WINDOW
+  // seconds (or since admission, when shorter). A slower upload is refused
+  // with a 408, its partial file removed and its backup slot released.
+  BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: wholeNumber("BACKUP_UPLOAD_MIN_BYTES_PER_SECOND", 16384, 1, 1073741824),
+  BACKUP_UPLOAD_RATE_WINDOW_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_WINDOW_SECONDS", 60, 1, 3600),
+  BACKUP_UPLOAD_RATE_GRACE_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_GRACE_SECONDS", 30, 1, 3600),
 }).superRefine((values, ctx) => {
   if (values.LOGIN_BACKOFF_BASE_SECONDS > values.LOGIN_BACKOFF_MAX_SECONDS) {
     ctx.addIssue({

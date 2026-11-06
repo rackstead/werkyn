@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rm } from "node:fs/promises";
+import type { WriteStream } from "node:fs";
+import { mkdir, open, rm, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { pipeline, Transform, type Readable } from "node:stream";
 import { pipeline as pipeStreams } from "node:stream/promises";
@@ -77,7 +78,104 @@ export class BackupTransferStalledError extends AppError {
   }
 }
 
+export class BackupUploadTooSlowError extends AppError {
+  constructor(readonly bytesPerSecond: number) {
+    super(
+      408,
+      "Request Timeout",
+      `The backup upload was too slow and was abandoned. Uploads must average at least ${bytesPerSecond} bytes per second.`,
+    );
+  }
+}
+
 export const UPLOAD_INTERRUPTED_MESSAGE = "The backup upload did not complete";
+
+/**
+ * The slowest a backup upload may arrive (see
+ * docs/remediation/r42-backup-limits.md). Every value comes from the
+ * BACKUP_UPLOAD_* settings; tests pass short ones.
+ */
+export interface MinimumUploadRate {
+  /** Bytes per second the upload must average over the window. */
+  bytesPerSecond: number;
+  /** The sliding window the average is taken over. */
+  windowMs: number;
+  /** Time from the start of the upload before the rate is enforced. */
+  graceMs: number;
+}
+
+export interface RateWatch {
+  /** Count `bytes` received now. */
+  add(bytes: number): void;
+  /**
+   * The server has stopped reading (its staging write is behind), until
+   * resume(). That time is not held against the client.
+   */
+  pause(): void;
+  resume(): void;
+  /** Stop watching. Safe to call more than once. */
+  stop(): void;
+}
+
+/**
+ * Count an upload's bytes as they arrive, and call `onTooSlow` once if, at
+ * any check from `graceMs` after the start, the bytes received over the last
+ * `windowMs` (or since the start, when that is shorter) average less than
+ * `bytesPerSecond`. The check runs every tenth of the window, and at least
+ * once a second, so a client that sends nothing at all is caught too.
+ *
+ * Time is measured, so a check that runs late does not count a shorter
+ * period than it covers, but only while the server is reading: the grace
+ * period and the window leave out every pause() to resume() span.
+ */
+export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateWatch {
+  const checkMs = Math.max(1, Math.min(1000, Math.floor(rate.windowMs / 10)));
+  const started = performance.now();
+  let total = 0;
+  let stopped = false;
+  let pausedMs = 0;
+  let pausedAt: number | undefined;
+  /** Milliseconds since the start during which the server was reading. */
+  const reading = (now: number) => now - started - pausedMs - (pausedAt === undefined ? 0 : now - pausedAt);
+  // Totals at each check, oldest first. The first one is the newest at or
+  // before the start of the window, so the window is always covered.
+  const samples = [{ reading: 0, total: 0 }];
+  const tooSlow = (now: number) =>
+    total - samples[0].total < (rate.bytesPerSecond * (reading(now) - samples[0].reading)) / 1000;
+  const stop = () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+  const timer = setInterval(() => {
+    const now = reading(performance.now());
+    samples.push({ reading: now, total });
+    while (samples.length > 1 && samples[1].reading <= now - rate.windowMs) samples.shift();
+    if (now < rate.graceMs || !tooSlow(performance.now())) return;
+    // Timers run before pending socket reads. After synchronous work has
+    // held up the process (parsing another backup, say), bytes the client
+    // sent meanwhile are still waiting, so confirm once they have been read.
+    setImmediate(() => {
+      if (stopped || !tooSlow(performance.now())) return;
+      stop();
+      onTooSlow();
+    });
+  }, checkMs);
+  timer.unref();
+  return {
+    add(bytes) {
+      total += bytes;
+    },
+    pause() {
+      pausedAt ??= performance.now();
+    },
+    resume() {
+      if (pausedAt === undefined) return;
+      pausedMs += performance.now() - pausedAt;
+      pausedAt = undefined;
+    },
+    stop,
+  };
+}
 
 /**
  * A new, unused staging path of `kind` in `dir`, which is created if needed.
@@ -130,14 +228,18 @@ export interface StageOptions {
   dir: string;
   maxBytes: number;
   idleTimeoutMs: number;
+  /** Aborting it stops the copy with the signal's reason. */
+  signal?: AbortSignal;
 }
 
 /**
  * Write `source` to a new staged file without holding it in memory. Over
- * `maxBytes`, or idle for `idleTimeoutMs`, the copy stops with a 413 or 408.
- * On any failure the partial file is removed before the error is thrown.
+ * `maxBytes`, or idle for `idleTimeoutMs`, the copy stops with a 413 or 408;
+ * if `signal` is aborted, with its reason. On any failure the partial file is
+ * closed and removed before the error is thrown.
  */
 export async function stageStream(source: Readable, options: StageOptions): Promise<StagedFile> {
+  const { signal } = options;
   const file = await stagingPath("upload", options.dir);
   let size = 0;
   const meter = new Transform({
@@ -151,18 +253,43 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
       callback(null, chunk);
     },
   });
-  const idle = setTimeout(
-    () => meter.destroy(new BackupTransferStalledError()),
-    options.idleTimeoutMs,
-  );
+  // A stop (idle, or `signal`) destroys the meter only once the pipeline is
+  // listening for its error; one that comes while the file is still being
+  // opened is thrown when the open returns.
+  let stopped: unknown;
+  let piping = false;
+  const stopWith = (reason: unknown) => {
+    if (stopped !== undefined) return;
+    stopped = reason;
+    if (piping) meter.destroy(reason as Error);
+  };
+  const idle = setTimeout(() => stopWith(new BackupTransferStalledError()), options.idleTimeoutMs);
+  const abort = () => stopWith(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  let handle: FileHandle | undefined;
+  let output: WriteStream | undefined;
   try {
+    if (stopped !== undefined) throw stopped;
     // A new file; a link planted at its name is never followed (R33).
-    const output = await open(file, CREATE_NO_FOLLOW, 0o600).catch((error: unknown) => {
-      source.destroy();
-      throw error;
-    });
-    await pipeStreams(source, meter, output.createWriteStream());
+    handle = await open(file, CREATE_NO_FOLLOW, 0o600);
+    if (stopped !== undefined) throw stopped;
+    output = handle.createWriteStream();
+    piping = true;
+    await pipeStreams(source, meter, output);
   } catch (error) {
+    // Release the source, and close the file before removing it.
+    source.destroy();
+    const stream = output;
+    if (stream) {
+      if (!stream.closed) {
+        const closed = new Promise<void>((resolve) => stream.once("close", () => resolve()));
+        stream.destroy();
+        await closed;
+      }
+    } else {
+      await handle?.close().catch(() => {});
+    }
     await rm(file, { force: true });
     if (error instanceof AppError) throw error;
     // Disk errors are server errors; anything else came from the request.
@@ -170,6 +297,7 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
     throw new ValidationError(UPLOAD_INTERRUPTED_MESSAGE);
   } finally {
     clearTimeout(idle);
+    signal?.removeEventListener("abort", abort);
   }
   return stagedFile(file, size);
 }
@@ -223,7 +351,9 @@ export interface StagedUpload extends StagedFile {
 /**
  * Stream the request's uploaded backup file into `dir`, refusing it beyond
  * `maxBytes`. A request that sends nothing for `idleTimeoutMs`, before or
- * during the file, is dropped. The caller must dispose of the result once it
+ * during the file, is dropped. With `minRate`, a request whose body arrives
+ * more slowly than that, before or during the file, is refused with a 408
+ * (BackupUploadTooSlowError). The caller must dispose of the result once it
  * has finished with it.
  */
 export async function receiveBackupUpload(
@@ -232,11 +362,14 @@ export async function receiveBackupUpload(
     dir,
     maxBytes,
     idleTimeoutMs = BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
+    minRate,
     onFile,
   }: {
     dir: string;
     maxBytes: number;
     idleTimeoutMs?: number;
+    /** The slowest the request body may arrive, from this call on. */
+    minRate?: MinimumUploadRate;
     /** Called once the file part has started, before it is staged. */
     onFile?: () => void;
   },
@@ -247,43 +380,74 @@ export async function receiveBackupUpload(
   const pending = request.file({ limits: { fileSize: maxBytes } });
   pending.catch(() => {});
   const raw = request.raw;
-  let idle: NodeJS.Timeout | undefined;
-  const stalled = new Promise<never>((_, reject) => {
-    idle = setTimeout(() => {
-      reject(new BackupTransferStalledError());
-      raw.destroy();
-    }, idleTimeoutMs);
+
+  // Every byte of the body counts towards the minimum rate, multipart framing
+  // included, until the file is staged. A body that has fully arrived is no
+  // longer up to the client, so it is never refused as too slow. While the
+  // request is paused because staging is behind, the server is not reading,
+  // so that time does not count either.
+  const tooSlow = new AbortController();
+  const rate =
+    minRate &&
+    watchRate(minRate, () => {
+      if (!raw.complete) tooSlow.abort(new BackupUploadTooSlowError(minRate.bytesPerSecond));
+    });
+  const count = (chunk: Buffer) => rate?.add(chunk.length);
+  const paused = () => rate?.pause();
+  const resumed = () => rate?.resume();
+  if (raw.isPaused()) paused();
+  raw.on("data", count);
+  raw.on("pause", paused);
+  raw.on("resume", resumed);
+  const slow = new Promise<never>((_, reject) => {
+    tooSlow.signal.addEventListener("abort", () => reject(tooSlow.signal.reason), { once: true });
   });
-  const onData = () => idle?.refresh();
-  raw.on("data", onData);
-  let file: Awaited<typeof pending>;
+  slow.catch(() => {});
+
   try {
-    file = await Promise.race([pending, stalled]);
+    let idle: NodeJS.Timeout | undefined;
+    const stalled = new Promise<never>((_, reject) => {
+      idle = setTimeout(() => {
+        reject(new BackupTransferStalledError());
+        raw.destroy();
+      }, idleTimeoutMs);
+    });
+    const onData = () => idle?.refresh();
+    raw.on("data", onData);
+    let file: Awaited<typeof pending>;
+    try {
+      file = await Promise.race([pending, stalled, slow]);
+    } finally {
+      clearTimeout(idle);
+      raw.off("data", onData);
+    }
+    if (!file) {
+      throw new ValidationError("No file uploaded");
+    }
+    if (!file.filename.endsWith(".json") && !file.filename.endsWith(".zip")) {
+      throw new ValidationError("Only .json and .zip files are accepted");
+    }
+    onFile?.();
+    let staged: StagedFile;
+    try {
+      staged = await stageStream(file.file, { dir, maxBytes, idleTimeoutMs, signal: tooSlow.signal });
+    } catch (error) {
+      // Drop a client that stalled mid-file; it is not reading a response.
+      if (error instanceof BackupTransferStalledError) raw.destroy();
+      throw error;
+    }
+    // The multipart parser ends a file at its size limit instead of failing.
+    if (file.file.truncated) {
+      await staged.dispose();
+      throw new BackupUploadTooLargeError(maxBytes);
+    }
+    return { ...staged, filename: file.filename };
   } finally {
-    clearTimeout(idle);
-    raw.off("data", onData);
+    rate?.stop();
+    raw.off("data", count);
+    raw.off("pause", paused);
+    raw.off("resume", resumed);
   }
-  if (!file) {
-    throw new ValidationError("No file uploaded");
-  }
-  if (!file.filename.endsWith(".json") && !file.filename.endsWith(".zip")) {
-    throw new ValidationError("Only .json and .zip files are accepted");
-  }
-  onFile?.();
-  let staged: StagedFile;
-  try {
-    staged = await stageStream(file.file, { dir, maxBytes, idleTimeoutMs });
-  } catch (error) {
-    // Drop a client that stalled mid-file; it is not reading a response.
-    if (error instanceof BackupTransferStalledError) raw.destroy();
-    throw error;
-  }
-  // The multipart parser ends a file at its size limit instead of failing.
-  if (file.file.truncated) {
-    await staged.dispose();
-    throw new BackupUploadTooLargeError(maxBytes);
-  }
-  return { ...staged, filename: file.filename };
 }
 
 const sweeps = new Map<string, Promise<void>>();

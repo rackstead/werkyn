@@ -57,6 +57,10 @@ and never held in memory as a whole:
   entries. Beyond that the response is a 413 and the partial file is removed.
 - A request that sends no bytes for 60 seconds, whether before its file part
   starts or during the file, is dropped (408).
+- From admission until its file is staged, the upload must also keep to a
+  minimum average rate (16 KiB/s over 60 seconds by default, from 30 seconds
+  after admission). A slower one is answered 408, its partial file removed and
+  its admission released ([R42](r42-backup-limits.md)).
 - The staged file is removed on every path before the response is sent, so a
   client can start its next backup request as soon as it has the answer.
 - At startup, before the server accepts requests, staged files left by a
@@ -310,10 +314,12 @@ unchanged apart from awaiting the reader.
 
 An export longer than 10 minutes fails and must be made in parts. A long
 snapshot holds back the database's cleanup of old row versions while it
-lasts. A client that keeps sending, or reading, a few bytes a minute holds its
-admission; three such clients, in three workspaces, fill the process. The
-limits are per process, and up to three staged files of up to 1,088 MiB each
-can be on disk at once. Parsing `backup.json` is still synchronous (at most
-about 0.4 s). A workspace whose export exceeds the restore limits must still
-be exported in parts. The public backup documentation does not describe these
-limits or the backup's scope yet.
+lasts. A client that reads an export a few bytes a minute holds its admission;
+three such clients, in three workspaces, fill the process. Uploads now have a
+minimum rate ([R42](r42-backup-limits.md)), but one that keeps to it holds its
+admission until it ends. The limits are per process, and up to three staged
+files of up to 1,088 MiB each can be on disk at once. Parsing `backup.json` is
+still synchronous (at most about 0.6 s, see SEC-028). A workspace whose export
+exceeds the restore limits must still be exported in parts. The README's
+"Backups and restores" section describes these limits and proxy settings for
+operators; the public website documentation does not yet.

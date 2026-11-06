@@ -117,7 +117,11 @@ export async function forgotPasswordHandler(
 
   // Answered without waiting for the account lookup or the mail, so every
   // address gets the same response at the same speed.
-  authService.requestPasswordReset(request.server.prisma, body.email);
+  authService.requestPasswordReset(
+    request.server.prisma,
+    body.email,
+    request.ip,
+  );
 
   return reply.send({
     message: "If an account exists, a reset link has been sent.",

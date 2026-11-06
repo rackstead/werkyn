@@ -512,3 +512,47 @@ test("a password-reset request is answered alike for every address before any ac
   assert.equal(reset.statusCode, 200, reset.body);
   assert.equal((await login(real, "Reset-password-456")).status, 200);
 });
+
+test("pending reset requests are bounded per client and per process; repeats for one address add nothing", async () => {
+  const accounts = [];
+  for (let i = 0; i < 102; i++) accounts.push(await account("real"));
+  let release;
+  mailGate = new Promise((resolve) => (release = resolve));
+  const sent = mail.length;
+  const forgot = async (email, client) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/forgot-password",
+      payload: { email },
+      remoteAddress: client,
+    });
+    assert.equal(response.statusCode, 200, response.body);
+  };
+  let delivered;
+  try {
+    // One client: three requests in progress at most; its fourth is dropped
+    // and a repeat for a pending address adds nothing.
+    for (const email of accounts.slice(0, 4)) await forgot(email, "10.70.0.1");
+    await forgot(accounts[0], "10.70.0.2");
+    // Other clients fill the process bound of 100 (97 more).
+    for (let i = 4; i < 101; i++)
+      await forgot(accounts[i], `10.70.1.${Math.floor(i / 3)}`);
+    // The 101st distinct address, from a fresh client, is over the bound.
+    await forgot(accounts[101], "10.70.2.1");
+  } finally {
+    release();
+    mailGate = Promise.resolve();
+  }
+  await settlePasswordResetRequests();
+  delivered = mail.slice(sent).map((message) => message.to);
+  const expected = [...accounts.slice(0, 3), ...accounts.slice(4, 101)];
+  assert.deepEqual([...delivered].sort(), [...expected].sort());
+  // Once work drains, a dropped address can ask again.
+  await forgot(accounts[101], "10.70.2.1");
+  await forgot(accounts[3], "10.70.0.1");
+  await settlePasswordResetRequests();
+  assert.deepEqual(
+    mail.slice(sent + delivered.length).map((m) => m.to).sort(),
+    [accounts[3], accounts[101]].sort(),
+  );
+});

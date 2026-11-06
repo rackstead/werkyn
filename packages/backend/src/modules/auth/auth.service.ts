@@ -384,30 +384,49 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
 // looking the account up, replacing its link and waiting for the mail server
 // all happen afterwards. A request for an address whose earlier request is
 // still in progress adds nothing: that one sends the newest link. Work in
-// progress is bounded per process; past the bound a request is dropped and
+// progress is bounded per process and per client address, so one client
+// cannot hold the whole bound; past either bound a request is dropped and
 // logged, which the requester cannot tell from an unknown address (the link
 // does not arrive and can be requested again). Work for an address without
 // an account ends after one lookup, so only mail to existing accounts can
-// hold the bound for long.
+// hold the bound for long. The work is not durable (see
+// docs/remediation/r31-login-backoff.md).
 const MAX_PENDING_RESET_REQUESTS = 100;
+const MAX_PENDING_RESET_REQUESTS_PER_CLIENT = 3;
 const pendingResetRequests = new Map<string, Promise<void>>();
+const pendingResetClients = new Map<string, number>();
 
-export function requestPasswordReset(prisma: PrismaClient, email: string) {
+export function requestPasswordReset(
+  prisma: PrismaClient,
+  email: string,
+  client: string,
+) {
   const address = email.toLowerCase();
   if (pendingResetRequests.has(address)) return;
-  if (pendingResetRequests.size >= MAX_PENDING_RESET_REQUESTS) {
+  const fromClient = pendingResetClients.get(client) ?? 0;
+  if (
+    pendingResetRequests.size >= MAX_PENDING_RESET_REQUESTS ||
+    fromClient >= MAX_PENDING_RESET_REQUESTS_PER_CLIENT
+  ) {
     logger.warn(
-      { event: "password_reset_request_dropped" },
+      {
+        event: "password_reset_request_dropped",
+        bound: fromClient >= MAX_PENDING_RESET_REQUESTS_PER_CLIENT ? "client" : "process",
+      },
       "Too many password reset requests in progress; one was dropped",
     );
     return;
   }
+  pendingResetClients.set(client, fromClient + 1);
   const work: Promise<void> = forgotPassword(prisma, address)
     .catch((error) => {
       logger.error({ err: error }, "Password reset request failed");
     })
     .finally(() => {
       pendingResetRequests.delete(address);
+      const left = (pendingResetClients.get(client) ?? 1) - 1;
+      if (left > 0) pendingResetClients.set(client, left);
+      else pendingResetClients.delete(client);
     });
   pendingResetRequests.set(address, work);
 }

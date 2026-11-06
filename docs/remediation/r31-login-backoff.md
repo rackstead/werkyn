@@ -124,8 +124,9 @@ they matter only while one of them is failing.
   account up. Replacing the reset link and sending the mail run afterwards
   (`requestPasswordReset` in `auth.service.ts`). A repeated request for an
   address whose earlier one is still running adds nothing, because the running
-  one sends the newest link. Each process runs at most 100 requests for
-  distinct addresses at a time. Further requests are logged
+  one sends the newest link. Each process runs at most 100 requests at a
+  time, and at most 3 from one client IP address, so one client cannot take
+  the whole bound. Further requests are logged
   (`password_reset_request_dropped`) and dropped. The requester sees the same
   answer as for an unknown address and can ask again. Work for an address
   without an account ends after one lookup, so only mail to existing accounts
@@ -209,7 +210,11 @@ shipped container entrypoint applies migrations before starting the server.
   - a late undecided report does not uncount failures newer than a sign-in;
   - a correct password whose sign-in is refused, because the password was
     replaced while it waited for the account row, stays a counted failure;
-  - a cross-origin frontend can read `Retry-After`, because CORS exposes it.
+  - a cross-origin frontend can read `Retry-After`, because CORS exposes it;
+  - while mail is held, pending reset requests stop at 3 per client and 100
+    per process, a repeat for a pending address adds nothing, every accepted
+    request delivers its link, and a dropped address can ask again once the
+    work drains.
 - `tests/integration/login-backoff-bounds.test.mjs` runs with 256 slots:
   - 600 unique unknown addresses through the sign-in route leave at most 256
     rows and only `401` or `429` answers;
@@ -260,11 +265,11 @@ shipped container entrypoint applies migrations before starting the server.
   thousand client IP addresses. The two-job password check limit is a cheaper
   way to deny service.
 - **Process-local limits.** The route limit, the password-check admission and
-  the 100 pending reset requests are counted per server process. Only the
+  the pending reset-request bounds are counted per server process. Only the
   backoff is shared.
 - **Reset requests are best effort, not durable.** An answered request lives
   only in the process that answered it:
-  - it is dropped past the 100-request bound;
+  - it is dropped past the 100-request or 3-per-client bound;
   - it is lost if the process stops;
   - the server waits at most 2 seconds for it on a clean shutdown.
 

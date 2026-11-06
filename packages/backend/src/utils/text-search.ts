@@ -1,4 +1,4 @@
-import type { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 
 /**
  * Runs text-search queries, those that filter with `contains` and mode
@@ -36,39 +36,55 @@ export async function withSearchPlans<const P extends readonly Prisma.PrismaProm
   return results.slice(1 + settings.length) as { -readonly [K in keyof P]: Awaited<P[K]> };
 }
 
-/** The indexes of migration 20261105180000_search_trigram_indexes. */
+/**
+ * The indexes of migration 20261105180000_search_trigram_indexes: name,
+ * table and column. Each is a single-column GIN index with gin_trgm_ops.
+ */
 export const SEARCH_TRIGRAM_INDEXES = [
-  "Task_title_trgm_idx",
-  "Task_description_trgm_idx",
-  "ChatMessage_content_trgm_idx",
-  "WikiPage_title_trgm_idx",
-  "File_name_trgm_idx",
+  ["Task_title_trgm_idx", "Task", "title"],
+  ["Task_description_trgm_idx", "Task", "description"],
+  ["ChatMessage_content_trgm_idx", "ChatMessage", "content"],
+  ["WikiPage_title_trgm_idx", "WikiPage", "title"],
+  ["File_name_trgm_idx", "File", "name"],
 ] as const;
 
 /**
- * Logs one warning when the search trigram indexes are not all present and
- * valid. The migration skips them on databases whose default collation does
+ * Logs one warning when any search trigram index is missing, invalid, or
+ * has an expected name but another definition (table, column, access method
+ * or operator class): the migration's IF NOT EXISTS would have skipped it.
+ * The migration skips the indexes on databases whose default collation does
  * not use libc (pg_trgm cannot follow ICU case folding there), and search
- * then reads the tables as before. Never throws.
+ * then reads the tables as before. Returns whether it warned; never throws.
  */
 export async function warnIfSearchIndexesMissing(
-  prisma: PrismaClient,
+  prisma: Pick<PrismaClient, "$queryRaw">,
   log: { warn(details: object, message: string): void },
 ): Promise<boolean> {
   try {
-    const [row] = await prisma.$queryRaw<{ present: number; provider: string | null }[]>`
+    const expected = Prisma.join(
+      SEARCH_TRIGRAM_INDEXES.map(([name, table, column]) => Prisma.sql`(${name}, ${table}, ${column})`),
+    );
+    const [row] = await prisma.$queryRaw<{ present: string[]; provider: string | null }[]>`
       SELECT
-        (SELECT count(*)::int FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = ANY(${[...SEARCH_TRIGRAM_INDEXES]}::text[])
-            AND c.relnamespace = to_regnamespace(current_schema()) AND i.indisvalid) AS present,
+        ARRAY(SELECT c.relname::text FROM pg_index i
+          JOIN pg_class c ON c.oid = i.indexrelid
+          JOIN pg_class t ON t.oid = i.indrelid
+          JOIN pg_am am ON am.oid = c.relam
+          JOIN pg_opclass o ON o.oid = i.indclass[0]
+          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+          WHERE (c.relname::text, t.relname::text, a.attname::text) IN (${expected})
+            AND c.relnamespace = to_regnamespace(current_schema())
+            AND i.indnatts = 1 AND i.indexprs IS NULL AND i.indpred IS NULL
+            AND am.amname = 'gin' AND o.opcname = 'gin_trgm_ops' AND i.indisvalid) AS present,
         (SELECT to_jsonb(d) ->> 'datlocprovider' FROM pg_database d
           WHERE d.datname = current_database()) AS provider`;
-    if (row.present === SEARCH_TRIGRAM_INDEXES.length) return false;
+    const missing = SEARCH_TRIGRAM_INDEXES.map(([name]) => name).filter((name) => !row.present.includes(name));
+    if (missing.length === 0) return false;
     const provider = { c: "libc", i: "icu", b: "builtin" }[row.provider ?? "c"] ?? row.provider;
     log.warn(
-      { present: row.present, expected: SEARCH_TRIGRAM_INDEXES.length, collationProvider: provider },
+      { missing, collationProvider: provider },
       provider === "libc"
-        ? "Search trigram indexes are missing or invalid; text search reads whole tables (docs/remediation/p02c.md)"
+        ? "Search trigram indexes are missing, invalid or defined differently; text search reads whole tables (docs/remediation/p02c.md)"
         : `Search trigram indexes are not created on a database whose default collation provider is ${provider}; text search reads whole tables (docs/remediation/p02c.md)`,
     );
     return true;

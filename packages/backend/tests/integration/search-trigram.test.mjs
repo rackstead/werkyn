@@ -722,6 +722,23 @@ describe("case folding", () => {
     const warnings = [];
     assert.equal(await warnIfSearchIndexesMissing(app.prisma, { warn: (...a) => warnings.push(a) }), false);
     assert.deepEqual(warnings, []);
+    // It reports an index with an expected name but another definition (the
+    // migration's IF NOT EXISTS would skip it), and a missing one.
+    for (const replacement of [`CREATE INDEX "WikiPage_title_trgm_idx" ON "WikiPage" ("title")`, null]) {
+      const found = [];
+      try {
+        await app.prisma.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe(`DROP INDEX "WikiPage_title_trgm_idx"`);
+          if (replacement) await tx.$executeRawUnsafe(replacement);
+          assert.equal(await warnIfSearchIndexesMissing(tx, { warn: (...a) => found.push(a) }), true);
+          throw new Error("rollback");
+        });
+      } catch (error) {
+        if (error.message !== "rollback") throw error;
+      }
+      assert.deepEqual(found.map(([details]) => details), [{ missing: ["WikiPage_title_trgm_idx"], collationProvider: "libc" }]);
+      assert.match(found[0][1], /missing, invalid or defined differently/);
+    }
   });
 
   describe("ICU databases", () => {

@@ -242,10 +242,11 @@ should raise `LOGIN_BACKOFF_SLOTS`.
     (default 60, at most 3,600). A request within the cooldown is answered
     alike and makes no token and no mail. The cooldown is read from the
     account's newest link, which is kept until it expires after an hour, so
-    longer cooldowns are not offered. A password change or reset deletes the
-    unused links and so ends the cooldown early. Across processes the cooldown
-    is best effort: two requests checked at the same moment can both send a
-    link.
+    longer cooldowns are not offered. A password change deletes the unused
+    links and so ends the cooldown early. A completed reset keeps its used link
+    until it expires, so the cooldown still runs from that link's creation.
+    Across processes the cooldown is best effort: two requests checked at the
+    same moment can both send a link.
   - Work for an address without an account ends after one lookup.
 
   The reviewer's flood probe ran against this design for 150 seconds: 65

@@ -49,6 +49,56 @@ describe("steadyEntry", () => {
     expect(steadyEntry(seen(before, "e3", "e4"), at("e0", "e1", "e2", "e3", "new", "e4"))?.key).toBe("e3");
   });
 
+  describe("a block of entries in view that sorts far away now", () => {
+    // 5,000 entries; 18 in view (e2500 to e2517).
+    const before = Array.from({ length: 5000 }, (_, i) => `e${i}`);
+    const view = seen(before, ...before.slice(2500, 2518));
+    const without = (block: string[]) => before.filter((k) => !block.includes(k));
+
+    it("keeps the entries that stayed when the top block sorts at the end", () => {
+      const block = before.slice(2500, 2514);
+      const kept = steadyEntry(view, at(...without(block), ...block));
+      expect(kept).toEqual({ ...view[14], now: 2500 });
+    });
+
+    it("keeps the entries above the block when it sorts at the end", () => {
+      const block = before.slice(2502, 2516);
+      const kept = steadyEntry(view, at(...without(block), ...block));
+      expect(kept).toEqual({ ...view[0], now: 2500 });
+    });
+
+    it("keeps the entries that stayed when the top block sorts far above", () => {
+      const block = before.slice(2500, 2514);
+      const after = without(block);
+      after.splice(100, 0, ...block);
+      expect(steadyEntry(view, at(...after))?.key).toBe("e2514");
+    });
+
+    it("keeps the entries left when the block is removed", () => {
+      const block = before.slice(2500, 2514);
+      expect(steadyEntry(view, at(...without(block)))).toEqual({ ...view[14], now: 2500 });
+    });
+
+    it("keeps the group that moved least when every group moved far", () => {
+      // 500 added above the view, and the top block renamed to the end.
+      const block = before.slice(2500, 2514);
+      const added = Array.from({ length: 500 }, (_, i) => `n${i}`);
+      const kept = steadyEntry(view, at(...added, ...without(block), ...block));
+      expect(kept).toEqual({ ...view[14], now: 3000 });
+      // 500 added above alone: the first entry seen.
+      expect(steadyEntry(view, at(...added, ...before))).toEqual({ ...view[0], now: 3000 });
+    });
+  });
+
+  it("prefers an entry of the group kept that is still rendered", () => {
+    const before = list(10);
+    const view = seen(before, "e5", "e6", "e7");
+    const after = at("x", "y", ...before);
+    expect(steadyEntry(view, after, (key) => key !== "e5")).toEqual({ ...view[1], now: 8 });
+    // None rendered: the first of the group.
+    expect(steadyEntry(view, after, () => false)).toEqual({ ...view[0], now: 7 });
+  });
+
   it("finds nothing when no entry seen is listed", () => {
     expect(steadyEntry(seen(list(4), "e1", "e2"), at("a", "b"))).toBeUndefined();
     expect(steadyEntry([], at("a"))).toBeUndefined();

@@ -289,8 +289,8 @@ export function TaskTable({
   // at a height other than their estimate, an editor above the view
   // closing, or content above the table changing height. The rows in view
   // are remembered by key with their place and the scroll position; after a
-  // change, <main> scrolls by however far the first of them that kept its
-  // order moved other than by the user scrolling. The browser's own scroll
+  // change, <main> scrolls by however far the one of them that stayed (see
+  // steadyRow) moved other than by the user scrolling. The browser's own scroll
   // anchoring is off for <main> while the List is windowed: it did not apply
   // to these changes, and the two together would move the rows twice.
   // Nothing is kept at the very top of the List.
@@ -337,7 +337,10 @@ export function TaskTable({
         if (item) {
           const want = kept.top - scrolled;
           scroller.scrollTop = item.start - want;
-          inView.current = { scrollTop: scroller.scrollTop, rows: [{ key: kept.key, top: want }] };
+          inView.current = {
+            scrollTop: scroller.scrollTop,
+            rows: [{ key: kept.key, top: want, index: kept.index }],
+          };
           return;
         }
       }
@@ -350,7 +353,8 @@ export function TaskTable({
       const { top, bottom } = row.getBoundingClientRect();
       if (bottom <= viewTop) continue;
       if (top >= viewBottom) break;
-      rows.push({ key, top: top - viewTop - remainder });
+      const index = rowIndexRef.current.get(key);
+      if (index !== undefined) rows.push({ key, top: top - viewTop - remainder, index });
     }
     inView.current = { scrollTop: scroller.scrollTop, rows };
   }, [scroller, virtualizer]);

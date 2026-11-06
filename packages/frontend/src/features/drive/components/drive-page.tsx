@@ -177,7 +177,10 @@ export function DrivePage({
   // is asked for again after a wait, below the entries already loaded,
   // which stay usable; the end of the list coming into view meanwhile does
   // not ask again.
+  // The listing shown: another folder, search or sort is another list.
+  const listKey = JSON.stringify([workspaceId, folderId, teamFolderId, searchQuery, sortBy, sortOrder]);
   const nextPage = useNextPageRetry({
+    listKey,
     failed: isFetchNextPageError,
     error,
     pages: data?.pages.length ?? 0,
@@ -294,30 +297,35 @@ export function DrivePage({
   // scrolling settles (a second without a change; at once the first time
   // for a list), so that skimming a long folder does not double the
   // requests it makes.
-  const [entriesInView, setEntriesInView] = useState<EntriesInView | null>(null);
-  const settled = useRef<{ timer?: ReturnType<typeof setTimeout>; once: boolean }>({ once: false });
-  const onVisibleEntries = useCallback((first: number, last: number) => {
-    clearTimeout(settled.current.timer);
-    const settle = () =>
-      setEntriesInView((current) =>
-        current?.[0] === first && current[1] === last ? current : [first, last],
-      );
-    if (settled.current.once) settled.current.timer = setTimeout(settle, SHARE_STATUS_SETTLE_MS);
-    else {
-      settled.current.once = true;
-      settle();
-    }
-  }, []);
-  // A list being loaded anew (another folder, search or sort) reports its
-  // entries in view anew once shown.
-  useEffect(() => {
-    if (!isLoading) return;
-    clearTimeout(settled.current.timer);
-    settled.current.once = false;
-    setEntriesInView(null);
-  }, [isLoading]);
-  useEffect(() => () => clearTimeout(settled.current.timer), []);
-  const sharedFileIds = useFileShareStatus(workspaceId, fileIds, entriesInView);
+  // Another list starts with no entries in view known; the views report
+  // them again (the callback changes with the list), and the first report
+  // counts at once.
+  const [entriesInView, setEntriesInView] = useState<{ listKey: string; range: EntriesInView } | null>(null);
+  const settleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const reportedFor = useRef<string | null>(null);
+  const onVisibleEntries = useCallback(
+    (first: number, last: number) => {
+      clearTimeout(settleTimer.current);
+      const settle = () =>
+        setEntriesInView((current) =>
+          current?.listKey === listKey && current.range[0] === first && current.range[1] === last
+            ? current
+            : { listKey, range: [first, last] },
+        );
+      if (reportedFor.current === listKey) settleTimer.current = setTimeout(settle, SHARE_STATUS_SETTLE_MS);
+      else {
+        reportedFor.current = listKey;
+        settle();
+      }
+    },
+    [listKey],
+  );
+  useEffect(() => () => clearTimeout(settleTimer.current), []);
+  const sharedFileIds = useFileShareStatus(
+    workspaceId,
+    fileIds,
+    entriesInView?.listKey === listKey ? entriesInView.range : null,
+  );
 
   const handleShare = useCallback(
     (file: DriveFile) => {

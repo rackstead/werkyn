@@ -823,6 +823,24 @@ export function useSharedByMe(wid: string) {
 
 // ── File Share Mutations ──
 
+/**
+ * Marks the share status of these files as stale. The Drive page keeps it
+ * in groups of entries (hooks/use-file-share-status.ts); only the groups
+ * holding one of these files are asked for again. Without files, every
+ * group of the workspace is.
+ */
+function invalidateShareStatus(qc: QueryClient, wid: string, fileIds?: readonly string[]) {
+  const changed = fileIds ? new Set(fileIds) : null;
+  return qc.invalidateQueries({
+    queryKey: ["file-share-status"],
+    predicate: (query) => {
+      const key = query.queryKey[1] as { wid?: string; key?: string } | undefined;
+      if (key?.wid !== wid) return false;
+      return !changed || (key.key ?? "").split(",").some((id) => changed.has(id));
+    },
+  });
+}
+
 export function useCreateFileShares(wid: string) {
   const qc = useQueryClient();
   return useMutation({
@@ -830,9 +848,9 @@ export function useCreateFileShares(wid: string) {
       api
         .post(`workspaces/${wid}/files/shares`, { json: input })
         .json<{ data: { count: number } }>(),
-    onSuccess: () => {
+    onSuccess: (_result, input) => {
       qc.invalidateQueries({ queryKey: ["file-shares"] });
-      qc.invalidateQueries({ queryKey: ["file-share-status"] });
+      invalidateShareStatus(qc, wid, input.fileIds);
       qc.invalidateQueries({ queryKey: ["files"] });
     },
   });
@@ -843,9 +861,9 @@ export function useRemoveFileShare(wid: string) {
   return useMutation({
     mutationFn: ({ fileId, userId }: { fileId: string; userId: string }) =>
       api.delete(`workspaces/${wid}/files/${fileId}/shares/${userId}`).then(() => {}),
-    onSuccess: () => {
+    onSuccess: (_result, { fileId }) => {
       qc.invalidateQueries({ queryKey: ["file-shares"] });
-      qc.invalidateQueries({ queryKey: ["file-share-status"] });
+      invalidateShareStatus(qc, wid, [fileId]);
       qc.invalidateQueries({ queryKey: ["files"] });
     },
   });
@@ -858,9 +876,9 @@ export function useCreateFileShareLink(wid: string) {
       api
         .post(`workspaces/${wid}/files/share-links`, { json: input })
         .json<{ data: FileShareLinkDetail }>(),
-    onSuccess: () => {
+    onSuccess: (_result, input) => {
       qc.invalidateQueries({ queryKey: ["file-share-links"] });
-      qc.invalidateQueries({ queryKey: ["file-share-status"] });
+      invalidateShareStatus(qc, wid, input.fileIds);
       qc.invalidateQueries({ queryKey: queryKeys.sharedByMe(wid) });
     },
   });
@@ -892,9 +910,19 @@ export function useDeleteFileShareLink(wid: string) {
   return useMutation({
     mutationFn: (linkId: string) =>
       api.delete(`workspaces/${wid}/file-share-links/${linkId}`).then(() => {}),
-    onSuccess: () => {
+    // The link's files, from the links on screen, before it is gone.
+    onMutate: (linkId: string) => {
+      for (const [, data] of qc.getQueriesData<{ data: FileShareLinkDetail[] }>({
+        queryKey: ["file-share-links"],
+      })) {
+        const link = data?.data.find((l) => l.id === linkId);
+        if (link) return { fileIds: link.files.map((f) => f.file.id) };
+      }
+      return { fileIds: undefined };
+    },
+    onSuccess: (_result, _linkId, context) => {
       qc.invalidateQueries({ queryKey: ["file-share-links"] });
-      qc.invalidateQueries({ queryKey: ["file-share-status"] });
+      invalidateShareStatus(qc, wid, context?.fileIds);
       qc.invalidateQueries({ queryKey: queryKeys.sharedByMe(wid) });
     },
   });

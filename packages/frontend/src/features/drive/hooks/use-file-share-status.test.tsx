@@ -1,56 +1,117 @@
 import type { ReactNode } from "react";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { useFileShareStatus } from "./use-file-share-status";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryKeys } from "@/lib/query-keys";
+import { useCreateFileShareLink, useCreateFileShares, useDeleteFileShareLink } from "../api";
+import { SHARE_STATUS_GROUP, shareStatusGroups, useFileShareStatus } from "./use-file-share-status";
 
-const requests = vi.hoisted(() => [] as string[][]);
+const net = vi.hoisted(() => ({ requests: [] as string[][], shared: new Set<string>() }));
 vi.mock("@/lib/api-client", () => ({
   api: {
     get: (url: string) => {
       const ids = new URLSearchParams(url.split("?")[1]).get("fileIds")!.split(",");
-      requests.push(ids);
-      // Every tenth file is shared.
-      return { json: () => Promise.resolve({ data: ids.filter((id) => Number(id.slice(1)) % 10 === 0) }) };
+      net.requests.push(ids);
+      return { json: () => Promise.resolve({ data: ids.filter((id) => net.shared.has(id)) }) };
     },
+    post: () => ({ json: () => Promise.resolve({ data: {} }) }),
+    delete: () => Promise.resolve(),
   },
 }));
 
-const ids = (n: number) => Array.from({ length: n }, (_, i) => `f${i}`);
+const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => `f${from + i}`);
 
-afterEach(() => {
-  cleanup();
-  requests.length = 0;
+let client: QueryClient;
+const wrapper = ({ children }: { children: ReactNode }) => (
+  <QueryClientProvider client={client}>{children}</QueryClientProvider>
+);
+beforeEach(() => {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  net.requests = [];
+  // Every tenth file is shared.
+  net.shared = new Set(ids(0, 2000).filter((_, i) => i % 10 === 0));
+});
+afterEach(cleanup);
+
+describe("shareStatusGroups", () => {
+  it("fills groups in list order and keeps their members as entries are added or removed", () => {
+    const first = shareStatusGroups([], ids(0, 450));
+    expect(first.map((g) => g.length)).toEqual([200, 200, 50]);
+    // An entry added at the top joins the last group; the others keep theirs.
+    const added = shareStatusGroups(first, ["new", ...ids(0, 450)]);
+    expect(added.slice(0, 2)).toEqual(first.slice(0, 2));
+    expect(added[2]).toEqual([...first[2], "new"]);
+    // A group none of whose entries is listed any more is dropped.
+    const removed = shareStatusGroups(added, ["new", ...ids(200, 450)]);
+    expect(removed).toEqual(added.slice(1));
+    // Another folder: new groups only.
+    expect(shareStatusGroups(removed, ids(1000, 1010))).toEqual([ids(1000, 1010)]);
+  });
 });
 
 describe("useFileShareStatus", () => {
-  it("asks in groups of 100 entries and merges the answers", async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    );
+  it("asks in groups and asks again only for the group an added entry joins", async () => {
     const { result, rerender } = renderHook(({ fileIds }) => useFileShareStatus("w", fileIds), {
       wrapper,
-      initialProps: { fileIds: ids(250) },
+      initialProps: { fileIds: ids(0, 450) },
     });
-    await waitFor(() => expect(result.current.size).toBe(25));
-    expect(requests.map((r) => r.length)).toEqual([100, 100, 50]);
-    expect(result.current.has("f240")).toBe(true);
+    await waitFor(() => expect(result.current.size).toBe(45));
+    expect(net.requests.map((r) => r.length)).toEqual([200, 200, 50]);
+    expect(Math.max(...net.requests.map((r) => r.length))).toBeLessThanOrEqual(SHARE_STATUS_GROUP);
 
-    // The next page of 50: only the last group is asked for again.
-    rerender({ fileIds: ids(300) });
-    await waitFor(() => expect(result.current.size).toBe(30));
-    expect(requests.map((r) => r.length)).toEqual([100, 100, 50, 100]);
-    expect(requests.at(-1)![0]).toBe("f200");
+    // An entry added at the top of the list.
+    net.shared.add("new");
+    rerender({ fileIds: ["new", ...ids(0, 450)] });
+    // The earlier answer stays while the last group is asked again.
+    expect(result.current.size).toBe(45);
+    await waitFor(() => expect(result.current.has("new")).toBe(true));
+    expect(net.requests.length).toBe(4);
+    expect(net.requests[3]).toEqual([...ids(400, 450), "new"]);
   });
 
   it("asks nothing for an empty folder", () => {
-    const client = new QueryClient();
-    const wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    );
     const { result } = renderHook(() => useFileShareStatus("w", []), { wrapper });
     expect(result.current.size).toBe(0);
-    expect(requests).toEqual([]);
+    expect(net.requests).toEqual([]);
+  });
+
+  it("asks again after a share change only for the groups holding the files changed", async () => {
+    const { result } = renderHook(
+      () => ({
+        status: useFileShareStatus("w", ids(0, 600)),
+        shares: useCreateFileShares("w"),
+        link: useCreateFileShareLink("w"),
+        unlink: useDeleteFileShareLink("w"),
+      }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.status.size).toBe(60));
+    expect(net.requests.length).toBe(3);
+
+    net.shared.add("f1");
+    await act(() => result.current.shares.mutateAsync({ fileIds: ["f1"], userIds: ["u2"] }));
+    await waitFor(() => expect(result.current.status.has("f1")).toBe(true));
+    expect(net.requests.length).toBe(4);
+    expect(net.requests[3]).toContain("f1");
+
+    net.shared.add("f450");
+    await act(() => result.current.link.mutateAsync({ fileIds: ["f450"] }));
+    await waitFor(() => expect(result.current.status.has("f450")).toBe(true));
+    expect(net.requests.length).toBe(5);
+    expect(net.requests[4]).toContain("f450");
+
+    // Deleting a link: its files come from the links on screen.
+    client.setQueryData(queryKeys.fileShareLinks("w", "f450"), {
+      data: [{ id: "l1", files: [{ file: { id: "f450" } }] }],
+    });
+    net.shared.delete("f450");
+    await act(() => result.current.unlink.mutateAsync("l1"));
+    await waitFor(() => expect(result.current.status.has("f450")).toBe(false));
+    expect(net.requests.length).toBe(6);
+    expect(net.requests[5]).toContain("f450");
+
+    // A link not on screen: every group is asked again.
+    await act(() => result.current.unlink.mutateAsync("unknown"));
+    await waitFor(() => expect(net.requests.length).toBe(9));
   });
 });

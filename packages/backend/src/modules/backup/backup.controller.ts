@@ -24,6 +24,7 @@ import {
   type StagedUpload,
 } from "./backup-staging.js";
 import { env } from "../../config/env.js";
+import { READ_NO_FOLLOW } from "../../services/storage-paths.js";
 import { liftRequestTimeout } from "../../plugins/request-limits.js";
 import { ValidationError } from "../../utils/errors.js";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
@@ -62,7 +63,7 @@ export async function exportHandler(
   // disk either way.
   let handle: FileHandle;
   try {
-    handle = await open(file.path, "r");
+    handle = await open(file.path, READ_NO_FOLLOW);
   } finally {
     await file.dispose();
   }
@@ -98,7 +99,7 @@ function isZipSignature(bytes: Buffer): boolean {
 }
 
 async function startsWithZipSignature(file: string): Promise<boolean> {
-  const handle = await open(file, "r");
+  const handle = await open(file, READ_NO_FOLLOW);
   try {
     const head = Buffer.alloc(4);
     const { bytesRead } = await handle.read(head, 0, 4, 0);
@@ -118,7 +119,7 @@ async function openStagedBackup(upload: StagedUpload): Promise<BackupArchiveCont
     return readBackupArchive(upload.path);
   }
   if (upload.size > BACKUP_JSON_LIMITS.maxBytes) throw new BackupJsonError("json-size");
-  return { jsonBuffer: await readFile(upload.path), assets: new Map() };
+  return { jsonBuffer: await readFile(upload.path, { flag: READ_NO_FOLLOW }), assets: new Map() };
 }
 
 /** Log the fixed reason code of a refused upload, never its content. */

@@ -13,7 +13,8 @@ import { MAX_REQUEST_BYTES, encodeFrame } from "./thumbnail-protocol.js";
  *   node thumbnail-worker.js [--no-memory-checks]
  */
 
-export type WorkerRequest = { id: number; path: string };
+/** Decode `path`, below the trusted directory `root` (the storage root). */
+export type WorkerRequest = { id: number; root: string; path: string };
 
 /** Frame headers; a successful result's thumbnail is the frame body. */
 export type WorkerMessage =
@@ -80,7 +81,7 @@ const memoryChecks = !process.argv.includes("--no-memory-checks");
 let jobs = Promise.resolve();
 
 async function handle(request: WorkerRequest) {
-  const result = await thumbnailFromFile(request.path, { memoryChecks });
+  const result = await thumbnailFromFile({ root: request.root, path: request.path }, { memoryChecks });
   // Free the source and decoder buffers now rather than at V8's next
   // collection, so the next decode starts from the worker's own size.
   globalThis.gc?.();

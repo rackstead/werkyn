@@ -883,9 +883,14 @@ test("injected depth and size budgets bound graph readers and writers", async ()
   const wikiBefore = await pages([s1.id, s2.id]);
   let reads = 0;
   const readStream = app.storage.readStream;
+  const openReadStream = app.storage.openReadStream;
   app.storage.readStream = (...args) => {
     reads++;
     return readStream.apply(app.storage, args);
+  };
+  app.storage.openReadStream = (...args) => {
+    reads++;
+    return openReadStream.apply(app.storage, args);
   };
   try {
     Object.assign(graphLimits, { maxDepth: 4, maxNodes: 2 });
@@ -949,6 +954,7 @@ test("injected depth and size budgets bound graph readers and writers", async ()
   } finally {
     Object.assign(graphLimits, defaultLimits);
     app.storage.readStream = readStream;
+    app.storage.openReadStream = openReadStream;
   }
 });
 

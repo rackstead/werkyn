@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir, open, rm } from "node:fs/promises";
 import path from "node:path";
 import { pipeline, Transform, type Readable } from "node:stream";
 import { pipeline as pipeStreams } from "node:stream/promises";
 import type { FastifyBaseLogger, FastifyRequest } from "fastify";
 import { AppError, ValidationError } from "../../utils/errors.js";
 import { BACKUP_ARCHIVE_LIMITS } from "./backup-archive.js";
+import { CREATE_NO_FOLLOW, StorageRoot, type StorageDirectory } from "../../services/storage-paths.js";
 
 const MiB = 1024 * 1024;
 
@@ -38,6 +38,26 @@ export function backupStagingDir(storageDir: string): string {
   return path.join(path.resolve(storageDir), ".tmp", "backup");
 }
 
+/**
+ * Open the staging directory `dir`, which is always two folders below the
+ * storage root (`<root>/.tmp/backup`). Those two are opened, and made if
+ * `create`, without following links (R33): a link there is refused rather
+ * than letting staged files be written, read or swept elsewhere. Staged
+ * files themselves are created with O_EXCL and O_NOFOLLOW and read with
+ * O_NOFOLLOW, so a link planted in place of one is never followed either.
+ */
+async function openStagingDirectory(dir: string, create: boolean): Promise<StorageDirectory> {
+  const resolved = path.resolve(dir);
+  const parent = path.dirname(resolved);
+  const root = path.dirname(parent);
+  // The storage root itself may be a link or mount point.
+  if (create) await mkdir(root, { recursive: true });
+  return new StorageRoot(root).openDirectory(
+    path.join(path.basename(parent), path.basename(resolved)),
+    { create, mode: 0o700 },
+  );
+}
+
 export interface StagedFile {
   readonly path: string;
   readonly size: number;
@@ -65,8 +85,34 @@ export const UPLOAD_INTERRUPTED_MESSAGE = "The backup upload did not complete";
  */
 export async function stagingPath(kind: "upload" | "export", dir: string) {
   await prepareBackupStaging(dir);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  return path.join(dir, `${kind}-${randomUUID()}.part`);
+  return (await stagingDirectory(dir)).entry(`${kind}-${randomUUID()}.part`);
+}
+
+/** Staging directories kept open, by path. */
+const openStaging = new Map<string, Promise<StorageDirectory>>();
+
+/**
+ * The staging directory `dir`, checked and opened once and then kept open.
+ * Staged files are named inside it (StorageDirectory.entry): with /proc each
+ * staged path is `/proc/self/fd/<fd>/<name>`, so every later create, read
+ * and removal of the file resolves inside the folder that was checked, even
+ * if the folder is replaced by a link meanwhile. A folder removed since is
+ * opened again; the earlier one stays open, as paths into it may be in use.
+ */
+async function stagingDirectory(dir: string): Promise<StorageDirectory> {
+  const key = path.resolve(dir);
+  const cached = openStaging.get(key);
+  if (cached) {
+    const directory = await cached.catch(() => undefined);
+    if (directory && (await directory.exists())) return directory;
+    if (openStaging.get(key) !== cached) return stagingDirectory(dir);
+  }
+  const opening = openStagingDirectory(dir, true);
+  openStaging.set(key, opening);
+  opening.catch(() => {
+    if (openStaging.get(key) === opening) openStaging.delete(key);
+  });
+  return opening;
 }
 
 /** A handle that removes `file` once, ignoring a file that is already gone. */
@@ -110,7 +156,12 @@ export async function stageStream(source: Readable, options: StageOptions): Prom
     options.idleTimeoutMs,
   );
   try {
-    await pipeStreams(source, meter, createWriteStream(file, { flags: "wx", mode: 0o600 }));
+    // A new file; a link planted at its name is never followed (R33).
+    const output = await open(file, CREATE_NO_FOLLOW, 0o600).catch((error: unknown) => {
+      source.destroy();
+      throw error;
+    });
+    await pipeStreams(source, meter, output.createWriteStream());
   } catch (error) {
     await rm(file, { force: true });
     if (error instanceof AppError) throw error;
@@ -266,18 +317,23 @@ export async function sweepBackupStaging(
   log: Pick<FastifyBaseLogger, "warn"> | undefined,
   dir: string,
 ): Promise<number> {
-  let names: string[];
+  let directory: StorageDirectory;
   try {
-    names = await readdir(dir);
+    directory = await openStagingDirectory(dir, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
     throw error;
   }
   let removed = 0;
-  for (const name of names) {
-    if (!STAGED_NAME.test(name)) continue;
-    await rm(path.join(dir, name), { force: true });
-    removed++;
+  try {
+    for (const name of await directory.list()) {
+      if (!STAGED_NAME.test(name)) continue;
+      // Inside the opened folder; a link of that name is removed itself.
+      await rm(directory.entry(name), { force: true });
+      removed++;
+    }
+  } finally {
+    await directory.close();
   }
   if (removed > 0) log?.warn({ removed }, "Removed staged backup files left by an earlier process");
   return removed;

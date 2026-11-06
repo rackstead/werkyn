@@ -110,7 +110,7 @@ export async function uploadFileStream(
       {
         size,
         head: (signal) => readHead(storage, storagePath, signal),
-        path: storage.localPath(storagePath),
+        path: await storage.decoderLocation(storagePath),
       },
       { workspaceId, fileId },
     );
@@ -959,6 +959,13 @@ export async function archiveFiles(
 
   for (const entry of entries) {
     const fileStream = storage.readStream(entry.storagePath);
+    // The archiver pipes each entry without forwarding its errors. A blob that
+    // cannot be read (missing, or refused below the storage root) ends the
+    // archive and its response instead of becoming an uncaught error.
+    fileStream.once("error", (err) => {
+      archive.abort();
+      passthrough.destroy(err);
+    });
     archive.append(fileStream, { name: entry.name });
   }
 

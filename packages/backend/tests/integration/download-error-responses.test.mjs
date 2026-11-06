@@ -279,6 +279,8 @@ test("guarded authorized app downloads return JSON for early blob errors, keep d
   for (const [method, kind] of [
     ["read", "reads"],
     ["readStream", "reads"],
+    ["openReadStream", "reads"],
+    ["open", "reads"],
     ["save", "writes"],
     ["saveStream", "writes"],
     ["delete", "deletes"],

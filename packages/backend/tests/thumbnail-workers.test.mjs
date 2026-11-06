@@ -375,3 +375,30 @@ test("the switch that skips the memory checks works only under NODE_ENV=test", a
   assert.equal(await checks("development"), "true");
   assert.equal(await checks("test"), "false");
 });
+
+test("a worker opens the stored file below its root and refuses a link anywhere below it (R33)", async () => {
+  const { mkdirSync, symlinkSync } = await import("node:fs");
+  const root = path.join(scratch, "storage-root");
+  const outside = path.join(scratch, "outside");
+  mkdirSync(path.join(root, "ws/files/u1"), { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(path.join(root, "ws/files/u1/own.png"), smallPng);
+  writeFileSync(path.join(outside, "own.png"), smallPng);
+  // A link as the file itself, and a link as the folder holding it.
+  symlinkSync(path.join(outside, "own.png"), path.join(root, "ws/files/u1/link.png"));
+  symlinkSync(outside, path.join(root, "ws/files/linked"));
+  const workers = pool();
+  const own = await workers.run({ root, path: "ws/files/u1/own.png" });
+  assert.equal(own.ok, true, JSON.stringify(own));
+  for (const file of ["ws/files/u1/link.png", "ws/files/linked/own.png"]) {
+    const result = await workers.run({ root, path: file });
+    assert.equal(result.ok, false, file);
+    assert.equal(result.outcome, "failed", file);
+    assert.equal(result.details.reason, "refused: symbolic link below the storage root", file);
+  }
+  // A path that leaves the root fails before anything is opened.
+  const escaped = await workers.run({ root, path: "../outside/own.png" });
+  assert.equal(escaped.ok, false);
+  assert.equal(escaped.outcome, "failed");
+  assert.equal((await workers.run(small)).ok, true, "the worker still serves");
+});

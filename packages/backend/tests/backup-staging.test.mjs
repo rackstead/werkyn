@@ -70,8 +70,10 @@ test("a staged upload is written to a private file without being held in memory"
   const staged = await stageStream(stream, { dir, maxBytes: total, idleTimeoutMs: 5_000 });
   clearInterval(sampler);
   assert.equal(staged.size, total);
-  assert.equal(path.dirname(staged.path), dir);
+  // Named inside the opened staging folder (/proc/self/fd/<fd>/<name> on
+  // Linux, R33): the file is in `dir`.
   assert.match(path.basename(staged.path), /^upload-[0-9a-f-]{36}\.part$/);
+  assert.deepEqual(await readdir(dir), [path.basename(staged.path)]);
   const info = await stat(staged.path);
   assert.equal(info.size, total);
   assert.equal(info.mode & 0o777, 0o600);
@@ -187,7 +189,9 @@ test("nothing is staged until leftovers have been swept, and a failed sweep is r
   const leftover = `upload-${crypto.randomUUID()}.part`;
   await writeFile(path.join(dir, leftover), "left behind");
   const fresh = await stagingPath("upload", dir);
-  assert.equal(path.dirname(fresh), dir);
+  // Named inside the opened staging folder (/proc/self/fd/<fd>/<name> on
+  // Linux, R33), so it is a file in `dir` either way.
+  assert.match(path.basename(fresh), /^upload-[0-9a-f-]{36}\.part$/);
   assert.deepEqual(await readdir(dir), [], "the leftover was swept first");
 
   // After a successful sweep, files staged since are never swept again.
@@ -349,4 +353,48 @@ test("a download reports its last byte as it is handed on, not when the file rea
   partial.resume();
   await new Promise((resolve) => partial.once("close", resolve));
   assert.equal(abandoned, false);
+});
+
+test("staging refuses linked staging folders and keeps using the folder it checked (R33)", async () => {
+  const { existsSync } = await import("node:fs");
+  const { symlink, unlink, rename } = await import("node:fs/promises");
+  const root = freshDir();
+  const dir = path.join(root, ".tmp", "backup");
+  const outside = path.join(scratch, `outside-${dirs}`);
+  await mkdir(root, { recursive: true });
+  await mkdir(outside);
+  await writeFile(path.join(outside, `upload-${crypto.randomUUID()}.part`), "outside");
+  const before = (await readdir(outside)).sort();
+  const stage = () => stageStream(Readable.from([Buffer.from("staged bytes")]), { dir, maxBytes: MiB, idleTimeoutMs: 5_000 });
+
+  // A link as the staging folder's parent, or as the folder itself, is
+  // refused: nothing is staged or swept through it.
+  await symlink(outside, path.join(root, ".tmp"));
+  await assert.rejects(prepareBackupStaging(dir, log), { code: "ESTORAGEREFUSED", statusCode: 403 });
+  await assert.rejects(stage(), { code: "ESTORAGEREFUSED" });
+  await unlink(path.join(root, ".tmp"));
+  await mkdir(path.join(root, ".tmp"));
+  await symlink(outside, dir);
+  await assert.rejects(stage(), { code: "ESTORAGEREFUSED" });
+  assert.deepEqual((await readdir(outside)).sort(), before, "nothing was written or swept outside");
+  await unlink(dir);
+
+  const first = await stage();
+  assert.equal(await readFile(first.path, "utf8"), "staged bytes");
+  if (existsSync("/proc/self/fd")) {
+    // The checked folder is replaced by a link to the outside: staged files
+    // are still created, read and removed inside the folder that was checked.
+    const parked = path.join(root, "parked");
+    await rename(dir, parked);
+    await symlink(outside, dir);
+    const second = await stage();
+    assert.equal(await readFile(second.path, "utf8"), "staged bytes");
+    assert.equal((await readdir(parked)).length, 2);
+    await first.dispose();
+    await second.dispose();
+    assert.deepEqual(await readdir(parked), []);
+    assert.deepEqual((await readdir(outside)).sort(), before, "the link was never followed");
+  } else {
+    await first.dispose();
+  }
 });

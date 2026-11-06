@@ -2,6 +2,7 @@ import os from "node:os";
 import { logger } from "../../utils/logger.js";
 import { THUMBNAIL_LIMITS, thumbnailFormat } from "./thumbnail-checks.js";
 import type { DecodeDetails } from "./thumbnail-decode.js";
+import type { ThumbnailFile } from "./thumbnail-protocol.js";
 import { ThumbnailWorkerPool, type WorkerDetails, type WorkerResult } from "./thumbnail-workers.js";
 
 export { THUMBNAIL_HEAD_BYTES, THUMBNAIL_LIMITS, THUMBNAIL_SOURCE_MAX_BYTES } from "./thumbnail-checks.js";
@@ -233,8 +234,11 @@ export interface ThumbnailSource {
    * `signal` aborts when the caller stops waiting.
    */
   head(signal: AbortSignal): Promise<Buffer>;
-  /** Its path on the local filesystem; a decoder worker reads it from there. */
-  path: string;
+  /**
+   * Where a decoder worker reads it: below the storage root, never through a
+   * link (StorageProvider.decoderLocation).
+   */
+  path: ThumbnailFile;
 }
 
 export interface ThumbnailOptions {

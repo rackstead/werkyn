@@ -7,10 +7,11 @@ import {
   type BackupFile,
 } from "@pm/shared";
 import type { StorageProvider } from "../../services/storage.js";
+import { CREATE_NO_FOLLOW } from "../../services/storage-paths.js";
 import { ZipArchive } from "archiver";
 import { once } from "node:events";
-import { createWriteStream, type WriteStream } from "node:fs";
-import { rm } from "node:fs/promises";
+import type { WriteStream } from "node:fs";
+import { open, rm, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, pipeline as pipeStreams, Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -172,10 +173,11 @@ class ExportArchive {
    */
   constructor(
     readonly file: string,
+    output: FileHandle,
     private readonly budget: BackupExportBudget,
     stop: AbortSignal,
   ) {
-    this.output = createWriteStream(file, { flags: "wx", mode: 0o600 });
+    this.output = output.createWriteStream();
     this.written = pipeline(this.archive, this.output);
     const fail = (error: Error) => this.fail(error);
     this.archive.on("error", fail);
@@ -462,8 +464,17 @@ export async function exportBackup(
   const stop = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
   const stopper = new ExportStop(stop);
 
-  const file = await stagingPath("export", options.stagingDir ?? backupStagingDir(env.STORAGE_DIR));
-  const archive = new ExportArchive(file, new BackupExportBudget(limits, jsonLimits), stop);
+  let file: string;
+  let output: FileHandle;
+  try {
+    file = await stagingPath("export", options.stagingDir ?? backupStagingDir(env.STORAGE_DIR));
+    // A new file; a link planted at its name is never followed (R33).
+    output = await open(file, CREATE_NO_FOLLOW, 0o600);
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
+  const archive = new ExportArchive(file, output, new BackupExportBudget(limits, jsonLimits), stop);
   let workspace: { name: string; slug: string };
   let size: number;
   try {

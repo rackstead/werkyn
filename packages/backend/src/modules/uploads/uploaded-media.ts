@@ -1,10 +1,9 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
 import path from "node:path";
 import { fileTypeFromBuffer } from "file-type";
-import { env } from "../../config/env.js";
+import { MissingBlobError } from "../../services/storage.js";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
+import { sendStoredFile } from "./stored-file-response.js";
 import { applyUntrustedContentPolicy } from "../../utils/untrusted-content.js";
 import { hasShareGrant, shareGrantCookieName } from "../../utils/share-grants.js";
 
@@ -57,29 +56,30 @@ export function applyUploadedMediaResponsePolicy(reply: FastifyReply) {
 }
 
 async function serve(request: FastifyRequest, reply: FastifyReply, media: NonNullable<ReturnType<typeof parseUploadedMedia>>, download: boolean) {
-  const root = path.resolve(env.STORAGE_DIR, media.workspaceId, "uploads");
-  const filename = path.resolve(root, media.relative);
-  if (!filename.startsWith(root + path.sep)) throw new ForbiddenError("Invalid uploaded media path");
-  let file;
+  // Storage checks and opens the file below the workspace's uploads folder,
+  // refusing a link anywhere below the storage root or a special file (R33,
+  // 403); the response is then sent from that open descriptor.
+  let blob;
   try {
-    file = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = await file.stat();
-    if (!stat.isFile()) throw new NotFoundError("Uploaded media not found");
-    if (stat.size > MAX_BYTES) throw new ValidationError("Uploaded media exceeds the rendering limit");
-    const prefix = Buffer.alloc(Math.min(stat.size, 8192));
-    const { bytesRead } = await file.read(prefix, 0, prefix.length, 0);
+    blob = await request.server.storage.open(`${media.workspaceId}/uploads/${media.relative}`);
+  } catch (error) {
+    if (error instanceof MissingBlobError) throw new NotFoundError("Uploaded media not found");
+    throw error;
+  }
+  try {
+    if (blob.stat.size > MAX_BYTES) throw new ValidationError("Uploaded media exceeds the rendering limit");
+    const prefix = Buffer.alloc(Math.min(blob.stat.size, 8192));
+    const { bytesRead } = await blob.handle.read(prefix, 0, prefix.length, 0);
     const detected = await fileTypeFromBuffer(prefix.subarray(0, bytesRead)).catch(() => undefined);
     const extension = path.extname(media.filename).slice(1).toLowerCase();
     const matchesExtension = detected && (extension === detected.ext || (detected.ext === "jpg" && extension === "jpeg"));
     const safe = detected && matchesExtension && SAFE_MEDIA.has(detected.mime);
     responsePolicy.set(reply, { mime: !download && safe ? detected.mime : "application/octet-stream", filename: media.filename, download: download || !safe });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ELOOP") throw new NotFoundError("Uploaded media not found");
+    await blob.handle.close();
     throw error;
-  } finally {
-    await file?.close();
   }
-  return reply.sendFile(media.relative, root);
+  return sendStoredFile(reply, blob);
 }
 
 type MediaQuery = { url?: string; download?: string };

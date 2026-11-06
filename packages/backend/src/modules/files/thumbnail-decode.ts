@@ -1,5 +1,3 @@
-import fs from "node:fs/promises";
-import { constants } from "node:fs";
 import sharp from "sharp";
 import type { SharpOptions } from "sharp";
 import { fileTypeFromBuffer } from "file-type";
@@ -15,6 +13,8 @@ import {
   type DecodeHints,
   type ThumbnailFormat,
 } from "./thumbnail-checks.js";
+import { StorageRefusedError, StorageRoot } from "../../services/storage-paths.js";
+import { thumbnailFileLocation, type ThumbnailFile } from "./thumbnail-protocol.js";
 
 /**
  * The decoding half of Drive thumbnails. Only the decoder worker processes
@@ -105,16 +105,26 @@ class Skip extends Error {
   }
 }
 
-/**
- * The stored file at `path`, read whole. Only a regular file of at most
- * THUMBNAIL_SOURCE_MAX_BYTES is read; it is opened without blocking, so a
- * FIFO or device cannot stall the worker.
- */
-export async function readThumbnailSource(path: string): Promise<Buffer> {
-  const handle = await fs.open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+/** The stored file, opened below its root; links and special files are refused. */
+async function openThumbnailSource(file: ThumbnailFile) {
+  const { root, path } = thumbnailFileLocation(file);
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Skip("unsupported", { reason: "not a regular file" });
+    // Opened without blocking, so a FIFO or device cannot stall the worker.
+    return await new StorageRoot(root).openFile(path);
+  } catch (error) {
+    if (!(error instanceof StorageRefusedError)) throw error;
+    if (error.reason === "not-a-file") throw new Skip("unsupported", { reason: "not a regular file" });
+    throw new Skip("failed", { reason: "refused: symbolic link below the storage root" });
+  }
+}
+
+/**
+ * The stored file, read whole. Only a regular file of at most
+ * THUMBNAIL_SOURCE_MAX_BYTES is read.
+ */
+export async function readThumbnailSource(file: ThumbnailFile): Promise<Buffer> {
+  const { handle, stat } = await openThumbnailSource(file);
+  try {
     if (stat.size > THUMBNAIL_SOURCE_MAX_BYTES) throw new Skip("unsupported", { reason: "over the source limit" });
     const bytes = Buffer.alloc(stat.size);
     let filled = 0;
@@ -129,11 +139,11 @@ export async function readThumbnailSource(path: string): Promise<Buffer> {
   }
 }
 
-/** Reads, checks and decodes the stored file at `path`. Never throws. */
-export async function thumbnailFromFile(path: string, options: DecodeOptions = {}): Promise<DecodeResult> {
+/** Reads, checks and decodes the stored file. Never throws. */
+export async function thumbnailFromFile(file: ThumbnailFile, options: DecodeOptions = {}): Promise<DecodeResult> {
   const progress: DecodeDetails = { stage: "read" };
   try {
-    const source = await readThumbnailSource(path);
+    const source = await readThumbnailSource(file);
     return { ok: true, thumbnail: await decode(source, progress, options), details: progress };
   } catch (err) {
     if (err instanceof Skip) return { ok: false, outcome: err.outcome, details: { ...progress, ...err.details } };

@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "../../utils/logger.js";
 import type { DecodeDetails, DecodeOutcome, DecodeResult } from "./thumbnail-decode.js";
-import { FrameReader, ProtocolError, type Frame } from "./thumbnail-protocol.js";
+import { FrameReader, ProtocolError, thumbnailFileLocation, type Frame, type ThumbnailFile } from "./thumbnail-protocol.js";
 import type { WorkerRequest } from "./thumbnail-worker.js";
 
 /**
@@ -94,7 +94,7 @@ type SlotState = "stopped" | "starting" | "ready" | "busy" | "exiting";
 
 interface Job {
   id: number;
-  path: string;
+  file: ThumbnailFile;
   resolve: (result: WorkerResult) => void;
   /** Set once the deadline passed and the worker was killed. */
   timedOut: boolean;
@@ -170,18 +170,19 @@ export class ThumbnailWorkerPool {
   }
 
   /**
-   * Decodes the stored file at `filePath` in a worker. `signal` stops the
+   * Decodes the stored file in a worker, which opens it below its root
+   * without following links (ThumbnailFile). `signal` stops the
    * decode: the worker is killed and the result is "timed-out". Resolves
    * once the worker is free again (after it has exited, if it was killed),
    * so the caller's admission turn covers the worker's memory. Never
    * rejects.
    */
-  async run(filePath: string, signal?: AbortSignal): Promise<WorkerResult> {
+  async run(file: ThumbnailFile, signal?: AbortSignal): Promise<WorkerResult> {
     if (this.closed) return failed("thumbnail workers are shut down");
     this.start();
     let resolve!: (result: WorkerResult) => void;
     const done = new Promise<WorkerResult>((settle) => { resolve = settle; });
-    const job: Job = { id: this.nextJob++, path: filePath, resolve, timedOut: false, sent: false };
+    const job: Job = { id: this.nextJob++, file, resolve, timedOut: false, sent: false };
     const slot = await this.reserveSlot(job, signal);
     if (!slot) {
       return signal?.aborted
@@ -399,7 +400,7 @@ export class ThumbnailWorkerPool {
     if (slot.job !== job || job.timedOut || slot.state !== "ready" || !slot.channel) return;
     slot.state = "busy";
     job.sent = true;
-    const request: WorkerRequest = { id: job.id, path: job.path };
+    const request: WorkerRequest = { id: job.id, ...thumbnailFileLocation(job.file) };
     slot.channel.write(`${JSON.stringify(request)}\n`, (error) => {
       if (error && slot.job === job) this.stop(slot, null); // reported as a crash on exit
     });

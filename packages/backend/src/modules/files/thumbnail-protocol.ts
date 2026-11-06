@@ -13,11 +13,27 @@
  * receiver sees it.
  */
 
+import path from "node:path";
+
 /** A header is a few hundred bytes of JSON. */
 export const MAX_HEADER_BYTES = 64 * 1024;
 /** A thumbnail is a 400-pixel-wide WebP; anything larger is not one. */
 export const MAX_BODY_BYTES = 16 * 1024 * 1024;
-/** A request line (an id and a path). */
+/**
+ * A stored file for a decoder: `path` below the trusted directory `root` (the
+ * storage root), opened there without following any link (R33). A plain
+ * string is a file whose own directory is trusted.
+ */
+export type ThumbnailFile = string | { root: string; path: string };
+
+/** The trusted directory and the path below it. */
+export function thumbnailFileLocation(file: ThumbnailFile): { root: string; path: string } {
+  return typeof file === "string"
+    ? { root: path.dirname(file), path: path.basename(file) }
+    : { root: file.root, path: file.path };
+}
+
+/** A request line (an id, a root and a path). */
 export const MAX_REQUEST_BYTES = 64 * 1024;
 
 export function encodeFrame(header: unknown, body: Uint8Array = new Uint8Array(0)): Buffer {

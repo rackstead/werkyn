@@ -122,7 +122,8 @@ async function observe(t, label, response, before, expectedReads) {
     rowsUnchanged: safeJSON(rows) === safeJSON(before.rows), rows };
   await checkpoint(label, actual); t.diagnostic(safeJSON({ label, ...actual }));
   assert.deepEqual(rows, before.rows);
-  assert.deepEqual(effectDelta, { openReadStream: expectedReads, readStream: expectedReads, read: 0, save: 0, saveStream: 0, delete: 0, exists: 0 });
+  // openReadStream opens the blob itself (it no longer goes through readStream).
+  assert.deepEqual(effectDelta, { openReadStream: expectedReads, readStream: 0, read: 0, save: 0, saveStream: 0, delete: 0, exists: 0 });
   return actual;
 }
 async function snapshot() { return { rows: await state(), effects: counters() }; }

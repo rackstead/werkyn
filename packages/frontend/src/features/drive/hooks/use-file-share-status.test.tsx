@@ -112,6 +112,26 @@ describe("useFileShareStatus", () => {
     expect(result.current.has("f1000")).toBe(true);
   });
 
+  it("asks for pages arriving below a settled view once it settles again", async () => {
+    const settled: readonly [number, number] = [1060, 1080];
+    const { result, rerender } = renderHook(
+      ({ fileIds, inView }: { fileIds: string[]; inView: readonly [number, number] }) =>
+        useFileShareStatus("w", fileIds, inView),
+      { wrapper, initialProps: { fileIds: ids(0, 1100), inView: settled } },
+    );
+    await waitFor(() => expect(result.current.size).toBe(9));
+    expect(net.requests).toEqual([ids(1010, 1100)]);
+    // Two pages arrive below the view, which stays where it is.
+    rerender({ fileIds: ids(0, 1150), inView: settled });
+    rerender({ fileIds: ids(0, 1200), inView: settled });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    expect(net.requests.length).toBe(1);
+    // The view settles again further on: one request for what it needs.
+    rerender({ fileIds: ids(0, 1200), inView: [1120, 1140] });
+    await waitFor(() => expect(net.requests.length).toBe(2));
+    expect(net.requests[1]).toEqual(ids(1100, 1200));
+  });
+
   it("asks again after the time a refused request gives", async () => {
     const refusals = { left: 1 };
     const { api } = await import("@/lib/api-client");

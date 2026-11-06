@@ -86,13 +86,24 @@ export function useFileShareStatus(
           : [inView[0] - SHARE_STATUS_MARGIN, inView[1] + SHARE_STATUS_MARGIN],
     [inView, fileIds.length],
   );
-  const previous = useRef<{ wid: string; groups: string[][] }>({ wid, groups: [] });
+  const previous = useRef<{ wid: string; groups: string[][]; inView?: EntriesInView | null }>({
+    wid,
+    groups: [],
+  });
   const groups = useMemo(() => {
     const before = previous.current.wid === wid ? previous.current.groups : [];
-    const next = shareStatusGroups(before, fileIds, near);
-    previous.current = { wid, groups: next };
+    // New groups start from the entries near the view when it has just
+    // settled; when only the list changed (a page arrived next to the view,
+    // an entry was added), from the entries in view alone. So the pages
+    // that keep arriving below a view at the end of the loaded entries are
+    // asked for when the view settles near them, not one by one.
+    const settled = previous.current.wid !== wid || previous.current.inView !== inView;
+    const from: readonly [number, number] =
+      settled || !inView ? near : [inView[0], inView[1]];
+    const next = shareStatusGroups(before, fileIds, from);
+    previous.current = { wid, groups: next, inView };
     return next;
-  }, [wid, fileIds, near]);
+  }, [wid, fileIds, near, inView]);
   const indexOf = useMemo(() => new Map(fileIds.map((id, i) => [id, i])), [fileIds]);
   // A group asked for again under new members (one whose entry left the
   // list) has no answer until it arrives: its entries keep the answer shown

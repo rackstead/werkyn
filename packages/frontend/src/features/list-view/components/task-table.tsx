@@ -22,7 +22,7 @@ import {
 import { useProjectTasks, type Task } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels, useCustomFields } from "@/features/projects/api";
 import { getColumns } from "./columns";
-import { steadyRow, type SeenRow } from "./steady-row";
+import { steadyRows, type SeenRow } from "./steady-row";
 import { ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -288,19 +288,28 @@ export function TaskTable({
   // created, deleted or moved by others or by a bulk action, rows rendered
   // at a height other than their estimate, an editor above the view
   // closing, or content above the table changing height. The rows in view
-  // are remembered by key with their place and the scroll position; after a
-  // change, <main> scrolls by however far the one of them that stayed (see
-  // steadyRow) moved other than by the user scrolling. The browser's own scroll
-  // anchoring is off for <main> while the List is windowed: it did not apply
-  // to these changes, and the two together would move the rows twice.
-  // Nothing is kept at the very top of the List.
+  // (at least half of each) are remembered by key with their place and the
+  // scroll position; after a change, <main> scrolls by however far one of
+  // them that stayed (see steadyRows) moved other than by the user
+  // scrolling. The browser's own scroll anchoring is off for <main> while
+  // the List is windowed: it did not apply to these changes, and the two
+  // together would move the rows twice. Nothing is kept at the very top of
+  // the List.
   const rowIndex = useMemo(
     () => new Map(listRows.map((row, index) => [row.key, index])),
     [listRows],
   );
   const rowIndexRef = useRef(rowIndex);
   rowIndexRef.current = rowIndex;
-  const inView = useRef<{ scrollTop: number; rows: SeenRow[] } | null>(null);
+  const inView = useRef<{
+    scrollTop: number;
+    rows: SeenRow[];
+    // Set after scrolling to a row that was not rendered (see below).
+    placing?: true;
+    // The row kept last, and the List it was kept in.
+    kept?: string;
+    list?: Map<string, number>;
+  } | null>(null);
   const keepRowsInView = useCallback(() => {
     const body = bodyRef.current;
     if (!scroller || !body) return;
@@ -309,6 +318,7 @@ export function TaskTable({
     // Scroll positions are whole pixels; what a correction could not make up
     // is carried over, so repeated changes do not add up to a visible drift.
     let remainder = 0;
+    let keptKey: string | undefined;
     if (last && scroller.scrollTop > 0) {
       let scrolled = scroller.scrollTop - last.scrollTop;
       // The List got shorter while at or near its end, and the browser moved
@@ -318,34 +328,67 @@ export function TaskTable({
       // After a longer scroll (End, the scrollbar, a jump) the rows seen
       // before are elsewhere and there is nothing to keep; a shorter one
       // keeps them in the rendered range.
-      const kept =
+      const stayed =
         Math.abs(scrolled) < scroller.clientHeight / 2
-          ? steadyRow(last.rows, (key) => rowIndexRef.current.get(key))
+          ? steadyRows(last.rows, (key) => rowIndexRef.current.get(key))
+          : [];
+      // The first of them still rendered: a short scroll can take the first
+      // ones out of the rendered range.
+      const rendered = new Map<string, HTMLTableRowElement>();
+      for (const row of body.rows) {
+        if (row.dataset.rowKey) rendered.set(row.dataset.rowKey, row);
+      }
+      // Until the List changes again or the user scrolls, the row kept last
+      // stays the one kept: rows that a correction brought into view above
+      // it are rendered and measured then, and settling to their heights
+      // they would otherwise move it.
+      const again =
+        scrolled === 0 && last.list === rowIndexRef.current && last.kept !== undefined
+          ? stayed.find(({ key }) => key === last.kept && rendered.has(key))
           : undefined;
-      const row = kept && [...body.rows].find((row) => row.dataset.rowKey === kept.key);
+      const kept = again ?? stayed.find(({ key }) => rendered.has(key)) ?? stayed[0];
+      const row = kept && rendered.get(kept.key);
       if (kept && row) {
         const want = kept.top - scrolled;
         const moved = row.getBoundingClientRect().top - viewTop - want;
         if (Math.abs(moved) >= 0.5) scroller.scrollTop += moved;
         remainder = row.getBoundingClientRect().top - viewTop - want;
+        keptKey = kept.key;
       } else if (kept) {
-        // It is not rendered any more: so many rows were added or removed
-        // above (a bulk change) that the rendered range now holds other
-        // rows. Scroll to where it is now; once it is rendered, the next pass
-        // places it exactly.
-        const item = virtualizer.measurementsCache[kept.index];
-        if (item) {
-          const want = kept.top - scrolled;
-          scroller.scrollTop = item.start - want;
-          inView.current = {
-            scrollTop: scroller.scrollTop,
-            rows: [{ key: kept.key, top: want, index: kept.index }],
-          };
-          return;
+        // None of them is rendered any more: so many rows were added or
+        // removed above (a bulk change) that the rendered range now holds
+        // other rows. Scroll to where one of them is now, one that belongs in
+        // view, so that it is rendered; once it is, the next pass places it
+        // exactly. Until <main> has handled that scroll there is nothing to
+        // see; after any other scroll, the rows in view are seen afresh.
+        const placing = last.placing && last.rows[0];
+        if (placing && placing.index === kept.index) {
+          if (scroller.scrollTop === last.scrollTop) return;
+        } else {
+          const target =
+            stayed.find(
+              ({ top }) => top - scrolled >= 0 && top - scrolled < scroller.clientHeight,
+            ) ?? kept;
+          const item = virtualizer.measurementsCache[target.index];
+          if (item) {
+            const want = target.top - scrolled;
+            scroller.scrollTop = item.start - want;
+            inView.current = {
+              scrollTop: scroller.scrollTop,
+              rows: [{ key: target.key, top: want, index: target.index }],
+              placing: true,
+            };
+            return;
+          }
         }
       }
     }
+    // The rows at least half in view. A sliver of a row at the edge of the
+    // view is not a row the user sees: kept when the rows between it and
+    // the others left (a bulk change), it would move the rows they do see.
+    // Rows partly in view count only when no row is half in view.
     const rows: SeenRow[] = [];
+    const partly: SeenRow[] = [];
     const viewBottom = viewTop + scroller.clientHeight;
     for (const row of body.rows) {
       const key = row.dataset.rowKey;
@@ -354,9 +397,16 @@ export function TaskTable({
       if (bottom <= viewTop) continue;
       if (top >= viewBottom) break;
       const index = rowIndexRef.current.get(key);
-      if (index !== undefined) rows.push({ key, top: top - viewTop - remainder, index });
+      if (index === undefined) continue;
+      const shown = Math.min(bottom, viewBottom) - Math.max(top, viewTop);
+      (shown * 2 >= bottom - top ? rows : partly).push({ key, top: top - viewTop - remainder, index });
     }
-    inView.current = { scrollTop: scroller.scrollTop, rows };
+    inView.current = {
+      scrollTop: scroller.scrollTop,
+      rows: rows.length > 0 ? rows : partly,
+      kept: keptKey,
+      list: rowIndexRef.current,
+    };
   }, [scroller, virtualizer]);
   // After every render of the table, before the browser paints.
   useLayoutEffect(keepRowsInView);

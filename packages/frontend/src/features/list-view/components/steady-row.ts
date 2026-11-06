@@ -6,9 +6,10 @@ export interface SeenRow {
 }
 
 /**
- * Of the rows seen in view (top to bottom), the one to keep in place after the
- * List changed, with its index now; undefined when none of them is in the List
- * any more.
+ * Of the rows seen in view (top to bottom), the ones that stayed when the List
+ * changed, the one to keep in place first, with their indexes now; empty when
+ * none of them is in the List any more. The caller keeps the first of them
+ * that is still rendered.
  *
  * Rows added or removed above the view change every seen row's index alike. A
  * row moved by someone (a colleague, a bulk action) changes order with the
@@ -24,19 +25,19 @@ export interface SeenRow {
  * - Of that set, skip rows that moved much further than the least-moved ones
  *   (counting less than half as much): a block moved far up can still be in
  *   order with the rows below it.
- * - Return the first remaining row that every such best set includes (for two
- *   rows that swapped places, the row after the pair), else the first.
+ * - Rows that every such best set includes come first (for two rows that
+ *   swapped places, the rows after the pair), in order, then the others.
  */
-export function steadyRow(
+export function steadyRows(
   seen: readonly SeenRow[],
   indexOf: (key: string) => number | undefined,
-): { key: string; top: number; index: number } | undefined {
+): Array<{ key: string; top: number; index: number }> {
   const rows = seen.flatMap((row) => {
     const now = indexOf(row.key);
     return now === undefined ? [] : [{ key: row.key, top: row.top, was: row.index, index: now }];
   });
   const n = rows.length;
-  if (n === 0) return undefined;
+  if (n === 0) return [];
   const weight = rows.map((row) => 1 / (1 + Math.abs(row.index - row.was)));
   const close = (a: number, b: number) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a));
 
@@ -70,11 +71,14 @@ export function steadyRow(
   const candidates = rows
     .map((row, i) => ({ row, i }))
     .filter(({ i }) => inBest[i] && weight[i] >= heaviest / 2);
-  const kept =
-    candidates.find(({ i }) => {
-      const without = runs(i).best;
-      return without < best && !close(without, best);
-    }) ?? candidates[0];
-  const { key, top, index } = kept.row;
-  return { key, top, index };
+  // Rows every best set includes first, in order; then the others.
+  const inEvery = ({ i }: { i: number }) => {
+    const without = runs(i).best;
+    return without < best && !close(without, best);
+  };
+  const ordered = [
+    ...candidates.filter(inEvery),
+    ...candidates.filter((candidate) => !inEvery(candidate)),
+  ];
+  return ordered.map(({ row: { key, top, index } }) => ({ key, top, index }));
 }

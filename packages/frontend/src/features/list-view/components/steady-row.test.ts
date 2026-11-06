@@ -1,20 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { steadyRow } from "./steady-row";
+import { steadyRows } from "./steady-row";
 
 // Rows seen in view top to bottom as [key, index then, index now]; a row no
 // longer in the List has `undefined` now.
 function keep(...rows: Array<[string, number, number | undefined]>) {
+  return order(...rows)[0];
+}
+// All the rows that stayed, in the order they would be kept.
+function order(...rows: Array<[string, number, number | undefined]>) {
   const now = new Map(rows.map(([key, , index]) => [key, index]));
-  return steadyRow(
+  return steadyRows(
     rows.map(([key, index], i) => ({ key, index, top: i * 41 })),
     (key) => now.get(key),
-  )?.key;
+  ).map((row) => row.key);
 }
 // Rows k..k+n-1 seen at indexes from..from+n-1.
 const block = (prefix: string, from: number, count: number, shift: number) =>
   Array.from({ length: count }, (_, i): [string, number, number] => [`${prefix}${i}`, from + i, from + i + shift]);
 
-describe("steadyRow", () => {
+describe("steadyRows", () => {
   it("keeps the first row when rows were added or removed above the view", () => {
     expect(keep(...block("r", 100, 20, 3))).toBe("r0");
     expect(keep(...block("r", 100, 20, -2))).toBe("r0");
@@ -62,6 +66,25 @@ describe("steadyRow", () => {
     // The top 14 rows moved to the first group: still in order with the rows below them.
     const moved = Array.from({ length: 14 }, (_, i): [string, number, number] => [`m${i}`, 3490 + i, 5 + i]);
     expect(keep(...moved, ...block("s", 3504, 6, 0))).toBe("s0");
+  });
+
+  it("keeps the rows above a block that left the middle of the view", () => {
+    // Rows above and below the block both stayed; one side has to move, and
+    // as with the browser's anchoring the rows above are kept. (The List
+    // only counts rows at least half in view, so a sliver of a row above a
+    // block at the top of the view is not kept: see task-table.)
+    const moved = Array.from({ length: 14 }, (_, i): [string, number, number] => [`m${i}`, 100 + i, 4990 + i]);
+    expect(keep(["t", 99, 99], ...moved, ...block("s", 114, 6, -14))).toBe("t");
+  });
+
+  it("lists the other rows that stayed after the first, so a rendered one can be kept", () => {
+    // Nothing moved: every row, in order.
+    expect(order(...block("r", 100, 4, 0))).toEqual(["r0", "r1", "r2", "r3"]);
+    // A swap at the top: the rows after the pair, then the pair.
+    expect(order(["a", 1, 2], ["b", 2, 1], ["c", 3, 3], ["d", 4, 4])).toEqual(["c", "d", "a", "b"]);
+    // The top block moved far below: only the rows that stayed.
+    const moved = Array.from({ length: 4 }, (_, i): [string, number, number] => [`m${i}`, 10 + i, 900 + i]);
+    expect(order(...moved, ...block("s", 14, 3, -4))).toEqual(["s0", "s1", "s2"]);
   });
 
   it("skips rows that are no longer in the List", () => {

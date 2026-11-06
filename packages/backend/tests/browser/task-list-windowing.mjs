@@ -1448,10 +1448,13 @@ async function smoke({ browser, origin, fixture, prisma }) {
       // 10. A bulk move of the top block of rows in view (more than half of
       // them, the partly visible top row included) to the last group: the
       // rows that stayed keep their place and a click where the pointer
-      // rests hits its task. First by a colleague, then by the user's own
-      // bulk status change. (With every row rendered, the user's own bulk
-      // change lets the rows that stayed slide up into the space instead;
-      // recorded, not asserted, there.)
+      // rests hits its task. By a colleague, by a colleague right after a
+      // short scroll (less than half the view, enough to take the rows seen
+      // before it out of the rendered range), and by the user's own bulk
+      // status change with a sliver of the row above the block in view.
+      // (With every row rendered, the user's own bulk change lets the rows
+      // that stayed slide up into the space instead; recorded, not asserted,
+      // there.)
       const [, , review, done] = fixture.statuses;
       const windowed = await page.evaluate(() => document.querySelector("table").hasAttribute("aria-rowcount"));
       const result = {};
@@ -1520,39 +1523,59 @@ async function smoke({ browser, origin, fixture, prisma }) {
         return now ? Math.round((now.top - row.top) * 100) / 100 : null;
       };
 
-      // A colleague's bulk change.
-      let tasks = await reviewTasks();
-      await into(tasks[Math.floor(tasks.length / 3)], -17);
-      let view = await rowsInView();
-      let count = Math.min(14, view.length - 4);
-      let moving = view.slice(0, count);
-      let stay = view[count + 2];
-      let firstStaying = view[count];
-      await pointAt(stay.title);
-      const ids = [];
-      for (const row of moving) ids.push((await taskByTitle(row.title)).id);
-      await api("POST", `/projects/${fixture.project.id}/tasks/bulk-update`, { taskIds: ids, statusId: done.id });
       const movedToDone = async (taskIds) =>
         prisma.task.count({ where: { id: { in: taskIds }, statusId: done.id } });
-      assert.equal(await movedToDone(ids), ids.length, "the colleague's bulk change moved every selected task");
-      await settleOn(stay.title, "colleague's bulk change");
-      result.colleague = {
-        moved: count,
-        rowsInView: view.length,
-        firstStaying: await shiftOf(firstStaying),
-        stay: await shiftOf(stay),
-        clickTarget: stay.title,
-        checked: await clickAtPointer(),
+      // A colleague's bulk change.
+      const colleagueBulk = async (label) => {
+        const view = await rowsInView();
+        const count = Math.min(14, view.length - 4);
+        const stay = view[count + 2];
+        const firstStaying = view[count];
+        await pointAt(stay.title);
+        const ids = [];
+        for (const row of view.slice(0, count)) ids.push((await taskByTitle(row.title)).id);
+        await api("POST", `/projects/${fixture.project.id}/tasks/bulk-update`, { taskIds: ids, statusId: done.id });
+        assert.equal(await movedToDone(ids), ids.length, `the bulk change moved every selected task (${label})`);
+        await settleOn(stay.title, `bulk change (${label})`);
+        return {
+          moved: count,
+          rowsInView: view.length,
+          firstStaying: await shiftOf(firstStaying),
+          stay: await shiftOf(stay),
+          clickTarget: stay.title,
+          checked: await clickAtPointer(),
+        };
       };
+      let tasks = await reviewTasks();
+      await into(tasks[Math.floor(tasks.length / 3)], -17);
+      result.colleague = await colleagueBulk("colleague");
 
-      // The user's own bulk change, first row aligned with the top of the view.
+      // The same right after a short scroll down, in one step.
       tasks = await reviewTasks();
-      await into(tasks[Math.floor(tasks.length / 2)], 0);
-      view = await rowsInView();
-      count = Math.min(14, view.length - 4);
-      moving = view.slice(0, count);
-      stay = view[count + 2];
-      firstStaying = view[count];
+      await into(tasks[Math.floor((tasks.length * 3) / 5)], -17);
+      const scrolledBy = await page.evaluate(() => {
+        const main = document.querySelector("main");
+        const by = Math.floor(main.clientHeight * 0.47);
+        main.scrollTop += by;
+        return by;
+      });
+      await frames(page, 6);
+      result.afterShortScroll = { scrolledBy, ...(await colleagueBulk("colleague after a short scroll")) };
+
+      // The user's own bulk change, the first row moved 1 px below the top
+      // of the view: a sliver of the row above it, which stays, is in view.
+      tasks = await reviewTasks();
+      await into(tasks[Math.floor(tasks.length / 2)], 1);
+      const view = (await rowsInView()).filter((row) => row.top >= 0);
+      const sliver = await page.evaluate((title) => {
+        const rows = [...document.querySelector("table").tBodies[0].rows];
+        const above = rows[rows.findIndex((r) => r.cells[1]?.textContent === title) - 1];
+        return above.getBoundingClientRect().bottom - document.querySelector("main").getBoundingClientRect().top;
+      }, view[0].title);
+      const count = Math.min(14, view.length - 4);
+      const moving = view.slice(0, count);
+      let stay = view[count + 2];
+      let firstStaying = view[count];
       const ownIds = [];
       for (const row of moving) ownIds.push((await taskByTitle(row.title)).id);
       for (const row of moving) {
@@ -1561,7 +1584,12 @@ async function smoke({ browser, origin, fixture, prisma }) {
         await page.mouse.up();
         await frames(page, 2);
       }
+      assert(sliver > 0 && sliver < 20, `a sliver of the row above the block is in view (${sliver} px)`);
       assert.equal((await checkedTitles()).length, count, "rows selected for the bulk change");
+      // Positions right before the change (selecting the rows re-renders them).
+      const before = new Map((await rowsInView()).map((row) => [row.title, row.top]));
+      stay = { title: stay.title, top: before.get(stay.title) };
+      firstStaying = { title: firstStaying.title, top: before.get(firstStaying.title) };
       const bulk = page.waitForResponse((r) => r.url().includes("/tasks/bulk-update"));
       await page.locator("select").filter({ hasText: "Change status" }).selectOption(done.id);
       assert.equal((await bulk).status(), 200);
@@ -1570,6 +1598,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
       result.own = {
         moved: count,
         rowsInView: view.length,
+        sliverAbove: Math.round(sliver * 100) / 100,
         firstStaying: await shiftOf(firstStaying),
         stay: await shiftOf(stay),
       };
@@ -1581,6 +1610,13 @@ async function smoke({ browser, origin, fixture, prisma }) {
       assert(Math.abs(result.colleague.stay) <= 1, "rows that stayed keep their place (colleague)");
       assert(Math.abs(result.colleague.firstStaying) <= 1, "first row that stayed keeps its place (colleague)");
       assert.deepEqual(result.colleague.checked, [result.colleague.clickTarget], "click after a colleague's bulk change");
+      assert(Math.abs(result.afterShortScroll.stay) <= 1, "rows that stayed keep their place (after a short scroll)");
+      assert(Math.abs(result.afterShortScroll.firstStaying) <= 1, "first row that stayed keeps its place (after a short scroll)");
+      assert.deepEqual(
+        result.afterShortScroll.checked,
+        [result.afterShortScroll.clickTarget],
+        "click after a colleague's bulk change after a short scroll",
+      );
       if (windowed) {
         assert(Math.abs(result.own.stay) <= 1, "rows that stayed keep their place (own bulk change)");
         assert(Math.abs(result.own.firstStaying) <= 1, "first row that stayed keeps its place (own bulk change)");

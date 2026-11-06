@@ -7,7 +7,8 @@ type ShutdownLog = {
 
 export interface ShutdownStep {
   name: string;
-  run: () => unknown;
+  /** Called with the milliseconds left before the overall deadline. */
+  run: (remainingMs: number) => unknown;
   /**
    * The step's own budget. When it runs out the step is logged as failed and
    * the next step starts, so one stalled step cannot keep later ones (such as
@@ -16,9 +17,9 @@ export interface ShutdownStep {
   timeoutMs?: number;
 }
 
-async function runStep(step: ShutdownStep): Promise<void> {
+async function runStep(step: ShutdownStep, remainingMs: number): Promise<void> {
   if (step.timeoutMs === undefined) {
-    await step.run();
+    await step.run(remainingMs);
     return;
   }
   let timer: NodeJS.Timeout | undefined;
@@ -29,7 +30,10 @@ async function runStep(step: ShutdownStep): Promise<void> {
     );
   });
   try {
-    await Promise.race([Promise.resolve().then(step.run), budget]);
+    await Promise.race([
+      Promise.resolve().then(() => step.run(Math.min(remainingMs, step.timeoutMs!))),
+      budget,
+    ]);
   } finally {
     clearTimeout(timer);
   }
@@ -47,6 +51,8 @@ export interface ShutdownOptions {
    * forces exit.
    */
   forceAfterMs?: number;
+  /** The clock for the time left that steps are told (tests inject one). */
+  now?: () => number;
 }
 
 /**
@@ -60,6 +66,7 @@ export function createShutdownHandler({
   exit = (code) => process.exit(code),
   timeoutMs = 8000,
   forceAfterMs = 1000,
+  now = Date.now,
 }: ShutdownOptions) {
   let startedAt: number | undefined;
   let exited = false;
@@ -71,12 +78,13 @@ export function createShutdownHandler({
 
   return async function shutdown(signal?: string): Promise<void> {
     if (startedAt !== undefined) {
-      if (Date.now() - startedAt < forceAfterMs) return;
+      if (now() - startedAt < forceAfterMs) return;
       log.warn({ signal }, "Shutdown already in progress; forcing exit");
       finish(1);
       return;
     }
-    startedAt = Date.now();
+    const started = now();
+    startedAt = started;
     log.info({ signal }, "Shutting down...");
 
     let current: string | undefined;
@@ -93,7 +101,7 @@ export function createShutdownHandler({
     for (const step of steps) {
       current = step.name;
       try {
-        await runStep(step);
+        await runStep(step, Math.max(0, started + timeoutMs - now()));
       } catch (err) {
         failed = true;
         log.error({ err, step: step.name }, `Shutdown step failed: ${step.name}`);

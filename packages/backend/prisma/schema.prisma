@@ -124,16 +124,24 @@ model RotatedRefreshToken {
   @@index([rotatedAt])
 }
 
-model LoginAttempt {
-  id           String    @id @default(cuid())
-  email        String    @unique
-  failedCount  Int       @default(0)
-  lastFailedAt DateTime?
-  lockedUntil  DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+/// Consecutive failed password sign-ins per slot. Every submitted address,
+/// with or without an account, maps to one of LOGIN_BACKOFF_SLOTS slots by a
+/// keyed hash, and a trusted browser to one of as many device lanes (from
+/// 16777216), so the table is bounded and stores no address. Written only by
+/// modules/auth/login-throttle.ts (docs/remediation/r31-login-backoff.md).
+model LoginThrottle {
+  slot           Int      @id
+  failures       Int
+  lastFailureAt  DateTime
+  /// Admitted attempts so far; each sign-in holds its number as a ticket.
+  admissions     BigInt   @default(0)
+  /// Admissions up to this number no longer count (success or quiet period).
+  clearedThrough BigInt   @default(0)
+  /// New each time the row is created (a sequence), so outcomes for a row
+  /// pruned meanwhile never touch the row created after it.
+  generation     BigInt   @default(autoincrement())
 
-  @@index([email])
+  @@index([lastFailureAt])
 }
 
 model PasswordResetToken {

@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { DriveFile } from "../api";
 import { useFileDragDrop } from "../hooks/use-file-drag-drop";
 import { getFileIcon, formatFileSize } from "@/lib/file-icons";
@@ -15,6 +16,9 @@ import { cn } from "@/lib/utils";
 
 interface FileRowProps {
   file: DriveFile;
+  /** The entry's index in the folder listing. */
+  index: number;
+  onRowFocus?: (fileId: string) => void;
   canEdit: boolean;
   selectable?: boolean;
   selected?: boolean;
@@ -33,8 +37,12 @@ interface FileRowProps {
   isShared?: boolean;
 }
 
-export function FileRow({
+// Memoized: scrolling renders the list again, and only rows coming into view
+// need to render.
+export const FileRow = memo(function FileRow({
   file,
+  index,
+  onRowFocus,
   canEdit,
   selectable,
   selected,
@@ -55,13 +63,26 @@ export function FileRow({
   const Icon = getFileIcon(file.mimeType, file.isFolder);
   const { attributes, listeners, setNodeRef, isDragging, isOver } = useFileDragDrop(file, canEdit);
 
+  // Arrow keys move to the entry before or after this one. The list keeps
+  // the rows next to the focused one rendered (see useDriveWindow).
+  const focusEntry = (row: HTMLElement, at: number) => {
+    row.parentElement?.querySelector<HTMLElement>(`:scope > [data-index="${at}"]`)?.focus();
+  };
+
   const row = (
     <tr
       ref={setNodeRef}
       {...(canEdit ? { ...listeners, ...attributes } : {})}
       tabIndex={0}
+      data-index={index}
+      data-anchor-key={file.id}
+      data-file-id={file.id}
+      onFocus={onRowFocus && (() => onRowFocus(file.id))}
+      // KeepInView keeps the rows in view in place; the browser's scroll
+      // anchoring must not move them a second time.
+      style={{ overflowAnchor: "none" }}
       className={cn(
-        "group/row border-b hover:bg-accent/50 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset",
+        "group/row hover:bg-accent/50 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset",
         "cursor-pointer",
         isDragging && "opacity-50",
         isOver && file.isFolder && "bg-primary/10 ring-1 ring-primary",
@@ -79,17 +100,15 @@ export function FileRow({
         }
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          const next = (e.currentTarget as HTMLElement).nextElementSibling as HTMLElement | null;
-          next?.focus();
+          focusEntry(e.currentTarget, index + 1);
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
-          const prev = (e.currentTarget as HTMLElement).previousElementSibling as HTMLElement | null;
-          prev?.focus();
+          focusEntry(e.currentTarget, index - 1);
         }
       }}
     >
-      <td className="px-3 py-2">
+      <td className="border-b px-3 py-2">
         <div className="flex items-center gap-2 min-w-0">
           {selectable ? (
             <div className="relative h-4 w-4 shrink-0">
@@ -139,16 +158,16 @@ export function FileRow({
           )}
         </div>
       </td>
-      <td className="px-3 py-2 text-sm text-muted-foreground whitespace-nowrap">
+      <td className="border-b px-3 py-2 text-sm text-muted-foreground truncate">
         {file.isFolder ? "\u2014" : formatFileSize(file.size)}
       </td>
-      <td className="px-3 py-2 text-sm text-muted-foreground whitespace-nowrap">
+      <td className="border-b px-3 py-2 text-sm text-muted-foreground truncate">
         {file.uploadedBy?.displayName ?? "\u2014"}
       </td>
-      <td className="px-3 py-2 text-sm text-muted-foreground whitespace-nowrap">
+      <td className="border-b px-3 py-2 text-sm text-muted-foreground truncate">
         {timeAgo(file.updatedAt)}
       </td>
-      <td className="px-3 py-2 text-right">
+      <td className="border-b px-3 py-2 text-right">
         {canEdit && (
           <FileActionMenu
             file={file}
@@ -188,4 +207,4 @@ export function FileRow({
       </ContextMenuContent>
     </ContextMenu>
   );
-}
+});

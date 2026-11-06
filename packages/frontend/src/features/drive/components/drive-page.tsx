@@ -18,7 +18,6 @@ import {
   useTeamFolders,
   useStarFile,
   useUnstarFile,
-  useFileShareStatus,
   useArchiveFiles,
   type DriveFile,
   type SortBy,
@@ -28,6 +27,9 @@ import { FilePreviewSlideover, UploadProgress } from "./lazy-drive-panels";
 import { DriveBulkActions } from "./drive-bulk-actions";
 import { useFileUpload } from "../hooks/use-file-upload";
 import { useFileSelection } from "../hooks/use-file-selection";
+import { useFileShareStatus } from "../hooks/use-file-share-status";
+import { useSettledEntries } from "../hooks/use-settled-entries";
+import { useNextPageRetry } from "../hooks/use-next-page-retry";
 import { useRecentFiles } from "../hooks/use-recent-files";
 import { useAuthStore } from "@/stores/auth-store";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -106,8 +108,18 @@ export function DrivePage({
   const isRoot = !folderId && !teamFolderId;
   const showInlineSections = isRoot && !isSearching && section === "home";
 
-  const { data, hasNextPage, isFetchingNextPage, fetchNextPage, isLoading, isError, refetch } =
-    useFiles(
+  const {
+    data,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+    isLoading,
+    isError,
+    isFetchNextPageError,
+    isRefetchError,
+    error,
+    refetch,
+  } = useFiles(
       workspaceId,
       isSearching ? null : (folderId ?? null),
       isSearching ? undefined : teamFolderId,
@@ -148,6 +160,9 @@ export function DrivePage({
   const [activeDrag, setActiveDrag] = useState<DriveFile | null>(null);
   const [showTrashConfirm, setShowTrashConfirm] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Scrolls the folder's entries; the list and grid render only the entries
+  // near its view.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const selection = useFileSelection();
 
   const sensors = useSensors(
@@ -156,7 +171,24 @@ export function DrivePage({
     }),
   );
 
-  const handleLoadMore = useCallback(() => fetchNextPage(), [fetchNextPage]);
+  // A next page that fails (the server's per-address request limit, say)
+  // is asked for again after a wait, below the entries already loaded,
+  // which stay usable; the end of the list coming into view meanwhile does
+  // not ask again.
+  // The listing shown: another folder, search or sort is another list.
+  const listKey = JSON.stringify([workspaceId, folderId, teamFolderId, searchQuery, sortBy, sortOrder]);
+  const nextPage = useNextPageRetry({
+    listKey,
+    failed: isFetchNextPageError,
+    error,
+    pages: data?.pages.length ?? 0,
+    fetchNextPage,
+  });
+  // After a failed next page only the timer above and "Try again" ask for
+  // it again, not the end of the list coming (or staying) in view.
+  const handleLoadMore = useCallback(() => {
+    if (!isFetchNextPageError) fetchNextPage();
+  }, [fetchNextPage, isFetchNextPageError]);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const file = event.active.data.current?.file as DriveFile | undefined;
@@ -170,7 +202,8 @@ export function DrivePage({
       const { active, over } = event;
       if (!over) return;
 
-      const activeFileId = active.data.current?.id as string;
+      const activeFileId = active.data.current?.id as string | undefined;
+      if (!activeFileId) return;
       const overData = over.data.current;
       if (!overData || overData.type !== "folder") return;
 
@@ -259,12 +292,11 @@ export function DrivePage({
 
   const fileIds = useMemo(() => files.map((f) => f.id), [files]);
 
-  // Share status for indicators
-  const { data: shareStatusData } = useFileShareStatus(workspaceId, fileIds);
-  const sharedFileIds = useMemo(
-    () => new Set(shareStatusData?.data ?? []),
-    [shareStatusData],
-  );
+  // Share status for indicators, asked for near the entries in view once
+  // scrolling settles (see useSettledEntries), so that skimming a long
+  // folder does not double the requests it makes.
+  const { onVisibleEntries, entriesInView } = useSettledEntries(listKey, view);
+  const sharedFileIds = useFileShareStatus(workspaceId, fileIds, entriesInView);
 
   const handleShare = useCallback(
     (file: DriveFile) => {
@@ -361,13 +393,34 @@ export function DrivePage({
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)
     : null;
 
+  // Below the entries when a request for the folder failed after some had
+  // loaded: they stay listed and usable.
+  const listNotice = isFetchNextPageError ? (
+    <div role="status" className="flex items-center justify-center gap-3 px-4 py-4 text-sm text-muted-foreground">
+      <span>
+        Couldn&apos;t load more files.
+        {nextPage.retryInSeconds !== null && ` Trying again in ${nextPage.retryInSeconds} s.`}
+      </span>
+      <Button variant="outline" size="sm" onClick={nextPage.retryNow} disabled={isFetchingNextPage}>
+        Try again
+      </Button>
+    </div>
+  ) : isRefetchError ? (
+    <div role="status" className="flex items-center justify-center gap-3 px-4 py-4 text-sm text-muted-foreground">
+      <span>Couldn&apos;t refresh this folder.</span>
+      <Button variant="outline" size="sm" onClick={() => refetch()}>
+        Try again
+      </Button>
+    </div>
+  ) : null;
+
   const contentArea = (
     <>
       {isLoading ? (
         <div className="flex items-center justify-center py-16">
           <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
         </div>
-      ) : isError ? (
+      ) : isError && !data ? (
         <div className="flex flex-col items-center justify-center gap-3 py-16">
           <p className="text-sm text-destructive">Failed to load files</p>
           <Button variant="outline" size="sm" onClick={() => refetch()}>
@@ -377,6 +430,10 @@ export function DrivePage({
       ) : view === "list" ? (
         <FileListView
           files={files}
+          scrollElement={scroller}
+          draggingId={activeDrag?.id ?? null}
+          onVisibleEntries={onVisibleEntries}
+          footer={listNotice}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}
@@ -405,6 +462,10 @@ export function DrivePage({
       ) : (
         <FileGridView
           files={files}
+          scrollElement={scroller}
+          draggingId={activeDrag?.id ?? null}
+          onVisibleEntries={onVisibleEntries}
+          footer={listNotice}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}
@@ -543,7 +604,7 @@ export function DrivePage({
           fileInputRef={fileInputRef}
           disabled={!canEdit}
         >
-          <div className="flex-1 overflow-y-auto">
+          <div ref={setScroller} className="flex-1 overflow-y-auto">
             {/* Starred section — home or starred view */}
             {(showInlineSections || (section === "starred" && isRoot && !isSearching)) && (
               <StarredSection

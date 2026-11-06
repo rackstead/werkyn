@@ -777,6 +777,9 @@ const SMOKE_STEPS = [
   "upload",
   "grid",
   "above",
+  "block",
+  "resize",
+  "rate",
 ];
 // Rows in view may move by at most this much (CSS pixels) through a change
 // above them.
@@ -1088,6 +1091,57 @@ async function smoke({ browser, origin, fixture, prisma }) {
         return bar ? Number(bar.textContent.split(" ")[0]) : 0;
       });
     const blur = () => page.evaluate(() => document.activeElement?.blur());
+
+    // A colleague renames the top block of entries in view, more than stay
+    // (all but the last `stay`), so that they sort after every other entry;
+    // the user's next refresh shows it. The view must not follow the block:
+    // the entries that stayed keep their places, and a click where the
+    // pointer rests (on one of them) hits the entry under it.
+    let blocks = 0;
+    async function renameTopBlock(view, stay) {
+      const listed = await order();
+      const ids = new Map(listed.map((e) => [e.name, e.id]));
+      const block = view.slice(0, view.length - stay);
+      blocks++;
+      for (const [i, e] of block.entries())
+        await prisma.file.update({
+          where: { id: ids.get(e.name) },
+          data: { name: `zz block ${blocks} ${String(i).padStart(2, "0")} ${e.name}` },
+        });
+      return block;
+    }
+
+    if (steps.includes("block")) {
+      log("step", "block");
+      for (const where of [0.25, 0.5]) {
+        await loadAll(page, pages, "");
+        await page.evaluate(async (where) => {
+          const s = window.__drive.scroller();
+          s.scrollTop = where * (s.scrollHeight - s.clientHeight);
+          await window.__drive.frames(3);
+        }, where);
+        await page.waitForTimeout(150);
+        const before = await inView();
+        const stayed = before.slice(before.length - 4);
+        const target = stayed[1].name;
+        const point = await checkboxOf(target);
+        await page.mouse.move(point.x, point.y);
+        const top = await page.evaluate(() => window.__drive.scroller().scrollTop);
+        const block = await renameTopBlock(before, 4);
+        await refresh(target);
+        const after = await inView();
+        const result = moved(stayed, after);
+        const scrolled = (await page.evaluate(() => window.__drive.scroller().scrollTop)) - top;
+        const checked = await clickAt({ ...point, name: target });
+        const detail = { at: where, block: block.length, stayed: stayed.length, ...result, scrolled, target, checked };
+        report.block ??= [];
+        report.block.push({ view: "list", ...detail });
+        assert.equal(result.compared, stayed.length, `block ${where}: the entries that stayed are in view`);
+        assert(result.maxMove <= STILL, `block ${where}: the entries that stayed moved ${result.maxMove}px`);
+        assert.deepEqual(checked, [target], `block ${where}: click hit ${checked}`);
+        pass("block", `list: top ${block.length} of ${before.length} in view renamed to sort at the end (${where * 100}%)`, detail);
+      }
+    }
 
     if (steps.includes("bulk")) {
       log("step", "bulk");
@@ -1443,6 +1497,69 @@ async function smoke({ browser, origin, fixture, prisma }) {
       await page.keyboard.press("Escape");
       await page.getByRole("menuitem", { name: "Rename" }).waitFor({ state: "detached" });
       pass("grid", "context menu on a card");
+
+      if (steps.includes("block")) {
+        // The top lines of cards in view (all but the last line) renamed to
+        // sort at the end: the view stays; the first card left keeps its
+        // place, and the others reflow behind it.
+        await loadAll(page, pages, "");
+        await scrollTo("middle");
+        await page.waitForTimeout(150);
+        const before = await inView();
+        const block = await renameTopBlock(before, columns);
+        const stayed = before.slice(before.length - columns);
+        const top = await page.evaluate(() => window.__drive.scroller().scrollTop);
+        await refresh(stayed[1].name);
+        const after = await inView();
+        const first = after.find((e) => e.name === stayed[0].name);
+        const scrolled = (await page.evaluate(() => window.__drive.scroller().scrollTop)) - top;
+        const detail = {
+          block: block.length,
+          stayed: stayed.length,
+          firstLeftMoved: first ? first.top - stayed[0].top : null,
+          scrolled,
+        };
+        report.block ??= [];
+        report.block.push({ view: "grid", ...detail });
+        assert(first, "grid block: the first card left is in view");
+        assert(Math.abs(first.top - stayed[0].top) <= STILL, `grid block: the first card left moved ${first.top - stayed[0].top}px`);
+        assert(Math.abs(scrolled) < VIEWPORT.height, `grid block: the view moved ${scrolled}px`);
+        pass("block", `grid: top ${block.length} cards in view renamed to sort at the end`, detail);
+      }
+
+      if (steps.includes("resize")) {
+        // Window widths across the grid's breakpoints (1024, 768 and 640 px:
+        // 5, 4, 3 and 2 columns): the first card fully in view stays within
+        // a line of its place.
+        await scrollTo("middle");
+        await page.waitForTimeout(150);
+        report.resize = [];
+        for (const width of [900, 700, 560, 1440]) {
+          const before = (await inView()).find((e) => e.top >= -1);
+          await page.setViewportSize({ width, height: VIEWPORT.height });
+          await page.waitForTimeout(400);
+          await page.evaluate(() => window.__drive.frames(3));
+          const after = await inView();
+          const same = after.find((e) => e.name === before.name);
+          const detail = {
+            width,
+            columns: await page.evaluate(() => {
+              const cards = window.__drive.inView();
+              return cards.filter((c) => Math.abs(c.top - cards[0].top) < 1).length;
+            }),
+            entry: before.name,
+            topBefore: before.top,
+            topAfter: same ? same.top : null,
+          };
+          report.resize.push(detail);
+          assert(same, `resize ${width}: ${before.name} still in view`);
+          assert(Math.abs(same.top - before.top) <= 140, `resize ${width}: ${before.name} moved ${same.top - before.top}px`);
+          pass("resize", `grid at ${width} px`, detail);
+        }
+        await page.setViewportSize(VIEWPORT);
+        await page.waitForTimeout(300);
+      }
+
       await page.getByRole("button", { name: "List view" }).click();
       await page.waitForFunction(() => document.querySelector("table"));
     }
@@ -1511,15 +1628,103 @@ async function smoke({ browser, origin, fixture, prisma }) {
   } finally {
     await context.close();
   }
+
+  if (steps.includes("rate")) {
+    // One client address, as a browser has (the server allows 100 API
+    // requests a minute per address): skimming the folder in flicks, and
+    // jumping to its end as fast as pages arrive. Neither may end with the
+    // folder replaced by "Failed to load files"; a refused page is asked
+    // for again after the wait the server gives, and jumping reaches the end.
+    log("step", "rate");
+    report.rate = [];
+    const runs = [
+      { name: "flicks of 30 x 100 px, then 0.7 s", kind: "flick" },
+      { name: "to the end as fast as pages arrive", kind: "jump" },
+    ];
+    for (const [n, run] of runs.entries()) {
+      proxyAddress = `127.0.3.${10 + n}`;
+      const { context, page, pages } = await openContext(browser, origin, fixture);
+      const refused = [];
+      let shareStatusRequests = 0;
+      page.on("response", (response) => {
+        if (response.status() === 429) refused.push(new URL(response.url()).pathname);
+        if (new URL(response.url()).pathname.endsWith("/files/share-status")) shareStatusRequests++;
+      });
+      try {
+        const t0 = Date.now();
+        await page.goto(`${origin}${folderPath(fixture, "list")}`);
+        await installHelpers(page);
+        await page.waitForFunction(() => window.__drive.entries().length > 10);
+        const v = await page.evaluate(() => {
+          const r = window.__drive.scroller().getBoundingClientRect();
+          return { x: r.left + r.width * 0.75, y: r.top + r.height / 2 };
+        });
+        await page.mouse.move(v.x, v.y);
+        let state = {};
+        let notices = 0;
+        for (let i = 0; Date.now() - t0 < 180_000; i++) {
+          if (run.kind === "flick") {
+            for (let k = 0; k < 30; k++) {
+              await page.mouse.wheel(0, 100);
+              await page.waitForTimeout(10);
+            }
+            await page.waitForTimeout(700);
+          } else {
+            await page.evaluate(async (away) => {
+              const s = window.__drive.scroller();
+              if (away) {
+                s.scrollTop = s.scrollHeight - s.clientHeight - 400;
+                await window.__drive.frames(2);
+              }
+              s.scrollTop = s.scrollHeight;
+            }, i % 5 === 0);
+            await page.waitForTimeout(40);
+          }
+          state = await page.evaluate(() => {
+            const s = window.__drive.scroller();
+            return {
+              failed: [...document.querySelectorAll("p")].some((p) => p.textContent === "Failed to load files"),
+              notice: [...document.querySelectorAll('[role="status"]')].some((e) => /load more files/.test(e.textContent)),
+              atEnd: s ? s.scrollHeight - s.clientHeight - s.scrollTop < 2 : false,
+            };
+          });
+          if (state.notice) notices++;
+          const last = pages.at(-1);
+          if (state.failed || (last?.nextCursor === null && state.atEnd)) break;
+        }
+        const detail = {
+          run: run.name,
+          seconds: Math.round((Date.now() - t0) / 1000),
+          pagesLoaded: pages.filter((p) => p.status === 200).length,
+          refused: refused.length,
+          refusedListing: refused.filter((p) => p.endsWith("/files")).length,
+          shareStatusRequests,
+          noticeSeen: notices > 0,
+          failedShown: !!state.failed,
+          reachedEnd: pages.at(-1)?.nextCursor === null,
+        };
+        report.rate.push(detail);
+        assert(!state.failed, `${run.name}: "Failed to load files"`);
+        if (run.kind === "jump") assert(detail.reachedEnd, `${run.name}: the end of the folder was not reached`);
+        pass("rate", run.name, detail);
+      } finally {
+        await context.close();
+        proxyAddress = null;
+      }
+    }
+  }
   return checks;
 }
 
-// Each connection from a different loopback address (127.0.1.1-250).
+// Each connection from a different loopback address (127.0.1.1-250), or
+// from `proxyAddress` when set (the rate step: one client address).
 let lastAddress = 0;
+let proxyAddress = null;
 class SpreadAgent extends http.Agent {
   createConnection(options, callback) {
     lastAddress = (lastAddress % 250) + 1;
-    return super.createConnection({ ...options, localAddress: `127.0.1.${lastAddress}` }, callback);
+    const localAddress = proxyAddress ?? `127.0.1.${lastAddress}`;
+    return super.createConnection({ ...options, localAddress }, callback);
   }
 }
 

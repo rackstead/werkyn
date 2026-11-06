@@ -161,3 +161,42 @@ export async function checkSearchIndexes(
   );
   return "warned";
 }
+
+/**
+ * Runs checkSearchIndexes at startup and, while the client avoids trigram
+ * indexes (the check failed, or found trigram indexes on a non-libc
+ * database), again every `intervalMs` until it no longer does: after the
+ * indexes are dropped, or once a failed check succeeds. A warning is logged
+ * only when it differs from the previous one. The timer does not keep the
+ * process alive; `stop` ends it.
+ */
+export async function startSearchIndexCheck(
+  prisma: Pick<PrismaClient, "$queryRaw">,
+  log: { warn(details: object, message: string): void },
+  schema = "public",
+  intervalMs = 60_000,
+): Promise<{ result: SearchIndexCheck; stop(): void }> {
+  let last: string | undefined;
+  const once = {
+    warn(details: object, message: string) {
+      if (message === last) return;
+      last = message;
+      log.warn(details, message);
+    },
+  };
+  const result = await checkSearchIndexes(prisma, once, schema);
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+  };
+  if (avoidTrigramIndexes.has(prisma)) {
+    timer = setInterval(() => {
+      void checkSearchIndexes(prisma, once, schema, { reportFailure: false }).then(() => {
+        if (!avoidTrigramIndexes.has(prisma)) stop();
+      });
+    }, intervalMs);
+    timer.unref();
+  }
+  return { result, stop };
+}

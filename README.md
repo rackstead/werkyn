@@ -99,7 +99,8 @@ the server prints at startup (for the default schema: `DROP INDEX
 "public"."Task_title_trgm_idx", "public"."Task_description_trgm_idx",
 "public"."ChatMessage_content_trgm_idx", "public"."WikiPage_title_trgm_idx",
 "public"."File_name_trgm_idx";`; use `DATABASE_URL`'s `schema` instead of
-`public` if it sets one). Until then the server's searches avoid them. See
+`public` if it sets one). Until then the server's searches avoid them; it
+notices the drop within a minute, without a restart. See
 [P02c](docs/remediation/p02c.md), including how to recover a failed migration
 and how to build the indexes beforehand without blocking writes.
 

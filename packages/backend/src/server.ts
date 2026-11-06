@@ -11,7 +11,7 @@ import { startBlobCleanupWorker } from "./services/blob-cleanup.js";
 import { dexManager } from "./services/dex-manager.js";
 import { logger } from "./utils/logger.js";
 import { createShutdownHandler } from "./utils/shutdown.js";
-import { checkSearchIndexes } from "./utils/text-search.js";
+import { startSearchIndexCheck } from "./utils/text-search.js";
 
 async function start() {
   const app = await buildApp();
@@ -22,16 +22,14 @@ async function start() {
     // by disabling them (see plugins/request-limits.ts).
     // One warning when the search indexes are absent or must not be used
     // (an ICU database); checked before serving, so no search reads indexes
-    // that would drop matches. If the check cannot run, searches avoid the
-    // indexes and the check is retried every minute until it succeeds.
-    const searchSchema = new URL(env.DATABASE_URL).searchParams.get("schema") ?? "public";
-    if ((await checkSearchIndexes(app.prisma, app.log, searchSchema)) === "failed") {
-      const retry = setInterval(() => {
-        void checkSearchIndexes(app.prisma, app.log, searchSchema, { reportFailure: false })
-          .then((result) => { if (result !== "failed") clearInterval(retry); });
-      }, 60_000);
-      retry.unref();
-    }
+    // that would drop matches. While searches avoid the indexes (the check
+    // failed, or restored indexes on an ICU database), it is repeated every
+    // minute until they no longer have to.
+    const searchIndexCheck = await startSearchIndexCheck(
+      app.prisma,
+      app.log,
+      new URL(env.DATABASE_URL).searchParams.get("schema") ?? "public",
+    );
 
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
 
@@ -108,6 +106,7 @@ async function start() {
         { name: "blob cleanup", run: () => blobCleanup.stop(), timeoutMs: 1_000 },
         { name: "chat deliveries", run: () => chatDeliveries.stop(), timeoutMs: 500 },
         { name: "dex", run: () => dexManager.stop(), timeoutMs: 5_500 },
+        { name: "search index check", run: async () => searchIndexCheck.stop(), timeoutMs: 100 },
         { name: "http server", run: () => app.close() },
       ],
     });

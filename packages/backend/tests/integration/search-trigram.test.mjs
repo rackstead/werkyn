@@ -43,7 +43,7 @@ process.env.STORAGE_DIR = storage;
 const { buildApp } = await import("../../src/app.js");
 const { searchTasks, searchWikiPages } = await import("../../src/modules/workspaces/workspaces.service.js");
 const { searchMessages, chatSearchPlan } = await import("../../src/modules/chat/chat.service.js");
-const { checkSearchIndexes, searchAvoidsTrigramIndexes } = await import("../../src/utils/text-search.js");
+const { checkSearchIndexes, searchAvoidsTrigramIndexes, startSearchIndexCheck } = await import("../../src/utils/text-search.js");
 const { listFiles } = await import("../../src/modules/files/files.service.js");
 const { listTasks } = await import("../../src/modules/tasks/tasks.service.js");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
@@ -951,10 +951,16 @@ describe("case folding", () => {
       };
       const unchecked = new PrismaClient({ datasourceUrl: url(`${sessions} -c enable_seqscan=off`) });
       const checked = new PrismaClient({ datasourceUrl: url(sessions) });
+      let watch;
       try {
+        // The server's startup check, rechecking every 50 ms while it avoids
+        // the indexes.
         const warnings = [];
-        assert.equal(await checkSearchIndexes(checked, { warn: (...a) => warnings.push(a) }), "warned");
+        watch = await startSearchIndexCheck(checked, { warn: (...a) => warnings.push(a) }, "public", 50);
+        assert.equal(watch.result, "warned");
         assert.equal(searchAvoidsTrigramIndexes(checked), true);
+        // The rechecks repeat no warning while nothing changes.
+        await new Promise((resolve) => setTimeout(resolve, 300));
         assert.equal(warnings.length, 1);
         const [details, message] = warnings[0];
         assert.equal(details.collationProvider, "icu");
@@ -975,14 +981,19 @@ describe("case folding", () => {
         const lost = await contents(unchecked);
         t.diagnostic(`"οδος" through the restored index: ${JSON.stringify(lost)}`);
         if (version < 180000) assert.ok(lost.length < 3, `the restored index drops matches without the check: ${JSON.stringify(lost)}`);
-        // After the drop statements, the check reports the plain ICU state
-        // and no longer keeps the client off the (gone) indexes.
+        // The operator runs the drop statements while the server runs: the
+        // next recheck reports the plain ICU state once, lifts the fallback
+        // and stops.
         for (const statement of details.drop) await und.prisma.$executeRawUnsafe(statement);
-        const after = [];
-        assert.equal(await checkSearchIndexes(checked, { warn: (...a) => after.push(a) }), "warned");
-        assert.match(after[0][1], /are not created on a database whose default collation provider is icu/);
+        const deadline = Date.now() + 10_000;
+        while (searchAvoidsTrigramIndexes(checked) && Date.now() < deadline)
+          await new Promise((resolve) => setTimeout(resolve, 25));
         assert.equal(searchAvoidsTrigramIndexes(checked), false);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(warnings.length, 2, JSON.stringify(warnings.map(([, m]) => m.slice(0, 60))));
+        assert.match(warnings[1][1], /are not created on a database whose default collation provider is icu/);
       } finally {
+        watch?.stop();
         await Promise.allSettled([unchecked.$disconnect(), checked.$disconnect()]);
         await und.prisma.$executeRawUnsafe(`DROP EXTENSION IF EXISTS pg_trgm CASCADE`);
       }

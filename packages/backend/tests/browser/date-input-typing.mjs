@@ -389,13 +389,15 @@ try {
     // and pressed: only null is sent, not the typed date first.
     for (const [name, use] of [
       ["panel-clear-click", async (clear) => clear.click()],
-      ["panel-clear-tab", async (clear, check, from) => {
+      // The task ID is passed in: the loop's own binding is not yet set
+      // while this array is built.
+      ["panel-clear-tab", async (clear, check, from, id) => {
         for (let i = 0; i < 3 && !(await clear.evaluate((el) => el === document.activeElement)); i++) {
           await page.keyboard.press("Tab");
         }
         await settle();
         check("focus on Clear", await clear.evaluate((el) => el === document.activeElement), null);
-        check("nothing sent on reaching Clear", writesFor(from, ids[name]).length === 0, writesFor(from, ids[name]));
+        check("nothing sent on reaching Clear", writesFor(from, id).length === 0, writesFor(from, id));
         await page.keyboard.press("Enter");
       }],
     ]) {
@@ -404,7 +406,7 @@ try {
         const from = writes.length;
         await panel.getByLabel("Due date", { exact: true }).focus();
         await type(typing);
-        await use(panel.getByRole("button", { name: "Clear due date" }), check, from);
+        await use(panel.getByRole("button", { name: "Clear due date" }), check, from, ids[name]);
         await settle();
         check("cleared", (await saved(ids[name])).dueDate === null, await saved(ids[name]));
         check("only null sent", JSON.stringify(writesFor(from, ids[name]).map((w) => w.body)) === '[{"dueDate":null}]', writesFor(from, ids[name]));

@@ -357,6 +357,21 @@ function encodeMyTasksCursor(row: MyTasksPosition) {
   return Buffer.from(JSON.stringify(values)).toString("base64url");
 }
 
+// A crafted cursor must hold values the query can use, or the request is
+// refused here as an invalid cursor:
+// - Task.position is an INT4 column, and Prisma fails the whole query (a 500)
+//   for a number outside it.
+// - A JSON string can carry a lone UTF-16 surrogate escape, which Prisma
+//   cannot send (a 500), or NUL, which PostgreSQL refuses in text.
+const INT4_MIN = -(2 ** 31);
+const INT4_MAX = 2 ** 31 - 1;
+
+const isInt4 = (value: unknown): value is number =>
+  Number.isInteger(value) && (value as number) >= INT4_MIN && (value as number) <= INT4_MAX;
+
+const isText = (value: unknown): value is string =>
+  typeof value === "string" && !value.includes("\u0000") && !/\p{Cs}/u.test(value);
+
 function decodeMyTasksCursor(cursor: string, sort: MyTasksQueryInput["sort"]): MyTasksPosition {
   try {
     const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
@@ -364,18 +379,18 @@ function decodeMyTasksCursor(cursor: string, sort: MyTasksQueryInput["sort"]): M
     if (
       sort === "project" &&
       value.length === 4 &&
-      typeof value[0] === "string" &&
-      typeof value[1] === "string" &&
-      Number.isSafeInteger(value[2]) &&
-      typeof value[3] === "string"
+      isText(value[0]) &&
+      isText(value[1]) &&
+      isInt4(value[2]) &&
+      isText(value[3])
     ) {
       return { sort, projectName: value[0], projectId: value[1], position: value[2], id: value[3] };
     }
     if (
       sort === "dueDate" &&
       value.length === 2 &&
-      (value[0] === null || typeof value[0] === "string") &&
-      typeof value[1] === "string"
+      (value[0] === null || isText(value[0])) &&
+      isText(value[1])
     ) {
       return { sort, dueDate: value[0], id: value[1] };
     }

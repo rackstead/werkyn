@@ -4,6 +4,7 @@ import { useInfiniteScroll } from "../hooks/use-infinite-scroll";
 import { useDriveWindow } from "../hooks/use-drive-window";
 import { FileRow } from "./file-row";
 import { KeepInView } from "./keep-in-view";
+import { fileVersion } from "../lib/file-version";
 import { ChevronUp, ChevronDown, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -111,7 +112,14 @@ export function FileListView({
     onVisible: onVisibleEntries,
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
-  const keyAt = useCallback((index: number) => files[index]?.id, [files]);
+  const keys = useMemo(() => files.map((file) => file.id), [files]);
+  const versionOf = useCallback(
+    (id: string) => {
+      const index = indexById.get(id);
+      return index === undefined ? undefined : fileVersion(files[index]);
+    },
+    [files, indexById],
+  );
   // Space held below the entries while they are kept in place at the end of
   // the list until the next page arrives (see KeepInView's onShort). It
   // lasts until the entries change.
@@ -207,7 +215,8 @@ export function FileListView({
             scroller={scrollElement}
             container={bodyRef}
             indexOf={indexOf}
-            keyAt={keyAt}
+            keys={keys}
+            versionOf={versionOf}
             offsetOf={offsetOf}
             onCorrected={onCorrected}
             onShort={hasNextPage ? onShort : undefined}

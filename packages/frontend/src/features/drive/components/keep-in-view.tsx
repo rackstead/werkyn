@@ -1,19 +1,21 @@
 import { Component, type ReactNode, type RefObject } from "react";
-import { steadyEntry, type AroundEntry, type SeenEntry } from "../lib/steady-entry";
-
-// Entries listed just above and just below the view that are remembered
-// with the entries in view (see steadyEntry).
-const AROUND = 5;
+import { steadyEntry, type SeenEntry } from "../lib/steady-entry";
 
 interface KeepInViewProps {
   /** The element that scrolls the entries. */
   scroller: HTMLElement | null;
   /** Holds the entries, each marked with `data-anchor-key`; its top is the top of the first entry. */
   container: RefObject<HTMLElement | null>;
+  /** The keys of the entries as now rendered, in order (a new array only when the list changes). */
+  keys: readonly string[];
   /** An entry's index in the list as now rendered; undefined when it is no longer listed. */
   indexOf: (key: string) => number | undefined;
-  /** The key of the entry at this index in the list as now rendered. */
-  keyAt: (index: number) => string | undefined;
+  /**
+   * What the list's order depends on for an entry as now rendered (its
+   * name, its modification time ...): an entry whose version is unchanged
+   * after a change of the list did not move past the other entries.
+   */
+  versionOf?: (key: string) => string | undefined;
   /** The top of the entry at this index below the container's top, for an entry that is not rendered. */
   offsetOf: (index: number) => number;
   /** Called after the view was scrolled to keep the entries in place. */
@@ -38,17 +40,13 @@ interface KeepInViewProps {
 interface Snapshot {
   scrollTop: number;
   seen: SeenEntry[];
-  around: AroundEntry[];
-  // The list before the change, to find entries above the view that are
-  // still listed when none of the entries seen is.
+  // The list before the change: which entries stayed in their order, and
+  // the place of an entry that was not seen when none of those seen stayed.
+  keys: readonly string[];
+  versionOf?: (key: string) => string | undefined;
   listTop: number;
-  keyAt: (index: number) => string | undefined;
   offsetOf: (index: number) => number;
 }
-
-// How many entries still listed above the view are compared when none of
-// the entries seen is listed any more.
-const SURVIVORS = 11;
 
 /** An element's top in the scroller's content (independent of its scroll position). */
 function contentTop(element: Element, scroller: HTMLElement): number {
@@ -69,10 +67,13 @@ function contentTop(element: Element, scroller: HTMLElement): number {
  *
  * Right before React applies a change to the DOM, it records the entries in
  * view with their place in the scroller's content and the scroll position.
- * After the change, it picks one of them (see steadyEntry: one that moved
- * with the entries listed just around the view, never one that sorts far
- * away now, however many moved with it) and scrolls by however far that
- * entry moved in the content.
+ * After the change, it picks one of them (see steadyEntry: one that kept
+ * its order relative to the whole list, never one that sorts elsewhere now,
+ * however many moved with it) and scrolls by however far that entry moved
+ * in the content. When none of them stayed listed (at the end of the list,
+ * a refresh can leave every one of them for the next page), the entry
+ * nearest to the view that stayed keeps its place instead, at the place
+ * its index gave it before the change.
  * Both places are measured in the content, not on screen, so the browser
  * clamping the scroll position at the end of a list that got shorter is not
  * mistaken for the user scrolling, and the user's own scrolling never moves
@@ -81,33 +82,6 @@ function contentTop(element: Element, scroller: HTMLElement): number {
  * Nothing is kept while the top of the list is in view: entries added at the
  * top show there, as they do without windowing.
  */
-/**
- * When none of the entries seen is listed now (at the end of the list, a
- * refresh can leave every one of them, and many above them, for the next
- * page), an entry above the view that is still listed keeps its place
- * instead, at the place its index gave it before the change: of the
- * nearest such entries, one that moved as most of them did (so not one
- * renamed to sort elsewhere), the nearest.
- */
-function survivorAbove(
-  snapshot: Snapshot,
-  indexOf: (key: string) => number | undefined,
-): (SeenEntry & { now: number }) | undefined {
-  const first = Math.min(...snapshot.seen.map((entry) => entry.index));
-  const survivors: Array<SeenEntry & { now: number }> = [];
-  for (let index = first - 1; index >= 0 && survivors.length < SURVIVORS; index--) {
-    const key = snapshot.keyAt(index);
-    const now = key === undefined ? undefined : indexOf(key);
-    if (key !== undefined && now !== undefined)
-      survivors.push({ key, index, now, top: snapshot.listTop + snapshot.offsetOf(index) });
-  }
-  const counts = new Map<number, number>();
-  for (const entry of survivors) counts.set(entry.now - entry.index, (counts.get(entry.now - entry.index) ?? 0) + 1);
-  let shift: number | undefined;
-  for (const [candidate, count] of counts) if (shift === undefined || count > counts.get(shift)!) shift = candidate;
-  return survivors.find((entry) => entry.now - entry.index === shift);
-}
-
 export class KeepInView extends Component<KeepInViewProps> {
   // A scroll position to apply once the list holds the space it was short of.
   private retry: number | null = null;
@@ -131,26 +105,18 @@ export class KeepInView extends Component<KeepInViewProps> {
       if (index !== undefined) seen.push({ key, index, top: top - viewTop + scrollTop });
     }
     if (seen.length === 0) return null;
-    const first = Math.min(...seen.map((entry) => entry.index));
-    const last = Math.max(...seen.map((entry) => entry.index));
-    const around: AroundEntry[] = [];
-    for (let index = first - AROUND; index <= last + AROUND; index++) {
-      if (index >= first && index <= last) continue;
-      const key = index >= 0 ? previous.keyAt(index) : undefined;
-      if (key !== undefined) around.push({ key, index });
-    }
     return {
       scrollTop,
       seen,
-      around,
+      keys: previous.keys,
+      versionOf: previous.versionOf,
       listTop: listTop - viewTop + scrollTop,
-      keyAt: previous.keyAt,
       offsetOf: previous.offsetOf,
     };
   }
 
   componentDidUpdate(_props: KeepInViewProps, _state: unknown, snapshot: Snapshot | null) {
-    const { scroller, indexOf, offsetOf, onCorrected, onShort } = this.props;
+    const { scroller, keys, indexOf, versionOf, offsetOf, onCorrected, onShort } = this.props;
     const container = this.props.container.current;
     if (this.retry !== null && scroller) {
       const want = this.retry;
@@ -165,10 +131,26 @@ export class KeepInView extends Component<KeepInViewProps> {
     const rendered = new Map<string, HTMLElement>();
     for (const element of container.querySelectorAll<HTMLElement>("[data-anchor-key]"))
       rendered.set(element.dataset.anchorKey!, element);
+    const isRendered = (key: string) => rendered.has(key);
+    const before = snapshot.versionOf;
     const kept =
-      steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key), snapshot.around) ??
-      survivorAbove(snapshot, indexOf);
+      // The same list (a render for scrolling, a selection): every entry
+      // stayed, and the first entry seen still rendered is kept.
+      snapshot.keys === keys
+        ? snapshot.seen
+            .map((entry) => ({ ...entry, now: entry.index }))
+            .find((entry) => isRendered(entry.key)) ?? { ...snapshot.seen[0], now: snapshot.seen[0].index }
+        : steadyEntry(
+            snapshot.seen,
+            {
+              before: snapshot.keys,
+              indexOf,
+              changed: before && versionOf ? (key) => before(key) !== versionOf(key) : undefined,
+            },
+            isRendered,
+          );
     if (!kept) return;
+    const keptTop = kept.top ?? snapshot.listTop + snapshot.offsetOf(kept.index);
     const element = rendered.get(kept.key);
     const top = element
       ? contentTop(element, scroller)
@@ -176,7 +158,7 @@ export class KeepInView extends Component<KeepInViewProps> {
         // holds other entries. Every entry has the same height, so its place
         // follows from its index.
         contentTop(container, scroller) + offsetOf(kept.now);
-    const want = snapshot.scrollTop + (top - kept.top);
+    const want = snapshot.scrollTop + (top - keptTop);
     if (!Number.isFinite(want) || Math.abs(scroller.scrollTop - want) < 0.5) return;
     scroller.scrollTop = want;
     // At the end of the list, the browser stops the scroll position at the

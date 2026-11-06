@@ -5,6 +5,7 @@ import { useDriveWindow } from "../hooks/use-drive-window";
 import { GRID_CLASS, useGridColumns } from "../hooks/use-grid-columns";
 import { FileCard } from "./file-card";
 import { KeepInView } from "./keep-in-view";
+import { fileVersion } from "../lib/file-version";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -152,7 +153,14 @@ export function FileGridView({
     onCorrected(scrollElement.scrollTop);
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
-  const keyAt = useCallback((index: number) => files[index]?.id, [files]);
+  const keys = useMemo(() => files.map((file) => file.id), [files]);
+  const versionOf = useCallback(
+    (id: string) => {
+      const index = indexById.get(id);
+      return index === undefined ? undefined : fileVersion(files[index]);
+    },
+    [files, indexById],
+  );
   // Space held below the entries while they are kept in place at the end of
   // the list until the next page arrives (see KeepInView's onShort). It
   // lasts until the entries change.
@@ -216,7 +224,8 @@ export function FileGridView({
           scroller={scrollElement}
           container={gridRef}
           indexOf={indexOf}
-          keyAt={keyAt}
+          keys={keys}
+          versionOf={versionOf}
           offsetOf={offsetOf}
           onCorrected={onCorrected}
           onShort={hasNextPage ? onShort : undefined}

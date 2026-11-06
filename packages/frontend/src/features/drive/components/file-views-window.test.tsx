@@ -382,6 +382,38 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     expect(topOf(stayed)).toBe(top);
   });
 
+  it("keeps the rows left when a renamed run reaches past the view, or at the end of a short folder", async () => {
+    const files = range(0, 1000);
+    const renamed = (block: DriveFile[]) => block.map((f) => ({ ...f, name: `zz ${f.name}`, updatedAt: "2026-11-01T00:00:00Z" }));
+    const away = (all: DriveFile[], block: DriveFile[]) => [...all.filter((f) => !block.includes(f)), ...renamed(block)];
+    const { rerender } = render(<Harness files={files} />);
+    // The 5 entries above the view and the top 7 in view sort at the end.
+    await scrollTo(HEAD + 500 * ROW);
+    let top = topOf("f507");
+    rerender(<Harness files={away(files, files.slice(495, 507))} />);
+    expect(topOf("f507")).toBe(top);
+    // The bottom of the view and the 5 entries below it.
+    rerender(<Harness files={files} />);
+    await scrollTo(HEAD + 500 * ROW);
+    top = topOf("f501");
+    rerender(<Harness files={away(files, files.slice(503, 515))} />);
+    expect(topOf("f501")).toBe(top);
+
+    // A folder of 40 at its end: all but the last 3 in view now sort last,
+    // only a few places further down; the 3 left are the ones that stayed.
+    cleanup();
+    scroller = null;
+    scrollTop = 0;
+    const short = range(0, 40);
+    const view = render(<Harness files={short} />);
+    await scrollTo(contentHeight() - VIEW);
+    const first = Number(entryAt(5)!.slice(1));
+    const block = short.slice(first, 37);
+    top = topOf("f38");
+    view.rerender(<Harness files={away(short, block)} />);
+    expect(topOf("f38")).toBe(top);
+  });
+
   it("keeps the focused row and its neighbours rendered, and arrow keys move through rows", async () => {
     render(<Harness files={range(0, 1000)} />);
     await scrollTo(HEAD + 300 * ROW);
@@ -520,5 +552,18 @@ describe("windowed Drive grid", { timeout: 30_000 }, () => {
     const lastTop = topOf(last);
     rerender(<Harness view="grid" files={files.slice(15)} />);
     expect(topOf(last)).toBe(lastTop);
+  });
+
+  it("keeps the cards left when a renamed run reaches past the view", async () => {
+    const files = range(0, 1000);
+    const { rerender } = render(<Harness view="grid" files={files} />);
+    await scrollTo(SORT_BAR + 100 * LINE + 30);
+    // The view's first line stays; the cards after it and 5 below the view
+    // are renamed to sort at the end.
+    const top = topOf("f500");
+    const block = files.slice(505, 525);
+    const renamed = block.map((f) => ({ ...f, name: `zz ${f.name}`, updatedAt: "2026-11-01T00:00:00Z" }));
+    rerender(<Harness view="grid" files={[...files.filter((f) => !block.includes(f)), ...renamed]} />);
+    expect(topOf("f500")).toBe(top);
   });
 });

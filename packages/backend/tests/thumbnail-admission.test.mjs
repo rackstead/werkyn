@@ -722,7 +722,8 @@ test("container checks stop after a bounded amount of work on crafted files", as
   ]) {
     const started = performance.now();
     assert.equal(check(), refused, name);
-    assert.ok(performance.now() - started < 50, `${name} took ${performance.now() - started} ms`);
+    // About 20 ms here; a shared CI runner has taken 53. Unbounded, the WebP took 208.
+    assert.ok(performance.now() - started < 100, `${name} took ${performance.now() - started} ms`);
   }
   // 680 Exif items in the last of 2,000 mdat boxes stay within the entry
   // limit; locating their extents is a binary search, not a scan of every

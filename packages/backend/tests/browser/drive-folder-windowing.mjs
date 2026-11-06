@@ -91,6 +91,8 @@ const KNOWN_431 = process.env.DRIVE_KNOWN_431 === "1";
 // Set to record, not assert, the "anchor" step's results (for comparing
 // another build).
 const COMPARE = process.env.DRIVE_COMPARE === "1";
+// Set while the rate step runs: its 429 answers are expected.
+let expect429 = false;
 const log = (...args) => console.error("[drive-window]", ...args);
 
 // ─── Fixture ────────────────────────────────────────────────
@@ -325,6 +327,8 @@ async function openContext(browser, origin, fixture) {
     // URL get 431 once the folder has some 600 entries loaded; counted
     // separately (see shareStatus431 in the report).
     if (KNOWN_431 && /status of 431/.test(text)) return;
+    // The rate step reaches the server's request limit on purpose.
+    if (expect429 && /status of 429/.test(text)) return;
     report.errors.push(`console: ${text}`);
     log("console error", text);
   });
@@ -1655,6 +1659,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
     // for again after the wait the server gives, and jumping reaches the end.
     log("step", "rate");
     report.rate = [];
+    expect429 = true;
     const runs = [
       { name: "flicks of 30 x 100 px, then 0.7 s", kind: "flick" },
       { name: "to the end as fast as pages arrive", kind: "jump" },

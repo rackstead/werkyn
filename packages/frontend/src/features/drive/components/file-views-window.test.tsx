@@ -308,6 +308,26 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     expect(entryAt(200)).toBe(under);
   });
 
+  it("keeps the view at the end through a refresh that adds many above it, or renames the entry just above", async () => {
+    const files = range(0, 1000);
+    const { rerender } = render(<Harness files={files} />);
+    await scrollTo(contentHeight() - VIEW);
+    const under = entryAt(200)!;
+    const top = topOf(under);
+    // The entry just above the view is renamed to sort at the top, and 30
+    // are added above: the view's entries wait for the next page.
+    const renamed = files[985];
+    const rest = files.filter((f) => f !== renamed);
+    rerender(<Harness files={[renamed, ...range(-30, 0), ...rest.slice(0, 969)]} hasNextPage />);
+    rerender(<Harness files={[renamed, ...range(-30, 0), ...rest]} />);
+    expect(topOf(under)).toBe(top);
+    // 600 added above: every entry within 500 places of the view waits too.
+    const now = [renamed, ...range(-30, 0), ...rest];
+    rerender(<Harness files={[...range(-700, -100), ...now.slice(0, now.length - 600)]} hasNextPage />);
+    rerender(<Harness files={[...range(-700, -100), ...now]} />);
+    expect(topOf(under)).toBe(top);
+  });
+
   it("does not move the view for an entry renamed out of it, nor at the top of the list", async () => {
     const files = range(0, 1000);
     const { rerender } = render(<Harness files={files} />);

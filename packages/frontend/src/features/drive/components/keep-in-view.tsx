@@ -39,15 +39,16 @@ interface Snapshot {
   scrollTop: number;
   seen: SeenEntry[];
   around: AroundEntry[];
-  // The list before the change, to find the entry nearest above the view
-  // that is still listed when none of the entries seen is.
+  // The list before the change, to find entries above the view that are
+  // still listed when none of the entries seen is.
   listTop: number;
   keyAt: (index: number) => string | undefined;
   offsetOf: (index: number) => number;
 }
 
-// How far above the view to look for an entry still listed.
-const NEAREST_LISTED = 500;
+// How many entries still listed above the view are compared when none of
+// the entries seen is listed any more.
+const SURVIVORS = 11;
 
 /** An element's top in the scroller's content (independent of its scroll position). */
 function contentTop(element: Element, scroller: HTMLElement): number {
@@ -82,22 +83,29 @@ function contentTop(element: Element, scroller: HTMLElement): number {
  */
 /**
  * When none of the entries seen is listed now (at the end of the list, a
- * refresh can leave every one of them, and those just above them, for the
- * next page), the nearest entry above the view that is still listed keeps
- * its place instead, at the place its index gave it before the change.
+ * refresh can leave every one of them, and many above them, for the next
+ * page), an entry above the view that is still listed keeps its place
+ * instead, at the place its index gave it before the change: of the
+ * nearest such entries, one that moved as most of them did (so not one
+ * renamed to sort elsewhere), the nearest.
  */
-function nearestListedAbove(
+function survivorAbove(
   snapshot: Snapshot,
   indexOf: (key: string) => number | undefined,
 ): (SeenEntry & { now: number }) | undefined {
   const first = Math.min(...snapshot.seen.map((entry) => entry.index));
-  for (let index = first - 1; index >= Math.max(0, first - NEAREST_LISTED); index--) {
+  const survivors: Array<SeenEntry & { now: number }> = [];
+  for (let index = first - 1; index >= 0 && survivors.length < SURVIVORS; index--) {
     const key = snapshot.keyAt(index);
     const now = key === undefined ? undefined : indexOf(key);
     if (key !== undefined && now !== undefined)
-      return { key, index, now, top: snapshot.listTop + snapshot.offsetOf(index) };
+      survivors.push({ key, index, now, top: snapshot.listTop + snapshot.offsetOf(index) });
   }
-  return undefined;
+  const counts = new Map<number, number>();
+  for (const entry of survivors) counts.set(entry.now - entry.index, (counts.get(entry.now - entry.index) ?? 0) + 1);
+  let shift: number | undefined;
+  for (const [candidate, count] of counts) if (shift === undefined || count > counts.get(shift)!) shift = candidate;
+  return survivors.find((entry) => entry.now - entry.index === shift);
 }
 
 export class KeepInView extends Component<KeepInViewProps> {
@@ -159,7 +167,7 @@ export class KeepInView extends Component<KeepInViewProps> {
       rendered.set(element.dataset.anchorKey!, element);
     const kept =
       steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key), snapshot.around) ??
-      nearestListedAbove(snapshot, indexOf);
+      survivorAbove(snapshot, indexOf);
     if (!kept) return;
     const element = rendered.get(kept.key);
     const top = element

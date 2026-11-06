@@ -142,6 +142,13 @@ const SEARCH_TERMS: [string, string][] = [
   ["two words", "webhook audit"],
   ["no match", "qzxv"],
 ];
+/** One-channel chat search terms: common-word phrases, a word, no match. */
+const CHANNEL_SEARCH_TERMS: [string, string][] = [
+  ["two words", "webhook audit"],
+  ["two other words", "deploy mobile"],
+  ["3 letters", "upl"],
+  ["no match", "qzxv"],
+];
 const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
 
 async function fixture() {
@@ -206,6 +213,15 @@ async function fixture() {
     SELECT v."pageId" AS id FROM "WikiPageVersion" v JOIN "WikiPage" p ON p.id = v."pageId"
     JOIN "WikiSpace" s ON s.id = p."spaceId" WHERE s."workspaceId" = ${wid}
     GROUP BY v."pageId" ORDER BY count(*) DESC, v."pageId" LIMIT 1`;
+  // The member's largest DM and private channel, for one-channel search.
+  const [dm] = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT c.id FROM "ChatChannel" c JOIN "ChatChannelMember" cm ON cm."channelId" = c.id AND cm."userId" = ${member.id}
+    JOIN "ChatMessage" m ON m."channelId" = c.id WHERE c."workspaceId" = ${wid} AND c.type = 'DM'
+    GROUP BY c.id ORDER BY count(*) DESC, c.id LIMIT 1`;
+  const [privateChannel] = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT c.id FROM "ChatChannel" c JOIN "ChatChannelMember" cm ON cm."channelId" = c.id AND cm."userId" = ${member.id}
+    JOIN "ChatMessage" m ON m."channelId" = c.id WHERE c."workspaceId" = ${wid} AND c.type = 'PRIVATE'
+    GROUP BY c.id ORDER BY count(*) DESC, c.id LIMIT 1`;
   // Rows a small fixture may lack; their endpoints are skipped.
   const optional = <T>(row: T) => row as T | undefined;
   return {
@@ -213,6 +229,7 @@ async function fixture() {
     thread: optional(thread), olderPage: optional(olderPage), folder: optional(folder),
     team: optional(team), space: optional(space), wikiParent: optional(wikiParent),
     commented: optional(commented), versioned: optional(versioned),
+    dm: optional(dm), privateChannel: optional(privateChannel),
   };
 }
 
@@ -321,6 +338,15 @@ async function readBench(f: Awaited<ReturnType<typeof fixture>>) {
         [`search: drive (member), ${label}`, get(m, `/workspaces/${f.wid}/files?search=${q}`)],
         [`search: drive (admin), ${label}`, get(a, `/workspaces/${f.wid}/files?search=${q}`)],
         [`search: task list, ${label}`, get(m, `/projects/${f.big.id}/tasks?search=${q}`)],
+      ];
+    }),
+    // One-channel chat search: the largest channel, a DM, a private channel.
+    ...CHANNEL_SEARCH_TERMS.flatMap(([label, term]): [string, (() => Promise<Response>) | undefined][] => {
+      const q = encodeURIComponent(term);
+      return [
+        [`search: chat #general, ${label}`, get(m, `/chat/${f.wid}/channels/${f.general.id}/messages/search?q=${q}`)],
+        [`search: chat DM, ${label}`, needs(f.dm, m, (c) => `/chat/${f.wid}/channels/${c.id}/messages/search?q=${q}`)],
+        [`search: chat private, ${label}`, needs(f.privateChannel, m, (c) => `/chat/${f.wid}/channels/${c.id}/messages/search?q=${q}`)],
       ];
     }),
   ];

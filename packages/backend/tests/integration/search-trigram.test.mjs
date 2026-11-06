@@ -12,12 +12,22 @@
 // - Search statements keep a plan per term (plan_cache_mode is set for their
 //   transaction only), so a generic plan cannot read the whole trigram index
 //   for a one- or two-letter term.
+// - On a libc database the index finds every row ILIKE finds, for every cased
+//   character. On an ICU database it would not (pg_trgm lowercases with
+//   libc), so the migration creates no index there and search returns
+//   ILIKE's rows from a scan, as on main; the startup check warns.
+// - A one-channel chat search in a small channel reads the channel, not the
+//   trigram index.
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
@@ -32,7 +42,8 @@ const storage = await mkdtemp(path.join(os.tmpdir(), "werkyn-search-trigram-"));
 process.env.STORAGE_DIR = storage;
 const { buildApp } = await import("../../src/app.js");
 const { searchTasks, searchWikiPages } = await import("../../src/modules/workspaces/workspaces.service.js");
-const { searchMessages } = await import("../../src/modules/chat/chat.service.js");
+const { searchMessages, chatSearchPlan } = await import("../../src/modules/chat/chat.service.js");
+const { warnIfSearchIndexesMissing } = await import("../../src/utils/text-search.js");
 const { listFiles } = await import("../../src/modules/files/files.service.js");
 const { listTasks } = await import("../../src/modules/tasks/tasks.service.js");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
@@ -430,6 +441,11 @@ describe("migration", () => {
 });
 
 describe("parity: index and table scan return the same rows in the same order", () => {
+  // The joined channel (2,013 messages) counts as large here, so the
+  // one-channel path may use the trigram index too (see "one-channel chat
+  // search" for the small-channel plan).
+  before(() => { chatSearchPlan.smallChannelMessages = 100; });
+  after(() => { chatSearchPlan.smallChannelMessages = 20_000; });
   for (const actor of ["member", "admin"])
     test(`every path and term (${actor})`, async (t) => {
       let compared = 0, nonEmpty = 0;
@@ -625,6 +641,326 @@ describe("plans per term", () => {
       assert.equal(mode, "auto");
     } finally {
       await single.$disconnect();
+    }
+  });
+});
+
+// ─── Case folding: libc and ICU databases ────────────────────────────────
+
+const backendDir = fileURLToPath(new URL("../../", import.meta.url));
+const prismaPackage = createRequire(import.meta.url).resolve("prisma/package.json");
+const prismaCli = path.resolve(path.dirname(prismaPackage), JSON.parse(await readFile(prismaPackage, "utf8")).bin.prisma);
+const run = promisify(execFile);
+
+/**
+ * Index against scan over every code point whose lower() or upper() differs
+ * from itself, in data rows c / lower(c) / upper(c) inside a word and at a
+ * word start, and patterns of the same shapes. The scan side is ILIKE in a
+ * join; the index side a forced GIN bitmap scan per pattern. Temporary
+ * tables, rolled back. Returns the pair counts.
+ */
+async function caseFoldSweep(db) {
+  let result;
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE cf_d (id serial PRIMARY KEY, cp int, s text) ON COMMIT DROP`);
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE cf_p (id serial PRIMARY KEY, cp int, pat text) ON COMMIT DROP`);
+      await tx.$executeRawUnsafe(`
+        WITH cps AS (SELECT cp, chr(cp) c FROM generate_series(1, 1114111) cp
+          WHERE cp NOT BETWEEN 55296 AND 57343 AND (lower(chr(cp)) <> chr(cp) OR upper(chr(cp)) <> chr(cp)))
+        INSERT INTO cf_d (cp, s) SELECT cp, shape FROM cps,
+          LATERAL (VALUES (c), (lower(c)), (upper(c))) v(x),
+          LATERAL (VALUES ('qa' || x || 'bq'), ('qa ' || x || 'bq'), ('Qa' || upper(x) || 'Bq')) t(shape)`);
+      await tx.$executeRawUnsafe(`
+        INSERT INTO cf_p (cp, pat) SELECT DISTINCT d.cp, shape FROM (SELECT DISTINCT cp FROM cf_d) d,
+          LATERAL (VALUES (chr(d.cp)), (lower(chr(d.cp))), (upper(chr(d.cp)))) v(y),
+          LATERAL (VALUES ('%a' || y || 'b%'), ('% ' || y || 'bq%')) p(shape)`);
+      await tx.$executeRawUnsafe(`CREATE INDEX cf_d_trgm ON cf_d USING gin (s gin_trgm_ops)`);
+      await tx.$executeRawUnsafe(`ANALYZE cf_d`);
+      await tx.$executeRawUnsafe(`ANALYZE cf_p`);
+      const [scan] = await tx.$queryRawUnsafe(`
+        SELECT count(*)::int AS n FROM cf_p p JOIN cf_d d ON d.cp = p.cp WHERE d.s ILIKE p.pat`);
+      await tx.$executeRawUnsafe(`SET LOCAL enable_seqscan = off`);
+      await tx.$executeRawUnsafe(`SET LOCAL enable_hashjoin = off`);
+      await tx.$executeRawUnsafe(`SET LOCAL enable_mergejoin = off`);
+      await tx.$executeRawUnsafe(`SET LOCAL enable_indexscan = off`);
+      const [plan] = await tx.$queryRawUnsafe(`
+        EXPLAIN (FORMAT JSON) SELECT p.id, d.id FROM cf_p p
+        CROSS JOIN LATERAL (SELECT id, cp FROM cf_d WHERE s ILIKE p.pat) d WHERE d.cp = p.cp`);
+      assert.match(JSON.stringify(plan), /"Index Name":"cf_d_trgm"/, "the sweep's index side reads the trigram index");
+      const [rows] = await tx.$queryRawUnsafe(`
+        WITH ref AS (SELECT p.id pid, d.id did FROM cf_p p JOIN cf_d d ON d.cp = p.cp
+                     WHERE d.s || '' ILIKE p.pat),
+             idx AS (SELECT p.id pid, d.id did FROM cf_p p
+                     CROSS JOIN LATERAL (SELECT id, cp FROM cf_d WHERE s ILIKE p.pat) d WHERE d.cp = p.cp)
+        SELECT (SELECT count(*)::int FROM (SELECT DISTINCT cp FROM cf_d) c) AS codepoints,
+               (SELECT count(*)::int FROM ref) AS scan,
+               (SELECT count(*)::int FROM idx) AS index,
+               (SELECT count(*)::int FROM (SELECT * FROM ref EXCEPT SELECT * FROM idx) m) AS missing,
+               (SELECT count(*)::int FROM (SELECT * FROM idx EXCEPT SELECT * FROM ref) x) AS extra`);
+      assert.equal(rows.scan, scan.n, "the scan side does not use the index");
+      result = rows;
+      throw new Error("rollback");
+    }, { timeout: 300_000, maxWait: 10_000 });
+  } catch (error) {
+    if (error.message !== "rollback") throw error;
+  }
+  return result;
+}
+
+describe("case folding", () => {
+  test("libc database: the trigram index finds every row ILIKE finds, for every cased character", async (t) => {
+    const [{ provider }] = await app.prisma.$queryRaw`
+      SELECT to_jsonb(d) ->> 'datlocprovider' AS provider FROM pg_database d WHERE d.datname = current_database()`;
+    if ((provider ?? "c") !== "c") return t.skip(`the test database's default collation provider is ${provider}`);
+    const sweep = await caseFoldSweep(app.prisma);
+    t.diagnostic(`libc: ${JSON.stringify(sweep)}`);
+    assert.ok(sweep.codepoints > 1000 && sweep.scan > 10_000, JSON.stringify(sweep));
+    assert.equal(sweep.missing, 0);
+    assert.equal(sweep.extra, 0);
+    // The startup check is quiet when the indexes are there.
+    const warnings = [];
+    assert.equal(await warnIfSearchIndexesMissing(app.prisma, { warn: (...a) => warnings.push(a) }), false);
+    assert.deepEqual(warnings, []);
+  });
+
+  describe("ICU databases", () => {
+    const databases = [];
+    let skip = null;
+    const TEXTS_ICU = [
+      "ΟΔΟΣ", "ΟΔΟΣ Α", "οδος κεντρική", "IŞIK lamba", "ışık lamba", "ISTANBUL ofis", "İstanbul ofis",
+      "istanbul ofis", "ⓐⓑⓒ circled", "ⒶⒷⒸ CIRCLED", "STRAẞE groß", "Straße", "Café Résumé", "plain warehouse sync",
+    ];
+    const TERMS_ICU = [
+      "οδος", "ΟΔΟΣ", "οδοσ", "ışık", "IŞIK", "ıstanbul", "istanbul", "İstanbul", "ISTANBUL", "ⓐⓑⓒ", "ⒶⒷⒸ",
+      "straße", "STRASSE", "café", "warehouse", "sync",
+    ];
+
+    before(async () => {
+      const [{ version, icu }] = await app.prisma.$queryRaw`
+        SELECT current_setting('server_version_num')::int AS version,
+               EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i') AS icu`;
+      if (version < 150000 || !icu) {
+        skip = "PostgreSQL without ICU database locales (version 15 or later built with ICU)";
+        return;
+      }
+      const base = new URL(process.env.TEST_DATABASE_URL);
+      for (const [key, locale] of [["und", "und"], ["tr", "tr-TR"]]) {
+        const name = `${base.pathname.slice(1)}_icu_${key}_${suffix.replaceAll("-", "")}`.slice(0, 63);
+        try {
+          await app.prisma.$executeRawUnsafe(
+            `CREATE DATABASE "${name}" TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE '${locale}'`);
+        } catch (error) {
+          skip = `cannot create an ICU database: ${error.message}`;
+          return;
+        }
+        const url = new URL(process.env.TEST_DATABASE_URL);
+        url.pathname = `/${name}`;
+        url.searchParams.set("connection_limit", "2");
+        databases.push({ key, name, url: url.toString() });
+      }
+      for (const db of databases) {
+        const { stdout } = await run(process.execPath, [prismaCli, "migrate", "deploy", "--schema", path.join(backendDir, "prisma/schema.prisma")], {
+          cwd: backendDir, env: { ...process.env, DATABASE_URL: db.url }, maxBuffer: 8 * 1024 * 1024,
+        });
+        db.deployOutput = stdout;
+        db.prisma = new PrismaClient({ datasourceUrl: db.url });
+        // A workspace with one task, message, page and file per text.
+        const user = await db.prisma.user.create({ data: { email: `icu-${suffix}@example.test`, displayName: "ICU", emailVerified: true } });
+        const workspace = await db.prisma.workspace.create({ data: {
+          name: "ICU", slug: `icu-${suffix}`, members: { create: { userId: user.id, role: "ADMIN" } },
+        } });
+        const project = await db.prisma.project.create({ data: { workspaceId: workspace.id, name: "ICU", members: { create: { userId: user.id } } } });
+        const status = await db.prisma.statusColumn.create({ data: { projectId: project.id, name: "Open", position: 0 } });
+        const channel = await db.prisma.chatChannel.create({ data: {
+          workspaceId: workspace.id, name: "icu", type: "PUBLIC", createdById: user.id, members: { create: { userId: user.id } },
+        } });
+        const space = await db.prisma.wikiSpace.create({ data: { workspaceId: workspace.id, name: "ICU", slug: "icu" } });
+        await db.prisma.task.createMany({ data: TEXTS_ICU.map((text, i) => ({
+          projectId: project.id, statusId: status.id, title: text, description: `<p>${text}</p>`, position: i, updatedAt: at(i),
+        })) });
+        await db.prisma.chatMessage.createMany({ data: TEXTS_ICU.map((text, i) => ({
+          channelId: channel.id, userId: user.id, content: text, createdAt: at(i),
+        })) });
+        await db.prisma.wikiPage.createMany({ data: TEXTS_ICU.map((text, i) => ({
+          spaceId: space.id, title: text, createdById: user.id, updatedAt: at(i),
+        })) });
+        await db.prisma.file.createMany({ data: TEXTS_ICU.map((text) => ({
+          workspaceId: workspace.id, name: text, isFolder: false, uploadedById: user.id, ownerId: user.id,
+        })) });
+        Object.assign(db, { user, workspace, project, channel });
+      }
+    });
+
+    after(async () => {
+      for (const db of databases) {
+        await db.prisma?.$disconnect();
+        await app.prisma.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${db.name}" WITH (FORCE)`);
+      }
+    });
+
+    test("the migration applies and creates neither pg_trgm nor any trigram index; the startup check warns", async (t) => {
+      if (skip) return t.skip(skip);
+      for (const db of databases) {
+        assert.match(db.deployOutput, /20261105180000_search_trigram_indexes/);
+        const [state] = await db.prisma.$queryRaw`
+          SELECT (SELECT datlocprovider::text FROM pg_database WHERE datname = current_database()) AS provider,
+                 (SELECT count(*)::int FROM pg_extension WHERE extname = 'pg_trgm') AS extensions,
+                 (SELECT count(*)::int FROM pg_class WHERE relname LIKE '%trgm%') AS indexes,
+                 (SELECT count(*)::int FROM _prisma_migrations
+                   WHERE migration_name = '20261105180000_search_trigram_indexes' AND finished_at IS NOT NULL) AS applied`;
+        assert.deepEqual(state, { provider: "i", extensions: 0, indexes: 0, applied: 1 }, db.key);
+        const warnings = [];
+        assert.equal(await warnIfSearchIndexesMissing(db.prisma, { warn: (...a) => warnings.push(a) }), true);
+        assert.equal(warnings.length, 1);
+        assert.equal(warnings[0][0].collationProvider, "icu");
+        assert.match(warnings[0][1], /collation provider is icu/);
+      }
+    });
+
+    test("every search path returns ILIKE's rows, as main does", async (t) => {
+      if (skip) return t.skip(skip);
+      for (const db of databases) {
+        const userId = db.user.id;
+        const wid = db.workspace.id;
+        for (const term of TERMS_ICU) {
+          const scan = async (table, column, order) => (await db.prisma.$queryRawUnsafe(
+            `SELECT id FROM "${table}" WHERE "${column}" ILIKE '%' || $1 || '%' ORDER BY ${order}`, term)).map((r) => r.id);
+          const tasks = (await searchTasks(db.prisma, wid, userId, "ADMIN", term, 50)).data.map((r) => r.id);
+          const byTitle = await scan("Task", "title", `"updatedAt" DESC`);
+          const byDescription = (await scan("Task", "description", `"updatedAt" DESC`)).filter((id) => !byTitle.includes(id));
+          assert.deepEqual(tasks, [...byTitle, ...byDescription], `${db.key} tasks "${term}"`);
+          assert.deepEqual(ids(await searchWikiPages(db.prisma, wid, term, 50)), await scan("WikiPage", "title", `"updatedAt" DESC`), `${db.key} wiki "${term}"`);
+          const messages = await scan("ChatMessage", "content", `"createdAt" DESC, id DESC`);
+          assert.deepEqual(ids((await searchMessages(db.prisma, wid, userId, term, undefined, undefined, 50)).data), messages, `${db.key} chat "${term}"`);
+          assert.deepEqual(ids((await searchMessages(db.prisma, wid, userId, term, db.channel.id, undefined, 50)).data), messages, `${db.key} channel "${term}"`);
+          const files = ids((await listFiles(db.prisma, wid, FileQuerySchema.parse({ search: term, limit: "100" }), { workspaceId: wid, userId, workspaceRole: "ADMIN" })).data);
+          assert.deepEqual([...files].sort(), [...await scan("File", "name", "id")].sort(), `${db.key} drive "${term}"`);
+          assert.deepEqual(ids((await listTasks(db.prisma, db.project.id, TaskQuerySchema.parse({ search: term, limit: "100" }))).data).sort(),
+            [...byTitle].sort(), `${db.key} task list "${term}"`);
+        }
+      }
+      // The case the migration avoids: on ICU, a trigram index (built here in
+      // a rolled-back transaction) would drop rows that ILIKE matches.
+      const und = databases.find((db) => db.key === "und");
+      const sweep = await (async () => {
+        let out;
+        try {
+          await und.prisma.$transaction(async (tx) => {
+            await tx.$executeRawUnsafe(`CREATE EXTENSION pg_trgm`);
+            await tx.$executeRawUnsafe(`CREATE INDEX icu_probe ON "ChatMessage" USING gin (content gin_trgm_ops)`);
+            // Distinct statement texts: a statement without parameters keeps
+            // its first plan, whatever the settings at its next execution.
+            await tx.$executeRawUnsafe(`SET LOCAL enable_seqscan = off`);
+            const viaIndex = await tx.$queryRawUnsafe(`SELECT content /* index */ FROM "ChatMessage" WHERE content ILIKE '%οδος%' ORDER BY content`);
+            await tx.$executeRawUnsafe(`SET LOCAL enable_seqscan = on`);
+            await tx.$executeRawUnsafe(`SET LOCAL enable_bitmapscan = off`);
+            const viaScan = await tx.$queryRawUnsafe(`SELECT content /* scan */ FROM "ChatMessage" WHERE content ILIKE '%οδος%' ORDER BY content`);
+            out = { viaIndex: viaIndex.map((r) => r.content), viaScan: viaScan.map((r) => r.content).sort() };
+            throw new Error("rollback");
+          });
+        } catch (error) {
+          if (error.message !== "rollback") throw error;
+        }
+        return out;
+      })();
+      t.diagnostic(`ICU "οδος" through a trigram index: ${JSON.stringify(sweep.viaIndex)}; by scan: ${JSON.stringify(sweep.viaScan)}`);
+      assert.deepEqual(sweep.viaScan, ["οδος κεντρική", "ΟΔΟΣ", "ΟΔΟΣ Α"].sort(), "ICU ILIKE applies the final-sigma rule");
+      // And the search above returned them, from a scan.
+      assert.deepEqual(
+        (await searchMessages(und.prisma, und.workspace.id, und.user.id, "οδος", undefined, undefined, 50)).data.map((m) => m.content).sort(),
+        sweep.viaScan);
+      // Turkish ICU: the dotless and dotted i fold as in Turkish.
+      const tr = databases.find((db) => db.key === "tr");
+      const found = async (term) => (await searchMessages(tr.prisma, tr.workspace.id, tr.user.id, term, undefined, undefined, 50)).data.map((m) => m.content);
+      assert.ok((await found("ışık")).includes("IŞIK lamba"));
+      assert.ok((await found("ıstanbul")).includes("ISTANBUL ofis"));
+    });
+
+    test("an ICU database's own trigram index would miss matches (why the migration skips it)", async (t) => {
+      if (skip) return t.skip(skip);
+      const und = databases.find((db) => db.key === "und");
+      await und.prisma.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+      try {
+        const sweep = await caseFoldSweep(und.prisma);
+        t.diagnostic(`ICU und: ${JSON.stringify(sweep)}`);
+        assert.equal(sweep.extra, 0);
+        const [{ version }] = await und.prisma.$queryRaw`SELECT current_setting('server_version_num')::int AS version`;
+        // PostgreSQL 16 and 17: pg_trgm lowercases with libc. (Re-check the
+        // migration's provider condition if a later version reports 0.)
+        if (version < 180000) assert.ok(sweep.missing > 0, JSON.stringify(sweep));
+      } finally {
+        await und.prisma.$executeRawUnsafe(`DROP EXTENSION IF EXISTS pg_trgm`);
+      }
+    });
+  });
+});
+
+// ─── One-channel chat search in a small channel ──────────────────────────
+
+describe("one-channel chat search", () => {
+  /**
+   * The plan of the service's page query for a one-channel search, EXPLAINed
+   * after the service's own settings statement in one transaction.
+   */
+  async function channelSearchPlan(db, term, channelId) {
+    const all = [];
+    const listener = (event) => all.push(event);
+    db.$on("query", listener);
+    await searchMessages(db, workspaces.main.id, users.member.id, term, channelId, undefined, 20);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const settings = all.find((event) => event.query.includes("set_config('enable_bitmapscan'"));
+    const page = all.find((event) => event.query.startsWith("SELECT ") && event.query.includes(" ILIKE ") && event.query.includes("ORDER BY"));
+    assert.ok(settings && page, "the service sends the channel-size settings and the page query");
+    return db.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(settings.query, ...JSON.parse(settings.params));
+      const [{ "QUERY PLAN": plan }] = await tx.$queryRawUnsafe(`EXPLAIN (FORMAT JSON) ${page.query}`, ...JSON.parse(page.params));
+      return JSON.stringify(plan);
+    });
+  }
+
+  test("a small channel is read through its own index; above the limit the trigram index may be used", async () => {
+    // The joined channel holds 2,013 messages.
+    assert.equal(chatSearchPlan.smallChannelMessages, 20_000);
+    // Default planner settings, apart from the service's own.
+    const plain = client(null, true);
+    try {
+      const small = await channelSearchPlan(plain, "warehouse", channels.joined.id);
+      assert.doesNotMatch(small, /_trgm_idx/);
+      assert.match(small, /"Index Name":"ChatMessage_channelId_createdAt_idx"/);
+    } finally {
+      await plain.$disconnect();
+    }
+    // Above the limit the service leaves the scans to the planner; on this
+    // small data only the index client prefers the trigram index.
+    chatSearchPlan.smallChannelMessages = 100;
+    try {
+      assert.match(await channelSearchPlan(indexed, "warehouse", channels.joined.id), /"Index Name":"ChatMessage_content_trgm_idx"/);
+    } finally {
+      chatSearchPlan.smallChannelMessages = 20_000;
+    }
+  });
+
+  test("both plans return the same messages, in order, as a scan and as ILIKE", async () => {
+    const wid = workspaces.main.id;
+    const reference = {};
+    for (const term of TERMS)
+      reference[term] = ids((await searchMessages(scanned, wid, users.member.id, term, channels.joined.id, undefined, 50)).data);
+    for (const term of ASCII_TERMS)
+      assert.deepEqual(reference[term], expectedMessages("member", term, 50, "joined"), `"${term}"`);
+    for (const limit of [20_000, 100]) {
+      chatSearchPlan.smallChannelMessages = limit;
+      try {
+        for (const term of TERMS)
+          for (const db of [app.prisma, indexed])
+            assert.deepEqual(
+              ids((await searchMessages(db, wid, users.member.id, term, channels.joined.id, undefined, 50)).data),
+              reference[term],
+              `"${term}", limit ${limit}`,
+            );
+      } finally {
+        chatSearchPlan.smallChannelMessages = 20_000;
+      }
     }
   });
 });

@@ -11,6 +11,7 @@ import { startBlobCleanupWorker } from "./services/blob-cleanup.js";
 import { dexManager } from "./services/dex-manager.js";
 import { logger } from "./utils/logger.js";
 import { createShutdownHandler } from "./utils/shutdown.js";
+import { warnIfSearchIndexesMissing } from "./utils/text-search.js";
 
 async function start() {
   const app = await buildApp();
@@ -20,6 +21,9 @@ async function start() {
     // long uploads, downloads and backups are bounded per route instead of
     // by disabling them (see plugins/request-limits.ts).
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
+
+    // One line when the search indexes are absent (e.g. an ICU database).
+    void warnIfSearchIndexesMissing(app.prisma, app.log);
 
     // Scheduled jobs. Runs of one job never overlap, and stop() signals the
     // run in progress to stop at its next safe point and waits for it.

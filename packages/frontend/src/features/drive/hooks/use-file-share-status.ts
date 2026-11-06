@@ -63,7 +63,8 @@ function retryRefused(failures: number, error: unknown) {
   return failures < 2 && error instanceof ApiError && error.statusCode === 429;
 }
 function refusedDelay(failures: number, error: unknown) {
-  return (error instanceof ApiError && error.retryAfterMs) || 2000 * 2 ** failures;
+  const asked = error instanceof ApiError ? error.retryAfter : undefined;
+  return asked ? asked * 1000 : 2000 * 2 ** failures;
 }
 
 /**

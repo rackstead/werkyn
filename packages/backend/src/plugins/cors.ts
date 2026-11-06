@@ -16,8 +16,8 @@ export default fp(async (fastify: FastifyInstance) => {
   await fastify.register(cors, {
     origin: origins,
     credentials: true,
-    // A frontend served from another origin reads how long to wait after a
-    // 429 from the request limit (plugins/rate-limit.ts).
+    // A frontend on another origin reads the wait of a 429 (sign-in backoff
+    // and route limits); Retry-After is not readable cross-origin otherwise.
     exposedHeaders: ["Retry-After"],
   });
 });

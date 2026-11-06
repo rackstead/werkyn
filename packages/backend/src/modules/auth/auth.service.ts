@@ -3,7 +3,14 @@ import type { WorkspaceAdmissionResult } from "@pm/shared";
 import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { admitWithInvite } from "../invites/admission.service.js";
 import { logger } from "../../utils/logger.js";
-import { hashPassword, verifyPassword } from "../../utils/passwords.js";
+import { env } from "../../config/env.js";
+import { hashPassword, verifyLoginPassword } from "../../utils/passwords.js";
+import { loginThrottle } from "./login-throttle.js";
+import {
+  credentialMatches,
+  deviceCookieAfterSignIn,
+  deviceToken,
+} from "./login-device.js";
 import {
   signAccessToken,
   generateSecureToken,
@@ -29,7 +36,7 @@ import {
   UnauthorizedError,
   NotFoundError,
   GoneError,
-  LockedError,
+  TooManyRequestsError,
 } from "../../utils/errors.js";
 
 export {
@@ -37,22 +44,6 @@ export {
   createRefreshSession,
   startRefreshSession,
 } from "./refresh-sessions.js";
-
-// Progressive lockout thresholds
-const LOCKOUT_THRESHOLDS = [
-  { attempts: 5, duration: 30 * 1000 },       // 30 seconds
-  { attempts: 10, duration: 5 * 60 * 1000 },  // 5 minutes
-  { attempts: 15, duration: 30 * 60 * 1000 }, // 30 minutes
-];
-
-function getLockoutDuration(failedCount: number): number {
-  for (let i = LOCKOUT_THRESHOLDS.length - 1; i >= 0; i--) {
-    if (failedCount >= LOCKOUT_THRESHOLDS[i].attempts) {
-      return LOCKOUT_THRESHOLDS[i].duration;
-    }
-  }
-  return 0;
-}
 
 export async function getUserWorkspaces(prisma: PrismaClient, userId: string) {
   return prisma.workspaceMember.findMany({
@@ -216,27 +207,16 @@ async function createPasswordAccount(
   throw new ConflictError("Concurrent account registration. Please try again.");
 }
 
-export async function login(
+/**
+ * The account whose password this is, or null. An unknown address or an
+ * account without a usable password does the same Argon2id work as a wrong
+ * password for a real account (verifyLoginPassword).
+ */
+async function passwordSignInUser(
   prisma: PrismaClient,
-  data: { email: string; password: string },
+  email: string,
+  password: string,
 ) {
-  const email = data.email.toLowerCase();
-
-  // Check lockout
-  const attempt = await prisma.loginAttempt.findUnique({
-    where: { email },
-  });
-
-  if (attempt?.lockedUntil && attempt.lockedUntil > new Date()) {
-    const secondsLeft = Math.ceil(
-      (attempt.lockedUntil.getTime() - Date.now()) / 1000,
-    );
-    throw new LockedError(
-      `Account locked. Try again in ${secondsLeft} seconds.`,
-      secondsLeft,
-    );
-  }
-
   const user = await prisma.user.findUnique({
     where: { email },
     select: {
@@ -251,8 +231,20 @@ export async function login(
       passwordHash: true,
     },
   });
+  const valid = await verifyLoginPassword(password, user?.passwordHash);
+  return valid ? user : null;
+}
 
-  // SSO enforcement: reject password login if SSO-only mode
+export async function login(
+  prisma: PrismaClient,
+  data: { email: string; password: string },
+  /** The login_device cookie the browser sent, if any (login-device.ts). */
+  deviceCookie?: string,
+) {
+  const email = data.email.toLowerCase();
+
+  // SSO enforcement: reject password login if SSO-only mode. This is the same
+  // for every address, so it is decided before an attempt is counted.
   const ssoConfig = await prisma.ssoConfig.findUnique({
     where: { id: "singleton" },
   });
@@ -262,36 +254,56 @@ export async function login(
     );
   }
 
-  if (!user || !user.passwordHash || !(await verifyPassword(data.password, user.passwordHash))) {
-    // Record failed attempt
-    const currentAttempt = await prisma.loginAttempt.upsert({
-      where: { email },
-      create: {
-        email,
-        failedCount: 1,
-        lastFailedAt: new Date(),
-      },
-      update: {
-        failedCount: { increment: 1 },
-        lastFailedAt: new Date(),
-      },
+  // Failed-attempt backoff (login-throttle.ts). Without a device token, every
+  // address, with or without an account, is counted and answered alike, so
+  // neither the refusal nor its Retry-After tells whether an account exists.
+  // A browser holding a valid token for this address (it signed in to it
+  // before; only an account's password can mint one) is counted in its own
+  // lane, so failures others send for the address do not hold it off. The
+  // token must also have been minted under the account's current password:
+  // a password change or reset ends every token. That lookup runs only for a
+  // token minted for this very address, which no one probing other people's
+  // addresses can present.
+  const throttle = loginThrottle();
+  const token = deviceToken(deviceCookie, email);
+  const device =
+    token &&
+    credentialMatches(
+      token,
+      (
+        await prisma.user.findUnique({
+          where: { email },
+          select: { passwordHash: true },
+        })
+      )?.passwordHash,
+    )
+      ? token.id
+      : null;
+  const addressMark = device ? await throttle.addressMark(prisma, email) : null;
+  const admission = device
+    ? await throttle.admitDevice(prisma, device)
+    : await throttle.admit(prisma, email);
+  if (!admission.admitted) {
+    throw new TooManyRequestsError(
+      `Too many sign-in attempts. Try again in ${admission.retryAfter} ${admission.retryAfter === 1 ? "second" : "seconds"}.`,
+      admission.retryAfter,
+    );
+  }
+
+  const { ticket } = admission;
+  // An attempt whose outcome was not decided (its password could not be
+  // checked, or its sign-in could not be completed) is not a failure.
+  const undecided = async (error: unknown): Promise<never> => {
+    await throttle.unchecked(prisma, ticket).catch((uncountError) => {
+      logger.warn({ err: uncountError }, "Could not uncount an undecided sign-in attempt");
     });
+    throw error;
+  };
 
-    const lockoutDuration = getLockoutDuration(currentAttempt.failedCount);
-    if (lockoutDuration > 0) {
-      await prisma.loginAttempt.update({
-        where: { email },
-        data: { lockedUntil: new Date(Date.now() + lockoutDuration) },
-      });
-    }
-
-    throw new UnauthorizedError("Invalid email or password");
-  }
-
-  // Reset login attempts on success
-  if (attempt) {
-    await prisma.loginAttempt.delete({ where: { email } }).catch(() => {});
-  }
+  const user = await passwordSignInUser(prisma, email, data.password).catch(
+    undecided,
+  );
+  if (!user) throw new UnauthorizedError("Invalid email or password");
 
   // A password login replaces the user's other sessions. The user row is held
   // FOR NO KEY UPDATE until the new session commits: a concurrent password
@@ -309,10 +321,18 @@ export async function login(
     if (current?.passwordHash !== user.passwordHash) return null;
     const replaced = await revokeUserRefreshSessions(tx, user.id, "login");
     return { replaced, session: await startRefreshSession(tx, user.id) };
-  }, refreshTransactionOptions);
+  }, refreshTransactionOptions).catch(undecided);
+  // The password stopped being the account's meanwhile: a counted failure.
   if (!signIn) throw new UnauthorizedError("Invalid email or password");
   // The replaced sessions' sockets close now that their revocation committed.
   endSessions(signIn.replaced);
+  // Only a completed sign-in clears failures, and only those admitted up to
+  // it (for a trusted device, also the address's failures admitted before it
+  // started); the session stands even if clearing them fails.
+  for (const cleared of addressMark ? [ticket, addressMark] : [ticket])
+    await throttle.succeeded(prisma, cleared).catch((clearError) => {
+      logger.warn({ err: clearError }, "Could not clear failed sign-ins after a sign-in");
+    });
   const { refreshToken, familyId } = signIn.session;
 
   const accessToken = signAccessToken({
@@ -324,7 +344,15 @@ export async function login(
 
   const { passwordHash: _, ...userWithoutPassword } = user;
 
-  return { user: userWithoutPassword, accessToken, refreshToken, workspaces };
+  return {
+    user: userWithoutPassword,
+    accessToken,
+    refreshToken,
+    workspaces,
+    // Bound to the hash this sign-in was checked and committed against (a
+    // successful check means the account has one).
+    deviceCookie: deviceCookieAfterSignIn(deviceCookie, email, user.passwordHash!),
+  };
 }
 
 export async function refresh(prisma: PrismaClient, rawToken: string) {
@@ -393,6 +421,122 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
   if (familyId) endSessions([familyId]);
 }
 
+// Password-reset requests are answered before their work runs, so the
+// response takes the same time whether or not the address has an account:
+// looking the account up, replacing its link and waiting for the mail server
+// all happen afterwards. How long work stays in progress depends on whether
+// the account exists (mail is sent only then), so no admission rule may
+// depend on work in progress: that would be an account oracle and would
+// drop other users' requests behind a shared proxy address.
+//
+// Work is bounded per address instead, after the answer: a request for an
+// address whose earlier request is still in progress adds nothing (that one
+// sends the newest link), and an account gets at most one new link per
+// PASSWORD_RESET_COOLDOWN_SECONDS (forgotPassword). Work for an address
+// without an account ends after one lookup. As a memory guard only, each
+// process starts at most PASSWORD_RESET_REQUESTS_PER_MINUTE requests,
+// counted by request alone before any lookup; past it every request, for
+// any address, is answered 429 with Retry-After. The default (6,000) takes
+// about 600 client addresses at the route limit to reach. Work in progress
+// is drained when the server closes (drainPasswordResetRequests); it is not
+// durable.
+const RESET_REQUEST_WINDOW_MS = 60_000;
+const pendingResetRequests = new Map<string, Promise<void>>();
+let resetWindowStart = 0;
+let resetWindowCount = 0;
+let resetWindowRefused = 0;
+
+/** Seconds until a request can be started, or 0 after counting this one. */
+function resetRequestWait(now: number): number {
+  if (now - resetWindowStart >= RESET_REQUEST_WINDOW_MS) {
+    if (resetWindowRefused > 0)
+      logger.warn(
+        { event: "password_reset_budget_exhausted", refused: resetWindowRefused },
+        "Password reset requests were refused: more than the per-minute ceiling arrived",
+      );
+    resetWindowStart = now;
+    resetWindowCount = 0;
+    resetWindowRefused = 0;
+  }
+  if (resetWindowCount >= env.PASSWORD_RESET_REQUESTS_PER_MINUTE) {
+    resetWindowRefused++;
+    return Math.max(1, Math.ceil((resetWindowStart + RESET_REQUEST_WINDOW_MS - now) / 1000));
+  }
+  resetWindowCount++;
+  return 0;
+}
+
+export function requestPasswordReset(prisma: PrismaClient, email: string) {
+  const wait = resetRequestWait(Date.now());
+  if (wait > 0) {
+    if (resetWindowRefused === 1)
+      logger.warn(
+        { event: "password_reset_budget_exhausted" },
+        "Too many password reset requests this minute; refusing until the next",
+      );
+    throw new TooManyRequestsError(
+      `Too many password reset requests right now. Try again in ${wait} ${wait === 1 ? "second" : "seconds"}.`,
+      wait,
+    );
+  }
+  const address = email.toLowerCase();
+  if (pendingResetRequests.has(address)) return;
+  const work: Promise<void> = forgotPassword(prisma, address)
+    .catch((error) => {
+      logger.error({ err: error }, "Password reset request failed");
+    })
+    .finally(() => {
+      pendingResetRequests.delete(address);
+    });
+  pendingResetRequests.set(address, work);
+}
+
+/** Resolves once no password-reset request work is in progress. */
+export async function settlePasswordResetRequests() {
+  while (pendingResetRequests.size > 0)
+    await Promise.allSettled([...pendingResetRequests.values()]);
+}
+
+// When closing the server must be done; set by the shutdown handler from
+// its overall deadline (server.ts). Other closes (tests) allow 5 seconds.
+const DEFAULT_RESET_DRAIN_MS = 5_000;
+let resetDrainDeadline: number | undefined;
+
+export function setPasswordResetDrainDeadline(deadline: number) {
+  resetDrainDeadline = deadline;
+}
+
+export function passwordResetDrainDeadline() {
+  return resetDrainDeadline ?? Date.now() + DEFAULT_RESET_DRAIN_MS;
+}
+
+/**
+ * Waits for password-reset work in progress until `deadline` (epoch ms), so
+ * the database stays open for it while the server closes. Work still running
+ * then is logged with its count and abandoned: its links may not arrive.
+ */
+export async function drainPasswordResetRequests(deadline: number) {
+  if (pendingResetRequests.size === 0) return;
+  logger.info(
+    { event: "password_reset_requests_draining", pending: pendingResetRequests.size },
+    "Waiting for password reset requests in progress",
+  );
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+  });
+  try {
+    await Promise.race([settlePasswordResetRequests(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (pendingResetRequests.size > 0)
+    logger.warn(
+      { event: "password_reset_requests_abandoned", abandoned: pendingResetRequests.size },
+      "Shutdown abandoned password reset requests in progress; their links may not arrive",
+    );
+}
+
 export async function forgotPassword(prisma: PrismaClient, email: string) {
   const user = await prisma.user.findUnique({
     where: { email: email.toLowerCase() },
@@ -401,6 +545,25 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   if (!user) {
     // Always return success to prevent email enumeration
     return;
+  }
+
+  // At most one new link per account per cooldown: a link made moments ago
+  // is still the newest. The requester was already answered alike. Links are
+  // kept until they expire (1 hour, the longest cooldown allowed), so the
+  // newest one's creation time is always there to check. A password change
+  // deletes the unused links and so ends the cooldown early; a completed
+  // reset keeps its used link, so the cooldown still runs from it.
+  if (env.PASSWORD_RESET_COOLDOWN_SECONDS > 0) {
+    const recent = await prisma.passwordResetToken.findFirst({
+      where: {
+        userId: user.id,
+        createdAt: {
+          gt: new Date(Date.now() - env.PASSWORD_RESET_COOLDOWN_SECONDS * 1000),
+        },
+      },
+      select: { id: true },
+    });
+    if (recent) return;
   }
 
   // Invalidate existing reset tokens
@@ -645,7 +808,6 @@ export async function resendVerification(
 export async function cleanupExpiredTokensAndAttempts(prisma: PrismaClient) {
   const now = new Date();
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
   await Promise.all([
@@ -672,9 +834,7 @@ export async function cleanupExpiredTokensAndAttempts(prisma: PrismaClient) {
     prisma.emailVerificationToken.deleteMany({
       where: { expiresAt: { lt: now } },
     }),
-    prisma.loginAttempt.deleteMany({
-      where: { updatedAt: { lt: oneDayAgo } },
-    }),
+    loginThrottle().prune(prisma),
     prisma.taskReminderSent.deleteMany({
       where: { sentAt: { lt: thirtyDaysAgo } },
     }),

@@ -8,8 +8,8 @@ export class ApiError extends Error {
   code?: string;
   /** The stored state a 409 edit conflict was checked against. */
   current?: EditConflictState;
-  /** For a 429: how long the server asks to wait before asking again (Retry-After). */
-  retryAfterMs?: number;
+  /** Whole seconds the server asked to wait (Retry-After), when it did. */
+  retryAfter?: number;
 
   constructor(
     statusCode: number,
@@ -47,4 +47,22 @@ export class IdentityChangedError extends ApiError {
 
 export function isIdentityChangedError(error: unknown): boolean {
   return error instanceof IdentityChangedError;
+}
+
+const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * A Retry-After header value as whole seconds from now: delay-seconds or an
+ * HTTP date (IMF-fixdate). Missing or unreadable values give undefined.
+ */
+export function retryAfterSeconds(
+  value: string | null,
+  now = Date.now(),
+): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const at = HTTP_DATE.test(trimmed) ? Date.parse(trimmed) : NaN;
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, Math.ceil((at - now) / 1000));
 }

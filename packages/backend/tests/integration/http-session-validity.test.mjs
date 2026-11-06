@@ -38,6 +38,8 @@ const { default: errors } = await import("../../src/plugins/errors.ts");
 const { baseLoggerOptions } = await import("../../src/utils/logger.ts");
 const { resetTransporter } = await import("../../src/utils/mailer.ts");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.ts");
+const { settlePasswordResetRequests } = await import("../../src/modules/auth/auth.service.ts");
+const { forgetSignInFailures } = await import("./support/login-throttle.mjs");
 const { Prisma, PrismaClient } = await import("@prisma/client");
 
 const domain = `http-session-${crypto.randomBytes(5).toString("hex")}.example.test`;
@@ -58,8 +60,9 @@ after(async () => {
   try {
     await app?.prisma.workspace.deleteMany({ where: { id: { in: workspaces } } });
     await app?.prisma.rotatedRefreshToken.deleteMany({ where: { familyId: { in: [...families] } } });
+    const accounts = (await app?.prisma.user.findMany({ where: { email: { endsWith: `@${domain}` } }, select: { email: true } })) ?? [];
     await app?.prisma.user.deleteMany({ where: { OR: [{ email: { endsWith: `@${domain}` } }, { id: { in: extraUserIds } }] } });
-    await app?.prisma.loginAttempt.deleteMany({ where: { email: { endsWith: `@${domain}` } } });
+    if (app) await forgetSignInFailures(app.prisma, accounts.map((a) => a.email));
   } finally {
     await app?.close();
     resetTransporter();
@@ -148,6 +151,8 @@ async function additionalSession(user) {
 async function resetLink(user) {
   const response = await request("POST", "/api/auth/forgot-password", { payload: { email: user.email } });
   assert.equal(response.status, 200, response.body);
+  // The request is answered before the link is made and sent.
+  await settlePasswordResetRequests();
   const message = smtp.messages.findLast((m) => m.envelope.to.includes(`<${user.email}>`));
   assert.ok(message, "forgot-password must deliver its link to the local SMTP capture");
   const textOf = (part) => part.text ?? part.parts.map(textOf).join("\n");

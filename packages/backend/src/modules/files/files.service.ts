@@ -96,8 +96,9 @@ export async function uploadFileStream(
   );
 
   // The declared type only decides whether to try. The stored bytes decide
-  // whether and how they are decoded; a busy server waits a bounded time for
-  // a transform turn and then stores the upload without one (thumbnails.ts).
+  // whether and how they are decoded, in a memory-limited worker process; a
+  // busy server waits a bounded time for a transform turn and then stores the
+  // upload without one (thumbnails.ts).
   let thumbnailPath: string | null = null;
   if (
     mimeType.startsWith("image/") &&
@@ -108,7 +109,7 @@ export async function uploadFileStream(
       {
         size,
         head: (signal) => readHead(storage, storagePath, signal),
-        read: () => storage.read(storagePath),
+        path: storage.localPath(storagePath),
       },
       { workspaceId, fileId },
     );

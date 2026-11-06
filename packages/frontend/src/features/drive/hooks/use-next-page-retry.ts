@@ -53,9 +53,8 @@ export function useNextPageRetry({ listKey, failed, error, pages, fetchNextPage 
       setRetryAt(null);
       return;
     }
-    const wait =
-      (error instanceof ApiError && error.retryAfterMs) ||
-      Math.min(LONGEST_WAIT, FIRST_WAIT * 2 ** failures.current);
+    const asked = error instanceof ApiError ? error.retryAfter : undefined;
+    const wait = asked ? asked * 1000 : Math.min(LONGEST_WAIT, FIRST_WAIT * 2 ** failures.current);
     failures.current++;
     setRetryAt(Date.now() + wait);
     setNow(Date.now());

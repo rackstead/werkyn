@@ -22,6 +22,9 @@ process.env.SMTP_FROM = "fixture@example.test";
 process.env.SMTP_USER = "";
 process.env.SMTP_PASS = "";
 process.env.SMTP_SECURE = "false";
+// These tests replace an account's link several times in a row; the
+// per-account reset cooldown is covered in login-backoff.test.mjs.
+process.env.PASSWORD_RESET_COOLDOWN_SECONDS = "0";
 const { buildApp } = await import("../../src/app.ts");
 const { hashPassword, verifyPassword } =
   await import("../../src/utils/passwords.ts");
@@ -30,8 +33,9 @@ const { resetTransporter } = await import("../../src/utils/mailer.ts");
 const { PrismaClient } = await import("@prisma/client");
 const { refreshLockLimits, startRefreshSession } =
   await import("../../src/modules/auth/refresh-sessions.ts");
-const { cleanupExpiredTokensAndAttempts } =
+const { cleanupExpiredTokensAndAttempts, settlePasswordResetRequests } =
   await import("../../src/modules/auth/auth.service.ts");
+const { forgetSignInFailures } = await import("./support/login-throttle.mjs");
 const domain = `account-link-${crypto.randomBytes(5).toString("hex")}.example.test`;
 const password = "Fixture-password-123";
 let app, origin, passwordHash, control;
@@ -54,12 +58,16 @@ after(async () => {
     await app?.prisma.workspace.deleteMany({
       where: { slug: { contains: domain } },
     });
+    const accounts =
+      (await app?.prisma.user.findMany({
+        where: { email: { endsWith: `@${domain}` } },
+        select: { email: true },
+      })) ?? [];
     await app?.prisma.user.deleteMany({
       where: { email: { endsWith: `@${domain}` } },
     });
-    await app?.prisma.loginAttempt.deleteMany({
-      where: { email: { endsWith: `@${domain}` } },
-    });
+    if (app)
+      await forgetSignInFailures(app.prisma, accounts.map((a) => a.email));
   } finally {
     await app?.close();
     await control?.$disconnect();
@@ -152,6 +160,8 @@ async function forgot(user) {
     payload: { email: user.email },
   });
   assert.equal(response.status, 200, response.body);
+  // The request is answered before the link is made and sent.
+  await settlePasswordResetRequests();
   return {
     raw: linkFor(user, "reset-password").pathname.split("/").at(-1),
     response,

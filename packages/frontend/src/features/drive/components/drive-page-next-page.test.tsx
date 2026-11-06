@@ -12,7 +12,7 @@ const net = vi.hoisted(() => ({
   listings: [] as string[],
   forbidden: false,
   refusals: 0,
-  retryAfterMs: 400 as number | undefined,
+  retryAfter: 1 as number | undefined,
 }));
 const file = (i: number) => ({
   id: `file-${i}`,
@@ -43,7 +43,7 @@ vi.mock("@/lib/api-client", async () => {
           if (net.refusals > 0) {
             net.refusals--;
             const error = new ApiError(429, "Too Many Requests", "Rate limit exceeded, retry in 1 seconds");
-            error.retryAfterMs = net.retryAfterMs;
+            error.retryAfter = net.retryAfter;
             return Promise.reject(error);
           }
           return Promise.resolve({ data: Array.from({ length: 50 }, (_, i) => file(i + 51)), nextCursor: null });
@@ -86,7 +86,7 @@ beforeEach(() => {
   net.listings = [];
   net.forbidden = false;
   net.refusals = 1;
-  net.retryAfterMs = 400;
+  net.retryAfter = 1;
   observers.clear();
   vi.stubGlobal(
     "IntersectionObserver",
@@ -126,8 +126,10 @@ describe("a next page that fails to load", () => {
     // While waiting, the end of the list coming into view does not ask again.
     endInView();
     expect(net.listings).toEqual(["first", "c1"]);
-    // After the wait, the page is asked for again and shown.
-    await screen.findByText("File 51.txt");
+    // After the second the server asked for, the page is asked for again and
+    // shown.
+    await screen.findByText(/Trying again in 1 s\./);
+    await screen.findByText("File 51.txt", undefined, { timeout: 3000 });
     expect(net.listings).toEqual(["first", "c1", "c1"]);
     expect(screen.queryByText(/Couldn't load more files/)).toBeNull();
   });
@@ -148,7 +150,7 @@ describe("a next page that fails to load", () => {
   });
 
   it("asks again at once from Try again, and backs off without Retry-After", async () => {
-    net.retryAfterMs = undefined;
+    net.retryAfter = undefined;
     net.refusals = 1;
     renderPage();
     await screen.findByText("File 1.txt");

@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/lib/api-error";
 import { NEXT_PAGE_RETRIES, useNextPageRetry } from "./use-next-page-retry";
 
-const refused = (retryAfterMs?: number) => {
+const refused = (retryAfter?: number) => {
   const error = new ApiError(429, "Too Many Requests", "Rate limit exceeded");
-  error.retryAfterMs = retryAfterMs;
+  error.retryAfter = retryAfter;
   return error;
 };
 
@@ -28,7 +28,7 @@ function setup() {
 describe("useNextPageRetry", () => {
   it("asks again after the server's Retry-After, and not before", () => {
     const { fetchNextPage, result, rerender } = setup();
-    rerender({ listKey: "a", failed: true, error: refused(30_000), pages: 1 });
+    rerender({ listKey: "a", failed: true, error: refused(30), pages: 1 });
     expect(result.current.waiting).toBe(true);
     expect(result.current.retryInSeconds).toBe(30);
     act(() => vi.advanceTimersByTime(29_000));

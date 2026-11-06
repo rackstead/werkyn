@@ -71,9 +71,6 @@ after(async () => {
     await app?.prisma.user.deleteMany({
       where: { email: { endsWith: `@${domain}` } },
     });
-    await app?.prisma.loginAttempt.deleteMany({
-      where: { email: { endsWith: `@${domain}` } },
-    });
   } finally {
     await app?.close();
     await rm(storageDir, { recursive: true, force: true });

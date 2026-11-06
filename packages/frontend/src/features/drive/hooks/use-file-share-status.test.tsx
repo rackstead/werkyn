@@ -140,13 +140,18 @@ describe("useFileShareStatus", () => {
       if (refusals.left-- > 0) {
         net.requests.push(["refused"]);
         const error = new ApiError(429, "Too Many Requests", "Rate limit exceeded");
-        error.retryAfterMs = 20;
+        error.retryAfter = 1;
         return { json: () => Promise.reject(error) };
       }
       return get(url);
     }) as typeof api.get);
     const { result } = renderHook(() => useFileShareStatus("w", ids(0, 100)), { wrapper });
-    await waitFor(() => expect(result.current.size).toBe(10));
+    await waitFor(() => expect(net.requests.length).toBe(1));
+    // Not before the second the server asked for, and not the 2 s used
+    // when it gives no time.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 600)));
+    expect(net.requests.length).toBe(1);
+    await waitFor(() => expect(result.current.size).toBe(10), { timeout: 1200 });
     expect(net.requests.map((r) => r.length)).toEqual([1, 100]);
   });
 

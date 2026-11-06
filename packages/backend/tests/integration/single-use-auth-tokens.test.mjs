@@ -585,6 +585,8 @@ test("a single reset changes the password, uses the token and ends every other s
     payload: { email: user.email },
   });
   assert.equal(requested.statusCode, 200, requested.body);
+  // The request is answered before the link is made and sent.
+  await authService.settlePasswordResetRequests();
   const message = mail.findLast((message) => message.to === user.email);
   const token = /reset-password\/([a-f0-9]{64})/.exec(message.text)?.[1];
   assert(token, "the reset bearer comes from the outgoing link");

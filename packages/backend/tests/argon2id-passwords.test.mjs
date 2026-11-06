@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import test, { after } from "node:test";
-import { hashPassword, verifyPassword } from "../src/utils/passwords.ts";
+import { hashPassword, verifyLoginPassword, verifyPassword } from "../src/utils/passwords.ts";
 import { logger } from "../src/utils/logger.ts";
 const bcrypt=createRequire(import.meta.url)("bcrypt");
 const fixture=JSON.parse(readFileSync(new URL("./fixtures/bcrypt-5.1.1-hashes.json",import.meta.url),"utf8")).fixtures;
@@ -30,4 +30,34 @@ test('native work failure has one fixed safe operation diagnostic while saturati
  assert.equal(failure?.statusCode,503);assert.equal(failure?.message,'Password checks are temporarily unavailable. Try again.');assert(!JSON.stringify({statusCode:failure.statusCode,error:failure.error,message:failure.message}).includes(marker));
  const jobs=[hashPassword('Owned-safe-diagnostic-active1'),hashPassword('Owned-safe-diagnostic-active2')];try{await assert.rejects(hashPassword('Owned-safe-diagnostic-third1'),e=>e.statusCode===503)}finally{await Promise.all(jobs)}const after=await hashPassword('Owned-safe-diagnostic-recovered1');assert.equal(await verifyPassword('Owned-safe-diagnostic-recovered1',after),true);
  const facts={ordinaryFailure503:true,permitReleasedAfterFailure:true,saturation503:true,recoveredAfterSettlement:true,diagnosticCalls:entries.length,diagnostics:entries};if(process.env.R31_DIAG_FACTS)writeFileSync(process.env.R31_DIAG_FACTS,JSON.stringify(facts,null,2)+'\n',{mode:0o600});assert.equal(entries.length,1,'A genuine native work failure must leave one fixed diagnostic; capacity refusal must not log as native failure');const safe=JSON.stringify(entries);assert.match(safe,/bcrypt_verify/);for(const secret of [marker,legacy.password,legacy.hash])assert(!safe.includes(secret));spy.mock.restore();
+});
+
+// R31 enumeration cost (docs/remediation/r31-login-backoff.md): sign-in for an
+// address without a usable stored hash does one admitted Argon2id check.
+test("sign-in without a usable stored hash does one admitted Argon2id verification and is refused",async()=>{
+ const hash=await hashPassword("Owned-login1");
+ assert.equal(await verifyLoginPassword("Owned-login1",hash),true);
+ assert.equal(await verifyLoginPassword("Owned-login2",hash),false);
+ assert.equal(await verifyLoginPassword(legacy.password,legacy.hash),true);
+ const long=fixture.find(x=>x.passwordBytes>72);
+ const unusable=[[ "Owned-login1",null],["Owned-login1",undefined],["Owned-login1",""],["Owned-login1","x".repeat(129)],["Owned-login1",hash.replace("t=2","t=99")],[long.password,long.hash]];
+ for(const [password,stored] of unusable)assert.equal(await verifyLoginPassword(password,stored),false);
+ // The same admission as a real check: while two native jobs run, the
+ // stand-in verification is refused exactly like a real one.
+ const first=hashPassword("Owned-busy1"),second=hashPassword("Owned-busy2");
+ try{
+  for(const [password,stored] of [["Owned-login1",hash],...unusable])await assert.rejects(verifyLoginPassword(password,stored),unavailable);
+  // Input no hash could accept is refused before native work for every address alike.
+  for(const stored of [null,hash,legacy.hash])assert.equal(await verifyLoginPassword("x".repeat(513),stored),false);
+ }finally{await Promise.all([first,second]);}
+});
+test("the stand-in verification costs about as much as a real Argon2id verification",async()=>{
+ const hash=await hashPassword("Owned-cost1");
+ const time=async(stored)=>{const start=process.hrtime.bigint();await verifyLoginPassword("Owned-cost2",stored);return Number(process.hrtime.bigint()-start)/1e6;};
+ const real=[],standIn=[];
+ await time(null);await time(hash);
+ for(let i=0;i<9;i++){real.push(await time(hash));standIn.push(await time(null));}
+ const median=v=>[...v].sort((a,b)=>a-b)[4];
+ const ratio=median(standIn)/median(real);
+ assert.ok(ratio>0.5&&ratio<2,`stand-in ${median(standIn)} ms, real ${median(real)} ms`);
 });

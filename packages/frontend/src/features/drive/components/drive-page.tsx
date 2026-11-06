@@ -57,8 +57,10 @@ import {
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
-// Scrolling has settled when the entries in view have not changed for this long.
+// Scrolling has settled when the entries in view have not changed for this
+// long, and settles at most this often.
 const SHARE_STATUS_SETTLE_MS = 1000;
+const SHARE_STATUS_GAP_MS = 4000;
 
 interface DrivePageProps {
   workspaceId: string;
@@ -303,20 +305,27 @@ export function DrivePage({
   const [entriesInView, setEntriesInView] = useState<{ listKey: string; range: EntriesInView } | null>(null);
   const settleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const reportedFor = useRef<string | null>(null);
+  const settledAt = useRef(0);
   const onVisibleEntries = useCallback(
     (first: number, last: number) => {
       clearTimeout(settleTimer.current);
-      const settle = () =>
+      const settle = () => {
+        settledAt.current = Date.now();
         setEntriesInView((current) =>
           current?.listKey === listKey && current.range[0] === first && current.range[1] === last
             ? current
             : { listKey, range: [first, last] },
         );
-      if (reportedFor.current === listKey) settleTimer.current = setTimeout(settle, SHARE_STATUS_SETTLE_MS);
-      else {
+      };
+      if (reportedFor.current !== listKey) {
         reportedFor.current = listKey;
         settle();
+        return;
       }
+      // Short pauses while skimming settle no more often than every few
+      // seconds, so that they do not ask for share status page by page.
+      const wait = Math.max(SHARE_STATUS_SETTLE_MS, settledAt.current + SHARE_STATUS_GAP_MS - Date.now());
+      settleTimer.current = setTimeout(settle, wait);
     },
     [listKey],
   );

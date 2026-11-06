@@ -8,6 +8,8 @@ export class ApiError extends Error {
   code?: string;
   /** The stored state a 409 edit conflict was checked against. */
   current?: EditConflictState;
+  /** For a 429: how long the server asks to wait before asking again (Retry-After). */
+  retryAfterMs?: number;
 
   constructor(
     statusCode: number,

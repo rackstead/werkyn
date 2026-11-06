@@ -28,7 +28,22 @@ export function mapApiErrorToForm(
   return null;
 }
 
+// Retry-After in seconds (or an HTTP date), as milliseconds from now.
+function retryAfterMs(response: KyResponse): number | undefined {
+  const value = response.headers.get("retry-after");
+  if (!value) return undefined;
+  const seconds = Number(value);
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
+
 async function parseErrorResponse(response: KyResponse): Promise<ApiError> {
+  const error = await parseErrorBody(response);
+  if (response.status === 429) error.retryAfterMs = retryAfterMs(response);
+  return error;
+}
+
+async function parseErrorBody(response: KyResponse): Promise<ApiError> {
   try {
     const body = (await response.json()) as {
       statusCode?: number;

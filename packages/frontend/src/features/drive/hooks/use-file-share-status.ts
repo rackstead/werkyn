@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
+import { ApiError } from "@/lib/api-error";
 import { queryKeys } from "@/lib/query-keys";
 
 // Share status is asked for in groups of entries. Each request names its
@@ -8,58 +9,94 @@ import { queryKeys } from "@/lib/query-keys";
 // folder outgrew the server's limit for a request's header (431) past some
 // 600 entries, so no entry showed its share icon.
 //
-// A group keeps its entries once formed: entries new to the list (the next
-// page, an upload, an entry moved in) join the last group while it has
-// room, or start a new one, and an entry that leaves the list leaves its
-// group. So an entry added near the top of a long folder asks again only
-// for the last group, not for every group after it, and the groups already
-// answered keep their answers. Share changes ask again only for the groups
-// holding the files changed (invalidateShareStatus in ../api).
+// Only the entries near the view are asked for, once scrolling has settled
+// (the caller passes the entries in view then): skimming through a long
+// folder costs one request per page loaded, not two, against the server's
+// per-address request limit. Entries near the view that are in no group yet
+// start new groups, in list order; a group keeps its members once formed, and
+// an entry that leaves the list leaves its group. So an entry added near the
+// top asks only for itself, an entry that comes back is asked for afresh,
+// and the groups already answered keep their answers. Groups away from the
+// view are not asked again (a share change, a refocused window) until the
+// view is near them. Share changes ask again only for the groups holding the
+// files changed (invalidateShareStatus in ../api).
 export const SHARE_STATUS_GROUP = 200;
+/** Entries before and after those in view whose share status is asked for too. */
+export const SHARE_STATUS_MARGIN = 50;
+
+/** The first and last index of the entries in view. */
+export type EntriesInView = readonly [first: number, last: number];
 
 /**
- * Groups for these entries, keeping the previous groups' members that are
- * still listed. An entry that leaves the list leaves its group (which is
- * then asked again), so an entry that comes back later (restored from the
- * trash, moved back) is asked for afresh rather than shown with its old
- * answer.
+ * Groups for these entries: the previous groups' members that are still
+ * listed, and a new group for each entry from `from` to `to` (all when
+ * omitted) that is in none, filled with the entries in no group that follow
+ * it, up to the group size. Scrolling on from a settled view therefore
+ * finds the next entries already asked for, about four pages at a time.
  */
-export function shareStatusGroups(previous: readonly string[][], fileIds: readonly string[]): string[][] {
+export function shareStatusGroups(
+  previous: readonly string[][],
+  fileIds: readonly string[],
+  [from, to]: readonly [number, number] = [0, fileIds.length - 1],
+): string[][] {
   const listed = new Set(fileIds);
   const groups = previous
     .map((group) => (group.every((id) => listed.has(id)) ? group : group.filter((id) => listed.has(id))))
     .filter((group) => group.length > 0);
   const grouped = new Set(groups.flat());
-  let last = groups.length > 0 ? [...groups[groups.length - 1]] : null;
-  if (last) groups.pop();
-  for (const id of fileIds) {
-    if (grouped.has(id)) continue;
-    grouped.add(id);
-    if (!last || last.length >= SHARE_STATUS_GROUP) {
-      if (last) groups.push(last);
-      last = [];
+  for (let i = Math.max(0, from); i <= Math.min(fileIds.length - 1, to); i++) {
+    if (grouped.has(fileIds[i])) continue;
+    const group: string[] = [];
+    for (let j = i; j < fileIds.length && group.length < SHARE_STATUS_GROUP; j++) {
+      if (grouped.has(fileIds[j])) continue;
+      grouped.add(fileIds[j]);
+      group.push(fileIds[j]);
     }
-    last.push(id);
+    groups.push(group);
   }
-  if (last) groups.push(last);
   return groups;
 }
 
+// A request refused by the server's request limit is asked again once the
+// limit allows (Retry-After), twice at most.
+function retryRefused(failures: number, error: unknown) {
+  return failures < 2 && error instanceof ApiError && error.statusCode === 429;
+}
+function refusedDelay(failures: number, error: unknown) {
+  return (error instanceof ApiError && error.retryAfterMs) || 2000 * 2 ** failures;
+}
+
 /**
- * The IDs of these files that are shared. Only the Drive page uses it; it is
- * kept out of the Drive API module, which other pages load too.
+ * The IDs of these files that are shared. `inView` gives the entries in view
+ * (null: none yet, nothing is asked); without it, every entry is asked for.
+ * Only the Drive page uses it; it is kept out of the Drive API module, which
+ * other pages load too.
  */
-export function useFileShareStatus(wid: string, fileIds: string[]): Set<string> {
+export function useFileShareStatus(
+  wid: string,
+  fileIds: string[],
+  inView?: EntriesInView | null,
+): Set<string> {
+  const near = useMemo<readonly [number, number]>(
+    () =>
+      inView === undefined
+        ? [0, fileIds.length - 1]
+        : inView === null
+          ? [0, -1]
+          : [inView[0] - SHARE_STATUS_MARGIN, inView[1] + SHARE_STATUS_MARGIN],
+    [inView, fileIds.length],
+  );
   const previous = useRef<{ wid: string; groups: string[][] }>({ wid, groups: [] });
   const groups = useMemo(() => {
     const before = previous.current.wid === wid ? previous.current.groups : [];
-    const next = shareStatusGroups(before, fileIds);
+    const next = shareStatusGroups(before, fileIds, near);
     previous.current = { wid, groups: next };
     return next;
-  }, [wid, fileIds]);
-  // A group asked for again under new members (the last group, as entries
-  // are added) has no answer until it arrives: its entries keep the answer
-  // shown before, so their icons do not blink.
+  }, [wid, fileIds, near]);
+  const indexOf = useMemo(() => new Map(fileIds.map((id, i) => [id, i])), [fileIds]);
+  // A group asked for again under new members (one whose entry left the
+  // list) has no answer until it arrives: its entries keep the answer shown
+  // before, so their icons do not blink.
   const groupsRef = useRef(groups);
   groupsRef.current = groups;
   const shown = useRef(new Set<string>());
@@ -82,6 +119,12 @@ export function useFileShareStatus(wid: string, fileIds: string[]): Set<string> 
           .get(`workspaces/${wid}/files/share-status?${params.toString()}`)
           .json<{ data: string[] }>();
       },
+      enabled: ids.some((id) => {
+        const index = indexOf.get(id);
+        return index !== undefined && index >= near[0] && index <= near[1];
+      }),
+      retry: retryRefused,
+      retryDelay: refusedDelay,
     })),
     combine,
   });

@@ -27,7 +27,8 @@ import { FilePreviewSlideover, UploadProgress } from "./lazy-drive-panels";
 import { DriveBulkActions } from "./drive-bulk-actions";
 import { useFileUpload } from "../hooks/use-file-upload";
 import { useFileSelection } from "../hooks/use-file-selection";
-import { useFileShareStatus } from "../hooks/use-file-share-status";
+import { useFileShareStatus, type EntriesInView } from "../hooks/use-file-share-status";
+import { useNextPageRetry } from "../hooks/use-next-page-retry";
 import { useRecentFiles } from "../hooks/use-recent-files";
 import { useAuthStore } from "@/stores/auth-store";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -55,6 +56,9 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+
+// Scrolling has settled when the entries in view have not changed for this long.
+const SHARE_STATUS_SETTLE_MS = 1000;
 
 interface DrivePageProps {
   workspaceId: string;
@@ -106,8 +110,18 @@ export function DrivePage({
   const isRoot = !folderId && !teamFolderId;
   const showInlineSections = isRoot && !isSearching && section === "home";
 
-  const { data, hasNextPage, isFetchingNextPage, fetchNextPage, isLoading, isError, refetch } =
-    useFiles(
+  const {
+    data,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+    isLoading,
+    isError,
+    isFetchNextPageError,
+    isRefetchError,
+    error,
+    refetch,
+  } = useFiles(
       workspaceId,
       isSearching ? null : (folderId ?? null),
       isSearching ? undefined : teamFolderId,
@@ -159,7 +173,20 @@ export function DrivePage({
     }),
   );
 
-  const handleLoadMore = useCallback(() => fetchNextPage(), [fetchNextPage]);
+  // A next page that fails (the server's per-address request limit, say)
+  // is asked for again after a wait, below the entries already loaded,
+  // which stay usable; the end of the list coming into view meanwhile does
+  // not ask again.
+  const nextPage = useNextPageRetry({
+    failed: isFetchNextPageError,
+    error,
+    pages: data?.pages.length ?? 0,
+    fetchNextPage,
+  });
+  const nextPageWaiting = nextPage.waiting;
+  const handleLoadMore = useCallback(() => {
+    if (!nextPageWaiting) fetchNextPage();
+  }, [fetchNextPage, nextPageWaiting]);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const file = event.active.data.current?.file as DriveFile | undefined;
@@ -263,8 +290,34 @@ export function DrivePage({
 
   const fileIds = useMemo(() => files.map((f) => f.id), [files]);
 
-  // Share status for indicators
-  const sharedFileIds = useFileShareStatus(workspaceId, fileIds);
+  // Share status for indicators, asked for near the entries in view once
+  // scrolling settles (a second without a change; at once the first time
+  // for a list), so that skimming a long folder does not double the
+  // requests it makes.
+  const [entriesInView, setEntriesInView] = useState<EntriesInView | null>(null);
+  const settled = useRef<{ timer?: ReturnType<typeof setTimeout>; once: boolean }>({ once: false });
+  const onVisibleEntries = useCallback((first: number, last: number) => {
+    clearTimeout(settled.current.timer);
+    const settle = () =>
+      setEntriesInView((current) =>
+        current?.[0] === first && current[1] === last ? current : [first, last],
+      );
+    if (settled.current.once) settled.current.timer = setTimeout(settle, SHARE_STATUS_SETTLE_MS);
+    else {
+      settled.current.once = true;
+      settle();
+    }
+  }, []);
+  // A list being loaded anew (another folder, search or sort) reports its
+  // entries in view anew once shown.
+  useEffect(() => {
+    if (!isLoading) return;
+    clearTimeout(settled.current.timer);
+    settled.current.once = false;
+    setEntriesInView(null);
+  }, [isLoading]);
+  useEffect(() => () => clearTimeout(settled.current.timer), []);
+  const sharedFileIds = useFileShareStatus(workspaceId, fileIds, entriesInView);
 
   const handleShare = useCallback(
     (file: DriveFile) => {
@@ -361,13 +414,34 @@ export function DrivePage({
     ? getFileIcon(activeDrag.mimeType, activeDrag.isFolder)
     : null;
 
+  // Below the entries when a request for the folder failed after some had
+  // loaded: they stay listed and usable.
+  const listNotice = isFetchNextPageError ? (
+    <div role="status" className="flex items-center justify-center gap-3 px-4 py-4 text-sm text-muted-foreground">
+      <span>
+        Couldn&apos;t load more files.
+        {nextPage.retryInSeconds !== null && ` Trying again in ${nextPage.retryInSeconds} s.`}
+      </span>
+      <Button variant="outline" size="sm" onClick={nextPage.retryNow} disabled={isFetchingNextPage}>
+        Try again
+      </Button>
+    </div>
+  ) : isRefetchError ? (
+    <div role="status" className="flex items-center justify-center gap-3 px-4 py-4 text-sm text-muted-foreground">
+      <span>Couldn&apos;t refresh this folder.</span>
+      <Button variant="outline" size="sm" onClick={() => refetch()}>
+        Try again
+      </Button>
+    </div>
+  ) : null;
+
   const contentArea = (
     <>
       {isLoading ? (
         <div className="flex items-center justify-center py-16">
           <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
         </div>
-      ) : isError ? (
+      ) : isError && !data ? (
         <div className="flex flex-col items-center justify-center gap-3 py-16">
           <p className="text-sm text-destructive">Failed to load files</p>
           <Button variant="outline" size="sm" onClick={() => refetch()}>
@@ -379,6 +453,8 @@ export function DrivePage({
           files={files}
           scrollElement={scroller}
           draggingId={activeDrag?.id ?? null}
+          onVisibleEntries={onVisibleEntries}
+          footer={listNotice}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}
@@ -409,6 +485,8 @@ export function DrivePage({
           files={files}
           scrollElement={scroller}
           draggingId={activeDrag?.id ?? null}
+          onVisibleEntries={onVisibleEntries}
+          footer={listNotice}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           canEdit={canEdit}

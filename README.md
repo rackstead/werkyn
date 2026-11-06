@@ -666,6 +666,15 @@ minimum to shorten that, or let your reverse proxy receive whole uploads first
 (below). Exports have no minimum download rate. See
 [R42](docs/remediation/r42-backup-limits.md).
 
+The minimum rate does not stop a client that reconnects after each `408`.
+Each slow upload is still refused after the grace period, but by starting a
+new one each time, a client can keep backup slots busy while sending almost
+nothing: a few hundred bytes every 30 seconds per slot at the defaults. To
+prevent that, let a reverse proxy receive whole uploads before passing them on
+(recommended, below), or limit how often one client may call the backup routes
+at the proxy (for example nginx `limit_req` or Traefik's `rateLimit`
+middleware).
+
 The backup page in the web app waits at most 60 seconds for a preview and 120
 seconds for a restore, upload included. For larger files on slower links, send
 the file to the API, for example with a personal API key:
@@ -717,7 +726,8 @@ from the rest of the API:
 - **Receiving whole uploads first.** A proxy that reads the whole upload before
   passing it on (nginx by default, Traefik's buffering middleware) takes slow
   clients off the server's backup slots: the slot is taken only once the
-  upload is complete. The proxy needs disk space for it.
+  upload is complete. This also covers clients that reconnect after each
+  `408`. The proxy needs disk space for it.
 - **Minimum rates.** nginx and Traefik have no minimum transfer rate; Caddy
   2.11.8 and later do, per route. Werkyn's own minimum applies behind any proxy.
 - **Whole-request deadlines** (Traefik's `readTimeout`, 60 s by default in

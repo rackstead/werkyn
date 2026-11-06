@@ -573,17 +573,28 @@ test("bytes sent while the server was busy are counted before a check refuses th
   const outcomes = [];
   const app = Fastify();
   await app.register(multipart);
-  let started;
-  const begun = new Promise((resolve) => (started = resolve));
+  let blockedFor;
   app.post("/upload", async (request) => {
-    started();
+    const pending = receiveBackupUpload(request, {
+      dir,
+      maxBytes: MiB,
+      idleTimeoutMs: 5_000,
+      minRate: { bytesPerSecond: 2000, windowMs: 1000, graceMs: 500 },
+    });
+    // Synchronous work holds this process for longer than the window, while
+    // the client's bytes wait in the socket. It runs in a socket read
+    // callback (parsing another backup runs in an I/O callback too), so the
+    // next turn of the event loop runs the overdue rate check before it
+    // reads the waiting bytes.
+    const started = Date.now();
+    request.raw.on("data", () => {
+      if (blockedFor !== undefined || Date.now() - started < 1_000) return;
+      const from = Date.now();
+      while (Date.now() - from < 1_500);
+      blockedFor = Date.now() - from;
+    });
     try {
-      const staged = await receiveBackupUpload(request, {
-        dir,
-        maxBytes: MiB,
-        idleTimeoutMs: 5_000,
-        minRate: { bytesPerSecond: 2000, windowMs: 1000, graceMs: 500 },
-      });
+      const staged = await pending;
       await staged.dispose();
       outcomes.push(["staged", staged.size]);
       return { ok: true };
@@ -622,14 +633,8 @@ test("bytes sent while the server was busy are counted before a check refuses th
   const child = spawn(process.execPath, ["-e", client], { stdio: ["ignore", "pipe", "inherit"] });
   let status = "";
   child.stdout.on("data", (chunk) => (status += chunk));
-  const exited = new Promise((resolve) => child.once("close", resolve));
-  await begun;
-  // Synchronous work holds this process for longer than the window, while the
-  // client's bytes wait in the socket.
-  await sleep(1_000);
-  const until = Date.now() + 1_500;
-  while (Date.now() < until);
-  await exited;
+  await new Promise((resolve) => child.once("close", resolve));
+  assert.ok(blockedFor >= 1_500, `blocked for ${blockedFor} ms`);
   assert.match(status, /^HTTP\/1\.1 200/, JSON.stringify(outcomes));
   assert.deepEqual(outcomes, [["staged", 14000]]);
 });

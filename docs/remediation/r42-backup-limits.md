@@ -90,10 +90,11 @@ Two smaller changes came with it:
   once the file part had started; a refusal before that (a missing or
   unsupported file) kept the connection until the 120-second request deadline
   while the client went on sending.
-- A staging copy stopped while its file was still being opened removed the
-  file before the open completed, so the file was then created and stayed
-  until the next startup sweep. On every failure, the file is now closed
-  before it is removed.
+- The staged file is still created with R33's no-follow open inside the
+  checked staging folder ([R33](r33-storage-symlinks.md)). An upload refused
+  while that open is in progress is stopped as soon as it completes, and on
+  every failure the file is closed before it is removed and the source is
+  released.
 
 ### After the change
 
@@ -177,8 +178,11 @@ paced client:
   minimum is staged;
 - an upload at twice the minimum is staged although the process is blocked
   for 1.5 seconds, longer than the window, while the client keeps sending
-  from another process. Without the confirmation after pending reads, it is
-  refused (checked by removing it);
+  from another process. The block runs in a socket read callback, as the
+  synchronous parse of another backup does in an I/O callback, so the
+  overdue check runs before the waiting bytes are read. Without the
+  confirmation after pending reads, it is refused (3 of 3 runs, checked by
+  removing it);
 - time the watch is paused is not counted, before or after the grace period,
   and silence after the pause is still reported;
 - a 1 MiB file sent at once is staged although staging writes take it at
@@ -197,6 +201,14 @@ first one leaves the slots held on main).
 
 ## Remaining limits
 
+- A client that reconnects after each 408 can keep slots busy while sending
+  almost nothing. Each slow upload is still refused, as specified, after the
+  grace period (30 seconds by default). By starting a new one each time, one
+  client per workspace can hold a slot at a few hundred bytes every 30
+  seconds, and three can hold the server's three. A reverse proxy that
+  receives whole uploads first (recommended) or per-route request limits at
+  the proxy prevent this. A cooldown per user after a 408 is a possible
+  follow-up.
 - A client that sends at or just above the minimum keeps its slot until its
   upload ends: up to about 19 hours for a 1,088 MiB file at the defaults. A
   reverse proxy that receives the whole body before passing it on (nginx by

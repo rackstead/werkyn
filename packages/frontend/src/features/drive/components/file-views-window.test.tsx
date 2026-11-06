@@ -404,7 +404,8 @@ describe("windowed Drive grid", { timeout: 30_000 }, () => {
         columns = to >= 1024 ? 5 : to >= 768 ? 4 : to >= 640 ? 3 : 2;
         for (const listener of listeners) listener();
       });
-    render(<Harness view="grid" files={range(0, 1000)} />);
+    const files = range(0, 1000);
+    const { rerender } = render(<Harness view="grid" files={files} />);
     await scrollTo(SORT_BAR + 100 * LINE + 30);
     expect(entryAt(1)).toBe("f500");
     expect(topOf("f500")).toBe(-30);
@@ -420,6 +421,15 @@ describe("windowed Drive grid", { timeout: 30_000 }, () => {
       expect(topOf(first)).toBe(-30);
       expect(entryAt(1)).toBe(first);
     }
+    // A refresh adding 3 entries at the top arrives with a column change:
+    // the first entry in view is followed by its id, not its old index.
+    width = 900;
+    columns = 4;
+    act(() => {
+      for (const listener of listeners) listener();
+      rerender(<Harness view="grid" files={[...range(-3, 0), ...files]} />);
+    });
+    expect(topOf("f495")).toBe(-30);
   });
 
   it("keeps the cards in view still when a line of entries is added or removed above them", async () => {

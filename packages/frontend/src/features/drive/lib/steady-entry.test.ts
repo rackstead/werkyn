@@ -50,10 +50,43 @@ describe("steadyEntry", () => {
   });
 
   describe("a block of entries in view that sorts far away now", () => {
-    // 5,000 entries; 18 in view (e2500 to e2517).
+    // 5,000 entries; 18 in view (e2500 to e2517), 5 more listed on each side.
     const before = Array.from({ length: 5000 }, (_, i) => `e${i}`);
     const view = seen(before, ...before.slice(2500, 2518));
+    const around = [...before.slice(2495, 2500), ...before.slice(2518, 2523)].map((key) => ({
+      key,
+      index: before.indexOf(key),
+    }));
     const without = (block: string[]) => before.filter((k) => !block.includes(k));
+
+    it("keeps the entries that stayed among their neighbours", () => {
+      const block = before.slice(2500, 2514);
+      const after = at(...without(block), ...block);
+      expect(steadyEntry(view, after, () => true, around)).toEqual({ ...view[14], now: 2500 });
+      // Sorting far above instead.
+      const above = without(block);
+      above.splice(100, 0, ...block);
+      expect(steadyEntry(view, at(...above), () => true, around)?.key).toBe("e2514");
+    });
+
+    it("does not follow one entry that lands near its old place while entries were added above", () => {
+      // 30 added above the view; the first entry in view is renamed so that
+      // it sorts 30 places earlier, about where it was.
+      const added = Array.from({ length: 30 }, (_, i) => `n${i}`);
+      const after = [...added, ...before.filter((k) => k !== "e2500")];
+      after.splice(2500, 0, "e2500");
+      const kept = steadyEntry(view, at(...after), () => true, around);
+      expect(kept).toEqual({ ...view[1], now: 2531 });
+    });
+
+    it("keeps the larger side of an entry added in view", () => {
+      const after = [...before];
+      after.splice(2503, 0, "new");
+      expect(steadyEntry(view, at(...after), () => true, around)?.key).toBe("e2503");
+      const late = [...before];
+      late.splice(2515, 0, "new");
+      expect(steadyEntry(view, at(...late), () => true, around)?.key).toBe("e2500");
+    });
 
     it("keeps the entries that stayed when the top block sorts at the end", () => {
       const block = before.slice(2500, 2514);

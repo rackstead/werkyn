@@ -5,37 +5,47 @@ export interface SeenEntry {
   index: number;
 }
 
+/** An entry listed just above or below the view (not seen): its key and its index then. */
+export interface AroundEntry {
+  key: string;
+  index: number;
+}
+
 /**
  * Of the entries seen in view (in list order), the one to keep in place
  * after the list changed, with its index now; undefined when none of them
  * is listed any more.
  *
  * The entries seen are grouped by how many places each moved (its index now
- * minus its index then):
+ * minus its index then). The group kept is the one that moved with the list
+ * around the view: `around` holds a few entries listed just above and just
+ * below the view, and the group whose shift most of them share kept its
+ * place in the list. So:
  *
- * - Entries added or removed above the view move every seen entry by the
- *   same number of places: one group, kept wherever it went.
- * - An entry added or removed within the view moves the entries on one side
- *   of it by one place; an entry moved a few places (a swap, a rename that
- *   sorts it next door) moves itself and its neighbours a little. These
- *   groups all stay near the view. Of the groups that moved by no more
- *   places than there are entries in view, the largest is kept (the first
- *   on a tie): as many entries as possible stay where they were on screen.
- * - Entries renamed or edited so that they sort far away move by more
- *   places than the view holds. However many of them there are, the view
- *   does not follow them: the entries that stayed near are kept.
- * - Only when every group moved far (many entries added or removed above
- *   the view, with or without other changes) is the group that moved least
- *   kept.
+ * - entries added or removed above the view move the entries seen and those
+ *   around them alike, by any number of places: that group is kept;
+ * - entries renamed so that they now sort far away (a colleague's batch
+ *   rename, an edit under the Modified sort) move away from their
+ *   neighbours: however many of them there are, the view does not follow
+ *   them, but keeps the entries that stayed among their neighbours;
+ * - one entry renamed to land near its old index while entries were added
+ *   above does not take the view with it either;
+ * - an entry added or removed within the view leaves the entries on each
+ *   side with their neighbours above or below: the larger side is kept, as
+ *   many entries as possible staying put (the first on a tie).
  *
- * Within the group, the first entry still rendered after the change is
- * kept, when one is (`isRendered`), so its place is measured rather than
- * computed.
+ * Without entries around the view (all of them changed too, or the list is
+ * that short), the largest of the groups that moved by no more places than
+ * there are entries in view is kept, or, when every group moved further,
+ * the one that moved least. Within the group, the first entry still
+ * rendered after the change is kept, when one is (`isRendered`), so its
+ * place is measured rather than computed.
  */
 export function steadyEntry(
   seen: readonly SeenEntry[],
   indexOf: (key: string) => number | undefined,
   isRendered: (key: string) => boolean = () => true,
+  around: readonly AroundEntry[] = [],
 ): (SeenEntry & { now: number }) | undefined {
   const entries = seen.flatMap((entry) => {
     const now = indexOf(entry.key);
@@ -49,19 +59,39 @@ export function steadyEntry(
     if (group) group.push(entry);
     else groups.set(shift, [entry]);
   }
-  let best: { shift: number; members: typeof entries } | undefined;
-  const near = [...groups].filter(([shift]) => Math.abs(shift) <= seen.length);
-  if (near.length > 0) {
-    for (const [shift, members] of near)
-      if (!best || members.length > best.members.length) best = { shift, members };
-  } else {
-    for (const [shift, members] of groups)
+  // How many entries around the view moved by each shift.
+  const neighbours = new Map<number, number>();
+  for (const entry of around) {
+    const now = indexOf(entry.key);
+    if (now === undefined) continue;
+    const shift = now - entry.index;
+    neighbours.set(shift, (neighbours.get(shift) ?? 0) + 1);
+  }
+  const shared = (shift: number) => neighbours.get(shift) ?? 0;
+
+  type Group = { shift: number; members: typeof entries };
+  let best: Group | undefined;
+  const all = [...groups].map(([shift, members]): Group => ({ shift, members }));
+  if (all.some((group) => shared(group.shift) > 0)) {
+    for (const group of all)
       if (
         !best ||
-        Math.abs(shift) < Math.abs(best.shift) ||
-        (Math.abs(shift) === Math.abs(best.shift) && members.length > best.members.length)
+        shared(group.shift) > shared(best.shift) ||
+        (shared(group.shift) === shared(best.shift) && group.members.length > best.members.length)
       )
-        best = { shift, members };
+        best = group;
+  } else {
+    const near = all.filter((group) => Math.abs(group.shift) <= seen.length);
+    for (const group of near.length > 0 ? near : all)
+      if (
+        !best ||
+        (near.length > 0
+          ? group.members.length > best.members.length
+          : Math.abs(group.shift) < Math.abs(best.shift) ||
+            (Math.abs(group.shift) === Math.abs(best.shift) &&
+              group.members.length > best.members.length))
+      )
+        best = group;
   }
   if (!best) return undefined;
   return best.members.find((entry) => isRendered(entry.key)) ?? best.members[0];

@@ -111,6 +111,7 @@ export function FileListView({
     onVisible: onVisibleEntries,
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
+  const keyAt = useCallback((index: number) => files[index]?.id, [files]);
   // Space held below the entries while they are kept in place at the end of
   // the list until the next page arrives (see KeepInView's onShort). It
   // lasts until the entries change.
@@ -206,6 +207,7 @@ export function FileListView({
             scroller={scrollElement}
             container={bodyRef}
             indexOf={indexOf}
+            keyAt={keyAt}
             offsetOf={offsetOf}
             onCorrected={onCorrected}
             onShort={hasNextPage ? onShort : undefined}

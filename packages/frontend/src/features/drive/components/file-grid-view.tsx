@@ -128,26 +128,31 @@ export function FileGridView({
   // places of the cards on screen no longer say which were in view
   // (KeepInView stands aside for this change); the line in view follows
   // from the scroll position and the layout before the change instead.
-  const layoutBefore = useRef({ columns, rowHeight, scrollMargin });
+  // The first entry in view is found by its id in the list now, which a
+  // refresh arriving with the same render may have changed.
+  const layoutBefore = useRef({ columns, rowHeight, scrollMargin, files });
   const columnChange = useRef<{ from: typeof layoutBefore.current; scrollTop: number } | null>(null);
   if (layoutBefore.current.columns !== columns && scrollElement && !columnChange.current)
     columnChange.current = { from: layoutBefore.current, scrollTop: scrollElement.scrollTop };
   useLayoutEffect(() => {
     const change = columnChange.current;
     columnChange.current = null;
-    layoutBefore.current = { columns, rowHeight, scrollMargin };
+    layoutBefore.current = { columns, rowHeight, scrollMargin, files };
     if (!change || !scrollElement) return;
     const { from, scrollTop } = change;
     if (scrollTop <= from.scrollMargin) return;
     const line = Math.floor((scrollTop - from.scrollMargin) / from.rowHeight);
     const offset = from.scrollMargin + line * from.rowHeight - scrollTop;
-    const first = line * from.columns;
+    const firstId = from.files[line * from.columns]?.id;
+    const found = firstId === undefined ? undefined : indexById.get(firstId);
+    const first = found ?? Math.min(line * from.columns, files.length - 1);
     const want = scrollMargin + Math.floor(first / columns) * rowHeight - offset;
     if (Math.abs(scrollElement.scrollTop - want) < 0.5) return;
     scrollElement.scrollTop = want;
     onCorrected(scrollElement.scrollTop);
   });
   const indexOf = useCallback((id: string) => indexById.get(id), [indexById]);
+  const keyAt = useCallback((index: number) => files[index]?.id, [files]);
   // Space held below the entries while they are kept in place at the end of
   // the list until the next page arrives (see KeepInView's onShort). It
   // lasts until the entries change.
@@ -211,6 +216,7 @@ export function FileGridView({
           scroller={scrollElement}
           container={gridRef}
           indexOf={indexOf}
+          keyAt={keyAt}
           offsetOf={offsetOf}
           onCorrected={onCorrected}
           onShort={hasNextPage ? onShort : undefined}

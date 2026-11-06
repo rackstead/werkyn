@@ -1,5 +1,9 @@
 import { Component, type ReactNode, type RefObject } from "react";
-import { steadyEntry, type SeenEntry } from "../lib/steady-entry";
+import { steadyEntry, type AroundEntry, type SeenEntry } from "../lib/steady-entry";
+
+// Entries listed just above and just below the view that are remembered
+// with the entries in view (see steadyEntry).
+const AROUND = 5;
 
 interface KeepInViewProps {
   /** The element that scrolls the entries. */
@@ -8,6 +12,8 @@ interface KeepInViewProps {
   container: RefObject<HTMLElement | null>;
   /** An entry's index in the list as now rendered; undefined when it is no longer listed. */
   indexOf: (key: string) => number | undefined;
+  /** The key of the entry at this index in the list as now rendered. */
+  keyAt: (index: number) => string | undefined;
   /** The top of the entry at this index below the container's top, for an entry that is not rendered. */
   offsetOf: (index: number) => number;
   /** Called after the view was scrolled to keep the entries in place. */
@@ -32,6 +38,7 @@ interface KeepInViewProps {
 interface Snapshot {
   scrollTop: number;
   seen: SeenEntry[];
+  around: AroundEntry[];
 }
 
 /** An element's top in the scroller's content (independent of its scroll position). */
@@ -53,9 +60,10 @@ function contentTop(element: Element, scroller: HTMLElement): number {
  *
  * Right before React applies a change to the DOM, it records the entries in
  * view with their place in the scroller's content and the scroll position.
- * After the change, it picks one of them (see steadyEntry: never one that
- * sorts far away now, however many moved with it) and scrolls by however
- * far that entry moved in the content.
+ * After the change, it picks one of them (see steadyEntry: one that moved
+ * with the entries listed just around the view, never one that sorts far
+ * away now, however many moved with it) and scrolls by however far that
+ * entry moved in the content.
  * Both places are measured in the content, not on screen, so the browser
  * clamping the scroll position at the end of a list that got shorter is not
  * mistaken for the user scrolling, and the user's own scrolling never moves
@@ -85,7 +93,16 @@ export class KeepInView extends Component<KeepInViewProps> {
       const index = previous.indexOf(key);
       if (index !== undefined) seen.push({ key, index, top: top - viewTop + scrollTop });
     }
-    return seen.length > 0 ? { scrollTop, seen } : null;
+    if (seen.length === 0) return null;
+    const first = Math.min(...seen.map((entry) => entry.index));
+    const last = Math.max(...seen.map((entry) => entry.index));
+    const around: AroundEntry[] = [];
+    for (let index = first - AROUND; index <= last + AROUND; index++) {
+      if (index >= first && index <= last) continue;
+      const key = index >= 0 ? previous.keyAt(index) : undefined;
+      if (key !== undefined) around.push({ key, index });
+    }
+    return { scrollTop, seen, around };
   }
 
   componentDidUpdate(_props: KeepInViewProps, _state: unknown, snapshot: Snapshot | null) {
@@ -104,7 +121,7 @@ export class KeepInView extends Component<KeepInViewProps> {
     const rendered = new Map<string, HTMLElement>();
     for (const element of container.querySelectorAll<HTMLElement>("[data-anchor-key]"))
       rendered.set(element.dataset.anchorKey!, element);
-    const kept = steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key));
+    const kept = steadyEntry(snapshot.seen, indexOf, (key) => rendered.has(key), snapshot.around);
     if (!kept) return;
     const element = rendered.get(kept.key);
     const top = element

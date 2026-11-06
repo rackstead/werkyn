@@ -885,7 +885,8 @@ async function smoke({ browser, origin, fixture, prisma }) {
       };
     }
     // Clicks the resting point and returns the entry whose box got checked;
-    // clicks it again to clear the selection.
+    // then clears the selection from the selection bar (which can cover a
+    // point near the bottom of the view).
     async function clickAt(point) {
       await page.mouse.move(point.x, point.y);
       await page.mouse.click(point.x, point.y);
@@ -895,7 +896,7 @@ async function smoke({ browser, origin, fixture, prisma }) {
           .filter(({ el }) => el.querySelector('input[type="checkbox"]')?.checked)
           .map((e) => e.name),
       );
-      await page.mouse.click(point.x, point.y);
+      if (checked.length > 0) await page.getByTitle("Clear selection").click();
       await page
         .waitForFunction(
           () => ![...document.querySelectorAll("span")].some((x) => /^\d+ selected$/.test(x.textContent)),

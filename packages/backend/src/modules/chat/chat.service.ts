@@ -5,6 +5,7 @@ import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
 import { isLockTimeoutError, isStatementCanceledError } from "../../utils/retryable-database-errors.js";
+import { withSearchPlans } from "../../utils/text-search.js";
 
 // ─── Channels ──────────────────────────────────────────
 
@@ -1096,6 +1097,34 @@ export async function archiveChannel(
 
 // ─── Search ───────────────────────────────────────────
 
+export const chatSearchPlan = {
+  /**
+   * A one-channel search in a channel with at most this many messages
+   * (deleted ones included) reads the channel's messages, newest first, as
+   * it did before the trigram index. The index's posting lists span every
+   * channel of every workspace, so for a term made of common trigrams the
+   * planner's index plan read far more than such a channel holds
+   * (docs/remediation/p02c.md).
+   */
+  smallChannelMessages: 20_000,
+};
+
+/**
+ * Turns bitmap and sequential scans off for the search transaction when the
+ * channel is small, so the plan reads the channel through its
+ * ("channelId", "createdAt") index instead of the trigram index. The count
+ * reads at most smallChannelMessages + 1 index entries.
+ */
+function smallChannelPlan(prisma: PrismaClient, channelId: string) {
+  const limit = chatSearchPlan.smallChannelMessages;
+  return prisma.$queryRaw`
+    SELECT set_config('enable_bitmapscan', CASE WHEN small THEN 'off' ELSE current_setting('enable_bitmapscan') END, true),
+           set_config('enable_seqscan', CASE WHEN small THEN 'off' ELSE current_setting('enable_seqscan') END, true)
+    FROM (SELECT count(*) <= ${limit} AS small FROM (
+      SELECT 1 FROM "ChatMessage" WHERE "channelId" = ${channelId} LIMIT ${limit + 1}
+    ) bounded) channel`;
+}
+
 export async function searchMessages(
   prisma: PrismaClient,
   workspaceId: string,
@@ -1139,21 +1168,23 @@ export async function searchMessages(
       }
     : undefined;
 
-  const messages = await prisma.chatMessage.findMany({
-    where: cursorEligibility ? { AND: [where, cursorEligibility] } : where,
-    omit: chatMessageOmit,
-    include: {
-      user: {
-        select: { id: true, displayName: true, avatarUrl: true },
+  const [messages] = await withSearchPlans(prisma, [
+    prisma.chatMessage.findMany({
+      where: cursorEligibility ? { AND: [where, cursorEligibility] } : where,
+      omit: chatMessageOmit,
+      include: {
+        user: {
+          select: { id: true, displayName: true, avatarUrl: true },
+        },
+        channel: {
+          select: { id: true, name: true, type: true },
+        },
       },
-      channel: {
-        select: { id: true, name: true, type: true },
-      },
-    },
-    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take: limit + 1,
-    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-  });
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    }),
+  ], channelId ? [smallChannelPlan(prisma, channelId)] : []);
 
   const hasMore = messages.length > limit;
   if (hasMore) messages.pop();

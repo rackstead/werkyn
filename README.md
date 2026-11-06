@@ -78,6 +78,32 @@ The migration preserves outstanding links but removes raw token columns;
 rolling back application code alone cannot restore compatibility. See the
 [upgrade and rollback guidance](docs/remediation/sec-026.md).
 
+The search-index migration `20261105180000_search_trigram_indexes` installs the
+PostgreSQL extension `pg_trgm` (a contrib module) and trigram indexes for text
+search. On PostgreSQL 13 and later the database owner can install it, and the
+bundled Compose database needs nothing. If Werkyn's database role may not
+create extensions (PostgreSQL 12 or older, or a managed service that requires
+allow-listing, such as Azure's `azure.extensions`), have an administrator run
+`CREATE EXTENSION IF NOT EXISTS pg_trgm;` in the Werkyn database before
+upgrading. The migration is one transaction, so writes to tasks wait until it
+commits, and writes to chat messages, files and wiki pages from their index
+build on (5.5 s and 3.5 s for 100,000 tasks and 200,000 messages); reads do
+not wait. On a database whose default collation uses ICU (or the builtin
+provider), where pg_trgm cannot match `ILIKE`'s case folding, the migration
+creates neither the extension nor the indexes, search works as before, and the
+server logs a warning at startup; check with `SELECT datlocprovider FROM
+pg_database WHERE datname = current_database();` (`c` is libc). A dump of a
+libc database restored into an ICU or builtin database keeps the indexes:
+drop them after the restore with the schema-qualified `DROP INDEX` statements
+the server prints at startup (for the default schema: `DROP INDEX
+"public"."Task_title_trgm_idx", "public"."Task_description_trgm_idx",
+"public"."ChatMessage_content_trgm_idx", "public"."WikiPage_title_trgm_idx",
+"public"."File_name_trgm_idx";`; use `DATABASE_URL`'s `schema` instead of
+`public` if it sets one). Until then the server's searches avoid them; it
+notices the drop within a minute, without a restart. See
+[P02c](docs/remediation/p02c.md), including how to recover a failed migration
+and how to build the indexes beforehand without blocking writes.
+
 ## Features
 
 ### Project Management

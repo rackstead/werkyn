@@ -501,6 +501,10 @@ model Task {
   // left out on purpose: as an index-only source of a project's task IDs it
   // made the planner hash every readable task for the notification list.
   @@index([projectId, archived, position, createdAt])
+  // Trigram indexes for title and description search (ILIKE '%term%'; pg_trgm,
+  // migration 20261105180000_search_trigram_indexes).
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "Task_title_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "Task_description_trgm_idx")
 }
 
 model TaskAssignee {
@@ -794,6 +798,9 @@ model File {
   @@index([teamFolderId])
   @@index([storagePath])
   @@index([thumbnailPath])
+  // Trigram index for Drive name search (ILIKE '%term%'; pg_trgm, migration
+  // 20261105180000_search_trigram_indexes).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "File_name_trgm_idx")
 }
 
 // Stored blobs whose owning row is gone. Database triggers (see the
@@ -1050,6 +1057,9 @@ model WikiPage {
   @@index([spaceId, parentId, position])
   @@index([parentId])
   @@index([createdById])
+  // Trigram index for title search (ILIKE '%term%'; pg_trgm, migration
+  // 20261105180000_search_trigram_indexes).
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "WikiPage_title_trgm_idx")
 }
 
 model WikiPageVersion {
@@ -1237,6 +1247,9 @@ model ChatMessage {
   @@index([channelId, createdAt])
   @@index([parentId])
   @@index([userId])
+  // Trigram index for message search (ILIKE '%term%'; pg_trgm, migration
+  // 20261105180000_search_trigram_indexes).
+  @@index([content(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatMessage_content_trgm_idx")
 }
 
 /// Outbox row written in the same transaction as a chat message. It is retried

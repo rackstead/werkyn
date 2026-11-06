@@ -23,6 +23,7 @@ import { logActivity } from "../../utils/activity-log.js";
 import { enqueueNotification } from "../notifications/notification-delivery.js";
 import { assertProjectAccess, assertTaskEdit } from "../../utils/project-access.js";
 import { sanitizeDescription } from "../../utils/description-html.js";
+import { withSearchPlans } from "../../utils/text-search.js";
 import {
   assertProjectAssignees,
   assertProjectLabels,
@@ -148,25 +149,35 @@ export async function listTasks(
 
   if (query.view === "board") {
     // Board view: return all non-archived tasks, no pagination
-    const tasks = await prisma.task.findMany({
+    const boardQuery = prisma.task.findMany({
       where: { ...where, archived: false },
       include,
       orderBy,
     });
+    // A title search is planned for its term (utils/text-search.ts).
+    const tasks = query.search
+      ? (await withSearchPlans(prisma, [boardQuery]))[0]
+      : await boardQuery;
     return { data: (await withTaskCounts(prisma, projectId, tasks)).map(scopeTaskRelations) };
   }
 
   // Paginated view
-  const [tasks, total] = await Promise.all([
-    prisma.task.findMany({
-      where,
-      include,
-      orderBy,
-      skip: (query.page - 1) * query.limit,
-      take: query.limit,
-    }),
-    prisma.task.count({ where }),
-  ]);
+  const pageQuery = prisma.task.findMany({
+    where,
+    include,
+    orderBy,
+    skip: (query.page - 1) * query.limit,
+    take: query.limit,
+  });
+  const countQuery = prisma.task.count({ where });
+  // A title search is planned for its term (utils/text-search.ts); the page
+  // and the count still run in parallel, each in its own transaction.
+  const [tasks, total] = query.search
+    ? await Promise.all([
+        withSearchPlans(prisma, [pageQuery]).then(([page]) => page),
+        withSearchPlans(prisma, [countQuery]).then(([count]) => count),
+      ])
+    : await Promise.all([pageQuery, countQuery]);
 
   return {
     data: (await withTaskCounts(prisma, projectId, tasks)).map(scopeTaskRelations),

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Link } from "@tanstack/react-router";
 import { ApiError } from "@/lib/api-client";
+import { retryWait, useRetryCountdown } from "../hooks/use-retry-countdown";
 
 interface LoginFormProps {
   inviteToken?: string;
@@ -14,6 +15,10 @@ interface LoginFormProps {
 
 export function LoginForm({ inviteToken }: LoginFormProps) {
   const login = useLogin(inviteToken);
+  // Repeated failed sign-ins are answered 429 with Retry-After: count the
+  // wait down and keep the form from sending until it has passed.
+  const wait = useRetryCountdown(login.error);
+  const timedRefusal = retryWait(login.error) > 0;
   const {
     register,
     handleSubmit,
@@ -24,6 +29,7 @@ export function LoginForm({ inviteToken }: LoginFormProps) {
   });
 
   const onSubmit = handleSubmit((data) => {
+    if (wait > 0) return;
     login.mutate(data);
   });
 
@@ -62,7 +68,13 @@ export function LoginForm({ inviteToken }: LoginFormProps) {
         )}
       </div>
 
-      {login.isError && (
+      {login.isError && wait > 0 && (
+        <p className="text-sm text-destructive">
+          Too many sign-in attempts. Try again in {wait}{" "}
+          {wait === 1 ? "second" : "seconds"}.
+        </p>
+      )}
+      {login.isError && !timedRefusal && (
         <p className="text-sm text-destructive">
           {login.error instanceof ApiError
             ? login.error.message
@@ -70,7 +82,11 @@ export function LoginForm({ inviteToken }: LoginFormProps) {
         </p>
       )}
 
-      <Button type="submit" className="w-full" disabled={login.isPending}>
+      <Button
+        type="submit"
+        className="w-full"
+        disabled={login.isPending || wait > 0}
+      >
         {login.isPending ? "Signing in..." : "Sign in"}
       </Button>
 

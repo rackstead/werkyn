@@ -77,11 +77,12 @@ export class GoneError extends AppError {
   }
 }
 
-export class LockedError extends AppError {
+/** Refused until a later time; Retry-After carries the whole seconds. */
+export class TooManyRequestsError extends AppError {
   retryAfter: number;
 
-  constructor(message = "Account locked", retryAfter: number) {
-    super(423, "Locked", message);
+  constructor(message: string, retryAfter: number) {
+    super(429, "Too Many Requests", message);
     this.retryAfter = retryAfter;
   }
 }

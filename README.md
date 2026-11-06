@@ -485,6 +485,48 @@ inserted link observed during invalidation, makes the password operation return
 its retryable busy 503 without changing anything. See
 [docs/remediation/sec-027.md](docs/remediation/sec-027.md).
 
+## Sign-in protection
+
+The sign-in route allows 10 requests per minute from one client IP address. Each
+email address also has a failed sign-in count, kept in the database, so it holds
+across server processes. After 5 consecutive failures for an email address, the
+next attempt must wait 2 seconds. The wait doubles with each further failure, up to
+60 seconds. During a wait, sign-in answers `429 Too Many Requests` with a
+`Retry-After` header and checks no password; the sign-in form counts the wait
+down. The account is never locked: once the wait passes, the correct password
+signs in. A successful sign-in clears the count, and so does an hour without
+attempts.
+
+Email addresses with and without an account are counted and answered alike.
+Unknown addresses and accounts without a password (SSO only) do the same Argon2id work as
+a wrong password. Password-reset requests are answered before the account lookup
+or mail delivery runs. So neither answers nor timing tell whether an account
+exists. The count table has a fixed maximum size and stores no addresses, so
+requests for many made-up addresses cannot grow it without limit. See
+[docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
+
+The server reads these optional settings at startup. An empty value keeps the
+default:
+
+| Variable | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `LOGIN_BACKOFF_THRESHOLD` | `5` | 1–100 | Consecutive failures before the first wait |
+| `LOGIN_BACKOFF_BASE_SECONDS` | `2` | 1–900 | First wait; doubles per further failure |
+| `LOGIN_BACKOFF_MAX_SECONDS` | `60` | 1–900 | Longest wait (at least the base) |
+| `LOGIN_BACKOFF_RESET_SECONDS` | `3600` | 60–604800 | Quiet time after which failures are forgotten (at least the longest wait) |
+| `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Most rows the count table holds |
+
+With Docker Compose, add them under the `werkyn` service's `environment`, for
+example `LOGIN_BACKOFF_MAX_SECONDS: 30`. Addresses share a row only when their
+keyed hashes collide. With more rows, collisions are rarer, and the table can
+grow larger under a flood (about 100 bytes per row). The hash key is derived from
+`JWT_SECRET`, so rotating that secret also forgets every count.
+
+The migration `20261105150000_bounded_login_backoff` replaces the
+`LoginAttempt` table with `LoginThrottle`. Recent failure counts and any
+remaining lockouts are dropped. Stop older servers before applying it, as for
+other migrations: they still use `LoginAttempt` and would fail sign-ins.
+
 ## Contributing
 
 Contributions are welcome! This project is in active development. Please check back soon for contribution guidelines and code of conduct.

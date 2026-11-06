@@ -115,7 +115,9 @@ export async function forgotPasswordHandler(
 ) {
   const body = request.body as { email: string };
 
-  await authService.forgotPassword(request.server.prisma, body.email);
+  // Answered without waiting for the account lookup or the mail, so every
+  // address gets the same response at the same speed.
+  authService.requestPasswordReset(request.server.prisma, body.email);
 
   return reply.send({
     message: "If an account exists, a reset link has been sent.",

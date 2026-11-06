@@ -72,7 +72,7 @@ async function main() {
     await prisma.rotatedRefreshToken.deleteMany();
     await prisma.passwordResetToken.deleteMany();
     await prisma.emailVerificationToken.deleteMany();
-    await prisma.loginAttempt.deleteMany();
+    await prisma.loginThrottle.deleteMany();
     await prisma.user.deleteMany();
   }
 

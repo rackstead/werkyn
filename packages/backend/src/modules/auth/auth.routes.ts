@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   registerHandler,
   loginHandler,
@@ -9,6 +10,7 @@ import {
   verifyEmailHandler,
   resendVerificationHandler,
 } from "./auth.controller.js";
+import { settlePasswordResetRequests } from "./auth.service.js";
 import oidcRoutes from "./oidc/oidc.routes.js";
 import { validate } from "../../middleware/validate.js";
 import { authenticate } from "../../middleware/authenticate.js";
@@ -25,7 +27,20 @@ import {
   ResendVerificationSchema,
 } from "@pm/shared";
 
+// How long closing the server waits for password-reset requests that were
+// answered before their work finished (auth.service.ts).
+const RESET_REQUEST_DRAIN_MS = 2_000;
+
 export default async function authRoutes(fastify: FastifyInstance) {
+  // Runs before the database connection closes (hooks close in reverse
+  // order of registration, and the Prisma plugin registers first).
+  fastify.addHook("onClose", async () => {
+    await Promise.race([
+      settlePasswordResetRequests(),
+      delay(RESET_REQUEST_DRAIN_MS, undefined, { ref: false }),
+    ]);
+  });
+
   // OIDC sub-routes
   await fastify.register(oidcRoutes, { prefix: "/oidc" });
 

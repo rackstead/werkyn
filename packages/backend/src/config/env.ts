@@ -152,7 +152,33 @@ const envSchema = z.object({
   DEX_INTERNAL_PORT: port("DEX_INTERNAL_PORT", 5556),
   DEX_STORAGE_TYPE: oneOf("DEX_STORAGE_TYPE", ["sqlite3", "postgres"]).default("sqlite3"),
   DEX_CLIENT_SECRET: z.string().optional(),
+
+  // Failed password sign-in backoff (docs/remediation/r31-login-backoff.md).
+  // After THRESHOLD consecutive failures for one address, each further
+  // attempt waits BASE seconds, doubling per failure up to MAX. Failures are
+  // forgotten after RESET quiet seconds or a successful sign-in. SLOTS bounds
+  // the tracking table's rows.
+  LOGIN_BACKOFF_THRESHOLD: wholeNumber("LOGIN_BACKOFF_THRESHOLD", 5, 1, 100),
+  LOGIN_BACKOFF_BASE_SECONDS: wholeNumber("LOGIN_BACKOFF_BASE_SECONDS", 2, 1, 900),
+  LOGIN_BACKOFF_MAX_SECONDS: wholeNumber("LOGIN_BACKOFF_MAX_SECONDS", 60, 1, 900),
+  LOGIN_BACKOFF_RESET_SECONDS: wholeNumber("LOGIN_BACKOFF_RESET_SECONDS", 3600, 60, 604800),
+  LOGIN_BACKOFF_SLOTS: wholeNumber("LOGIN_BACKOFF_SLOTS", 65536, 256, 16777216),
 }).superRefine((values, ctx) => {
+  if (values.LOGIN_BACKOFF_BASE_SECONDS > values.LOGIN_BACKOFF_MAX_SECONDS) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["LOGIN_BACKOFF_BASE_SECONDS"],
+      message: "LOGIN_BACKOFF_BASE_SECONDS must not exceed LOGIN_BACKOFF_MAX_SECONDS",
+    });
+  }
+  if (values.LOGIN_BACKOFF_MAX_SECONDS > values.LOGIN_BACKOFF_RESET_SECONDS) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["LOGIN_BACKOFF_MAX_SECONDS"],
+      message: "LOGIN_BACKOFF_MAX_SECONDS must not exceed LOGIN_BACKOFF_RESET_SECONDS",
+    });
+  }
+
   // Browsers drop SameSite=None cookies that are not Secure, so sign-in
   // would silently fail. Production defaults to Secure when unset.
   const secure =

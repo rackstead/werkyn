@@ -67,13 +67,52 @@ export async function hashPassword(password: string): Promise<string> {
   });
 }
 
-export async function verifyPassword(password: string, hash: string): Promise<boolean> {
-  if (!validPassword(password) || typeof hash !== "string" || hash.length > 128) return false;
+/** The check a stored hash supports, or none (no native work). */
+function storedHashCheck(password: string, hash: unknown): (() => Promise<boolean>) | undefined {
+  if (typeof hash !== "string" || hash.length > 128) return undefined;
   if (ownArgon2Hash(hash))
-    return admitted("argon2_verify", () => argon2.verify(hash, Buffer.from(password, "utf8")));
+    return () => admitted("argon2_verify", () => argon2.verify(hash, Buffer.from(password, "utf8")));
   // bcrypt cannot distinguish suffixes after72 bytes. Long legacy inputs need
   // the existing reset route; no login rewrite can recover their lost bytes.
   if (Buffer.byteLength(password, "utf8") <= 72 && legacyHash(hash))
-    return admitted("bcrypt_verify", () => bcrypt.compare(password, hash));
+    return () => admitted("bcrypt_verify", () => bcrypt.compare(password, hash));
+  return undefined;
+}
+
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  if (!validPassword(password)) return false;
+  return (await storedHashCheck(password, hash)?.()) ?? false;
+}
+
+// Sign-in verifies against this hash of random bytes when there is no stored
+// hash to check. It is made with the same parameters as every new hash, so
+// verifying it costs the same; it is started when the module loads so the
+// first such sign-in does not also pay for making it.
+let dummyHash: Promise<string> | undefined;
+function dummy(): Promise<string> {
+  if (!dummyHash) {
+    const made = argon2.hash(randomBytes(32), { ...PARAMETERS, salt: randomBytes(16) });
+    dummyHash = made;
+    made.catch(() => {
+      if (dummyHash === made) dummyHash = undefined;
+    });
+  }
+  return dummyHash;
+}
+dummy().catch(() => {});
+
+/**
+ * Sign-in check with the same native work whether or not the address has a
+ * usable password: an unknown address, an account without a password (SSO
+ * only), an unsupported stored hash or a legacy hash with an over-long input
+ * costs one Argon2id verification at the accepted parameters, admitted like
+ * any other, and is refused. Inputs no hash could accept are refused before
+ * native work for every address alike.
+ */
+export async function verifyLoginPassword(password: string, hash: string | null | undefined): Promise<boolean> {
+  if (!validPassword(password)) return false;
+  const check = storedHashCheck(password, hash);
+  if (check) return check();
+  await admitted("argon2_verify", async () => argon2.verify(await dummy(), Buffer.from(password, "utf8")));
   return false;
 }

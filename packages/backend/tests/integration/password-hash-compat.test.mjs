@@ -23,6 +23,12 @@ process.env.SMTP_SECURE = "false";
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { resetTransporter } = await import("../../src/utils/mailer.ts");
+const { loginSlot, loginThrottle } = await import(
+  "../../src/modules/auth/login-throttle.ts"
+);
+const { settlePasswordResetRequests } = await import(
+  "../../src/modules/auth/auth.service.ts"
+);
 
 // Hashes written by bcrypt 5.1.1, the release used before bcrypt 6.
 const recorded = JSON.parse(
@@ -74,11 +80,16 @@ after(async () => {
     await app.prisma.workspace.deleteMany({
       where: { slug: { contains: suffix } },
     });
+    const accounts = await app.prisma.user.findMany({
+      where: { email: { endsWith: domain } },
+      select: { email: true },
+    });
     await app.prisma.user.deleteMany({
       where: { email: { endsWith: domain } },
     });
-    await app.prisma.loginAttempt.deleteMany({
-      where: { email: { endsWith: domain } },
+    const { slots } = loginThrottle().policy;
+    await app.prisma.loginThrottle.deleteMany({
+      where: { slot: { in: accounts.map((a) => loginSlot(a.email, slots)) } },
     });
   } finally {
     nodemailer.createTransport = originalTransport;
@@ -181,6 +192,8 @@ test("resetting a password replaces a bcrypt 5.1.1 hash", async () => {
     payload: { email: user.email },
   });
   assert.equal(requested.statusCode, 200, requested.body);
+  // The request is answered before the link is made and sent.
+  await settlePasswordResetRequests();
   const message = mail.findLast((message) => message.to === user.email);
   const token = /reset-password\/([a-f0-9]{64})/.exec(message.text)?.[1];
   assert(token, "the reset bearer comes from the outgoing link");

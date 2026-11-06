@@ -772,6 +772,33 @@ describe("case folding", () => {
     assert.equal(await checkSearchIndexes(flaky, { warn: (...a) => silent.push(a) }), "ok");
     assert.equal(searchAvoidsTrigramIndexes(flaky), false);
     assert.deepEqual(silent, []);
+    // The startup loop: rechecks one at a time while the check fails, stops
+    // after the first success, so a later failure cannot bring the fallback
+    // back without anyone checking again.
+    failing = true;
+    let calls = 0;
+    const counted = { $queryRaw: (...args) => { calls++; return flaky.$queryRaw(...args); } };
+    const loopWarnings = [];
+    const loop = await startSearchIndexCheck(counted, { warn: (...a) => loopWarnings.push(a) }, "public", 20);
+    try {
+      assert.equal(loop.result, "failed");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.ok(calls >= 3, `rechecked ${calls} times`);
+      assert.equal(searchAvoidsTrigramIndexes(counted), true);
+      assert.equal(loopWarnings.length, 1, "failures are reported once");
+      failing = false;
+      const deadline = Date.now() + 5_000;
+      while (searchAvoidsTrigramIndexes(counted) && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(searchAvoidsTrigramIndexes(counted), false);
+      const after = calls;
+      failing = true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(calls, after, "no check after the successful one");
+      assert.equal(searchAvoidsTrigramIndexes(counted), false);
+    } finally {
+      loop.stop();
+    }
   });
 
   describe("ICU databases", () => {

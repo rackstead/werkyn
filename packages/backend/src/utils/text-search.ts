@@ -165,9 +165,10 @@ export async function checkSearchIndexes(
 /**
  * Runs checkSearchIndexes at startup and, while the client avoids trigram
  * indexes (the check failed, or found trigram indexes on a non-libc
- * database), again every `intervalMs` until it no longer does: after the
- * indexes are dropped, or once a failed check succeeds. A warning is logged
- * only when it differs from the previous one. The timer does not keep the
+ * database), again `intervalMs` after the previous check finished, until it
+ * no longer does: after the indexes are dropped, or once a failed check
+ * succeeds. One check runs at a time. A warning is logged only when it
+ * differs from the previous one. The timer does not keep the
  * process alive; `stop` ends it.
  */
 export async function startSearchIndexCheck(
@@ -185,18 +186,23 @@ export async function startSearchIndexCheck(
     },
   };
   const result = await checkSearchIndexes(prisma, once, schema);
-  let timer: ReturnType<typeof setInterval> | undefined;
-  const stop = () => {
-    if (timer) clearInterval(timer);
-    timer = undefined;
-  };
-  if (avoidTrigramIndexes.has(prisma)) {
-    timer = setInterval(() => {
-      void checkSearchIndexes(prisma, once, schema, { reportFailure: false }).then(() => {
-        if (!avoidTrigramIndexes.has(prisma)) stop();
-      });
+  // One check at a time: the next is scheduled only after the previous one
+  // finished and the client still avoids the indexes.
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const schedule = () => {
+    if (stopped || !avoidTrigramIndexes.has(prisma)) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      void checkSearchIndexes(prisma, once, schema, { reportFailure: false }).then(schedule);
     }, intervalMs);
     timer.unref();
-  }
+  };
+  schedule();
+  const stop = () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
   return { result, stop };
 }

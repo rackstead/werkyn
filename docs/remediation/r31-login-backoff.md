@@ -43,12 +43,17 @@ checked:
    `Retry-After` header (whole seconds) and the message `Too many sign-in
    attempts. Try again in N seconds.` No password is checked, the attempt is
    not counted, and the wait does not grow. The correct password also waits.
+   CORS exposes `Retry-After`, so a frontend on another allowed origin can
+   read it. The sign-in form shows the wait counting down and does not send
+   until it has passed.
 3. After the wait, the next attempt is checked. A correct password signs in,
    however many failures came before. There is no lockout.
-4. A correct password clears the count. An hour without counted attempts also
-   clears it.
-5. If the password could not be checked (`503`, password checks busy), the
-   attempt is not counted.
+4. A completed sign-in clears the count. An hour without counted attempts
+   also clears it. A correct password whose sign-in is then refused, because a
+   concurrent password change or reset replaced it, stays a counted failure.
+5. If the outcome was not decided, the attempt is not counted. This covers a
+   password that could not be checked (`503`, password checks busy) and a
+   session transaction that failed.
 
 The request is refused at once. No server worker, database connection or
 timer is held during the wait. A refused attempt costs two small database
@@ -61,6 +66,20 @@ server processes, take the row lock one at a time. So a burst of parallel
 guesses cannot all pass the check before any failure is recorded: in a burst of
 20, at most 5 passwords are checked.
 
+Each admitted attempt also gets the slot's next admission number, which acts
+as its ticket. An outcome changes only the admissions it owns:
+
+- A sign-in sets the count to the number of attempts admitted after it, never
+  more than the current count, and records its number as cleared. Failures
+  that overlapped it and were admitted later keep their count.
+- An undecided attempt uncounts itself only if no later sign-in has cleared it.
+
+Any outcome reported more than half the reset period after its admission
+changes nothing, because by then the row may have been pruned and started
+again. Each of these rules can leave the count too high, never too low. For
+example, an overlapping later attempt that was uncounted before an earlier
+sign-in finished still counts.
+
 ### Bounded tracking without addresses
 
 The `LoginThrottle` table has at most `LOGIN_BACKOFF_SLOTS` rows (default
@@ -72,7 +91,8 @@ key = HMAC-SHA256(JWT_SECRET, "werkyn login backoff slot v1")
 ```
 
 The slot number is the primary key. A row holds only the slot, the failure
-count and the time of the last counted attempt, so the table stores no address.
+count, the time of the last counted attempt and the two admission numbers, so
+the table stores no address.
 However many distinct addresses are sent, the table cannot hold more rows than
 there are slots. The daily cleanup deletes rows quiet for longer than the reset
 period, and rows outside the configured slot range after
@@ -102,10 +122,14 @@ they matter only while one of them is failing.
   is counted. Its answer is the same for every address.
 - Forgot-password answers `200` with the same message before it looks the
   account up. Replacing the reset link and sending the mail run afterwards
-  (`requestPasswordReset` in `auth.service.ts`). Each process runs at most 100
-  such requests at a time. Further requests are logged
+  (`requestPasswordReset` in `auth.service.ts`). A repeated request for an
+  address whose earlier one is still running adds nothing, because the running
+  one sends the newest link. Each process runs at most 100 requests for
+  distinct addresses at a time. Further requests are logged
   (`password_reset_request_dropped`) and dropped. The requester sees the same
-  answer as for an unknown address and can ask again. When the server closes,
+  answer as for an unknown address and can ask again. Work for an address
+  without an account ends after one lookup, so only mail to existing accounts
+  can hold the bound for long. When the server closes,
   it waits up to 2 seconds for requests in progress before closing the
   database connection. A failure in this work (database or mail) is logged and
   no longer reaches the requester. Mail failures were already logged and never
@@ -179,7 +203,13 @@ shipped container entrypoint applies migrations before starting the server.
   - two separate server processes share one address's backoff, and a success
     in one clears it for the other;
   - forgot-password answers alike for all three kinds while the mail server
-    holds every message, and the delivered link then works.
+    holds every message, and the delivered link then works;
+  - a sign-in clears only failures admitted up to it, keeping later
+    overlapping ones;
+  - a late undecided report does not uncount failures newer than a sign-in;
+  - a correct password whose sign-in is refused, because the password was
+    replaced while it waited for the account row, stays a counted failure;
+  - a cross-origin frontend can read `Retry-After`, because CORS exposes it.
 - `tests/integration/login-backoff-bounds.test.mjs` runs with 256 slots:
   - 600 unique unknown addresses through the sign-in route leave at most 256
     rows and only `401` or `429` answers;
@@ -232,6 +262,16 @@ shipped container entrypoint applies migrations before starting the server.
 - **Process-local limits.** The route limit, the password-check admission and
   the 100 pending reset requests are counted per server process. Only the
   backoff is shared.
+- **Reset requests are best effort, not durable.** An answered request lives
+  only in the process that answered it:
+  - it is dropped past the 100-request bound;
+  - it is lost if the process stops;
+  - the server waits at most 2 seconds for it on a clean shutdown.
+
+  In each case the requester sees the usual answer, but no link arrives, and
+  must ask again. Before this change, such a request either was answered with
+  an error or held the request open. A durable outbox for account mail would
+  remove this; it is a separate feature.
 - **Measured in-process only.** The timing evidence was measured in-process on
   one machine. It is not a remote measurement or a production load test
   (R39/R42).

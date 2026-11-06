@@ -258,20 +258,20 @@ export async function login(
     );
   }
 
-  let user: Awaited<ReturnType<typeof passwordSignInUser>>;
-  try {
-    user = await passwordSignInUser(prisma, email, data.password);
-  } catch (error) {
-    // The password was not checked (for example, password checks were busy),
-    // so the attempt is not a failure.
-    await throttle.unchecked(prisma, admission.slot).catch((uncountError) => {
-      logger.warn({ err: uncountError }, "Could not uncount an unchecked sign-in attempt");
+  const { ticket } = admission;
+  // An attempt whose outcome was not decided (its password could not be
+  // checked, or its sign-in could not be completed) is not a failure.
+  const undecided = async (error: unknown): Promise<never> => {
+    await throttle.unchecked(prisma, ticket).catch((uncountError) => {
+      logger.warn({ err: uncountError }, "Could not uncount an undecided sign-in attempt");
     });
     throw error;
-  }
-  if (!user) throw new UnauthorizedError("Invalid email or password");
+  };
 
-  await throttle.succeeded(prisma, admission.slot);
+  const user = await passwordSignInUser(prisma, email, data.password).catch(
+    undecided,
+  );
+  if (!user) throw new UnauthorizedError("Invalid email or password");
 
   // A password login replaces the user's other sessions. The user row is held
   // FOR NO KEY UPDATE until the new session commits: a concurrent password
@@ -289,10 +289,16 @@ export async function login(
     if (current?.passwordHash !== user.passwordHash) return null;
     const replaced = await revokeUserRefreshSessions(tx, user.id, "login");
     return { replaced, session: await startRefreshSession(tx, user.id) };
-  }, refreshTransactionOptions);
+  }, refreshTransactionOptions).catch(undecided);
+  // The password stopped being the account's meanwhile: a counted failure.
   if (!signIn) throw new UnauthorizedError("Invalid email or password");
   // The replaced sessions' sockets close now that their revocation committed.
   endSessions(signIn.replaced);
+  // Only a completed sign-in clears failures, and only those admitted up to
+  // it; the session stands even if clearing them fails.
+  await throttle.succeeded(prisma, ticket).catch((clearError) => {
+    logger.warn({ err: clearError }, "Could not clear failed sign-ins after a sign-in");
+  });
   const { refreshToken, familyId } = signIn.session;
 
   const accessToken = signAccessToken({
@@ -376,14 +382,19 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
 // Password-reset requests are answered before their work runs, so the
 // response takes the same time whether or not the address has an account:
 // looking the account up, replacing its link and waiting for the mail server
-// all happen afterwards. Work in progress is bounded per process; past the
-// bound a request is dropped and logged, which the requester cannot tell from
-// an unknown address (the link simply does not arrive and can be requested
-// again).
+// all happen afterwards. A request for an address whose earlier request is
+// still in progress adds nothing: that one sends the newest link. Work in
+// progress is bounded per process; past the bound a request is dropped and
+// logged, which the requester cannot tell from an unknown address (the link
+// does not arrive and can be requested again). Work for an address without
+// an account ends after one lookup, so only mail to existing accounts can
+// hold the bound for long.
 const MAX_PENDING_RESET_REQUESTS = 100;
-const pendingResetRequests = new Set<Promise<void>>();
+const pendingResetRequests = new Map<string, Promise<void>>();
 
 export function requestPasswordReset(prisma: PrismaClient, email: string) {
+  const address = email.toLowerCase();
+  if (pendingResetRequests.has(address)) return;
   if (pendingResetRequests.size >= MAX_PENDING_RESET_REQUESTS) {
     logger.warn(
       { event: "password_reset_request_dropped" },
@@ -391,20 +402,20 @@ export function requestPasswordReset(prisma: PrismaClient, email: string) {
     );
     return;
   }
-  const work: Promise<void> = forgotPassword(prisma, email)
+  const work: Promise<void> = forgotPassword(prisma, address)
     .catch((error) => {
       logger.error({ err: error }, "Password reset request failed");
     })
     .finally(() => {
-      pendingResetRequests.delete(work);
+      pendingResetRequests.delete(address);
     });
-  pendingResetRequests.add(work);
+  pendingResetRequests.set(address, work);
 }
 
 /** Resolves once no password-reset request work is in progress. */
 export async function settlePasswordResetRequests() {
   while (pendingResetRequests.size > 0)
-    await Promise.allSettled([...pendingResetRequests]);
+    await Promise.allSettled([...pendingResetRequests.values()]);
 }
 
 export async function forgotPassword(prisma: PrismaClient, email: string) {

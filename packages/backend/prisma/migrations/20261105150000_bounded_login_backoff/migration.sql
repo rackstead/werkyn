@@ -10,6 +10,9 @@
 -- submitted address (with or without an account) to a slot with a keyed
 -- hash, modulo LOGIN_BACKOFF_SLOTS, so the table never holds more rows than
 -- that setting and never stores an address. Slot numbers are non-negative.
+-- "admissions" numbers the slot's admitted attempts; a sign-in's outcome
+-- clears or uncounts only its own and earlier admissions ("clearedThrough"),
+-- so attempts admitted after it keep their count.
 --
 -- Stop older servers before applying: they still read "LoginAttempt" and
 -- would answer sign-ins with 500 until replaced. The shipped entrypoint
@@ -20,6 +23,8 @@ CREATE TABLE "LoginThrottle" (
     "slot" INTEGER NOT NULL,
     "failures" INTEGER NOT NULL,
     "lastFailureAt" TIMESTAMP(3) NOT NULL,
+    "admissions" BIGINT NOT NULL DEFAULT 0,
+    "clearedThrough" BIGINT NOT NULL DEFAULT 0,
 
     CONSTRAINT "LoginThrottle_pkey" PRIMARY KEY ("slot"),
     CONSTRAINT "LoginThrottle_slot_check" CHECK ("slot" >= 0),

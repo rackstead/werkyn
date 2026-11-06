@@ -28,6 +28,7 @@ Object.assign(process.env, {
   SMTP_PASS: "",
   SMTP_SECURE: "false",
   SMTP_FROM: "noreply@werkyn.example.test",
+  CORS_ORIGIN: "http://localhost:5173",
 });
 
 const { buildApp } = await import("../../src/app.ts");
@@ -214,6 +215,22 @@ test("the wait doubles per failure up to the cap and never becomes a lock", asyn
   assert.equal(await failures(email), 0);
 });
 
+test("a frontend on another allowed origin can read the wait", async () => {
+  const email = await account("unknown");
+  for (let i = 0; i < 5; i++) await login(email, WRONG);
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/auth/login",
+    payload: { email, password: WRONG },
+    headers: { origin: "http://localhost:5173" },
+    remoteAddress: nextAddress(),
+  });
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.headers["retry-after"], "2");
+  assert.equal(response.headers["access-control-allow-origin"], "http://localhost:5173");
+  assert.match(response.headers["access-control-expose-headers"] ?? "", /retry-after/i);
+});
+
 test("refused attempts are not counted and do not lengthen the wait", async () => {
   const email = await account("real");
   for (let i = 0; i < 5; i++) await login(email, WRONG);
@@ -297,6 +314,83 @@ test("an attempt whose password check was unavailable is not counted", async () 
   assert.equal(refused.after, refused.before);
 });
 
+test("a sign-in clears only the failures admitted up to it, not overlapping later ones", async () => {
+  const throttle = loginThrottle();
+  const email = await account("unknown");
+  const first = await throttle.admit(app.prisma, email);
+  const second = await throttle.admit(app.prisma, email);
+  const third = await throttle.admit(app.prisma, email);
+  assert.ok(first.admitted && second.admitted && third.admitted);
+  assert.equal(await failures(email), 3);
+  // The second attempt signs in while the third (admitted after it) fails.
+  await throttle.succeeded(app.prisma, second.ticket);
+  assert.equal(await failures(email), 1);
+  // A slower report for an earlier attempt changes nothing it does not own.
+  await throttle.succeeded(app.prisma, first.ticket);
+  assert.equal(await failures(email), 1);
+  await throttle.unchecked(app.prisma, first.ticket);
+  assert.equal(await failures(email), 1);
+});
+
+test("an undecided attempt reported after a later sign-in does not uncount newer failures", async () => {
+  const throttle = loginThrottle();
+  const email = await account("unknown");
+  const busy = await throttle.admit(app.prisma, email);
+  const signedIn = await throttle.admit(app.prisma, email);
+  await throttle.succeeded(app.prisma, signedIn.ticket);
+  assert.equal(await failures(email), 0);
+  const newer = await throttle.admit(app.prisma, email);
+  assert.ok(newer.admitted);
+  assert.equal(await failures(email), 1);
+  // The first attempt's password check failed to run; it was already
+  // cleared by the sign-in, so the newer failure keeps its count.
+  await throttle.unchecked(app.prisma, busy.ticket);
+  assert.equal(await failures(email), 1);
+  // Its own undecided outcome still uncounts the newer attempt.
+  await throttle.unchecked(app.prisma, newer.ticket);
+  assert.equal(await failures(email), 0);
+});
+
+test("a correct password whose sign-in is refused because the password changed stays a counted failure", async () => {
+  const email = await account("real");
+  await login(email, WRONG);
+  const user = await app.prisma.user.findUniqueOrThrow({ where: { email } });
+  const replacement = await hashPassword("Replacement-password-1");
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  let held;
+  const holding = new Promise((resolve) => (held = resolve));
+  // Holds the account row as a password change does, then changes the hash.
+  const change = app.prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${user.id} FOR NO KEY UPDATE`;
+      held();
+      await gate;
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash: replacement } });
+    },
+    { timeout: 15_000 },
+  );
+  await holding;
+  const pending = login(email, PASSWORD);
+  try {
+    // The sign-in verified the old password and now waits for the row.
+    for (let i = 0; ; i++) {
+      const [{ waiting }] = await app.prisma.$queryRaw`
+        SELECT count(*)::int AS waiting FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock'
+      `;
+      if (waiting > 0) break;
+      assert.ok(i < 500, "the sign-in waits for the account row");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  } finally {
+    release();
+    await change;
+  }
+  assert.deepEqual(await pending, invalid);
+  assert.equal(await failures(email), 2);
+});
+
 test("the tracking table holds counters only, no addresses", async () => {
   const columns = await app.prisma.$queryRaw`
     SELECT column_name FROM information_schema.columns
@@ -305,7 +399,7 @@ test("the tracking table holds counters only, no addresses", async () => {
   `;
   assert.deepEqual(
     columns.map((c) => c.column_name),
-    ["slot", "failures", "lastFailureAt"],
+    ["slot", "failures", "lastFailureAt", "admissions", "clearedThrough"],
   );
   const [old] = await app.prisma.$queryRaw`
     SELECT to_regclass('"LoginAttempt"')::text AS name

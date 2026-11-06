@@ -13,8 +13,8 @@ import { env } from "../../config/env.js";
  * choosing addresses that collide with a given one.
  *
  * An attempt is counted as a failure when it is admitted, before its password
- * is checked, and the count is cleared when the password proves correct. So
- * parallel attempts cannot all pass the check before any failure is recorded:
+ * is checked, and the count is cleared when it signs in. So parallel attempts
+ * cannot all pass the check before any failure is recorded:
  * attempts on one slot are admitted one at a time by the row lock, and once
  * `threshold` are counted, each further attempt must wait
  * `baseSeconds * 2^(failures - threshold)` seconds, at most `maxSeconds`,
@@ -23,6 +23,15 @@ import { env } from "../../config/env.js";
  * never grows while refused and the account is never locked: after the
  * stated wait the correct password signs in. Failures are forgotten after
  * `resetSeconds` without an admitted attempt.
+ *
+ * Each admitted attempt gets the slot's next admission number (its ticket).
+ * Its outcome changes only what it owns: a sign-in clears the failures of its
+ * own and earlier admissions, keeping those admitted after it (from this or a
+ * colliding address); an attempt whose password was never checked uncounts
+ * itself only while no later outcome has cleared it. An outcome reported more
+ * than half the reset period after its admission changes nothing, since the
+ * row may by then have been pruned and started again (both directions keep
+ * the count, never lower it wrongly).
  */
 export interface LoginBackoffPolicy {
   threshold: number;
@@ -32,8 +41,16 @@ export interface LoginBackoffPolicy {
   slots: number;
 }
 
+export interface AdmissionTicket {
+  slot: number;
+  /** The slot's admission number of this attempt. */
+  number: bigint;
+  /** performance.now() when it was admitted. */
+  at: number;
+}
+
 export type LoginAdmission =
-  | { admitted: true; slot: number }
+  | { admitted: true; ticket: AdmissionTicket }
   | { admitted: false; retryAfter: number };
 
 // Counts stop growing here; the delay reaches its cap long before.
@@ -75,15 +92,22 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     const slot = loginSlot(email, slots);
     // The delay owed after the row's current count; the proposed row's time
     // (EXCLUDED) is the one clock reading of this statement.
-    const admitted = await prisma.$queryRaw<Array<{ failures: number }>>`
-      INSERT INTO "LoginThrottle" AS t ("slot", "failures", "lastFailureAt")
-      VALUES (${slot}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC')
+    const admitted = await prisma.$queryRaw<Array<{ admissions: bigint }>>`
+      INSERT INTO "LoginThrottle" AS t
+        ("slot", "failures", "lastFailureAt", "admissions", "clearedThrough")
+      VALUES (${slot}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC', 1, 0)
       ON CONFLICT ("slot") DO UPDATE SET
         "failures" = CASE
           WHEN t."lastFailureAt" <= EXCLUDED."lastFailureAt" - ${resetSeconds}::integer * interval '1 second'
             THEN 1
           ELSE LEAST(t."failures", ${MAX_FAILURES}::integer) + 1
         END,
+        "clearedThrough" = CASE
+          WHEN t."lastFailureAt" <= EXCLUDED."lastFailureAt" - ${resetSeconds}::integer * interval '1 second'
+            THEN t."admissions"
+          ELSE t."clearedThrough"
+        END,
+        "admissions" = t."admissions" + 1,
         "lastFailureAt" = EXCLUDED."lastFailureAt"
       WHERE t."failures" < ${threshold}::integer
         OR t."lastFailureAt"
@@ -92,9 +116,13 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
               ${maxSeconds}::float8
             ) * interval '1 second'
           <= EXCLUDED."lastFailureAt"
-      RETURNING t."failures"
+      RETURNING t."admissions"
     `;
-    if (admitted.length > 0) return { admitted: true, slot };
+    if (admitted.length > 0)
+      return {
+        admitted: true,
+        ticket: { slot, number: BigInt(admitted[0]!.admissions), at: performance.now() },
+      };
 
     const [waiting] = await prisma.$queryRaw<Array<{ seconds: number | null }>>`
       SELECT CEIL(EXTRACT(EPOCH FROM (
@@ -116,22 +144,42 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     };
   }
 
-  /** A correct password ends the slot's failures. */
-  async function succeeded(prisma: PrismaClient, slot: number) {
+  // Within half the reset period of its admission the row cannot have been
+  // pruned or restarted (both need resetSeconds without an admission).
+  const current = (ticket: AdmissionTicket) =>
+    performance.now() - ticket.at < (resetSeconds * 1000) / 2;
+
+  /**
+   * The attempt signed in: failures admitted up to and including it no
+   * longer count. At most the number admitted after it remain (fewer if
+   * some of those were uncounted already).
+   */
+  async function succeeded(prisma: PrismaClient, ticket: AdmissionTicket) {
+    if (!current(ticket)) return;
     await prisma.$executeRaw`
-      DELETE FROM "LoginThrottle" WHERE "slot" = ${slot}::integer
+      UPDATE "LoginThrottle" SET
+        "failures" = LEAST("failures", "admissions" - ${ticket.number}::bigint),
+        "clearedThrough" = ${ticket.number}::bigint
+      WHERE "slot" = ${ticket.slot}::integer
+        AND "admissions" >= ${ticket.number}::bigint
+        AND "clearedThrough" < ${ticket.number}::bigint
     `;
   }
 
   /**
-   * Uncounts an admitted attempt whose password was never checked (the
-   * check was unavailable). Its time stays, which can only delay the next
-   * attempt, never admit one early.
+   * Uncounts an admitted attempt whose outcome was not decided (its password
+   * could not be checked, or its sign-in could not be completed), unless a
+   * later outcome already cleared it. Its time stays, which can only delay
+   * the next attempt, never admit one early.
    */
-  async function unchecked(prisma: PrismaClient, slot: number) {
+  async function unchecked(prisma: PrismaClient, ticket: AdmissionTicket) {
+    if (!current(ticket)) return;
     await prisma.$executeRaw`
       UPDATE "LoginThrottle" SET "failures" = "failures" - 1
-      WHERE "slot" = ${slot}::integer AND "failures" > 0
+      WHERE "slot" = ${ticket.slot}::integer
+        AND "admissions" >= ${ticket.number}::bigint
+        AND "clearedThrough" < ${ticket.number}::bigint
+        AND "failures" > 0
     `;
   }
 

@@ -129,9 +129,13 @@ model RotatedRefreshToken {
 /// keyed hash, so the table is bounded and stores no address. Written only by
 /// modules/auth/login-throttle.ts (docs/remediation/r31-login-backoff.md).
 model LoginThrottle {
-  slot          Int      @id
-  failures      Int
-  lastFailureAt DateTime
+  slot           Int      @id
+  failures       Int
+  lastFailureAt  DateTime
+  /// Admitted attempts so far; each sign-in holds its number as a ticket.
+  admissions     BigInt   @default(0)
+  /// Admissions up to this number no longer count (success or quiet period).
+  clearedThrough BigInt   @default(0)
 
   @@index([lastFailureAt])
 }

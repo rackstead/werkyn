@@ -276,12 +276,12 @@ try {
     async function type(keys) {
       for (const key of keys) await page.keyboard.press(key, { delay: 20 });
     }
-    // Tab until focus leaves the input (the first Tab after the last part
-    // may stop on the browser's calendar button inside the input).
+    // Tab until focus leaves the input and its clear button (the first Tab
+    // after the last part may stop on the browser's calendar button inside the
+    // input; focus on the clear button keeps the edit for that button).
     async function tabOut(input) {
-      for (let i = 0; i < 4 && (await input.evaluate((el) => el === document.activeElement)); i++) {
-        await page.keyboard.press("Tab");
-      }
+      const inside = () => input.evaluate((el) => el.parentElement.contains(document.activeElement));
+      for (let i = 0; i < 5 && (await inside()); i++) await page.keyboard.press("Tab");
     }
 
     async function closePanel() {

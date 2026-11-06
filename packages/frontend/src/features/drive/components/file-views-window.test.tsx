@@ -287,6 +287,9 @@ describe("windowed Drive list", { timeout: 30_000 }, () => {
     rerender(<Harness files={refreshed} hasNextPage />);
     expect(topOf(under)).toBe(top);
     expect(entryAt(200)).toBe(under);
+    // The next page's sentinel is at the end of the content, in view.
+    const sentinel = scroller!.querySelector("table ~ .py-4")!;
+    expect(sentinel.nextElementSibling).toBeNull();
     // The next page arrives: the space held goes, nothing moves.
     rerender(<Harness files={[...range(-3, 0), ...files]} />);
     expect(topOf(under)).toBe(top);

@@ -264,6 +264,10 @@ export function FileGridView({
         </KeepInView>
       </div>
 
+      {/* The space held for entries left for the next page comes before the
+          sentinel, so the sentinel stays at the end of the scroller's
+          content, in view, and loads that page. */}
+      {holdHeight > 0 && <div aria-hidden="true" style={{ height: holdHeight }} />}
       {hasNextPage && (
         <div ref={sentinelRef} className="flex justify-center py-4">
           {isFetchingNextPage && (
@@ -272,7 +276,6 @@ export function FileGridView({
         </div>
       )}
       {footer}
-      {holdHeight > 0 && <div aria-hidden="true" style={{ height: holdHeight }} />}
     </div>
   );
 }

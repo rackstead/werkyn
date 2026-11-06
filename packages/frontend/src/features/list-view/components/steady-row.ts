@@ -38,6 +38,12 @@ export function steadyRows(
   });
   const n = rows.length;
   if (n === 0) return [];
+  // Nothing moved, or rows were only added or removed above: every row, in
+  // order (what the rest below gives too, without its cost on each scroll).
+  const shift = rows[0].index - rows[0].was;
+  if (rows.every((row) => row.index - row.was === shift)) {
+    return rows.map(({ key, top, index }) => ({ key, top, index }));
+  }
   const weight = rows.map((row) => 1 / (1 + Math.abs(row.index - row.was)));
   const close = (a: number, b: number) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a));
 
@@ -72,13 +78,17 @@ export function steadyRows(
     .map((row, i) => ({ row, i }))
     .filter(({ i }) => inBest[i] && weight[i] >= heaviest / 2);
   // Rows every best set includes first, in order; then the others.
-  const inEvery = ({ i }: { i: number }) => {
-    const without = runs(i).best;
-    return without < best && !close(without, best);
-  };
+  const inEvery = new Set(
+    candidates
+      .filter(({ i }) => {
+        const without = runs(i).best;
+        return without < best && !close(without, best);
+      })
+      .map(({ i }) => i),
+  );
   const ordered = [
-    ...candidates.filter(inEvery),
-    ...candidates.filter((candidate) => !inEvery(candidate)),
+    ...candidates.filter(({ i }) => inEvery.has(i)),
+    ...candidates.filter(({ i }) => !inEvery.has(i)),
   ];
   return ordered.map(({ row: { key, top, index } }) => ({ key, top, index }));
 }

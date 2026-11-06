@@ -519,7 +519,9 @@ Email addresses with and without an account are counted and answered alike when 
 people's addresses. Unknown addresses and accounts without a password (SSO only)
 do the same Argon2id work as a wrong password. Password-reset requests are
 answered before the account lookup or mail delivery runs. So neither answers nor
-timing tell whether an account exists. The count table has a fixed maximum size
+timing tell whether an account exists. Each server process starts at most 600
+reset requests a minute, counted by request alone. Past that, every reset request
+is answered `429` with `Retry-After` until the minute ends. The count table has a fixed maximum size
 and stores no addresses, so requests for many made-up addresses cannot grow it
 without limit. See
 [docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).

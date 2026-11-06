@@ -76,11 +76,12 @@ as its ticket. An outcome changes only the admissions it owns:
   that overlapped it and were admitted later keep their count.
 - An undecided attempt uncounts itself only if no later sign-in has cleared it.
 
-Any outcome reported more than half the reset period after its admission
-changes nothing, because by then the row may have been pruned and started
-again. Each of these rules can leave the count too high, never too low. For
-example, an overlapping later attempt that was uncounted before an earlier
-sign-in finished still counts.
+A ticket also carries the row's generation. The generation comes from a
+sequence and is new each time a row is created. So an outcome for a row that
+was pruned meanwhile never touches the row created after it, even when the
+admission numbers match. Each of these rules can leave the count too high,
+never too low. For example, an overlapping later attempt that was uncounted
+before an earlier sign-in finished still counts.
 
 ### Trusted browsers (device cookies)
 
@@ -107,7 +108,10 @@ following OWASP's "device cookies" (`login-device.ts`):
 - A sign-in that presents an unexpired, unaltered token for its address is
   counted in that device's own lane instead of the address's slot. The lane is
   a second set of `LOGIN_BACKOFF_SLOTS` rows, keyed by the device id. It has
-  the same rules: 5 failures, then 2, 4, … 60-second waits. Someone holding a
+  the same rules: 5 failures, then 2, 4, … 60-second waits. The lanes are
+  numbered from 16,777,216, above the largest address slot any setting
+  allows, so changing `LOGIN_BACKOFF_SLOTS` never turns one kind of row into
+  the other. Someone holding a
   stolen cookie therefore gets one more lane at the same rate, not unlimited
   guesses. The password is always checked.
 - A trusted sign-in clears its lane's failures. It also clears the address
@@ -167,9 +171,11 @@ count, the time of the last counted attempt and the two admission numbers, so
 the table stores no address.
 However many distinct addresses are sent, the table cannot hold more rows than
 there are slots. A device lane is
-`LOGIN_BACKOFF_SLOTS + (HMAC-SHA256(key, "device " + device id) mod slots)`.
+`16777216 + (HMAC-SHA256(key, "device " + device id) mod LOGIN_BACKOFF_SLOTS)`.
 The daily cleanup deletes rows quiet for longer than the reset period, and rows
-outside both ranges after `LOGIN_BACKOFF_SLOTS` is lowered.
+outside both ranges after `LOGIN_BACKOFF_SLOTS` is lowered. Changing the
+setting reshuffles which addresses share a slot. It is like rotating
+`JWT_SECRET`: counts may move to other addresses until they are forgotten.
 
 Addresses whose slots collide share a count. A collision can only make a wait
 start sooner; it never lets an address skip one. Without `JWT_SECRET`, nobody
@@ -216,9 +222,17 @@ should raise `LOGIN_BACKOFF_SLOTS`.
   other users' links. An earlier revision capped work at 3 per client IP. The
   review measured that cap as an oracle: the prober's own link arrived 0/15
   times when the probed account existed and 15/15 when it did not. It also
-  dropped 2 of 5 users' links behind one IP. The route's request limit
-  (10 a minute per client) bounds the work instead, as it bounded concurrent
-  requests before.
+  dropped 2 of 5 users' links behind one IP. Instead, two limits bound the
+  work, and both count requests only, before any lookup:
+  - the route's limit of 10 a minute per client;
+  - a process-wide budget of 600 reset requests a minute.
+
+  Past the budget, every request, for any address, is answered `429` with
+  `Retry-After` and the same message. Exhausting the budget is logged
+  (`password_reset_budget_exhausted`). A request deduplicated against
+  pending work still counts toward the budget, so the refusal never depends
+  on pending work. With the mail transport's own timeouts, this bounds the
+  work in progress. The forgot-password form counts the wait down.
 - When the server closes, it keeps the database open for reset work in
   progress until shortly before the shutdown deadline (8 seconds overall).
   Work still running then is logged (`password_reset_requests_abandoned`,
@@ -341,13 +355,18 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
   - a repeat for a pending address adds nothing;
   - closing the server waits for reset mail slower than 2 seconds and
     delivers it;
-  - work still running at the drain deadline is logged with its count.
+  - work still running at the drain deadline is logged with its count;
+  - an outcome for a pruned row does not touch the row created after it, even
+    at the same admission number.
 - `tests/integration/login-backoff-bounds.test.mjs` runs with 256 slots:
   - 600 unique unknown addresses through the sign-in route leave at most 256
     rows and only `401` or `429` answers;
   - 2,000 more addresses admitted directly still leave at most 256 rows;
   - cleanup removes rows past the quiet period and rows outside the address
-    and device ranges.
+    and device ranges;
+  - after 600 reset requests in a minute, the next one is refused `429`. The
+    refusal is identical for an existing and an unknown address, and the
+    refused request does no work.
 - `tests/argon2id-passwords.test.mjs` checks that sign-in without a usable
   hash is refused and uses the same native admission (`503` while two jobs
   run). It also checks that the stand-in check costs between half and twice a
@@ -361,7 +380,9 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
   - that nothing is sent during the wait;
   - that a new `429` restarts the countdown;
   - that a `429` without `Retry-After` shows the server's message;
-  - that `Retry-After` is read as seconds or as an HTTP date.
+  - that `Retry-After` is read as seconds or as an HTTP date;
+  - in `forgot-password-form.test.tsx`, a reset `429` counts down and sends
+    nothing during the wait.
 
 ## Limitations
 
@@ -397,6 +418,11 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
   address: the app does not trust proxy headers, so behind a reverse proxy it
   counts all users together, as before this change. Only the backoff is
   shared.
+- **Reset requests can be refused for everyone during a flood.** More than
+  600 reset requests a minute to one process (about 60 client addresses at
+  the route limit) are answered `429` until the minute ends, for every
+  address. That keeps the work bounded and reveals nothing about accounts. A
+  user caught by it sees the countdown and can ask again.
 - **Reset requests are not durable.** An answered request lives only in the
   process that answered it. It is lost if the process is killed, or if its
   mail is still being sent at the shutdown deadline; that case is logged. The

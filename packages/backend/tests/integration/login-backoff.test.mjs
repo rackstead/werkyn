@@ -33,7 +33,7 @@ Object.assign(process.env, {
 
 const { buildApp } = await import("../../src/app.ts");
 const { hashPassword } = await import("../../src/utils/passwords.ts");
-const { loginSlot, loginThrottle } = await import(
+const { loginSlot, loginThrottle, DEVICE_LANES } = await import(
   "../../src/modules/auth/login-throttle.ts"
 );
 const { settlePasswordResetRequests } = await import(
@@ -355,6 +355,23 @@ test("an undecided attempt reported after a later sign-in does not uncount newer
   assert.equal(await failures(email), 0);
 });
 
+test("an outcome for a row pruned meanwhile does not touch the row created after it", async () => {
+  const throttle = loginThrottle();
+  const email = await account("unknown");
+  const old = await throttle.admit(app.prisma, email);
+  const mark = await throttle.addressMark(app.prisma, email);
+  // The row is pruned (quiet past the reset period) and created again by a
+  // new failure, reaching the same admission number as the old tickets.
+  await app.prisma.loginThrottle.delete({ where: { slot: slotOf(email) } });
+  const fresh = await throttle.admit(app.prisma, email);
+  assert.equal(fresh.ticket.number, old.ticket.number);
+  assert.notEqual(fresh.ticket.generation, old.ticket.generation);
+  await throttle.succeeded(app.prisma, old.ticket);
+  await throttle.succeeded(app.prisma, mark);
+  await throttle.unchecked(app.prisma, old.ticket);
+  assert.equal(await failures(email), 1);
+});
+
 test("a correct password whose sign-in is refused because the password changed stays a counted failure", async () => {
   const email = await account("real");
   await login(email, WRONG);
@@ -414,7 +431,7 @@ async function browserLogin(email, password, cookie) {
 
 const deviceIds = (cookie) => cookie.split("~").map((token) => token.split(".")[0]);
 const deviceSlot = (id) => {
-  const slot = DEFAULT_SLOTS + loginSlot(`device ${id}`, DEFAULT_SLOTS);
+  const slot = DEVICE_LANES + loginSlot(`device ${id}`, DEFAULT_SLOTS);
   usedSlots.add(slot);
   return slot;
 };
@@ -548,7 +565,7 @@ test("the tracking table holds counters only, no addresses", async () => {
   `;
   assert.deepEqual(
     columns.map((c) => c.column_name),
-    ["slot", "failures", "lastFailureAt", "admissions", "clearedThrough"],
+    ["slot", "failures", "lastFailureAt", "admissions", "clearedThrough", "generation"],
   );
   const [old] = await app.prisma.$queryRaw`
     SELECT to_regclass('"LoginAttempt"')::text AS name

@@ -13,7 +13,8 @@ import { env } from "../../config/env.js";
  * without the server secret from choosing addresses that collide with a given
  * one. A browser that signed in to the address before (login-device.ts) is
  * counted in its device's own lane instead, one of `slots` device rows
- * (slots to 2 * slots - 1), so the table holds at most 2 * slots rows.
+ * numbered from DEVICE_LANES (above any address slot whatever the setting),
+ * so the table holds at most 2 * slots rows.
  *
  * An attempt is counted as a failure when it is admitted, before its password
  * is checked, and the count is cleared when it signs in. So parallel attempts
@@ -29,14 +30,14 @@ import { env } from "../../config/env.js";
  * device's own lane is not affected by them. Failures are forgotten after
  * `resetSeconds` without an admitted attempt.
  *
- * Each admitted attempt gets the slot's next admission number (its ticket).
- * Its outcome changes only what it owns: a sign-in clears the failures of its
- * own and earlier admissions, keeping those admitted after it (from this or a
- * colliding address); an attempt whose password was never checked uncounts
- * itself only while no later outcome has cleared it. An outcome reported more
- * than half the reset period after its admission changes nothing, since the
- * row may by then have been pruned and started again (both directions keep
- * the count, never lower it wrongly).
+ * Each admitted attempt gets the slot's next admission number and the row's
+ * generation (its ticket). Its outcome changes only what it owns: a sign-in
+ * clears the failures of its own and earlier admissions, keeping those
+ * admitted after it (from this or a colliding address); an attempt whose
+ * password was never checked uncounts itself only while no later outcome has
+ * cleared it. A row created again after being pruned has a new generation,
+ * so an outcome for the old row changes nothing (both directions keep the
+ * count, never lower it wrongly).
  */
 export interface LoginBackoffPolicy {
   threshold: number;
@@ -48,10 +49,10 @@ export interface LoginBackoffPolicy {
 
 export interface AdmissionTicket {
   slot: number;
+  /** The row's generation: new each time the row is created. */
+  generation: bigint;
   /** The slot's admission number of this attempt. */
   number: bigint;
-  /** performance.now() when it was admitted. */
-  at: number;
 }
 
 export type LoginAdmission =
@@ -60,6 +61,11 @@ export type LoginAdmission =
 
 // Counts stop growing here; the delay reaches its cap long before.
 const MAX_FAILURES = 1_000_000;
+
+// Trusted-device lanes start above the largest address slot any
+// LOGIN_BACKOFF_SLOTS setting allows, so changing the setting never turns
+// one kind of row into the other.
+export const DEVICE_LANES = 16_777_216;
 
 export function policyFromEnv(): LoginBackoffPolicy {
   return {
@@ -92,7 +98,7 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
 
   /** Counts an attempt from a trusted device in that device's own lane. */
   function admitDevice(prisma: PrismaClient, deviceId: string) {
-    return admitSlot(prisma, slots + loginSlot(`device ${deviceId}`, slots));
+    return admitSlot(prisma, DEVICE_LANES + loginSlot(`device ${deviceId}`, slots));
   }
 
   /**
@@ -105,11 +111,14 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     email: string,
   ): Promise<AdmissionTicket | null> {
     const slot = loginSlot(email, slots);
-    const [row] = await prisma.$queryRaw<Array<{ admissions: bigint }>>`
-      SELECT "admissions" FROM "LoginThrottle" WHERE "slot" = ${slot}::integer
+    const [row] = await prisma.$queryRaw<
+      Array<{ admissions: bigint; generation: bigint }>
+    >`
+      SELECT "admissions", "generation" FROM "LoginThrottle"
+      WHERE "slot" = ${slot}::integer
     `;
     return row
-      ? { slot, number: BigInt(row.admissions), at: performance.now() }
+      ? { slot, generation: BigInt(row.generation), number: BigInt(row.admissions) }
       : null;
   }
 
@@ -124,7 +133,9 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
   ): Promise<LoginAdmission> {
     // The delay owed after the row's current count; the proposed row's time
     // (EXCLUDED) is the one clock reading of this statement.
-    const admitted = await prisma.$queryRaw<Array<{ admissions: bigint }>>`
+    const admitted = await prisma.$queryRaw<
+      Array<{ admissions: bigint; generation: bigint }>
+    >`
       INSERT INTO "LoginThrottle" AS t
         ("slot", "failures", "lastFailureAt", "admissions", "clearedThrough")
       VALUES (${slot}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC', 1, 0)
@@ -148,12 +159,16 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
               ${maxSeconds}::float8
             ) * interval '1 second'
           <= EXCLUDED."lastFailureAt"
-      RETURNING t."admissions"
+      RETURNING t."admissions", t."generation"
     `;
     if (admitted.length > 0)
       return {
         admitted: true,
-        ticket: { slot, number: BigInt(admitted[0]!.admissions), at: performance.now() },
+        ticket: {
+          slot,
+          generation: BigInt(admitted[0]!.generation),
+          number: BigInt(admitted[0]!.admissions),
+        },
       };
 
     const [waiting] = await prisma.$queryRaw<Array<{ seconds: number | null }>>`
@@ -176,23 +191,18 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     };
   }
 
-  // Within half the reset period of its admission the row cannot have been
-  // pruned or restarted (both need resetSeconds without an admission).
-  const current = (ticket: AdmissionTicket) =>
-    performance.now() - ticket.at < (resetSeconds * 1000) / 2;
-
   /**
    * The attempt signed in: failures admitted up to and including it no
    * longer count. At most the number admitted after it remain (fewer if
    * some of those were uncounted already).
    */
   async function succeeded(prisma: PrismaClient, ticket: AdmissionTicket) {
-    if (!current(ticket)) return;
     await prisma.$executeRaw`
       UPDATE "LoginThrottle" SET
         "failures" = LEAST("failures", "admissions" - ${ticket.number}::bigint),
         "clearedThrough" = ${ticket.number}::bigint
       WHERE "slot" = ${ticket.slot}::integer
+        AND "generation" = ${ticket.generation}::bigint
         AND "admissions" >= ${ticket.number}::bigint
         AND "clearedThrough" < ${ticket.number}::bigint
     `;
@@ -205,10 +215,10 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
    * the next attempt, never admit one early.
    */
   async function unchecked(prisma: PrismaClient, ticket: AdmissionTicket) {
-    if (!current(ticket)) return;
     await prisma.$executeRaw`
       UPDATE "LoginThrottle" SET "failures" = "failures" - 1
       WHERE "slot" = ${ticket.slot}::integer
+        AND "generation" = ${ticket.generation}::bigint
         AND "admissions" >= ${ticket.number}::bigint
         AND "clearedThrough" < ${ticket.number}::bigint
         AND "failures" > 0
@@ -220,7 +230,8 @@ export function createLoginThrottle(policy: LoginBackoffPolicy) {
     await prisma.$executeRaw`
       DELETE FROM "LoginThrottle"
       WHERE "lastFailureAt" <= (clock_timestamp() AT TIME ZONE 'UTC') - ${resetSeconds}::integer * interval '1 second'
-        OR "slot" >= ${2 * slots}::integer
+        OR ("slot" >= ${slots}::integer AND "slot" < ${DEVICE_LANES}::integer)
+        OR "slot" >= ${DEVICE_LANES + slots}::integer
     `;
   }
 

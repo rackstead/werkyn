@@ -400,17 +400,58 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
 // Password-reset requests are answered before their work runs, so the
 // response takes the same time whether or not the address has an account:
 // looking the account up, replacing its link and waiting for the mail server
-// all happen afterwards. A request for an address whose earlier request is
-// still in progress adds nothing: that one sends the newest link. Nothing
-// else is refused here: how long work stays in progress depends on whether
-// the account exists (mail is sent only then), so a bound on work in
-// progress would be an account oracle and would drop other users' requests
-// behind a shared proxy address. The route's per-client request limit
-// bounds the work instead. Work in progress is drained when the server
-// closes (drainPasswordResetRequests); it is not durable.
+// all happen afterwards. How long work stays in progress depends on whether
+// the account exists (mail is sent only then), so no admission rule may
+// depend on work in progress: that would be an account oracle and would
+// drop other users' requests behind a shared proxy address. Instead each
+// process starts at most RESET_REQUEST_BUDGET requests per minute, counted
+// by request alone, before any lookup; past it every request, for any
+// address, is answered 429 with Retry-After. With the mail transport's own
+// timeouts, that bounds the work in progress. A request for an address
+// whose earlier request is still in progress adds nothing (it still counts
+// toward the budget): that one sends the newest link. Work in progress is
+// drained when the server closes (drainPasswordResetRequests); it is not
+// durable.
+const RESET_REQUEST_BUDGET = 600;
+const RESET_REQUEST_WINDOW_MS = 60_000;
 const pendingResetRequests = new Map<string, Promise<void>>();
+let resetWindowStart = 0;
+let resetWindowCount = 0;
+let resetWindowRefused = 0;
+
+/** Seconds until a request can be started, or 0 after counting this one. */
+function resetRequestWait(now: number): number {
+  if (now - resetWindowStart >= RESET_REQUEST_WINDOW_MS) {
+    if (resetWindowRefused > 0)
+      logger.warn(
+        { event: "password_reset_budget_exhausted", refused: resetWindowRefused },
+        "Password reset requests were refused: more than the per-minute budget arrived",
+      );
+    resetWindowStart = now;
+    resetWindowCount = 0;
+    resetWindowRefused = 0;
+  }
+  if (resetWindowCount >= RESET_REQUEST_BUDGET) {
+    resetWindowRefused++;
+    return Math.max(1, Math.ceil((resetWindowStart + RESET_REQUEST_WINDOW_MS - now) / 1000));
+  }
+  resetWindowCount++;
+  return 0;
+}
 
 export function requestPasswordReset(prisma: PrismaClient, email: string) {
+  const wait = resetRequestWait(Date.now());
+  if (wait > 0) {
+    if (resetWindowRefused === 1)
+      logger.warn(
+        { event: "password_reset_budget_exhausted" },
+        "Too many password reset requests this minute; refusing until the next",
+      );
+    throw new TooManyRequestsError(
+      `Too many password reset requests right now. Try again in ${wait} ${wait === 1 ? "second" : "seconds"}.`,
+      wait,
+    );
+  }
   const address = email.toLowerCase();
   if (pendingResetRequests.has(address)) return;
   const work: Promise<void> = forgotPassword(prisma, address)

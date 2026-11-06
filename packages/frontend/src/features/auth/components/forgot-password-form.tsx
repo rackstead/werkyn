@@ -6,9 +6,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Link } from "@tanstack/react-router";
+import { ApiError } from "@/lib/api-client";
+import { retryWait, useRetryCountdown } from "../hooks/use-retry-countdown";
 
 export function ForgotPasswordForm() {
   const forgotPassword = useForgotPassword();
+  // A 429 (route limit or the server's reset budget) carries Retry-After.
+  const wait = useRetryCountdown(forgotPassword.error);
+  const timedRefusal = retryWait(forgotPassword.error) > 0;
   const {
     register,
     handleSubmit,
@@ -19,6 +24,7 @@ export function ForgotPasswordForm() {
   });
 
   const onSubmit = handleSubmit((data) => {
+    if (wait > 0) return;
     forgotPassword.mutate(data);
   });
 
@@ -52,10 +58,24 @@ export function ForgotPasswordForm() {
         )}
       </div>
 
+      {forgotPassword.isError && wait > 0 && (
+        <p className="text-sm text-destructive">
+          Too many requests. Try again in {wait}{" "}
+          {wait === 1 ? "second" : "seconds"}.
+        </p>
+      )}
+      {forgotPassword.isError && !timedRefusal && (
+        <p className="text-sm text-destructive">
+          {forgotPassword.error instanceof ApiError
+            ? forgotPassword.error.message
+            : "The reset link could not be requested. Try again."}
+        </p>
+      )}
+
       <Button
         type="submit"
         className="w-full"
-        disabled={forgotPassword.isPending}
+        disabled={forgotPassword.isPending || wait > 0}
       >
         {forgotPassword.isPending ? "Sending..." : "Send reset link"}
       </Button>

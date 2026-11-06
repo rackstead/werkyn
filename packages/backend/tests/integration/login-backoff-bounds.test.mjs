@@ -23,7 +23,7 @@ Object.assign(process.env, {
 });
 
 const { buildApp } = await import("../../src/app.ts");
-const { createLoginThrottle, loginThrottle, loginSlot } = await import(
+const { createLoginThrottle, loginThrottle, loginSlot, DEVICE_LANES } = await import(
   "../../src/modules/auth/login-throttle.ts"
 );
 const { cleanupExpiredTokensAndAttempts } = await import(
@@ -121,13 +121,15 @@ test("cleanup removes forgotten rows and rows outside the address and device ran
   await app.prisma.loginThrottle.deleteMany();
   const recent = loginSlot(`recent-${suffix}@example.test`, SLOTS);
   const forgotten = (recent + 1) % SLOTS;
-  const device = SLOTS + 10;
+  const device = DEVICE_LANES + 10;
+  // Rows left by a larger LOGIN_BACKOFF_SLOTS setting, in either range.
   await app.prisma.$executeRaw`
     INSERT INTO "LoginThrottle" ("slot", "failures", "lastFailureAt") VALUES
       (${recent}::integer, 7, (clock_timestamp() AT TIME ZONE 'UTC') - interval '59 minutes'),
       (${forgotten}::integer, 7, (clock_timestamp() AT TIME ZONE 'UTC') - interval '61 minutes'),
       (${device}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC'),
-      (${2 * SLOTS + 10}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC')
+      (${SLOTS + 10}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC'),
+      (${DEVICE_LANES + SLOTS + 10}::integer, 1, clock_timestamp() AT TIME ZONE 'UTC')
   `;
   await cleanupExpiredTokensAndAttempts(app.prisma);
   const left = await app.prisma.loginThrottle.findMany({
@@ -135,4 +137,46 @@ test("cleanup removes forgotten rows and rows outside the address and device ran
     orderBy: { slot: "asc" },
   });
   assert.deepEqual(left.map((r) => r.slot), [recent, device]);
+});
+
+test("each process starts at most 600 reset requests a minute, refusing any address alike past that", async () => {
+  const { settlePasswordResetRequests } = await import(
+    "../../src/modules/auth/auth.service.ts"
+  );
+  const forgot = async (email) => {
+    address++;
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/forgot-password",
+      payload: { email },
+      remoteAddress: `10.98.${(address >> 8) & 255}.${address & 255}`,
+    });
+    return { status: response.statusCode, retryAfter: response.headers["retry-after"], body: response.json() };
+  };
+  const owner = await app.prisma.user.create({
+    data: { email: `budget-${suffix}@example.test`, displayName: "budget", emailVerified: true },
+  });
+  try {
+    const statuses = new Map();
+    for (let i = 0; i < 600; i++) {
+      const { status } = await forgot(`budget-${suffix}-${i}@unknown.example.test`);
+      statuses.set(status, (statuses.get(status) ?? 0) + 1);
+    }
+    // Earlier tests in this process did not request resets, so all 600 start.
+    assert.deepEqual([...statuses], [[200, 600]]);
+    const unknown = await forgot(`budget-${suffix}-over@unknown.example.test`);
+    const existing = await forgot(owner.email);
+    assert.equal(unknown.status, 429);
+    assert.ok(Number(unknown.retryAfter) >= 1 && Number(unknown.retryAfter) <= 60);
+    // The refusal does not depend on whether the address has an account.
+    assert.deepEqual({ ...existing, retryAfter: undefined }, { ...unknown, retryAfter: undefined });
+    assert.match(existing.body.message, /^Too many password reset requests right now\. Try again in \d+ seconds?\.$/);
+    await settlePasswordResetRequests();
+    assert.equal(
+      await app.prisma.passwordResetToken.count({ where: { userId: owner.id } }),
+      0,
+    );
+  } finally {
+    await app.prisma.user.delete({ where: { id: owner.id } });
+  }
 });

@@ -56,7 +56,8 @@ function DateFilterInput({
       value={local}
       onChange={(e) => {
         setLocal(e.target.value);
-        const date = committedDate(e.target.value);
+        // A half-typed part also reads as "" but is not a cleared filter.
+        const date = committedDate(e.target.value, e.currentTarget);
         if (date !== undefined) onChange(date ?? undefined);
       }}
       className="h-8 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus:ring-1 focus:ring-ring"

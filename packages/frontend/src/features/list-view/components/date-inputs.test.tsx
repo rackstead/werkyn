@@ -49,6 +49,21 @@ it("the inline due date still clears the date", () => {
   expect(onUpdateTask.mock.calls).toEqual([["t2", { dueDate: null }]]);
 });
 
+it("the inline due date does not clear the date when a part is half typed", () => {
+  // Typing over a date: the first digit of the month leaves the input "" with
+  // bad input, which is not a cleared date.
+  const onUpdateTask = vi.fn();
+  const task = { id: "t3", dueDate: "2026-11-20", status: { isCompletion: false } } as unknown as Task;
+  const { container } = render(<InlineDueDateCell task={task} onUpdateTask={onUpdateTask} />);
+  fireEvent.click(screen.getByRole("button"));
+  const input = container.querySelector('input[type="date"]') as HTMLInputElement;
+  expect(document.activeElement).toBe(input);
+  Object.defineProperty(input, "validity", { configurable: true, get: () => ({ badInput: true }) });
+  fireEvent.change(input, { target: { value: "" } });
+  expect(onUpdateTask).not.toHaveBeenCalled();
+  expect(container.querySelector('input[type="date"]')).toBe(input);
+});
+
 it("the bulk due date applies only a complete date", () => {
   const { container } = render(
     <BulkActions projectId="p" selectedTaskIds={["a", "b"]} onClear={() => {}} />,
@@ -57,4 +72,21 @@ it("the bulk due date applies only a complete date", () => {
   for (const value of TYPING_2027) fireEvent.change(input, { target: { value } });
   expect(mutate).toHaveBeenCalledTimes(1);
   expect(mutate.mock.calls[0][0]).toEqual({ taskIds: ["a", "b"], dueDate: "2027-03-15" });
+});
+
+it("the bulk due date applies a typed date once, on Enter, not the dates on the way", () => {
+  const { container } = render(
+    <BulkActions projectId="p" selectedTaskIds={["a", "b"]} onClear={() => {}} />,
+  );
+  const input = container.querySelector('input[type="date"]') as HTMLInputElement;
+  input.focus();
+  // Year first: the day's first digit already makes a complete date.
+  for (const [key, value] of [["2", ""], ["0", ""], ["2", ""], ["7", ""], ["ArrowRight", ""], ["0", ""], ["3", ""], ["1", "2027-03-01"], ["5", "2027-03-15"]]) {
+    fireEvent.keyDown(input, { key });
+    fireEvent.change(input, { target: { value } });
+    fireEvent.keyUp(input, { key });
+  }
+  expect(mutate).not.toHaveBeenCalled();
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(mutate.mock.calls.map((call) => call[0])).toEqual([{ taskIds: ["a", "b"], dueDate: "2027-03-15" }]);
 });

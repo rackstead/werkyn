@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { committedDate } from "@/lib/date-input";
+import { DateInput } from "@/components/shared/date-input";
 import { useBulkUpdateTasks, useBulkDeleteTasks } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels } from "@/features/projects/api";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -148,14 +148,15 @@ export function BulkActions({
 
         {/* Set Due Date */}
         <div className="flex items-center gap-1">
-          <input
-            type="date"
-            onChange={(e) => {
-              // Only a complete date is applied, not a year still being typed.
-              const dueDate = committedDate(e.target.value);
+          {/* Applies a complete typed date on Enter or blur, or a picked
+              date; emptying it does nothing (Clear does that). */}
+          <DateInput
+            value={null}
+            onCommit={(dueDate) => {
               if (dueDate) handleUpdate({ dueDate });
             }}
             disabled={bulkUpdate.isPending}
+            aria-label="Set due date"
             className="h-8 rounded-md border border-input bg-transparent px-2 text-sm"
           />
           <button

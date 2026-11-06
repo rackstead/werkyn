@@ -15,7 +15,7 @@
 // TASK_LIST_RUNS   measured runs, each in a fresh browser context (default 3)
 // TASK_LIST_STEPS  smoke steps to run, comma-separated (aria, scroll,
 //                  keyboard, selection, edit, realtime, collapse, anchor,
-//                  edges, board);
+//                  edges, bulk, board);
 //                  all by default
 // TASK_LIST_REPORT path for the JSON report
 // TASK_LIST_SCREENSHOTS directory for screenshots taken during the smoke
@@ -1444,8 +1444,146 @@ async function smoke({ browser, origin, fixture, prisma }) {
       assert.deepEqual(result.clickAtEnd.checked, [target.title], "click at the end hit its task");
       pass("edges: a moved top row, content above the table, the end of the List", result);
     }
+    if (want("bulk")) {
+      // 10. A bulk move of the top block of rows in view (more than half of
+      // them, the partly visible top row included) to the last group: the
+      // rows that stayed keep their place and a click where the pointer
+      // rests hits its task. First by a colleague, then by the user's own
+      // bulk status change. (With every row rendered, the user's own bulk
+      // change lets the rows that stayed slide up into the space instead;
+      // recorded, not asserted, there.)
+      const [, , review, done] = fixture.statuses;
+      const windowed = await page.evaluate(() => document.querySelector("table").hasAttribute("aria-rowcount"));
+      const result = {};
+      const reviewTasks = async () =>
+        prisma.task.findMany({
+          where: { projectId: fixture.project.id, statusId: review.id },
+          orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+          select: { id: true, title: true },
+        });
+      const into = async (task, below) => {
+        await page.evaluate(() => {
+          document.querySelector("main").scrollTop = 0;
+          document.querySelector("table").parentElement.scrollLeft = 0;
+        });
+        await frames(page, 3);
+        const found = await page.evaluate((title) => {
+          const row = [...document.querySelector("table").tBodies[0].rows].find((r) => r.cells[1]?.textContent === title);
+          row?.scrollIntoView({ block: "start" });
+          return !!row;
+        }, task.title);
+        if (!found) await scrollToRow(page, (await expectedIndex(task.id)) + 2);
+        await frames(page, 4);
+        // Put the first row in view `below` px into the view (negative: partly
+        // scrolled out).
+        await page.evaluate((below) => {
+          const main = document.querySelector("main");
+          const view = main.getBoundingClientRect();
+          const first = [...document.querySelector("table").tBodies[0].rows].find(
+            (r) => r.cells.length > 1 && r.getBoundingClientRect().bottom > view.top + 1,
+          );
+          main.scrollTop += first.getBoundingClientRect().top - view.top - below;
+        }, below);
+        await frames(page, 6);
+      };
+      const checkedTitles = () =>
+        page.evaluate(() =>
+          [...document.querySelector("table").tBodies[0].rows]
+            .filter((r) => r.cells[0]?.querySelector("input")?.checked)
+            .map((r) => r.cells[1].textContent),
+        );
+      const settleOn = async (title, label) => {
+        const task = await taskByTitle(title);
+        const index = await expectedIndex(task.id);
+        await waitFor(async () => (await rowAt(title))?.index === index, label);
+        await frames(page, 6);
+      };
+      const pointAt = async (title) => {
+        const box = await page.evaluate((title) => {
+          const row = [...document.querySelector("table").tBodies[0].rows].find((r) => r.cells[1]?.textContent === title);
+          const b = row.cells[0].querySelector("input").getBoundingClientRect();
+          return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+        }, title);
+        await page.mouse.move(box.x, box.y);
+      };
+      const clickAtPointer = async () => {
+        await page.mouse.down();
+        await page.mouse.up();
+        await frames(page, 3);
+        const checked = await checkedTitles();
+        await page.getByTitle("Clear selection").click().catch(() => {});
+        await frames(page, 3);
+        return checked;
+      };
+      const shiftOf = async (row) => {
+        const now = await rowAt(row.title);
+        return now ? Math.round((now.top - row.top) * 100) / 100 : null;
+      };
+
+      // A colleague's bulk change.
+      let tasks = await reviewTasks();
+      await into(tasks[Math.floor(tasks.length / 3)], -17);
+      let view = await rowsInView();
+      let count = Math.min(14, view.length - 4);
+      let moving = view.slice(0, count);
+      let stay = view[count + 2];
+      let firstStaying = view[count];
+      await pointAt(stay.title);
+      const ids = [];
+      for (const row of moving) ids.push((await taskByTitle(row.title)).id);
+      await api("POST", `/projects/${fixture.project.id}/tasks/bulk-update`, { taskIds: ids, statusId: done.id });
+      await settleOn(stay.title, "colleague's bulk change");
+      result.colleague = {
+        moved: count,
+        rowsInView: view.length,
+        firstStaying: await shiftOf(firstStaying),
+        stay: await shiftOf(stay),
+        clickTarget: stay.title,
+        checked: await clickAtPointer(),
+      };
+
+      // The user's own bulk change, first row aligned with the top of the view.
+      tasks = await reviewTasks();
+      await into(tasks[Math.floor(tasks.length / 2)], 0);
+      view = await rowsInView();
+      count = Math.min(14, view.length - 4);
+      moving = view.slice(0, count);
+      stay = view[count + 2];
+      firstStaying = view[count];
+      for (const row of moving) {
+        await pointAt(row.title);
+        await page.mouse.down();
+        await page.mouse.up();
+        await frames(page, 2);
+      }
+      assert.equal((await checkedTitles()).length, count, "rows selected for the bulk change");
+      const bulk = page.waitForResponse((r) => r.url().includes("/tasks/bulk-update"));
+      await page.locator("select").filter({ hasText: "Change status" }).selectOption(done.id);
+      assert.equal((await bulk).status(), 200);
+      await settleOn(stay.title, "own bulk change");
+      result.own = {
+        moved: count,
+        rowsInView: view.length,
+        firstStaying: await shiftOf(firstStaying),
+        stay: await shiftOf(stay),
+      };
+      await pointAt(stay.title);
+      result.own.clickTarget = stay.title;
+      result.own.checked = await clickAtPointer();
+
+      log("bulk", JSON.stringify(result));
+      assert(Math.abs(result.colleague.stay) <= 1, "rows that stayed keep their place (colleague)");
+      assert(Math.abs(result.colleague.firstStaying) <= 1, "first row that stayed keeps its place (colleague)");
+      assert.deepEqual(result.colleague.checked, [result.colleague.clickTarget], "click after a colleague's bulk change");
+      if (windowed) {
+        assert(Math.abs(result.own.stay) <= 1, "rows that stayed keep their place (own bulk change)");
+        assert(Math.abs(result.own.firstStaying) <= 1, "first row that stayed keeps its place (own bulk change)");
+      }
+      assert.deepEqual(result.own.checked, [result.own.clickTarget], "click after the user's own bulk change");
+      pass("bulk move of the top block of rows in view", result);
+    }
     if (want("board")) {
-      // 10. The List has no drag-and-drop; the Board of the same project (not
+      // 11. The List has no drag-and-drop; the Board of the same project (not
       // windowed, unchanged here) still reorders by drag at this size.
       const opened = Date.now();
       await page.locator(`a[href$="/projects/${fixture.project.id}/board"]`).first().click();

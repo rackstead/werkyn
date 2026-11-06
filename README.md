@@ -75,7 +75,7 @@ disk at that path instead. Before upgrading an installation whose storage may ho
 links, list them in the running (older) container, which does not change anything:
 
 ```bash
-docker compose exec werkyn find /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
+docker compose exec werkyn find -H /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
 ```
 
 Replace each with what it points to. From this version on, the read-only

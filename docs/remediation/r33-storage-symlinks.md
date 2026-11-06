@@ -202,12 +202,13 @@ change. Look for links before upgrading.
 does not have the report script:
 
 ```bash
-docker compose exec werkyn find /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
+docker compose exec werkyn find -H /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
 ```
 
-`find` does not follow links by default. This lists every link (with its
-target), FIFO, socket and device below the storage folder. It also works
-outside Docker against the storage folder.
+`-H` follows the storage folder itself if it is a link (a supported setup),
+and no link below it. This lists every link (with its target), FIFO, socket
+and device below the storage folder. It also works outside Docker against
+the storage folder.
 
 **With this version,** use the read-only report. Run it in the upgraded
 container, or, to check before the upgraded server starts, in a one-off

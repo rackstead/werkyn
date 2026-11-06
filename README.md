@@ -502,8 +502,8 @@ and bound to that email address. Later sign-ins from that browser for that addre
 use the browser's own failure count, with the same waits, instead of the address's
 shared one. Someone who keeps sending wrong passwords for the address therefore
 cannot hold off a browser that has signed in before. The cookie grants no access by
-itself: the password is still checked. Signing out keeps it; clearing the
-browser's cookies or rotating `COOKIE_SECRET` removes it.
+itself: the password is still checked. Signing out keeps it. A password change
+or reset, clearing the browser's cookies, or rotating `COOKIE_SECRET` ends it.
 
 **What an attacker can still do.** Waits are first come, first served when they
 end. Someone who sends a wrong password for an address each time its wait ends
@@ -519,9 +519,13 @@ Email addresses with and without an account are counted and answered alike when 
 people's addresses. Unknown addresses and accounts without a password (SSO only)
 do the same Argon2id work as a wrong password. Password-reset requests are
 answered before the account lookup or mail delivery runs. So neither answers nor
-timing tell whether an account exists. Each server process starts at most 600
-reset requests a minute, counted by request alone. Past that, every reset request
-is answered `429` with `Retry-After` until the minute ends. The count table has a fixed maximum size
+timing tell whether an account exists. An account gets at most one new reset link
+per `PASSWORD_RESET_COOLDOWN_SECONDS`. Further requests get the same answer and add
+nothing. As a memory guard, each server process starts at most
+`PASSWORD_RESET_REQUESTS_PER_MINUTE` reset requests, counted by request alone;
+past that, every reset request is answered `429` with `Retry-After` until the minute
+ends. At the default of 6,000, reaching it takes about 600 client IP addresses at
+the route limit. The count table has a fixed maximum size
 and stores no addresses, so requests for many made-up addresses cannot grow it
 without limit. See
 [docs/remediation/r31-login-backoff.md](docs/remediation/r31-login-backoff.md).
@@ -536,6 +540,8 @@ default:
 | `LOGIN_BACKOFF_MAX_SECONDS` | `60` | 1–900 | Longest wait (at least the base) |
 | `LOGIN_BACKOFF_RESET_SECONDS` | `3600` | 60–604800 | Quiet time after which failures are forgotten (at least the longest wait) |
 | `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Rows for email addresses; trusted browsers use as many again |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | `60` | 0–86400 | Shortest time between two reset links for one account (0: no cooldown) |
+| `PASSWORD_RESET_REQUESTS_PER_MINUTE` | `6000` | 60–1000000 | Reset requests one server process starts per minute before answering `429` |
 
 With Docker Compose, add them under the `werkyn` service's `environment`, for
 example `LOGIN_BACKOFF_MAX_SECONDS: 30`. The table holds at most twice

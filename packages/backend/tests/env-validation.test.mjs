@@ -249,3 +249,19 @@ test("login backoff settings have safe defaults, bounded ranges and a consistent
     /must not exceed LOGIN_BACKOFF_RESET_SECONDS/,
   );
 });
+
+test("password-reset cooldown and per-process ceiling have safe defaults and bounded ranges", () => {
+  const { data } = accepts({});
+  assert.equal(data.PASSWORD_RESET_COOLDOWN_SECONDS, 60);
+  assert.equal(data.PASSWORD_RESET_REQUESTS_PER_MINUTE, 6000);
+  const blank = accepts({
+    PASSWORD_RESET_COOLDOWN_SECONDS: "",
+    PASSWORD_RESET_REQUESTS_PER_MINUTE: " ",
+  }).data;
+  assert.equal(blank.PASSWORD_RESET_REQUESTS_PER_MINUTE, 6000);
+  assert.equal(accepts({ PASSWORD_RESET_COOLDOWN_SECONDS: "0" }).data.PASSWORD_RESET_COOLDOWN_SECONDS, 0);
+  for (const value of ["-1", "86401", "1.5", "soon"])
+    rejects({ PASSWORD_RESET_COOLDOWN_SECONDS: value }, "PASSWORD_RESET_COOLDOWN_SECONDS", /whole number/);
+  for (const value of ["59", "1000001", "lots"])
+    rejects({ PASSWORD_RESET_REQUESTS_PER_MINUTE: value }, "PASSWORD_RESET_REQUESTS_PER_MINUTE", /whole number/);
+});

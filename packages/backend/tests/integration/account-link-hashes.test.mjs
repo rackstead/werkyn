@@ -22,6 +22,9 @@ process.env.SMTP_FROM = "fixture@example.test";
 process.env.SMTP_USER = "";
 process.env.SMTP_PASS = "";
 process.env.SMTP_SECURE = "false";
+// These tests replace an account's link several times in a row; the
+// per-account reset cooldown is covered in login-backoff.test.mjs.
+process.env.PASSWORD_RESET_COOLDOWN_SECONDS = "0";
 const { buildApp } = await import("../../src/app.ts");
 const { hashPassword, verifyPassword } =
   await import("../../src/utils/passwords.ts");

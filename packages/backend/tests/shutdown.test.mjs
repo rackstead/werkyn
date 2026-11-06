@@ -133,20 +133,24 @@ test("a duplicate signal does not change a clean exit", async () => {
 test("each step learns the time left before the overall deadline", async () => {
   const { log, exits, exit } = recorder();
   const seen = [];
+  // A clock the steps advance, so the expected times are exact.
+  let clock = 50_000;
   const shutdown = createShutdownHandler({
     log,
     exit,
     timeoutMs: 1000,
+    now: () => clock,
     steps: [
-      { name: "slow", run: (left) => { seen.push(left); return new Promise((resolve) => setTimeout(resolve, 120)); } },
-      { name: "budgeted", run: (left) => seen.push(left), timeoutMs: 300 },
+      { name: "slow", run: (left) => { seen.push(left); clock += 120; } },
+      { name: "budgeted", run: (left) => { seen.push(left); clock += 30; }, timeoutMs: 300 },
       { name: "http", run: (left) => seen.push(left) },
+      { name: "late", run: (left) => { seen.push(left); clock += 5_000; } },
+      { name: "after the deadline", run: (left) => seen.push(left) },
     ],
   });
   await shutdown("SIGTERM");
   assert.deepEqual(exits, [0]);
-  assert.ok(seen[0] > 900 && seen[0] <= 1000, `${seen[0]}`);
-  // A step with its own budget gets the smaller of the two.
-  assert.equal(seen[1], 300);
-  assert.ok(seen[2] > 700 && seen[2] <= 880, `${seen[2]}`);
+  // A step with its own budget gets the smaller of the two; time past the
+  // deadline is reported as none left.
+  assert.deepEqual(seen, [1000, 300, 850, 850, 0]);
 });

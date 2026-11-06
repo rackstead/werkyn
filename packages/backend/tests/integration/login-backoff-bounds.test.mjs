@@ -20,6 +20,8 @@ Object.assign(process.env, {
   JWT_SECRET: "login-backoff-bounds-jwt-secret",
   COOKIE_SECRET: "login-backoff-bounds-cookie-secret",
   LOGIN_BACKOFF_SLOTS: String(SLOTS),
+  // The smallest reset ceiling, so the test reaches it quickly.
+  PASSWORD_RESET_REQUESTS_PER_MINUTE: "60",
 });
 
 const { buildApp } = await import("../../src/app.ts");
@@ -139,7 +141,7 @@ test("cleanup removes forgotten rows and rows outside the address and device ran
   assert.deepEqual(left.map((r) => r.slot), [recent, device]);
 });
 
-test("each process starts at most 600 reset requests a minute, refusing any address alike past that", async () => {
+test("past the per-process reset ceiling, any address is refused alike", async () => {
   const { settlePasswordResetRequests } = await import(
     "../../src/modules/auth/auth.service.ts"
   );
@@ -158,12 +160,12 @@ test("each process starts at most 600 reset requests a minute, refusing any addr
   });
   try {
     const statuses = new Map();
-    for (let i = 0; i < 600; i++) {
+    for (let i = 0; i < 60; i++) {
       const { status } = await forgot(`budget-${suffix}-${i}@unknown.example.test`);
       statuses.set(status, (statuses.get(status) ?? 0) + 1);
     }
-    // Earlier tests in this process did not request resets, so all 600 start.
-    assert.deepEqual([...statuses], [[200, 600]]);
+    // Earlier tests in this process did not request resets, so all 60 start.
+    assert.deepEqual([...statuses], [[200, 60]]);
     const unknown = await forgot(`budget-${suffix}-over@unknown.example.test`);
     const existing = await forgot(owner.email);
     assert.equal(unknown.status, 429);

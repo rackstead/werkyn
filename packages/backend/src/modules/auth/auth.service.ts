@@ -3,9 +3,14 @@ import type { WorkspaceAdmissionResult } from "@pm/shared";
 import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { admitWithInvite } from "../invites/admission.service.js";
 import { logger } from "../../utils/logger.js";
+import { env } from "../../config/env.js";
 import { hashPassword, verifyLoginPassword } from "../../utils/passwords.js";
 import { loginThrottle } from "./login-throttle.js";
-import { deviceCookieAfterSignIn, trustedDevice } from "./login-device.js";
+import {
+  credentialMatches,
+  deviceCookieAfterSignIn,
+  deviceToken,
+} from "./login-device.js";
 import {
   signAccessToken,
   generateSecureToken,
@@ -254,9 +259,26 @@ export async function login(
   // neither the refusal nor its Retry-After tells whether an account exists.
   // A browser holding a valid token for this address (it signed in to it
   // before; only an account's password can mint one) is counted in its own
-  // lane, so failures others send for the address do not hold it off.
+  // lane, so failures others send for the address do not hold it off. The
+  // token must also have been minted under the account's current password:
+  // a password change or reset ends every token. That lookup runs only for a
+  // token minted for this very address, which no one probing other people's
+  // addresses can present.
   const throttle = loginThrottle();
-  const device = trustedDevice(deviceCookie, email);
+  const token = deviceToken(deviceCookie, email);
+  const device =
+    token &&
+    credentialMatches(
+      token,
+      (
+        await prisma.user.findUnique({
+          where: { email },
+          select: { passwordHash: true },
+        })
+      )?.passwordHash,
+    )
+      ? token.id
+      : null;
   const addressMark = device ? await throttle.addressMark(prisma, email) : null;
   const admission = device
     ? await throttle.admitDevice(prisma, device)
@@ -327,7 +349,9 @@ export async function login(
     accessToken,
     refreshToken,
     workspaces,
-    deviceCookie: deviceCookieAfterSignIn(deviceCookie, email),
+    // Bound to the hash this sign-in was checked and committed against (a
+    // successful check means the account has one).
+    deviceCookie: deviceCookieAfterSignIn(deviceCookie, email, user.passwordHash!),
   };
 }
 
@@ -403,16 +427,19 @@ export async function logout(prisma: PrismaClient, rawToken: string) {
 // all happen afterwards. How long work stays in progress depends on whether
 // the account exists (mail is sent only then), so no admission rule may
 // depend on work in progress: that would be an account oracle and would
-// drop other users' requests behind a shared proxy address. Instead each
-// process starts at most RESET_REQUEST_BUDGET requests per minute, counted
-// by request alone, before any lookup; past it every request, for any
-// address, is answered 429 with Retry-After. With the mail transport's own
-// timeouts, that bounds the work in progress. A request for an address
-// whose earlier request is still in progress adds nothing (it still counts
-// toward the budget): that one sends the newest link. Work in progress is
-// drained when the server closes (drainPasswordResetRequests); it is not
+// drop other users' requests behind a shared proxy address.
+//
+// Work is bounded per address instead, after the answer: a request for an
+// address whose earlier request is still in progress adds nothing (that one
+// sends the newest link), and an account gets at most one new link per
+// PASSWORD_RESET_COOLDOWN_SECONDS (forgotPassword). Work for an address
+// without an account ends after one lookup. As a memory guard only, each
+// process starts at most PASSWORD_RESET_REQUESTS_PER_MINUTE requests,
+// counted by request alone before any lookup; past it every request, for
+// any address, is answered 429 with Retry-After. The default (6,000) takes
+// about 600 client addresses at the route limit to reach. Work in progress
+// is drained when the server closes (drainPasswordResetRequests); it is not
 // durable.
-const RESET_REQUEST_BUDGET = 600;
 const RESET_REQUEST_WINDOW_MS = 60_000;
 const pendingResetRequests = new Map<string, Promise<void>>();
 let resetWindowStart = 0;
@@ -425,13 +452,13 @@ function resetRequestWait(now: number): number {
     if (resetWindowRefused > 0)
       logger.warn(
         { event: "password_reset_budget_exhausted", refused: resetWindowRefused },
-        "Password reset requests were refused: more than the per-minute budget arrived",
+        "Password reset requests were refused: more than the per-minute ceiling arrived",
       );
     resetWindowStart = now;
     resetWindowCount = 0;
     resetWindowRefused = 0;
   }
-  if (resetWindowCount >= RESET_REQUEST_BUDGET) {
+  if (resetWindowCount >= env.PASSWORD_RESET_REQUESTS_PER_MINUTE) {
     resetWindowRefused++;
     return Math.max(1, Math.ceil((resetWindowStart + RESET_REQUEST_WINDOW_MS - now) / 1000));
   }
@@ -518,6 +545,21 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   if (!user) {
     // Always return success to prevent email enumeration
     return;
+  }
+
+  // At most one new link per account per cooldown: a link made moments ago
+  // is still the newest. The requester was already answered alike.
+  if (env.PASSWORD_RESET_COOLDOWN_SECONDS > 0) {
+    const recent = await prisma.passwordResetToken.findFirst({
+      where: {
+        userId: user.id,
+        createdAt: {
+          gt: new Date(Date.now() - env.PASSWORD_RESET_COOLDOWN_SECONDS * 1000),
+        },
+      },
+      select: { id: true },
+    });
+    if (recent) return;
   }
 
   // Invalidate existing reset tokens

@@ -124,8 +124,16 @@ following OWASP's "device cookies" (`login-device.ts`):
   goes through the shared, account-independent path, whatever browsers
   elsewhere hold. A token for one's own address is ignored for any other
   address.
+- Each token also carries a keyed tag of the account's stored password hash.
+  A password change or reset writes a new hash, so it ends every token for the
+  account; a re-registered address gets a new account and hash. Because the
+  tag can only be checked against the account, sign-in looks the account's
+  hash up first. It does so only when the cookie holds a token whose HMAC is
+  valid for the submitted address, which only a sign-in to that address can
+  produce.
 - Signing out keeps the cookie, by design. Clearing the browser's cookies, its
-  expiry, or rotating `COOKIE_SECRET` removes the trust.
+  expiry, a password change or reset, or rotating `COOKIE_SECRET` removes the
+  trust.
 
 **Remaining risk.** A browser without a valid token can still be held off by
 someone targeting that address. That covers a new device, a cleared or private
@@ -215,24 +223,47 @@ should raise `LOGIN_BACKOFF_SLOTS`.
   account up. Replacing the reset link and sending the mail run afterwards
   (`requestPasswordReset` in `auth.service.ts`). A repeated request for an
   address whose earlier one is still running adds nothing, because the running
-  one sends the newest link. No other request is refused. Work for an
+  one sends the newest link. Work for an
   existing account lasts until its mail is sent, but work for an unknown
   address ends after one lookup. So any cap on work in progress would itself
   show which accounts exist, and behind a shared proxy address it would drop
   other users' links. An earlier revision capped work at 3 per client IP. The
   review measured that cap as an oracle: the prober's own link arrived 0/15
   times when the probed account existed and 15/15 when it did not. It also
-  dropped 2 of 5 users' links behind one IP. Instead, two limits bound the
-  work, and both count requests only, before any lookup:
-  - the route's limit of 10 a minute per client;
-  - a process-wide budget of 600 reset requests a minute.
+  dropped 2 of 5 users' links behind one IP.
 
-  Past the budget, every request, for any address, is answered `429` with
-  `Retry-After` and the same message. Exhausting the budget is logged
-  (`password_reset_budget_exhausted`). A request deduplicated against
-  pending work still counts toward the budget, so the refusal never depends
-  on pending work. With the mail transport's own timeouts, this bounds the
-  work in progress. The forgot-password form counts the wait down.
+  A later revision refused every request past 600 a minute per process. The
+  re-review measured that as a cheap total denial: about 60 client
+  addresses at the route limit left a real user 0 of 30 resets, against 30
+  of 30 on main. Work is now bounded per address, after the uniform answer:
+  - a request for an address whose earlier request is still running adds
+    nothing;
+  - an account gets at most one new link per `PASSWORD_RESET_COOLDOWN_SECONDS`
+    (default 60). A request within the cooldown is answered alike and makes
+    no token and no mail. Across processes the cooldown is best effort: two
+    requests checked at the same moment can both send a link.
+  - Work for an address without an account ends after one lookup.
+
+  The reviewer's flood probe ran against this design for 150 seconds: 65
+  client addresses per pool sent 1,950 requests for unknown addresses
+  (about 780 a minute), and a real user asked for a reset every 5 seconds.
+  All 1,950 flood requests and all 30 of the user's requests were answered
+  `200`. The user received a link at once, then one per cooldown (3 links).
+  With the cooldown set to 0, all 30 links arrived, as on main. The
+  reviewer's oracle probe still finds no difference: the prober's own link
+  arrived 15/15 times whether the probed account existed or not, and 10/10
+  with 50 ms mail.
+
+  So mail work is bounded by the number of accounts per cooldown, and other
+  work by the request rate. The route's limit of 10 a minute per client
+  still applies. Purely as a memory guard, each process starts at most
+  `PASSWORD_RESET_REQUESTS_PER_MINUTE` requests (default 6,000), counted by
+  request alone before any lookup. Past it, every request, for any address,
+  is answered `429` with `Retry-After` and the same message, and the first
+  refusal in each minute is logged (`password_reset_budget_exhausted`).
+  Reaching the default takes about 600 client addresses at the route limit.
+  That is more than the 480 or so that sign-in's two-job password-check
+  limit needs. The forgot-password form counts any `429` down.
 - When the server closes, it keeps the database open for reset work in
   progress until shortly before the shutdown deadline (8 seconds overall).
   Work still running then is logged (`password_reset_requests_abandoned`,
@@ -277,6 +308,8 @@ for unknown addresses.
 | `LOGIN_BACKOFF_MAX_SECONDS` | 60 | 1–900, at most the reset |
 | `LOGIN_BACKOFF_RESET_SECONDS` | 3600 | 60–604800 |
 | `LOGIN_BACKOFF_SLOTS` | 65536 | 256–16777216 |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | 60 | 0–86400 |
+| `PASSWORD_RESET_REQUESTS_PER_MINUTE` | 6000 | 60–1000000 |
 
 The server refuses to start with a value outside its range, or with the order
 base ≤ max ≤ reset broken. Each error names the variable and never repeats the
@@ -357,15 +390,19 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
     delivers it;
   - work still running at the drain deadline is logged with its count;
   - an outcome for a pruned row does not touch the row created after it, even
-    at the same admission number.
+    at the same admission number;
+  - a password change ends a browser's trust, and a token minted under the new
+    password is trusted;
+  - an account gets one reset link per cooldown: repeats within it are
+    answered alike and make nothing, and a link follows once it has passed.
 - `tests/integration/login-backoff-bounds.test.mjs` runs with 256 slots:
   - 600 unique unknown addresses through the sign-in route leave at most 256
     rows and only `401` or `429` answers;
   - 2,000 more addresses admitted directly still leave at most 256 rows;
   - cleanup removes rows past the quiet period and rows outside the address
     and device ranges;
-  - after 600 reset requests in a minute, the next one is refused `429`. The
-    refusal is identical for an existing and an unknown address, and the
+  - at the smallest ceiling (60 a minute), the next request is refused `429`.
+    The refusal is identical for an existing and an unknown address, and the
     refused request does no work.
 - `tests/argon2id-passwords.test.mjs` checks that sign-in without a usable
   hash is refused and uses the same native admission (`503` while two jobs
@@ -373,8 +410,9 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
   real one.
 - `tests/env-validation.test.mjs` covers defaults, ranges and ordering.
 - `tests/error-response-headers.test.mjs` covers `429` with `Retry-After`.
-- `tests/shutdown.test.mjs` checks that each shutdown step learns the time left
-  before the overall deadline. The reset drain uses it.
+- `tests/shutdown.test.mjs` checks, with an injected clock, that each shutdown
+  step learns the exact time left before the overall deadline. The reset drain
+  uses it.
 - In the frontend, `login-form.test.tsx` checks:
   - the countdown (3, 2, 1, then the form is usable again);
   - that nothing is sent during the wait;
@@ -418,11 +456,13 @@ After that upgrade, the recreated `LoginAttempt` is unused and can be dropped.
   address: the app does not trust proxy headers, so behind a reverse proxy it
   counts all users together, as before this change. Only the backoff is
   shared.
-- **Reset requests can be refused for everyone during a flood.** More than
-  600 reset requests a minute to one process (about 60 client addresses at
-  the route limit) are answered `429` until the minute ends, for every
-  address. That keeps the work bounded and reveals nothing about accounts. A
-  user caught by it sees the countdown and can ask again.
+- **Reset requests can be refused for everyone during a very large flood.**
+  More than `PASSWORD_RESET_REQUESTS_PER_MINUTE` (6,000) reset requests a
+  minute to one process are answered `429` until the minute ends, for every
+  address. That takes about 600 client addresses at the route limit. A user
+  caught by it sees the countdown and can ask again.
+- **One reset link per account per cooldown.** A user whose first mail was
+  lost waits up to `PASSWORD_RESET_COOLDOWN_SECONDS` (60 s) for another.
 - **Reset requests are not durable.** An answered request lives only in the
   process that answered it. It is lost if the process is killed, or if its
   mail is still being sent at the shutdown deadline; that case is logged. The

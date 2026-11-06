@@ -499,11 +499,12 @@ test("a device token counts only for its own address, unexpired and unaltered", 
   const { device } = await browserLogin(owner, PASSWORD);
   await holdAtCap(other);
   // Another address's token, an altered one and an expired one are ignored.
-  const minted = deviceCookieAfterSignIn(undefined, other);
+  const minted = deviceCookieAfterSignIn(undefined, other, passwordHash);
   const altered = minted.slice(0, -1) + (minted.endsWith("A") ? "B" : "A");
   const expired = deviceCookieAfterSignIn(
     undefined,
     other,
+    passwordHash,
     Date.now() - 31 * 24 * 60 * 60 * 1000,
   );
   for (const cookie of [device.value, altered, expired, "garbage"]) {
@@ -530,6 +531,24 @@ test("a device token counts only for its own address, unexpired and unaltered", 
   await holdAtCap(signedIn[5]);
   assert.equal((await browserLogin(signedIn[0], PASSWORD, cookie)).status, 200);
   assert.equal((await browserLogin(signedIn[5], PASSWORD, cookie)).status, 429);
+});
+
+test("a password change or reset ends the browser's trust", async () => {
+  const email = await account("real");
+  const { device } = await browserLogin(email, PASSWORD);
+  await holdAtCap(email);
+  assert.equal((await browserLogin(email, PASSWORD, device.value)).status, 200);
+  // The password changes (the change and reset routes write a new hash).
+  const changed = await hashPassword("Changed-password-456");
+  await app.prisma.user.update({ where: { email }, data: { passwordHash: changed } });
+  await holdAtCap(email);
+  const refused = await browserLogin(email, "Changed-password-456", device.value);
+  assert.equal(refused.status, 429);
+  assert.equal(refused.retryAfter, "60");
+  // A token minted under the new password is trusted again.
+  const renewed = deviceCookieAfterSignIn(device.value, email, changed);
+  assert.equal(renewed.split("~").length, 1, "the stale token for this address is replaced");
+  assert.equal((await browserLogin(email, "Changed-password-456", renewed)).status, 200);
 });
 
 test("without a device token, answers do not depend on whether some browser holds one for the address", async () => {
@@ -786,4 +805,43 @@ test("closing the server waits for reset work in progress, and logs work it aban
     [{ event: "password_reset_requests_abandoned", abandoned: 1 }],
   );
   setPasswordResetDrainDeadline(Date.now() + 5_000);
+});
+
+test("an account gets at most one new reset link per cooldown; further requests are answered alike and add nothing", async () => {
+  const email = await account("real");
+  const user = await app.prisma.user.findUniqueOrThrow({ where: { email } });
+  const unknown = await account("unknown");
+  const forgot = async (address) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/forgot-password",
+      payload: { email: address },
+      remoteAddress: nextAddress(),
+    });
+    await settlePasswordResetRequests();
+    return { status: response.statusCode, body: response.json() };
+  };
+  const sent = () => mail.filter((message) => message.to === email).length;
+  const first = await forgot(email);
+  assert.equal(sent(), 1);
+  // Within the cooldown (60 s by default) the same answer, and no new link.
+  const again = await forgot(email);
+  assert.deepEqual(again, first);
+  assert.deepEqual(await forgot(unknown), first);
+  assert.equal(sent(), 1);
+  assert.equal(
+    await app.prisma.passwordResetToken.count({ where: { userId: user.id } }),
+    1,
+  );
+  // Once the cooldown has passed, a new link replaces the old one.
+  await app.prisma.passwordResetToken.updateMany({
+    where: { userId: user.id },
+    data: { createdAt: new Date(Date.now() - 61_000) },
+  });
+  assert.deepEqual(await forgot(email), first);
+  assert.equal(sent(), 2);
+  assert.equal(
+    await app.prisma.passwordResetToken.count({ where: { userId: user.id, usedAt: null } }),
+    1,
+  );
 });

@@ -51,6 +51,8 @@ export interface ShutdownOptions {
    * forces exit.
    */
   forceAfterMs?: number;
+  /** The clock for the time left that steps are told (tests inject one). */
+  now?: () => number;
 }
 
 /**
@@ -64,6 +66,7 @@ export function createShutdownHandler({
   exit = (code) => process.exit(code),
   timeoutMs = 8000,
   forceAfterMs = 1000,
+  now = Date.now,
 }: ShutdownOptions) {
   let startedAt: number | undefined;
   let exited = false;
@@ -80,7 +83,7 @@ export function createShutdownHandler({
       finish(1);
       return;
     }
-    const started = Date.now();
+    const started = now();
     startedAt = started;
     log.info({ signal }, "Shutting down...");
 
@@ -98,7 +101,7 @@ export function createShutdownHandler({
     for (const step of steps) {
       current = step.name;
       try {
-        await runStep(step, Math.max(0, started + timeoutMs - Date.now()));
+        await runStep(step, Math.max(0, started + timeoutMs - now()));
       } catch (err) {
         failed = true;
         log.error({ err, step: step.name }, `Shutdown step failed: ${step.name}`);

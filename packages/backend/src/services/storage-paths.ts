@@ -1,5 +1,5 @@
 import fs, { type FileHandle } from "node:fs/promises";
-import { constants, type Stats } from "node:fs";
+import { constants, type Dir, type Stats } from "node:fs";
 import path from "node:path";
 import { ForbiddenError } from "../utils/errors.js";
 
@@ -114,6 +114,12 @@ class DirectoryChain {
     return this.proc ? `/proc/self/fd/${handle.fd}/${name}` : path.join(this.path, name);
   }
 
+  /** Whether the deepest directory still exists: a removed one has no links. */
+  async exists() {
+    const stat = await this.handles[this.handles.length - 1].stat().catch(() => undefined);
+    return (stat?.nlink ?? 0) > 0;
+  }
+
   async close() {
     await Promise.all(this.handles.map((handle) => handle.close().catch(() => {})));
   }
@@ -152,6 +158,8 @@ export interface StorageDirectory {
   /** How `name` in it is addressed (relative to its open descriptor where possible). */
   entry(name: string): string;
   list(): Promise<string[]>;
+  /** Whether the opened folder still exists (has not been removed since). */
+  exists(): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -396,6 +404,7 @@ export class StorageRoot {
       path: chain.path,
       entry: (name) => chain.entry(name),
       list: () => fs.readdir(chain.entry(".")),
+      exists: () => chain.exists(),
       close: () => chain.close(),
     };
   }
@@ -414,54 +423,81 @@ export interface StorageLinkFinding {
  * Walk the tree below `root` without following any link and report every
  * link and special file in it, up to `limit` findings (all are counted).
  * Read-only: it only lists directories, examines entries and reads links.
+ * Each folder is opened as StorageRoot opens one, without following a link
+ * and inside the folders above it, so a folder replaced by a link after it
+ * was listed is reported as a link, never entered.
  */
 export async function findStorageLinks(
   root: string,
-  { limit = 1000, onFinding }: { limit?: number; onFinding?: (finding: StorageLinkFinding) => void } = {},
+  {
+    limit = 1000,
+    onFinding,
+    procFd,
+  }: { limit?: number; onFinding?: (finding: StorageLinkFinding) => void; procFd?: boolean } = {},
 ): Promise<{ findings: StorageLinkFinding[]; total: number; directories: number; unreadable: string[] }> {
+  const storage = new StorageRoot(root, procFd === undefined ? {} : { procFd });
   const findings: StorageLinkFinding[] = [];
   const unreadable: string[] = [];
   let total = 0;
   let directories = 0;
+  const record = (finding: StorageLinkFinding) => {
+    total++;
+    onFinding?.(finding);
+    if (findings.length < limit) findings.push(finding);
+  };
   const pending = [""];
   while (pending.length > 0) {
     const relative = pending.pop()!;
-    const absolute = path.join(root, relative);
-    let directory;
+    let directory: StorageDirectory | undefined;
+    let listing: Dir;
     try {
-      directory = await fs.opendir(absolute);
-    } catch {
-      if (unreadable.length < limit) unreadable.push(relative || ".");
+      // The root itself may be a link or mount point and is opened normally.
+      if (relative) directory = await storage.openDirectory(relative);
+      listing = await fs.opendir(directory ? directory.entry(".") : root);
+    } catch (error) {
+      await directory?.close();
+      if (error instanceof StorageRefusedError) {
+        record({
+          path: relative,
+          kind: "symbolic-link",
+          target: await fs.readlink(path.join(root, relative)).catch(() => undefined),
+        });
+      } else if (unreadable.length < limit) {
+        unreadable.push(relative || ".");
+      }
       continue;
     }
-    directories++;
-    for await (const dirent of directory) {
-      const child = relative ? `${relative}/${dirent.name}` : dirent.name;
-      // Some filesystems do not report entry types; examine those (never following).
-      const known = [dirent.isDirectory(), dirent.isFile(), dirent.isSymbolicLink(), dirent.isFIFO(),
-        dirent.isSocket(), dirent.isBlockDevice(), dirent.isCharacterDevice()].some(Boolean);
-      const type = known ? dirent : await fs.lstat(path.join(absolute, dirent.name)).catch(() => dirent);
-      if (type.isDirectory()) {
-        pending.push(child);
-        continue;
+    const entry = (name: string) => (directory ? directory.entry(name) : path.join(root, name));
+    try {
+      directories++;
+      for await (const dirent of listing) {
+        const child = relative ? `${relative}/${dirent.name}` : dirent.name;
+        // Some filesystems do not report entry types; examine those (never following).
+        const known = [dirent.isDirectory(), dirent.isFile(), dirent.isSymbolicLink(), dirent.isFIFO(),
+          dirent.isSocket(), dirent.isBlockDevice(), dirent.isCharacterDevice()].some(Boolean);
+        const type = known ? dirent : await fs.lstat(entry(dirent.name)).catch(() => dirent);
+        if (type.isDirectory()) {
+          pending.push(child);
+          continue;
+        }
+        if (type.isFile()) continue;
+        const kind: StorageLinkFinding["kind"] = type.isSymbolicLink()
+          ? "symbolic-link"
+          : type.isFIFO()
+            ? "fifo"
+            : type.isSocket()
+              ? "socket"
+              : type.isBlockDevice() || type.isCharacterDevice()
+                ? "device"
+                : "other";
+        const finding: StorageLinkFinding = { path: child, kind };
+        if (kind === "symbolic-link") {
+          finding.target = await fs.readlink(entry(dirent.name)).catch(() => undefined);
+        }
+        record(finding);
       }
-      if (type.isFile()) continue;
-      const kind: StorageLinkFinding["kind"] = type.isSymbolicLink()
-        ? "symbolic-link"
-        : type.isFIFO()
-          ? "fifo"
-          : type.isSocket()
-            ? "socket"
-            : type.isBlockDevice() || type.isCharacterDevice()
-              ? "device"
-              : "other";
-      const finding: StorageLinkFinding = { path: child, kind };
-      if (kind === "symbolic-link") {
-        finding.target = await fs.readlink(path.join(absolute, dirent.name)).catch(() => undefined);
-      }
-      total++;
-      onFinding?.(finding);
-      if (findings.length < limit) findings.push(finding);
+    } finally {
+      await directory?.close();
     }
   }
   return { findings, total, directories, unreadable };

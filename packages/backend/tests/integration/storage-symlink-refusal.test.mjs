@@ -369,16 +369,15 @@ test("writes refuse a link below the root and create nothing through it", async 
     restore: async () => request("POST", `/api/workspaces/${workspace.id}/backup/restore`, {
       ...multipart({}, { name: "backup.zip", type: "application/zip", bytes: exported.rawPayload }),
     }),
-    "backup export": async () => request("POST", `/api/workspaces/${workspace.id}/backup/export`, {
-      payload: { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true },
-    }),
   };
+  const exportBackup = () => request("POST", `/api/workspaces/${workspace.id}/backup/export`, {
+    payload: { projects: [], channels: [], wikiSpaces: [{ spaceId: space.id }], includeFiles: true },
+  });
   const linked = {
     "Drive upload": driveFolder,
     "wiki media upload": path.dirname(seedMedia.replace(/^\/storage\//, "")),
     "avatar upload": `${workspace.id}/uploads/avatars`,
     restore: `${workspace.id}/uploads/wiki/imports`,
-    "backup export": ".tmp",
   };
   for (const [label, attempt] of Object.entries(attempts)) {
     await mkdir(onDisk(linked[label]), { recursive: true });
@@ -391,13 +390,21 @@ test("writes refuse a link below the root and create nothing through it", async 
       await undo();
     }
   }
-  // A link at the staging folder itself (one level deeper) is refused too.
-  const undo = await swapForLink(".tmp/backup", outside);
-  try {
-    assert.equal((await attempts["backup export"]()).statusCode, 403);
-    assert.deepEqual(await tree(outside), before);
-  } finally {
-    await undo();
+  // Backup staging was checked and opened when first used, and staged files
+  // are named through that open folder. Replacing the staging folder (or its
+  // parent) with a link afterwards does not redirect them: the export
+  // completes inside the folder that was checked. (A link present before
+  // first use is refused: tests/backup-staging.test.mjs.)
+  for (const folder of [".tmp", ".tmp/backup"]) {
+    const undo = await swapForLink(folder, outside);
+    try {
+      const response = await exportBackup();
+      assert.equal(response.statusCode, 200, `${folder}: ${response.body.slice(0, 200)}`);
+      assert.equal((await readBackupArchive(response.rawPayload)).assets.size > 0, true);
+      assert.deepEqual(await tree(outside), before, `staging through a linked ${folder} followed the link`);
+    } finally {
+      await undo();
+    }
   }
   assert.equal((await attempts["Drive upload"]()).statusCode, 201, "writes succeed once the links are gone");
 });

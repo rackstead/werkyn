@@ -67,12 +67,19 @@ for `docker run`, host directories and other setups.
 The storage folder (`STORAGE_DIR`, `/app/storage` in Compose) may itself be a
 symbolic link, a volume or a mount point; to move storage to another disk, point
 `STORAGE_DIR` or that link at the new disk, or mount the disk there, and restart.
-The server resolves it once at startup and logs the real path. Below it, every
-symbolic link is refused for reads (`403`), writes and deletes, so do not link
-a workspace folder or file to somewhere else: mount the other disk at that path
-instead. Before upgrading an installation whose storage may hold links, list them
-with `docker compose exec werkyn node packages/backend/dist/scripts/storage-link-report.js`
-(read-only) and replace each with what it points to. See
+The server resolves it once at startup and logs the real path. Below it, no
+symbolic link is ever followed: reads through one answer `403`, writes through
+one are refused, and deleting a file whose path is a link removes only the link.
+So do not link a workspace folder or file to somewhere else: mount the other
+disk at that path instead. Before upgrading an installation whose storage may hold
+links, list them in the running (older) container, which does not change anything:
+
+```bash
+docker compose exec werkyn find /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
+```
+
+Replace each with what it points to. From this version on, the read-only
+`packages/backend/dist/scripts/storage-link-report.js` lists them too; see
 [docs/remediation/r33-storage-symlinks.md](docs/remediation/r33-storage-symlinks.md).
 
 When upgrading an existing installation, back up the database and storage first.

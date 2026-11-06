@@ -397,3 +397,34 @@ test("the storage-link report lists every link and special file without followin
   await fs.mkdir(path.join(clean, "ws/files"), { recursive: true });
   assert.equal(run(clean), 0);
 });
+
+for (const proc of MODES) {
+  test(`${proc ? "/proc/self/fd" : "path fallback"}: the report never enters a folder swapped for a link after it was listed`, async (t) => {
+    const f = await fixture();
+    // Would be reported as wsA/files/u1/beyond-link if the swapped folder were entered.
+    await fs.symlink("/etc/passwd", path.join(f.outside, "beyond-link"));
+    const open = fs.open;
+    let swapped = false;
+    t.mock.method(fs, "open", async (...args) => {
+      // wsA/files has been listed and u1 queued; it becomes a link just
+      // before the report opens it.
+      if (!swapped && String(args[0]).endsWith(`${path.sep}u1`)) {
+        swapped = true;
+        fss.renameSync(f.at("wsA/files/u1"), path.join(f.base, "u1-moved"));
+        fss.symlinkSync(f.outside, f.at("wsA/files/u1"));
+      }
+      return open(...args);
+    });
+    let report;
+    try {
+      report = await findStorageLinks(f.root, { procFd: proc });
+    } finally {
+      t.mock.restoreAll();
+    }
+    assert.equal(swapped, true);
+    assert.deepEqual(
+      report.findings.map(({ path: p, kind, target }) => [p, kind, target]),
+      [["wsA/files/u1", "symbolic-link", f.outside]],
+    );
+  });
+}

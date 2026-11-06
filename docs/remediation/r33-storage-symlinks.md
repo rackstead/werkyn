@@ -129,8 +129,13 @@ the real folder and a link to an outside folder, for 3 seconds of reads
     the refusal as its reason), and the upload is stored without one. This
     applies whether the server's first-bytes read or the worker's open finds
     the link.
-  - A backup whose staging folder is a link answers `403`. The startup sweep
-    logs the refusal and stages nothing.
+  - If the staging folder (`.tmp` or `.tmp/backup`) is a link when it is first
+    used, the startup sweep logs the refusal and every backup request answers
+    `403` without staging anything. Once checked, the folder stays open and
+    staged files are named through it (`/proc/self/fd/<fd>/<name>`). Replacing
+    it with a link later therefore does not redirect a staged file: the file is
+    still created, read and removed in the folder that was checked. A folder
+    removed meanwhile is checked and opened again on its next use.
 
 ### Every entry point
 
@@ -143,7 +148,7 @@ the real folder and a link to an outside folder, for 3 seconds of reads
 | `/storage/:workspaceId/uploads/*` (authenticated) | `storage.open`, then sent from that descriptor | — | — |
 | Thumbnail worker (PR #198) | `StorageRoot.openFile` inside the worker, from the root and relative path it is sent | — | — |
 | Backup export (images), restore (images) | provider | provider | provider |
-| Backup staging (`<root>/.tmp/backup`) | staged files opened with `O_NOFOLLOW` | folders opened through `StorageRoot.openDirectory`; files created with `O_EXCL \| O_NOFOLLOW` | sweep removes names inside the opened folder |
+| Backup staging (`<root>/.tmp/backup`) | staged files named inside the opened folder and opened with `O_NOFOLLOW` | folders checked and opened once through `StorageRoot.openDirectory` and kept open; files created inside them with `O_EXCL \| O_NOFOLLOW` | sweep and disposal remove names inside the opened folder |
 | Blob cleanup worker, trash purge, request-time cleanup | — | — | provider |
 
 Responses for the two media routes are sent from the descriptor that was
@@ -191,21 +196,43 @@ This was checked in `node:20-alpine` with the built helper
 
 There is no deployed data. However, an installation that moved a workspace
 folder to another disk with a link would find its files refused after this
-change. To catch the likely case, startup checks the top level of the root
-and warns about each link there. To list every link and special file below
-the root, run the read-only report:
+change. Look for links before upgrading.
+
+**Before upgrading,** in the running container of the older version, which
+does not have the report script:
 
 ```bash
-# Docker Compose
+docker compose exec werkyn find /app/storage \( -type l -o -type p -o -type s -o -type b -o -type c \) -exec ls -ld {} +
+```
+
+`find` does not follow links by default. This lists every link (with its
+target), FIFO, socket and device below the storage folder. It also works
+outside Docker against the storage folder.
+
+**With this version,** use the read-only report. Run it in the upgraded
+container, or, to check before the upgraded server starts, in a one-off
+container of the newly built image (`docker compose build` first):
+
+```bash
+# After upgrading
 docker compose exec werkyn node packages/backend/dist/scripts/storage-link-report.js
+# Before starting the new version (no other services are started)
+docker compose run --rm --no-deps --entrypoint node werkyn packages/backend/dist/scripts/storage-link-report.js
 # From a checkout
 STORAGE_DIR=/path/to/storage node packages/backend/dist/scripts/storage-link-report.js [--json] [--limit=N] [--dir=PATH]
 ```
 
-The report never follows a link. It only lists folders, examines entries and
-reads link targets. It prints each entry's path below the root, its kind and,
-for links, the target. Its exit status is `0` when nothing was found, `2`
-when something was found or a folder could not be listed, and `1` on error.
+The report never follows a link. It opens each folder as the server does,
+without following a link and inside the folder above it. It only lists
+folders, examines entries and reads link targets. It prints each entry's
+path below the root, its kind and, for links, the target. Its exit status is
+`0` when nothing was found, `2` when something was found or a folder could
+not be listed, and `1` on error. Folders that the image's user cannot list
+are reported as unreadable; if that happens, run the one-off container with
+`--user root`.
+
+At startup the server also checks the top level of the root and warns about
+each link there.
 
 To fix each finding, do one of the following:
 
@@ -222,14 +249,9 @@ Remove FIFOs, sockets and device files. The application never creates them.
 - **Path fallback.** Without `/proc` (macOS development) the checks run on
   paths, and a link swapped in during an access can still be followed (see
   the table above). Production images run on Linux with `/proc`.
-- **Backup staging.**
-  - The staging folders are checked without following links on every use,
-    and staged files are created exclusively and opened without following
-    links.
-  - After that, a staged file is addressed by its path. Someone with write
-    access to the storage volume who swaps `.tmp/backup` for a link between
-    the check and the open could redirect a staged file, whose name is a
-    random UUID.
+- **Kept-open staging folder.** The server keeps one descriptor of the
+  staging folder open. If that folder is removed while running, its next use
+  checks and opens the new folder, and the old descriptor stays open too.
 - **Trusted root.** The root and everything above it are trusted, as the
   owner decided.
 - **Cost.** Each access opens one descriptor per folder level below the
@@ -265,7 +287,13 @@ Remove FIFOs, sockets and device files. The application never creates them.
   - Every Drive read route, every media route and every write route refuses
     links at the file, the folder and the workspace folder.
   - Delete removes a link itself or keeps the refused delete queued.
+  - A staging folder replaced by a link after first use still receives the
+    export.
   - The startup log and warning.
+- **`tests/backup-staging.test.mjs`** and **`tests/thumbnail-workers.test.mjs`**:
+  - A link as the staging folder or its parent is refused before first use.
+  - A staging folder swapped for a link after first use is never followed.
+  - The worker refuses a linked file and a linked folder.
 - **Updated tests.** Existing tests that mocked `fs.open`/`fs.mkdir` by
   absolute path, or counted `readStream` calls inside `openReadStream`, now
   match the folder-relative opens and the provider's actual read methods.

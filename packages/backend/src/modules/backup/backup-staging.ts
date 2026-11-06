@@ -85,9 +85,34 @@ export const UPLOAD_INTERRUPTED_MESSAGE = "The backup upload did not complete";
  */
 export async function stagingPath(kind: "upload" | "export", dir: string) {
   await prepareBackupStaging(dir);
-  const directory = await openStagingDirectory(dir, true);
-  await directory.close();
-  return path.join(dir, `${kind}-${randomUUID()}.part`);
+  return (await stagingDirectory(dir)).entry(`${kind}-${randomUUID()}.part`);
+}
+
+/** Staging directories kept open, by path. */
+const openStaging = new Map<string, Promise<StorageDirectory>>();
+
+/**
+ * The staging directory `dir`, checked and opened once and then kept open.
+ * Staged files are named inside it (StorageDirectory.entry): with /proc each
+ * staged path is `/proc/self/fd/<fd>/<name>`, so every later create, read
+ * and removal of the file resolves inside the folder that was checked, even
+ * if the folder is replaced by a link meanwhile. A folder removed since is
+ * opened again; the earlier one stays open, as paths into it may be in use.
+ */
+async function stagingDirectory(dir: string): Promise<StorageDirectory> {
+  const key = path.resolve(dir);
+  const cached = openStaging.get(key);
+  if (cached) {
+    const directory = await cached.catch(() => undefined);
+    if (directory && (await directory.exists())) return directory;
+    if (openStaging.get(key) !== cached) return stagingDirectory(dir);
+  }
+  const opening = openStagingDirectory(dir, true);
+  openStaging.set(key, opening);
+  opening.catch(() => {
+    if (openStaging.get(key) === opening) openStaging.delete(key);
+  });
+  return opening;
 }
 
 /** A handle that removes `file` once, ignoring a file that is already gone. */

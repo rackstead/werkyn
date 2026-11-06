@@ -154,3 +154,28 @@ test("each step learns the time left before the overall deadline", async () => {
   // deadline is reported as none left.
   assert.deepEqual(seen, [1000, 300, 850, 850, 0]);
 });
+
+test("the duplicate-signal window uses the same clock as the shutdown", async () => {
+  const { log, exits, exit } = recorder();
+  let clock = 0;
+  let release;
+  const shutdown = createShutdownHandler({
+    log,
+    exit,
+    forceAfterMs: 1000,
+    now: () => clock,
+    steps: [{ name: "http", run: () => new Promise((resolve) => { release = resolve; }) }],
+  });
+  const first = shutdown("SIGTERM");
+  // Within the window by the injected clock: a duplicate, ignored.
+  clock = 999;
+  await shutdown("SIGTERM");
+  assert.deepEqual(exits, []);
+  // Past it by the injected clock (wall time has barely moved): forces exit.
+  clock = 1000;
+  await shutdown("SIGTERM");
+  assert.deepEqual(exits, [1]);
+  release();
+  await first;
+  assert.deepEqual(exits, [1]);
+});

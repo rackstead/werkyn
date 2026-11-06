@@ -260,7 +260,9 @@ test("password-reset cooldown and per-process ceiling have safe defaults and bou
   }).data;
   assert.equal(blank.PASSWORD_RESET_REQUESTS_PER_MINUTE, 6000);
   assert.equal(accepts({ PASSWORD_RESET_COOLDOWN_SECONDS: "0" }).data.PASSWORD_RESET_COOLDOWN_SECONDS, 0);
-  for (const value of ["-1", "86401", "1.5", "soon"])
+  assert.equal(accepts({ PASSWORD_RESET_COOLDOWN_SECONDS: "3600" }).data.PASSWORD_RESET_COOLDOWN_SECONDS, 3600);
+  // A link lives an hour; the cooldown is read from it, so it cannot be longer.
+  for (const value of ["-1", "3601", "86400", "1.5", "soon"])
     rejects({ PASSWORD_RESET_COOLDOWN_SECONDS: value }, "PASSWORD_RESET_COOLDOWN_SECONDS", /whole number/);
   for (const value of ["59", "1000001", "lots"])
     rejects({ PASSWORD_RESET_REQUESTS_PER_MINUTE: value }, "PASSWORD_RESET_REQUESTS_PER_MINUTE", /whole number/);

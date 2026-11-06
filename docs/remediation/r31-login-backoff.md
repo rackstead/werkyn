@@ -239,9 +239,13 @@ should raise `LOGIN_BACKOFF_SLOTS`.
   - a request for an address whose earlier request is still running adds
     nothing;
   - an account gets at most one new link per `PASSWORD_RESET_COOLDOWN_SECONDS`
-    (default 60). A request within the cooldown is answered alike and makes
-    no token and no mail. Across processes the cooldown is best effort: two
-    requests checked at the same moment can both send a link.
+    (default 60, at most 3,600). A request within the cooldown is answered
+    alike and makes no token and no mail. The cooldown is read from the
+    account's newest link, which is kept until it expires after an hour, so
+    longer cooldowns are not offered. A password change or reset deletes the
+    unused links and so ends the cooldown early. Across processes the cooldown
+    is best effort: two requests checked at the same moment can both send a
+    link.
   - Work for an address without an account ends after one lookup.
 
   The reviewer's flood probe ran against this design for 150 seconds: 65
@@ -308,7 +312,7 @@ for unknown addresses.
 | `LOGIN_BACKOFF_MAX_SECONDS` | 60 | 1–900, at most the reset |
 | `LOGIN_BACKOFF_RESET_SECONDS` | 3600 | 60–604800 |
 | `LOGIN_BACKOFF_SLOTS` | 65536 | 256–16777216 |
-| `PASSWORD_RESET_COOLDOWN_SECONDS` | 60 | 0–86400 |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | 60 | 0–3600 |
 | `PASSWORD_RESET_REQUESTS_PER_MINUTE` | 6000 | 60–1000000 |
 
 The server refuses to start with a value outside its range, or with the order

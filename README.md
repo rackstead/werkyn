@@ -540,7 +540,7 @@ default:
 | `LOGIN_BACKOFF_MAX_SECONDS` | `60` | 1–900 | Longest wait (at least the base) |
 | `LOGIN_BACKOFF_RESET_SECONDS` | `3600` | 60–604800 | Quiet time after which failures are forgotten (at least the longest wait) |
 | `LOGIN_BACKOFF_SLOTS` | `65536` | 256–16777216 | Rows for email addresses; trusted browsers use as many again |
-| `PASSWORD_RESET_COOLDOWN_SECONDS` | `60` | 0–86400 | Shortest time between two reset links for one account (0: no cooldown) |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | `60` | 0–3600 | Shortest time between two reset links for one account (0: no cooldown; at most the link's 1-hour lifetime) |
 | `PASSWORD_RESET_REQUESTS_PER_MINUTE` | `6000` | 60–1000000 | Reset requests one server process starts per minute before answering `429` |
 
 With Docker Compose, add them under the `werkyn` service's `environment`, for

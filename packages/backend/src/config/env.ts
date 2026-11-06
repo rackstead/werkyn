@@ -166,10 +166,12 @@ const envSchema = z.object({
 
   // Password-reset requests (docs/remediation/r31-login-backoff.md). An
   // account gets at most one new link per COOLDOWN seconds; more requests
-  // are answered alike and add nothing. Each process starts at most
-  // REQUESTS_PER_MINUTE requests, a memory guard set far above what the
-  // per-client route limit lets a few clients send.
-  PASSWORD_RESET_COOLDOWN_SECONDS: wholeNumber("PASSWORD_RESET_COOLDOWN_SECONDS", 60, 0, 86400),
+  // are answered alike and add nothing. The cooldown is read from the newest
+  // link, which is kept until it expires after an hour, so it is at most an
+  // hour. Each process starts at most REQUESTS_PER_MINUTE requests, a memory
+  // guard set far above what the per-client route limit lets a few clients
+  // send.
+  PASSWORD_RESET_COOLDOWN_SECONDS: wholeNumber("PASSWORD_RESET_COOLDOWN_SECONDS", 60, 0, 3600),
   PASSWORD_RESET_REQUESTS_PER_MINUTE: wholeNumber("PASSWORD_RESET_REQUESTS_PER_MINUTE", 6000, 60, 1000000),
 }).superRefine((values, ctx) => {
   if (values.LOGIN_BACKOFF_BASE_SECONDS > values.LOGIN_BACKOFF_MAX_SECONDS) {

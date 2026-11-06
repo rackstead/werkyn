@@ -78,7 +78,7 @@ export function createShutdownHandler({
 
   return async function shutdown(signal?: string): Promise<void> {
     if (startedAt !== undefined) {
-      if (Date.now() - startedAt < forceAfterMs) return;
+      if (now() - startedAt < forceAfterMs) return;
       log.warn({ signal }, "Shutdown already in progress; forcing exit");
       finish(1);
       return;

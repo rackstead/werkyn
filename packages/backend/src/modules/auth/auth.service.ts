@@ -548,7 +548,10 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   }
 
   // At most one new link per account per cooldown: a link made moments ago
-  // is still the newest. The requester was already answered alike.
+  // is still the newest. The requester was already answered alike. Links are
+  // kept until they expire (1 hour, the longest cooldown allowed), so the
+  // newest one's creation time is always there to check; a password change
+  // or reset deletes unused links, which ends the cooldown early.
   if (env.PASSWORD_RESET_COOLDOWN_SECONDS > 0) {
     const recent = await prisma.passwordResetToken.findFirst({
       where: {

@@ -719,9 +719,16 @@ test("container checks stop after a bounded amount of work on crafted files", as
   // searches (the most escapes a JPEG walk reads), and at least 50 ms. On
   // the test host the reference takes 8 ms and the slowest bounded walk
   // 20 ms; before the bound, the WebP walk took 208 ms, about 25 references.
-  const referenceStarted = performance.now();
-  for (let i = 0, at = 6; i < 1 << 20; i++) at = stuffed.indexOf(0xff, at) + 2;
-  const pass = performance.now() - referenceStarted;
+  // The loop runs once untimed so the timed runs measure compiled code, not
+  // warm-up; the fastest of three is the reference.
+  const reference = () => { for (let i = 0, at = 6; i < 1 << 20; i++) at = stuffed.indexOf(0xff, at) + 2; };
+  reference();
+  let pass = Infinity;
+  for (let run = 0; run < 3; run++) {
+    const started = performance.now();
+    reference();
+    pass = Math.min(pass, performance.now() - started);
+  }
   const allowance = Math.max(50, 5 * pass);
   for (const [name, check, refused] of [
     ["avif boxes", () => checkAvif(avif).refused, "unreadable structure"],

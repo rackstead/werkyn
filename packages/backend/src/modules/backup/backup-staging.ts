@@ -86,6 +86,12 @@ export interface MinimumUploadRate {
 export interface RateWatch {
   /** Count `bytes` received now. */
   add(bytes: number): void;
+  /**
+   * The server has stopped reading (its staging write is behind), until
+   * resume(). That time is not held against the client.
+   */
+  pause(): void;
+  resume(): void;
   /** Stop watching. Safe to call more than once. */
   stop(): void;
 }
@@ -95,29 +101,35 @@ export interface RateWatch {
  * any check from `graceMs` after the start, the bytes received over the last
  * `windowMs` (or since the start, when that is shorter) average less than
  * `bytesPerSecond`. The check runs every tenth of the window, and at least
- * once a second, so a client that sends nothing at all is caught too. The
- * average is taken over measured time, so a check that runs late does not
- * count a shorter period than it covers.
+ * once a second, so a client that sends nothing at all is caught too.
+ *
+ * Time is measured, so a check that runs late does not count a shorter
+ * period than it covers, but only while the server is reading: the grace
+ * period and the window leave out every pause() to resume() span.
  */
 export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateWatch {
   const checkMs = Math.max(1, Math.min(1000, Math.floor(rate.windowMs / 10)));
   const started = performance.now();
   let total = 0;
   let stopped = false;
+  let pausedMs = 0;
+  let pausedAt: number | undefined;
+  /** Milliseconds since the start during which the server was reading. */
+  const reading = (now: number) => now - started - pausedMs - (pausedAt === undefined ? 0 : now - pausedAt);
   // Totals at each check, oldest first. The first one is the newest at or
   // before the start of the window, so the window is always covered.
-  const samples = [{ at: started, total: 0 }];
+  const samples = [{ reading: 0, total: 0 }];
   const tooSlow = (now: number) =>
-    total - samples[0].total < (rate.bytesPerSecond * (now - samples[0].at)) / 1000;
+    total - samples[0].total < (rate.bytesPerSecond * (reading(now) - samples[0].reading)) / 1000;
   const stop = () => {
     stopped = true;
     clearInterval(timer);
   };
   const timer = setInterval(() => {
-    const now = performance.now();
-    samples.push({ at: now, total });
-    while (samples.length > 1 && samples[1].at <= now - rate.windowMs) samples.shift();
-    if (now - started < rate.graceMs || !tooSlow(now)) return;
+    const now = reading(performance.now());
+    samples.push({ reading: now, total });
+    while (samples.length > 1 && samples[1].reading <= now - rate.windowMs) samples.shift();
+    if (now < rate.graceMs || !tooSlow(performance.now())) return;
     // Timers run before pending socket reads. After synchronous work has
     // held up the process (parsing another backup, say), bytes the client
     // sent meanwhile are still waiting, so confirm once they have been read.
@@ -131,6 +143,14 @@ export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateW
   return {
     add(bytes) {
       total += bytes;
+    },
+    pause() {
+      pausedAt ??= performance.now();
+    },
+    resume() {
+      if (pausedAt === undefined) return;
+      pausedMs += performance.now() - pausedAt;
+      pausedAt = undefined;
     },
     stop,
   };
@@ -299,7 +319,9 @@ export async function receiveBackupUpload(
 
   // Every byte of the body counts towards the minimum rate, multipart framing
   // included, until the file is staged. A body that has fully arrived is no
-  // longer up to the client, so it is never refused as too slow.
+  // longer up to the client, so it is never refused as too slow. While the
+  // request is paused because staging is behind, the server is not reading,
+  // so that time does not count either.
   const tooSlow = new AbortController();
   const rate =
     minRate &&
@@ -307,7 +329,12 @@ export async function receiveBackupUpload(
       if (!raw.complete) tooSlow.abort(new BackupUploadTooSlowError(minRate.bytesPerSecond));
     });
   const count = (chunk: Buffer) => rate?.add(chunk.length);
+  const paused = () => rate?.pause();
+  const resumed = () => rate?.resume();
+  if (raw.isPaused()) paused();
   raw.on("data", count);
+  raw.on("pause", paused);
+  raw.on("resume", resumed);
   const slow = new Promise<never>((_, reject) => {
     tooSlow.signal.addEventListener("abort", () => reject(tooSlow.signal.reason), { once: true });
   });
@@ -354,6 +381,8 @@ export async function receiveBackupUpload(
   } finally {
     rate?.stop();
     raw.off("data", count);
+    raw.off("pause", paused);
+    raw.off("resume", resumed);
   }
 }
 

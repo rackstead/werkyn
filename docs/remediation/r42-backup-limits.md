@@ -53,6 +53,11 @@ control it. They are read at startup, and an empty value keeps the default:
   counts a shorter period than it covers.
 - Every byte of the request body counts, multipart framing included, so a
   client that drips the part headers before its file is caught as well.
+- Time counts only while the server is reading. When its staging write falls
+  behind, the request stream is paused (back-pressure) until the write
+  catches up; that time is left out of both the grace period and the window,
+  so a slow disk is never held against a fast client. The 60-second transfer
+  idle timeout still bounds a staging write that stops altogether.
 - Checks run before pending socket reads in each turn of Node's event loop.
   When synchronous work has held up the process (parsing another backup, for
   example), a check that finds the upload too slow is confirmed only after the
@@ -173,7 +178,13 @@ paced client:
 - an upload at twice the minimum is staged although the process is blocked
   for 1.5 seconds, longer than the window, while the client keeps sending
   from another process. Without the confirmation after pending reads, it is
-  refused (checked by removing it).
+  refused (checked by removing it);
+- time the watch is paused is not counted, before or after the grace period,
+  and silence after the pause is still reported;
+- a 1 MiB file sent at once is staged although staging writes take it at
+  about 250 KiB/s, half the minimum, for about 4 seconds. Without leaving out
+  the time the request is paused for back-pressure, it is refused after about
+  0.6 seconds (checked by removing it).
 
 `tests/env-validation.test.mjs` checks the defaults, empty values, the
 accepted ranges and the refusals of 0, fractions and words.

@@ -345,6 +345,27 @@ test("an upload at or above the minimum rate is never reported, pauses within th
   assert.ok(reportedAt >= 1_000 && reportedAt < 1_400, `reported after ${reportedAt} ms`);
 });
 
+test("time the server spends not reading is not held against the upload", async () => {
+  const rate = { bytesPerSecond: 1000, windowMs: 400, graceMs: 200 };
+  let reported = false;
+  const watch = watchRate(rate, () => (reported = true));
+  watch.add(100);
+  // The server stops reading for longer than the grace period and the window.
+  watch.pause();
+  watch.pause();
+  await sleep(1_000);
+  assert.equal(reported, false, "a pause by the server was held against the client");
+  watch.resume();
+  watch.resume();
+  // Reading again, above the rate.
+  await feed(watch, 2000, 600);
+  assert.equal(reported, false);
+  // Silence while the server reads is still reported.
+  await sleep(800);
+  watch.stop();
+  assert.equal(reported, true, "silence after the pause was not reported");
+});
+
 test("an aborted staging copy stops with the abort reason and leaves no file", async () => {
   const dir = freshDir();
   const source = new PassThrough();
@@ -468,6 +489,76 @@ test("a request whose body arrives below the minimum rate gets a 408, before or 
   assert.match(steady.status, /^HTTP\/1\.1 200/);
   assert.deepEqual(outcomes, [["staged", 4500]]);
   assert.deepEqual(await readdir(dir).catch(() => []), []);
+});
+
+test("an upload is not refused as too slow while slow staging writes hold up its reading", async (t) => {
+  const fs = await import("node:fs");
+  const Fastify = (await import("fastify")).default;
+  const multipart = (await import("@fastify/multipart")).default;
+  const dir = freshDir();
+  const outcomes = [];
+  const app = Fastify();
+  await app.register(multipart);
+  // Staging takes the file at about 250 KiB/s, half the minimum rate below.
+  const diskBytesPerMs = 256;
+  const { _write, _writev } = fs.WriteStream.prototype;
+  fs.WriteStream.prototype._write = function (data, encoding, callback) {
+    setTimeout(() => _write.call(this, data, encoding, callback), data.length / diskBytesPerMs);
+  };
+  fs.WriteStream.prototype._writev = function (chunks, callback) {
+    const size = chunks.reduce((sum, { chunk }) => sum + chunk.length, 0);
+    setTimeout(() => _writev.call(this, chunks, callback), size / diskBytesPerMs);
+  };
+  t.after(() => {
+    fs.WriteStream.prototype._write = _write;
+    fs.WriteStream.prototype._writev = _writev;
+  });
+  app.post("/upload", async (request) => {
+    try {
+      const staged = await receiveBackupUpload(request, {
+        dir,
+        maxBytes: 2 * MiB,
+        idleTimeoutMs: 5_000,
+        minRate: { bytesPerSecond: 512 * 1024, windowMs: 500, graceMs: 300 },
+      });
+      await staged.dispose();
+      outcomes.push(["staged", staged.size]);
+      return { ok: true };
+    } catch (error) {
+      outcomes.push([error.constructor.name]);
+      throw error;
+    }
+  });
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  t.after(() => app.close());
+  const { port } = app.server.address();
+
+  // The client sends the whole file at once, far faster than the minimum,
+  // and much more than the stream buffers between the request and the disk
+  // hold, so the request stays incomplete while staging catches up.
+  const boundary = "disk-boundary";
+  const size = MiB;
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="b.zip"\r\n\r\n`),
+    Buffer.alloc(size, 120),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const socket = net.connect(port, "127.0.0.1");
+  await new Promise((resolve) => socket.once("connect", resolve));
+  let response = "";
+  socket.on("data", (chunk) => (response += chunk));
+  const started = Date.now();
+  socket.write(
+    `POST /upload HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: ${body.length}\r\n\r\n`,
+  );
+  socket.write(body);
+  await new Promise((resolve) => socket.once("close", resolve));
+  const elapsed = Date.now() - started;
+  t.diagnostic(`staged in ${elapsed} ms`);
+  // Staging was slower than the minimum for several windows.
+  assert.ok(elapsed > 2_000, `${elapsed} ms`);
+  assert.match(response, /^HTTP\/1\.1 200/, JSON.stringify(outcomes));
+  assert.deepEqual(outcomes, [["staged", size]]);
 });
 
 test("bytes sent while the server was busy are counted before a check refuses the upload", async (t) => {

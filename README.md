@@ -701,7 +701,7 @@ from the rest of the API:
   clients off the server's backup slots: the slot is taken only once the
   upload is complete. The proxy needs disk space for it.
 - **Minimum rates.** nginx and Traefik have no minimum transfer rate; Caddy
-  2.11.6 and later do. Werkyn's own minimum applies behind any proxy.
+  2.11.8 and later do, per route. Werkyn's own minimum applies behind any proxy.
 - **Whole-request deadlines** (Traefik's `readTimeout`, 60 s by default in
   Traefik 3; Caddy's `read_body`) end any upload that takes longer. Set them to
   the longest upload you accept.
@@ -751,7 +751,8 @@ limit on waiting for Werkyn's answer. Do not set the global `read_body` or
 transfer. `write_timeout 60s 16384` in the same `timeouts` block would also end
 export downloads that average under 16 KiB/s, which frees their slot.
 
-**Traefik** 3. The entry point's `readTimeout` limits how long the whole request,
+**Traefik** 3, assuming an HTTPS entry point `websecure` that already serves
+Werkyn. The entry point's `readTimeout` limits how long the whole request,
 upload included, may take (60 s by default), so raise it:
 
 ```yaml
@@ -771,8 +772,14 @@ http:
     werkyn-backup:
       rule: "Host(`werkyn.example.com`) && PathRegexp(`^/api/workspaces/[^/]+/backup/`)"
       entryPoints: [websecure]
+      tls: {}   # or the same TLS options (certResolver) as your main Werkyn router
       service: werkyn
       middlewares: [werkyn-backup-buffer]
+  services:
+    werkyn:   # or your existing Werkyn service
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3000"
   middlewares:
     werkyn-backup-buffer:
       buffering:

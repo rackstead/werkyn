@@ -782,6 +782,7 @@ const SMOKE_STEPS = [
   "grid",
   "above",
   "block",
+  "span",
   "resize",
   "rate",
 ];
@@ -1163,6 +1164,146 @@ async function smoke({ browser, origin, fixture, prisma }) {
         assert.deepEqual(checked, [target], `block ${where}: click hit ${checked}`);
         pass("block", `list: top ${block.length} of ${before.length} in view renamed to sort at the end (${where * 100}%)`, detail);
       }
+    }
+
+    // Review round 2: a run of entries renamed to sort far away that reaches
+    // past the view's top or bottom edge (taking in the entries listed just
+    // around the view), alone or with trashes and creates in the same
+    // refresh; in a long folder, and at the end of a short one. The entries
+    // left in view keep their places, and a click where the pointer rests
+    // (on one of them) hits the entry under it.
+    let spans = 0;
+    async function spanChange(kind, view, columns) {
+      const listed = await order();
+      const first = listed.findIndex((e) => e.name === view[0].name);
+      const last = listed.findIndex((e) => e.name === view.at(-1).name);
+      const changed = new Set();
+      spans++;
+      let n = 0;
+      const rename = async (entries, prefix = "zz") => {
+        for (const e of entries) {
+          changed.add(e.name);
+          await prisma.file.update({
+            where: { id: e.id },
+            data: { name: `${prefix} span ${spans} ${String(++n).padStart(3, "0")} ${e.name}` },
+          });
+        }
+      };
+      const trash = async (entries) => {
+        for (const e of entries) changed.add(e.name);
+        await prisma.file.updateMany({
+          where: { id: { in: entries.map((e) => e.id) } },
+          data: { trashedAt: new Date() },
+        });
+      };
+      // The top of the view: all but its last 4 entries (all but its last
+      // line in the grid, so that the cards left keep their lines).
+      const top = columns > 1 ? view.length - columns : Math.max(8, view.length - 4);
+      const above = columns > 1 ? columns : 5;
+      switch (kind) {
+        case "spanAbove":
+          await rename(listed.slice(first - above, first + top));
+          return { changed, fraction: 0.9 };
+        case "spanAboveHalf":
+          await rename(listed.slice(first - 8, first + Math.floor(view.length / 2)));
+          return { changed, fraction: 0.9 };
+        case "spanBelow":
+          // All but the top 4 entries (the top 2 lines of cards: the first
+          // one can be cut off by the view's top).
+          await rename(listed.slice(first + (columns > 1 ? 2 * columns : 4), last + 1 + above));
+          return { changed, fraction: 0.1 };
+        case "neighboursMove":
+          await rename(listed.slice(first - 5, first), "Aa");
+          await rename(listed.slice(last + 1, last + 6));
+          await rename(listed.slice(first, first + top));
+          return { changed, fraction: 0.9 };
+        case "span7":
+          await rename(listed.slice(first - 5, first + 7));
+          return { changed, fraction: 0.9 };
+        case "mixed": {
+          // Trashed well above and created above (as many in the grid, so
+          // that the lines stay), the top block and the entries above it
+          // renamed away, and in the list one trashed near the bottom.
+          await trash(listed.slice(first - 40, first - 40 + (columns > 1 ? columns : 3)));
+          for (let i = 0; i < (columns > 1 ? columns : 2); i++)
+            await colleague("POST", "/files/folder", {
+              name: `Folder 0000 span ${spans} ${i}`,
+              parentId: fixture.root.id,
+              teamFolderId: fixture.teamFolder.id,
+            });
+          await rename(listed.slice(first - above, first + top));
+          if (columns === 1) await trash([listed[last - 1]]);
+          return { changed, fraction: 0.85 };
+        }
+      }
+      throw new Error(`unknown span ${kind}`);
+    }
+    // The entries in view the change left where they were: those not changed,
+    // up to the first one changed after them (an entry trashed in view moves
+    // the entries below it up).
+    function leftInPlace(view, changed) {
+      const left = [];
+      for (const e of view) {
+        if (!changed.has(e.name)) left.push(e);
+        else if (left.length > 0) break;
+      }
+      return left;
+    }
+    // The entry left in place nearest to a fraction of the view's height
+    // whose checkbox is in view, and the point on its checkbox.
+    async function pointOn(left, fraction) {
+      const view = await page.evaluate(() => {
+        const r = window.__drive.scroller().getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom };
+      });
+      const y = view.top + (view.bottom - view.top) * fraction;
+      let best = null;
+      for (const e of left) {
+        const point = await checkboxOf(e.name);
+        if (point.y < view.top + 8 || point.y > view.bottom - 8) continue;
+        if (!best || Math.abs(point.y - y) < Math.abs(best.y - y)) best = { name: e.name, ...point };
+      }
+      assert(best, `a checkbox of the ${left.length} entries left is in view`);
+      return best;
+    }
+    async function spanCase(viewName, where, kind, columns) {
+      await loadAll(page, pages, "");
+      await scrollTo(where);
+      await page.waitForTimeout(150);
+      const before = await inView();
+      const { changed, fraction } = await spanChange(kind, before, columns);
+      const left = leftInPlace(before, changed);
+      const point = await pointOn(left, fraction);
+      await page.mouse.move(point.x, point.y);
+      const top = await page.evaluate(() => window.__drive.scroller().scrollTop);
+      await refresh(point.name);
+      const after = await inView();
+      const result = moved(left, after);
+      const scrolled = (await page.evaluate(() => window.__drive.scroller().scrollTop)) - top;
+      const checked = await clickAt(point);
+      const detail = { where, changed: changed.size, left: left.length, ...result, scrolled, target: point.name, checked };
+      report.span ??= [];
+      report.span.push({ view: viewName, kind, ...detail });
+      const label = `${viewName} ${where} ${kind}`;
+      assert.equal(result.compared, left.length, `${label}: the entries left are in view`);
+      assert(result.maxMove <= STILL, `${label}: the entries left moved ${result.maxMove}px`);
+      assert.deepEqual(checked, [point.name], `${label}: click hit ${checked}`);
+      pass("span", `${label} (${changed.size} changed, ${left.length} left in view)`, detail);
+    }
+
+    if (steps.includes("span")) {
+      log("step", "span");
+      for (const [where, kind] of [
+        ["middle", "spanAbove"],
+        ["middle", "spanAboveHalf"],
+        ["middle", "spanBelow"],
+        ["middle", "neighboursMove"],
+        ["middle", "mixed"],
+        ["middle", "span7"],
+        ["end", "spanAbove"],
+        ["near-end", "spanBelow"],
+      ])
+        await spanCase("list", where, kind, 1);
     }
 
     if (steps.includes("bulk")) {
@@ -1549,6 +1690,9 @@ async function smoke({ browser, origin, fixture, prisma }) {
         pass("block", `grid: top ${block.length} cards in view renamed to sort at the end`, detail);
       }
 
+      if (steps.includes("span"))
+        for (const kind of ["spanAbove", "spanBelow", "mixed"]) await spanCase("grid", "middle", kind, columns);
+
       if (steps.includes("resize")) {
         // Window widths across the grid's breakpoints (1024, 768 and 640 px:
         // 5, 4, 3 and 2 columns): the first card fully in view stays within
@@ -1584,6 +1728,124 @@ async function smoke({ browser, origin, fixture, prisma }) {
 
       await page.getByRole("button", { name: "List view" }).click();
       await page.waitForFunction(() => document.querySelector("table"));
+    }
+
+    if (steps.includes("span")) {
+      // A short folder, at its end: the top of the view (all but its last 4
+      // entries, or its last line of cards), with or without the entries
+      // just above it, renamed to sort last. They land only a few places
+      // further down, and the entries left move up more places than that;
+      // the entries left are still the ones kept in place. 40 entries for
+      // the list; 80 (two pages) for the grid, which with fewer could not
+      // scroll far enough up to keep its last line in place.
+      async function shortFolder(count) {
+        const folder = await prisma.file.create({
+          data: { workspaceId: fixture.workspace.id, name: `Short folder ${count}`, isFolder: true, uploadedById: fixture.owner.id },
+        });
+        const team = await prisma.teamFolder.create({
+          data: {
+            workspaceId: fixture.workspace.id,
+            folderId: folder.id,
+            name: `Short folder ${count}`,
+            members: { create: [{ userId: fixture.owner.id }, { userId: fixture.other.id }] },
+          },
+        });
+        await prisma.file.createMany({
+          data: Array.from({ length: count }, (_, i) => ({
+            workspaceId: fixture.workspace.id,
+            teamFolderId: team.id,
+            parentId: folder.id,
+            name: `Short ${String(i).padStart(3, "0")}.txt`,
+            isFolder: false,
+            mimeType: "text/plain",
+            size: 10n,
+            uploadedById: fixture.owner.id,
+          })),
+        });
+        return { folder, team, count };
+      }
+      const folders = { list: await shortFolder(40), grid: await shortFolder(80) };
+      for (const viewName of ["list", "grid"])
+        for (const withAbove of [false, true]) {
+          const { folder, team, count } = folders[viewName];
+          const responses = [];
+          const onResponse = (response) => {
+            const url = new URL(response.url());
+            if (response.request().method() === "GET" && url.searchParams.get("parentId") === folder.id)
+              responses.push(url.searchParams.get("cursor"));
+          };
+          page.on("response", onResponse);
+          await page.goto(
+            `${origin}/${fixture.workspace.slug}/drive?section=drive&folderId=${folder.id}&teamFolderId=${team.id}&view=${viewName}`,
+          );
+          await installHelpers(page);
+          await page.waitForFunction(() => window.__drive.entries().length > 10);
+          // Every page loaded and the view at the end.
+          const lastName = `Short ${String(count - 1).padStart(3, "0")}.txt`;
+          await page.waitForFunction(async (lastName) => {
+            const d = window.__drive;
+            const s = d.scroller();
+            s.scrollTop = s.scrollHeight;
+            await d.frames(2);
+            return d.entries().some((e) => e.name === lastName);
+          }, lastName);
+          await page.evaluate(() => window.__drive.frames(3));
+          await scrollTo("end");
+          await page.waitForTimeout(300);
+          const pagesLoaded = responses.length;
+          const before = await inView();
+          const columns =
+            viewName === "grid" ? before.filter((c) => Math.abs(c.top - before.at(-1).top) < 1).length : 1;
+          const listed = await prisma.file.findMany({
+            where: { parentId: folder.id, trashedAt: null },
+            orderBy: [{ name: "asc" }, { id: "asc" }],
+          });
+          const first = listed.findIndex((e) => e.name === before[0].name);
+          const stay = viewName === "grid" ? columns : 4;
+          const block = listed.slice(
+            withAbove ? Math.max(0, first - (viewName === "grid" ? columns : 5)) : first,
+            first + before.length - stay,
+          );
+          for (const e of block) await prisma.file.update({ where: { id: e.id }, data: { name: `Zz ${e.name}` } });
+          const left = leftInPlace(before, new Set(block.map((e) => e.name)));
+          const point = await pointOn(left, 0.9);
+          await page.mouse.move(point.x, point.y);
+          const top = await page.evaluate(() => window.__drive.scroller().scrollTop);
+          // A refresh (star the last entry in view not under the pointer),
+          // which refetches every page loaded, one after another.
+          const from = responses.length;
+          await page.evaluate((avoid) => {
+            const d = window.__drive;
+            const name = d.inView().filter((e) => e.name !== avoid && e.top > 0).at(-1).name;
+            d.entries()
+              .find((e) => e.name === name)
+              .el.querySelector('button[title="Star"], button[title="Unstar"]')
+              .click();
+          }, point.name);
+          const deadline = Date.now() + 30_000;
+          while (responses.length < from + pagesLoaded) {
+            assert(Date.now() < deadline, `${viewName} short folder: refetch of ${pagesLoaded} pages`);
+            await page.waitForTimeout(20);
+          }
+          await page.evaluate(() => window.__drive.frames(3));
+          await page.waitForTimeout(300);
+          await page.evaluate(() => window.__drive.frames(2));
+          page.off("response", onResponse);
+          const after = await inView();
+          const result = moved(left, after);
+          const scrolled = (await page.evaluate(() => window.__drive.scroller().scrollTop)) - top;
+          const checked = await clickAt(point);
+          for (const e of block) await prisma.file.update({ where: { id: e.id }, data: { name: e.name } });
+          const kind = withAbove ? "top of the view and the entries above it" : "top of the view";
+          const detail = { count, where: "end", renamed: block.length, left: left.length, ...result, scrolled, target: point.name, checked };
+          report.span ??= [];
+          report.span.push({ view: viewName, kind: `short ${withAbove ? "topPlusAbove" : "top"}`, ...detail });
+          const label = `${viewName} end of a ${count}-entry folder, ${kind}`;
+          assert.equal(result.compared, left.length, `${label}: the entries left are in view`);
+          assert(result.maxMove <= STILL, `${label}: the entries left moved ${result.maxMove}px`);
+          assert.deepEqual(checked, [point.name], `${label}: click hit ${checked}`);
+          pass("span", `${label} renamed to sort last (${block.length} renamed, ${left.length} left)`, detail);
+        }
     }
 
     if (steps.includes("above")) {

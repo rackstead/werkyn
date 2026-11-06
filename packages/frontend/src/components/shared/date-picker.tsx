@@ -34,9 +34,9 @@ export function DatePicker({ value, onChange, className, disabled, id, label }: 
       {value && !disabled && (
         <button
           type="button"
-          // Keeps focus in the input, so a date being typed is discarded by
-          // the clear instead of being saved by the blur just before it.
-          onMouseDown={(e) => e.preventDefault()}
+          // A date being typed is discarded by the clear, not saved by the
+          // blur just before it (see useDateInput's clearProps).
+          {...date.clearProps}
           onClick={date.clear}
           aria-label={label ? `Clear ${label.toLowerCase()}` : "Clear date"}
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"

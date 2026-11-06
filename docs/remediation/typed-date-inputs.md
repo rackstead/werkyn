@@ -29,24 +29,28 @@ date input as follows:
 - Focus leaving a half-typed edit keeps the saved date and shows it again.
   Chromium completes a half-typed part as focus leaves (a month "0" becomes
   01); that change is not treated as typed. A partial year is also kept back.
-- Escape discards a typed edit and is kept from the panel; with nothing typed,
-  Escape closes the panel as before.
+- Escape discards a typed edit and does not reach the panel or dialog. The
+  input carries `data-pending-edit` while an edit is pending, and `Dialog`
+  leaves such an Escape to it. With nothing typed, Escape closes the panel or
+  dialog as before.
 - A date chosen in the browser's picker is committed at once, as before; so is
   the picker's Clear.
 - Null is committed only by an explicit clear, or by an input emptied part by
   part when it loses focus. A typed date equal to the saved one sends nothing.
+- A clear button next to the input takes `clearProps`. Focus moving to it (a
+  click, or Tab) keeps the typed edit, and using it discards that edit and
+  sends only null. Leaving the button any other way, or pressing Escape there,
+  settles the edit as a blur of the input would.
 - A newer saved value (a refetch, another user) replaces the input unless
   something is being typed.
 
 Users of these rules:
 
 - `DatePicker`, used by the task panel's start date, due date and custom date
-  fields and by the new-task dialog. Its clear button keeps focus in the
-  input, so a date being typed is discarded rather than saved just before the
-  clear.
-- The List's bulk due date. It applies a typed date on Enter or blur.
-  Previously a year-first browser applied 2027-03-01 to every selected task
-  while 2027-03-15 was being typed.
+  fields and by the new-task dialog, with its clear button.
+- The List's bulk due date, with its Clear button. It applies a typed date on
+  Enter or blur. Previously a year-first browser applied 2027-03-01 to every
+  selected task while 2027-03-15 was being typed.
 
 The List's due-date and custom-field filters keep filtering as a date is typed.
 They use the corrected `committedDate()`, so a half-typed part no longer drops
@@ -80,13 +84,14 @@ They check that:
 - focus leaving a half-typed part (including Chromium's completion of it) or a
   partial year keeps the saved date;
 - focus moving between parts does not end the edit;
-- Escape discards the edit and keeps the panel open;
+- Escape discards the edit and keeps the panel or dialog open;
 - a picked date and the picker's Clear save at once;
 - an input emptied part by part saves null on blur;
-- the clear button discards a date being typed.
+- the clear button discards a date being typed, after a click or after Tab
+  moved to it, and focus moving on past it saves the date.
 
 `date-inputs.test.tsx` checks the List cell's half-typed guard and the bulk
-input.
+input and Clear.
 
 `packages/backend/tests/browser/date-input-typing.mjs` runs the production
 build against the API and PostgreSQL in Chromium under the en-US, de-DE and

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { DateInput } from "@/components/shared/date-input";
+import { useDateInput } from "@/components/shared/date-input";
 import { useBulkUpdateTasks, useBulkDeleteTasks } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels } from "@/features/projects/api";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -48,6 +48,13 @@ export function BulkActions({
       { onSuccess: () => onClear() },
     );
   };
+
+  const dueDate = useDateInput({
+    value: null,
+    onCommit: (date) => {
+      if (date) handleUpdate({ dueDate: date });
+    },
+  });
 
   return (
     <>
@@ -150,17 +157,18 @@ export function BulkActions({
         <div className="flex items-center gap-1">
           {/* Applies a complete typed date on Enter or blur, or a picked
               date; emptying it does nothing (Clear does that). */}
-          <DateInput
-            value={null}
-            onCommit={(dueDate) => {
-              if (dueDate) handleUpdate({ dueDate });
-            }}
+          <input
+            {...dueDate.inputProps}
             disabled={bulkUpdate.isPending}
             aria-label="Set due date"
             className="h-8 rounded-md border border-input bg-transparent px-2 text-sm"
           />
           <button
-            onClick={() => handleUpdate({ dueDate: null })}
+            {...dueDate.clearProps}
+            onClick={() => {
+              dueDate.discard();
+              handleUpdate({ dueDate: null });
+            }}
             disabled={bulkUpdate.isPending}
             className="rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
             title="Clear due date"

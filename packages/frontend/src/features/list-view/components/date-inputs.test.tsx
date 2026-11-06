@@ -90,3 +90,22 @@ it("the bulk due date applies a typed date once, on Enter, not the dates on the 
   fireEvent.keyDown(input, { key: "Enter" });
   expect(mutate.mock.calls.map((call) => call[0])).toEqual([{ taskIds: ["a", "b"], dueDate: "2027-03-15" }]);
 });
+
+it("the bulk Clear discards a typed date: Tab to Clear, then Clear, applies only null", () => {
+  const { container } = render(
+    <BulkActions projectId="p" selectedTaskIds={["a", "b"]} onClear={() => {}} />,
+  );
+  const input = container.querySelector('input[type="date"]') as HTMLInputElement;
+  input.focus();
+  for (const [key, value] of [["0", ""], ["3", ""], ["1", ""], ["5", ""], ["2", "0002-03-15"], ["0", "0020-03-15"], ["2", "0202-03-15"], ["7", "2027-03-15"]]) {
+    fireEvent.keyDown(input, { key });
+    fireEvent.change(input, { target: { value } });
+    fireEvent.keyUp(input, { key });
+  }
+  const clear = screen.getByRole("button", { name: "Clear" });
+  fireEvent.blur(input, { relatedTarget: clear });
+  expect(fireEvent.mouseDown(clear)).toBe(false);
+  fireEvent.click(clear);
+  expect(mutate.mock.calls.map((call) => call[0])).toEqual([{ taskIds: ["a", "b"], dueDate: null }]);
+  expect(input.value).toBe("");
+});

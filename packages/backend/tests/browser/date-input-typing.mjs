@@ -95,8 +95,9 @@ try {
   });
   const SCENARIOS = [
     "panel-due", "panel-target", "panel-start", "panel-partial", "panel-partial-year", "panel-escape",
-    "panel-clear", "panel-emptied", "panel-picked", "list-due", "list-target",
-    "list-picked", "list-backspace", "bulk-1", "bulk-2",
+    "panel-clear", "panel-clear-click", "panel-clear-tab", "panel-emptied", "panel-picked",
+    "list-due", "list-target", "list-picked", "list-backspace", "bulk-1", "bulk-2",
+    "bulk-clear-1", "bulk-clear-2",
   ];
   const tasks = {};
   let position = 0;
@@ -266,7 +267,7 @@ try {
         .slice(from)
         .filter((w) => w.path.endsWith("/bulk-update") || Object.values(ids).some((id) => w.path.includes(id)));
       const nulls = record.writes.filter((w) => JSON.stringify(w.body).includes("null"));
-      if (!name.endsWith("clear") && !name.endsWith("emptied") && !name.endsWith("backspace")) {
+      if (!/clear|emptied|backspace/.test(name)) {
         check("server never received null", nulls.length === 0, nulls);
       }
       console.error(locale, name, JSON.stringify(record.checks), JSON.stringify(record.notes));
@@ -383,6 +384,29 @@ try {
       check("sent once", writesFor(from, ids["panel-clear"]).length === 1, writesFor(from, ids["panel-clear"]));
     });
 
+    // Task panel: a full date typed, then Clear, clicked or reached with Tab
+    // and pressed: only null is sent, not the typed date first.
+    for (const [name, use] of [
+      ["panel-clear-click", async (clear) => clear.click()],
+      ["panel-clear-tab", async (clear) => {
+        for (let i = 0; i < 3 && !(await clear.evaluate((el) => el === document.activeElement)); i++) {
+          await page.keyboard.press("Tab");
+        }
+        await page.keyboard.press("Enter");
+      }],
+    ]) {
+      await scenario(name, async ({ check }) => {
+        const panel = await openPanel(name);
+        const from = writes.length;
+        await panel.getByLabel("Due date", { exact: true }).focus();
+        await type(typing);
+        await use(panel.getByRole("button", { name: "Clear due date" }));
+        await settle();
+        check("cleared", (await saved(ids[name])).dueDate === null, await saved(ids[name]));
+        check("only null sent", JSON.stringify(writesFor(from, ids[name]).map((w) => w.body)) === '[{"dueDate":null}]', writesFor(from, ids[name]));
+      });
+    }
+
     // Task panel: every part deleted, then Tab out.
     await scenario("panel-emptied", async ({ check }) => {
       const panel = await openPanel("panel-emptied");
@@ -459,6 +483,22 @@ try {
       check("typed date applied to both", both.every((d) => d === NEW), both);
       const bulk = writes.slice(from).filter((w) => w.path.endsWith("/bulk-update"));
       check("applied once", bulk.length === 1, bulk);
+    });
+
+    // Bulk due date: a full date typed, then Clear: only null is applied.
+    await scenario("bulk-clear", async ({ check }) => {
+      await openList();
+      for (const name of ["bulk-clear-1", "bulk-clear-2"]) await row(name).locator('input[type="checkbox"]').first().check();
+      const from = writes.length;
+      await page.locator('input[type="date"]:not([title])').focus();
+      await type(typing);
+      // The Clear button next to the bulk date input.
+      await page.locator('input[type="date"]:not([title]) + button').click();
+      await settle();
+      const both = [await saved(ids["bulk-clear-1"]), await saved(ids["bulk-clear-2"])].map((s) => s.dueDate);
+      check("cleared both", both.every((d) => d === null), both);
+      const bulk = writes.slice(from).filter((w) => w.path.endsWith("/bulk-update"));
+      check("only null applied", bulk.length === 1 && bulk[0].body.dueDate === null, bulk);
     });
 
     result.pageErrors = errors;

@@ -22,7 +22,7 @@ process.env.SMTP_FROM = "fixture@example.test";
 process.env.SMTP_USER = "";
 process.env.SMTP_PASS = "";
 process.env.SMTP_SECURE = "false";
-// These tests replace an account's link several times in a row; the
+// These tests issue an account's links several times in a row; the
 // per-account reset cooldown is covered in login-backoff.test.mjs.
 process.env.PASSWORD_RESET_COOLDOWN_SECONDS = "0";
 const { buildApp } = await import("../../src/app.ts");
@@ -33,7 +33,7 @@ const { resetTransporter } = await import("../../src/utils/mailer.ts");
 const { PrismaClient } = await import("@prisma/client");
 const { refreshLockLimits, startRefreshSession } =
   await import("../../src/modules/auth/refresh-sessions.ts");
-const { cleanupExpiredTokensAndAttempts, settlePasswordResetRequests } =
+const { cleanupExpiredTokensAndAttempts, forgotPassword, settlePasswordResetRequests } =
   await import("../../src/modules/auth/auth.service.ts");
 const { forgetSignInFailures } = await import("./support/login-throttle.mjs");
 const domain = `account-link-${crypto.randomBytes(5).toString("hex")}.example.test`;
@@ -417,11 +417,76 @@ test("register and resend persist verification digests and retain subject and in
   );
 });
 
+test("new reset requests preserve unused links until a successful reset invalidates the siblings", async () => {
+  const user = await makeUser();
+  const other = await makeUser();
+  const session = await login(user);
+  const { raw: first } = await forgot(user);
+  const original = await app.prisma.passwordResetToken.findUniqueOrThrow({
+    where: { tokenHash: hashToken(first) },
+  });
+  const { raw: second } = await forgot(user);
+  assert.notEqual(first, second);
+  assert.deepEqual(
+    await app.prisma.passwordResetToken.findUnique({
+      where: { id: original.id },
+    }),
+    original,
+    "requesting a newer link preserves the earlier link and its original expiry",
+  );
+  // Different server processes can issue concurrently after checking the
+  // best-effort cooldown. Neither may discard the victim's earlier links.
+  await Promise.all([
+    forgotPassword(app.prisma, user.email),
+    forgotPassword(app.prisma, user.email),
+  ]);
+  assert.equal(
+    await app.prisma.passwordResetToken.count({
+      where: { userId: user.id, usedAt: null },
+    }),
+    4,
+  );
+  const { raw: otherRaw } = await forgot(other);
+  assert.equal((await reset(first)).status, 200);
+  assert.equal((await reset(first)).status, 410);
+  assert.equal((await reset(second)).status, 404);
+  assert.equal(
+    await app.prisma.passwordResetToken.count({
+      where: { userId: user.id, usedAt: null },
+    }),
+    0,
+    "a successful reset still ends every other unused link",
+  );
+  assert.equal(
+    (await request("POST", "/api/auth/refresh", { cookie: session.cookie })).status,
+    401,
+  );
+  assert.equal((await reset(otherRaw)).status, 200);
+});
+
+test("a new reset request cannot replace a link whose reset is waiting for the account lock", async () => {
+  const user = await makeUser();
+  const { raw: first } = await forgot(user);
+  let second;
+  const [result] = await withLock(
+    (tx) => tx.$queryRaw`SELECT id FROM "User" WHERE id = ${user.id} FOR NO KEY UPDATE`,
+    async (start, waitBlocked) => {
+      start(() => reset(first));
+      await waitBlocked();
+      second = (await bounded(forgot(user))).raw;
+    },
+  );
+  assert.equal(result.status, 200, result.body);
+  assert.notEqual(first, second);
+  assert.equal((await reset(second)).status, 404);
+});
+
 test("successful password change invalidates earlier reset links while keeping other accounts and used records", async () => {
   const user = await makeUser();
   const other = await makeUser();
   const session = await login(user);
   const { raw } = await forgot(user);
+  const { raw: secondRaw } = await forgot(user);
   const { raw: otherRaw } = await forgot(other);
   await app.prisma.passwordResetToken.createMany({
     data: [3600_000, -1000].map((offset) => ({
@@ -449,6 +514,7 @@ test("successful password change invalidates earlier reset links while keeping o
     404,
     "a reset link issued before a successful password change must be invalid",
   );
+  assert.equal((await reset(secondRaw)).status, 404);
   assert.equal(
     await app.prisma.passwordResetToken.count({
       where: { userId: user.id, usedAt: null },
@@ -631,13 +697,14 @@ test("change, forgot-password and cleanup settle without deadlock and later issu
     (tx) =>
       tx.$queryRaw`SELECT id FROM "PasswordResetToken" WHERE id = ${old.id} FOR UPDATE`,
     async (start, waitBlocked) => {
-      start(async () => {
-        newer = await forgot(user);
-        return newer.response;
-      });
-      await waitBlocked();
+      await bounded(
+        start(async () => {
+          newer = await forgot(user);
+          return newer.response;
+        }),
+      );
       start(() => cleanupExpiredTokensAndAttempts(app.prisma));
-      await waitBlocked(2);
+      await waitBlocked();
       const changed = await bounded(start(() => change(user, session)));
       assert.equal(changed.status, 503, changed.body);
     },

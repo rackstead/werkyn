@@ -114,7 +114,7 @@ export async function changePassword(
     }
     // Invalidate pre-existing unused reset links before the password and
     // families change. The account lock excludes every reset. Other token
-    // holders are forgot-password/cleanup deletes; skip them so multi-row
+    // holders are cleanup deletes; skip them so multi-row
     // deletes cannot wait for one another in opposite row orders.
     await tx.$executeRaw`
       DELETE FROM "PasswordResetToken"

@@ -515,7 +515,11 @@ backfills families for existing sessions, so users stay signed in. See
 A password-reset link works once: when the same link is submitted several
 times at once, one request changes the password and ends the sessions, and the
 others get `410` and change nothing. An email-verification link is likewise
-consumed by exactly one request. Only SHA-256 digests of these account links
+consumed by exactly one request. Requesting another password-reset link keeps
+earlier unused links valid until their original one-hour expiry, so someone
+else requesting a link cannot interrupt a reset already in progress. A
+successful password reset or password change invalidates the account's other
+unused links. Only SHA-256 digests of these account links
 are stored; outstanding links survive the coordinated upgrade described in
 [docs/remediation/sec-026.md](docs/remediation/sec-026.md).
 

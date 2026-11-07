@@ -1,5 +1,13 @@
 # Failed sign-in backoff and enumeration cost (R31)
 
+## Current reset-link issuance (7 November 2026)
+
+The cooldown and uniform answers below still apply. Once the cooldown allows
+a new link, earlier unexpired, unused reset links keep their original expiry;
+requesting another link cannot invalidate them. Only expired unused links are
+pruned on issuance. A successful password reset or change invalidates other
+unused links. Descriptions of replacing a link below record the earlier policy.
+
 ## Problem
 
 Password sign-in had a per-client-address route limit (10 requests a minute)

@@ -1,5 +1,13 @@
 # Integration test flakes under CI load
 
+## Reset-link policy update (7 November 2026)
+
+New reset requests now retain earlier unexpired, unused links instead of
+replacing them. Successful password changes and resets still delete other
+unused links, so the password-storm test and its reset lane keep the behavior
+described below. The comparison to a link replaced by forgot-password in the
+historical explanation is superseded by this retention policy.
+
 Seven tests failed now and then in hosted CI, on main as well as on
 unrelated pull requests. Each failure came from the test, not from the
 behaviour it checks: a capture window, an order or a wait that held on an

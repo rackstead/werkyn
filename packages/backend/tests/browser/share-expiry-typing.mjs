@@ -14,8 +14,9 @@
 //   node --import tsx tests/browser/share-expiry-typing.mjs
 //
 // SHARE_EXPIRY_DIST may name another frontend build (default: packages/
-// frontend/dist), SHARE_EXPIRY_REPORT a JSON file for the results and
-// SHARE_EXPIRY_SHOTS a directory for screenshots of failed scenarios.
+// frontend/dist), SHARE_EXPIRY_REPORT a JSON file for the results,
+// SHARE_EXPIRY_SHOTS a directory for screenshots of failed scenarios, and
+// SHARE_EXPIRY_LOCALES a comma-separated subset of en-US, de-DE and ja-JP.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
@@ -246,7 +247,9 @@ try {
     return order;
   }
 
-  for (const run of RUNS) {
+  // SHARE_EXPIRY_LOCALES (comma-separated) runs only those languages.
+  const only = process.env.SHARE_EXPIRY_LOCALES?.split(",");
+  for (const run of RUNS.filter((r) => !only || only.includes(r.locale))) {
     const { locale, zone } = run;
     // On Linux, Chromium takes the date input's part order from the
     // environment's language; --lang alone is not enough there.
@@ -319,8 +322,14 @@ try {
     await page.goto(`${origin}/${workspace.slug}/drive?section=drive&folderId=${folders[locale].id}`);
     await page.getByText(`${locale} ${SAVE.at(-1)}.txt`, { exact: true }).waitFor();
 
+    // An input with a 4-digit `max` year moves on after four year digits by
+    // itself, so the ArrowRight after a year that is not last is left out.
     async function type(list) {
-      for (const key of list) await page.keyboard.press(key, { delay: 20 });
+      const moves = await page.evaluate(() => /^\d{4}-/.test(document.activeElement?.max ?? ""));
+      for (const key of list) {
+        if (key === "ArrowRight" && moves) continue;
+        await page.keyboard.press(key, { delay: 20 });
+      }
     }
     /** A real mouse click at the button's centre, enabled or not. */
     async function press(button) {

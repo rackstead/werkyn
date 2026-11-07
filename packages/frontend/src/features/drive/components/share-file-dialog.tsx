@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, type ReactNode } from "react";
+import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
   useFileShares,
   useFileShareLinks,
@@ -598,6 +598,32 @@ function LinkTab({
 }
 
 /**
+ * Lets a form send each request once while it is in flight: the second click
+ * of a double-click comes before the mutation reports it is pending, and
+ * would send the same request again. `pending` is the mutation's isPending;
+ * call `settled()` from the request's onSettled as well, in case a quick
+ * request never shows as pending.
+ */
+function useSendOnce(pending: boolean) {
+  const sent = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pending) sent.current = null;
+  }, [pending]);
+  return {
+    /** False when this request is already in flight. */
+    claim: (request: unknown) => {
+      const key = JSON.stringify(request);
+      if (sent.current === key) return false;
+      sent.current = key;
+      return true;
+    },
+    settled: () => {
+      sent.current = null;
+    },
+  };
+}
+
+/**
  * Password and expiry for a new link. An expiry date is sent only when it is
  * complete and not before today: Create refuses while the date input is half
  * typed (it is marked disabled), and a link without an expiry needs the date
@@ -614,6 +640,7 @@ function CreateLinkForm({
   onCreated: (link: ShareLink) => void;
 }) {
   const createLink = useCreateFileShareLink(workspaceId);
+  const once = useSendOnce(createLink.isPending);
   const [password, setPassword] = useState("");
   const expiry = useDateField();
   const problem = expiryProblem(expiry.content);
@@ -624,13 +651,16 @@ function CreateLinkForm({
     // click.
     const content = expiry.read();
     if (!content || expiryProblem(content)) return;
+    const request = {
+      fileIds,
+      password: password.trim() || undefined,
+      ...(content.kind === "date" ? { expiresAt: endOfLocalDay(content.date) } : {}),
+    };
+    if (!once.claim(request)) return;
     createLink.mutate(
+      request,
       {
-        fileIds,
-        password: password.trim() || undefined,
-        ...(content.kind === "date" ? { expiresAt: endOfLocalDay(content.date) } : {}),
-      },
-      {
+        onSettled: once.settled,
         onSuccess: (res) => {
           setPassword("");
           expiry.set(null);
@@ -714,14 +744,18 @@ function LinkExpiryEditor({
   update: ReturnType<typeof useUpdateFileShareLink>;
 }) {
   const current = link.expiresAt ? localExpiryDate(link.expiresAt) : null;
+  const once = useSendOnce(update.isPending);
   const expiry = useDateField(current);
   const problem = expiryProblem(expiry.content);
   const changed = expiry.content.kind === "date" && expiry.content.date !== current;
 
   const send = (expiresAt: string | null) => {
+    const request = { linkId: link.id, expiresAt };
+    if (!once.claim(request)) return;
     update.mutate(
-      { linkId: link.id, expiresAt },
+      request,
       {
+        onSettled: once.settled,
         onSuccess: (res) => {
           onSaved(res.data);
           toast.success(`This link now ${describeExpiry(res.data.expiresAt)}.`);

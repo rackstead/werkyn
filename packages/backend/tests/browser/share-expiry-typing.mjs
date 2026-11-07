@@ -15,8 +15,9 @@
 //
 // SHARE_EXPIRY_DIST may name another frontend build (default: packages/
 // frontend/dist), SHARE_EXPIRY_REPORT a JSON file for the results,
-// SHARE_EXPIRY_SHOTS a directory for screenshots of failed scenarios, and
-// SHARE_EXPIRY_LOCALES a comma-separated subset of en-US, de-DE and ja-JP.
+// SHARE_EXPIRY_SHOTS a directory for screenshots of failed scenarios,
+// SHARE_EXPIRY_LOCALES a comma-separated subset of en-US, de-DE and ja-JP, and
+// SHARE_EXPIRY_SCENARIOS a comma-separated subset of the scenarios.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
@@ -115,11 +116,15 @@ const DELIBERATE = new Set(["create-none", "create-cleared", "save-remove"]);
 const CREATE = [
   "create-half", "create-two-parts", "create-partial-year", "create-half-enter",
   "create-past", "create-full-click", "create-full-keyboard", "create-none", "create-cleared",
+  "create-focus-click-zero", "create-focus-click-full",
 ];
 const SAVE = [
   "save-half", "save-partial-year", "save-backspace", "save-untouched",
   "save-past", "save-full-click", "save-full-keyboard", "save-remove",
+  "save-focus-click-half", "save-double-click-full",
 ];
+// SHARE_EXPIRY_SCENARIOS (comma-separated) runs only those scenarios.
+const ONLY_SCENARIOS = process.env.SHARE_EXPIRY_SCENARIOS?.split(",");
 
 const app = await buildApp();
 let vite;
@@ -393,6 +398,7 @@ try {
      * OLD, or no link is made), or a date the link must end up with.
      */
     async function scenario(name, body, expect) {
+      if (ONLY_SCENARIOS && !ONLY_SCENARIOS.includes(name)) return;
       const from = writes.length;
       const id = files[locale][name];
       const record = { writes: [], stored: null, toasts: [], checks: {}, notes: {} };
@@ -516,6 +522,27 @@ try {
       await press(dialog.getByRole("button", { name: "Create link", exact: true }));
     }, null);
 
+    // A click that leaves focus in the date input (element.click(), as some
+    // assistive technology and automation send it): no press, and no blur
+    // for Chromium to settle a half-typed part. A lone "0" in the first part
+    // of an empty input still reads as empty then.
+    for (const [name, list, expect] of [
+      ["create-focus-click-zero", ["0"], "kept"],
+      ["create-focus-click-full", keys.full, typedEnd],
+    ]) {
+      await scenario(name, async ({ note }) => {
+        const dialog = await openLinkTab(name);
+        await input(dialog).focus();
+        await type(list);
+        const shown = await input(dialog).inputValue();
+        note("bad input before the click", await input(dialog).evaluate((el) => el.validity.badInput));
+        const button = dialog.getByRole("button", { name: "Create link", exact: true });
+        note("Create before the click", await looks(button));
+        await button.evaluate((el) => el.click());
+        return shown;
+      }, expect);
+    }
+
     // ─── Change an existing link's expiry ───────────────────
     for (const [name, list] of [
       ["save-half", keys.half],
@@ -560,6 +587,31 @@ try {
         return shown;
       }, typedEnd);
     }
+
+    // Half a part, then a click that leaves focus in the input.
+    await scenario("save-focus-click-half", async ({ note }) => {
+      const dialog = await openLinkTab("save-focus-click-half");
+      await openExpiryEditor(dialog);
+      await input(dialog).focus();
+      await type(keys.half);
+      const shown = await input(dialog).inputValue();
+      const save = dialog.getByRole("button", { name: "Save", exact: true });
+      note("Save before the click", await looks(save));
+      await save.evaluate((el) => el.click());
+      return shown;
+    }, "kept");
+
+    // A double-click on Save with the full date: one request.
+    await scenario("save-double-click-full", async () => {
+      const dialog = await openLinkTab("save-double-click-full");
+      await openExpiryEditor(dialog);
+      await input(dialog).focus();
+      await type(keys.full);
+      const shown = await input(dialog).inputValue();
+      const box = await dialog.getByRole("button", { name: "Save", exact: true }).boundingBox();
+      await page.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+      return shown;
+    }, typedEnd);
 
     // Deliberately removing the expiry, with the explicit button.
     await scenario("save-remove", async ({ check, note }) => {

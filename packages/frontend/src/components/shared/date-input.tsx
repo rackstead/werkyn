@@ -211,6 +211,12 @@ const sameContent = (a: DateInputContent, b: DateInputContent) =>
  * therefore not be `disabled` while the input is incomplete (a disabled
  * button gets no press, yet still gets the click once the completion enables
  * it); mark it `aria-disabled` and let the form refuse.
+ *
+ * A click can also come with no press and leave focus in the input
+ * (`element.click()`, as some assistive technology and automation send it).
+ * Nothing has settled the input then: a lone month "0" in an empty input
+ * still reads as empty. `read()` therefore settles the input itself by
+ * moving focus out of it, and returns null when that changed it.
  */
 export function useDateField(initial: string | null = null) {
   const ref = useRef<HTMLInputElement>(null);
@@ -235,14 +241,18 @@ export function useDateField(initial: string | null = null) {
   };
 
   /**
-   * The input's content now, for the form to send, or null when the press on
-   * the form's button changed it (see above).
+   * The input's content once settled, for the form to send, or null when the
+   * press on the form's button, or settling the input, changed it (see above).
    */
   const read = (): DateInputContent | null => {
-    const before = pressed.current;
+    const input = ref.current;
+    if (!input) return content;
+    // What was shown: at the press, or now when nothing was pressed.
+    const before = pressed.current ?? dateInputContent(input);
     pressed.current = null;
-    const now = ref.current ? refresh(ref.current) : content;
-    return before && !sameContent(before, now) ? null : now;
+    if (input.ownerDocument.activeElement === input) input.blur();
+    const now = refresh(input);
+    return sameContent(before, now) ? now : null;
   };
 
   /** Shows `date`, or empties the input (half-typed parts included). */

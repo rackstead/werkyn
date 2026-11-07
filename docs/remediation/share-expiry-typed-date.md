@@ -49,6 +49,20 @@ and Save are marked `aria-disabled` rather than `disabled` while the date is
 incomplete. A disabled button gets no press, so the check could not run, but
 it still gets that click.
 
+A click can also come with no press and leave focus in the input:
+`element.click()`, as some assistive technology and automation send it.
+Nothing has settled the input then, and a lone month "0" in an empty input
+still reads as empty, so Create made a link with no expiry. `read()`
+therefore settles the input itself before reading it: it moves focus out of
+the input, and Chromium marks or completes the half-typed part. If that
+changed what the input holds, the click sends nothing. This follow-up came
+from finding M1 of the PR #211 review.
+
+A double-click on Save, or on Remove expiration, used to send the same
+request twice: the second click came before the mutation reported it was
+pending. The dialog now sends a given request once while it is in flight.
+After a failure, the same request can be sent again.
+
 ### Create
 
 - Create sends an expiry only when the date is complete and not before local
@@ -145,7 +159,9 @@ passing would.
   - no request leaves a link without an expiry, and every expiry sent is a
     date the input showed;
   - Create and Save refuse incomplete and past dates;
-  - a press that completes a half-typed part sends nothing;
+  - a press that completes a half-typed part sends nothing, and so does a
+    click that leaves focus in the input when settling the input changes it;
+  - a double-click sends one request;
   - Clear date and Remove expiration work;
   - messages state the stored expiry;
   - a dialog for several files shows what the server stored.
@@ -159,7 +175,9 @@ passing would.
   the API and PostgreSQL in Chromium. It uses en-US in New York, de-DE in
   Kiritimati and ja-JP in Pago Pago. In each it types into Create and Save:
   half a part, two parts, a partial year, a past date, one Backspace, and the
-  full date (by click, by keyboard, and with Enter in the input). It records
+  full date (by click, by keyboard, and with Enter in the input). It also
+  uses `element.click()`, which leaves focus in the input, after a lone "0"
+  and after the full date, and double-clicks Save. It records
   every request and stored row. It fails on any request that creates a link
   without an expiry or sends null, unless the scenario chose that (no date,
   Clear date, Remove expiration). It also fails on any expiry that is not the
@@ -181,10 +199,17 @@ passing would.
   input did not show. `DateInput` has the same limit, since the browser
   reports nothing else.
 - A lone month "0" in an empty input reads as empty until focus leaves the
-  input. While it still has focus, Create looks usable. The press that moves
-  focus marks it incomplete, and nothing is sent.
+  input. While it still has focus, Create looks usable. Using it moves focus
+  out of the input, which marks it incomplete, and nothing is sent.
 - Keyboard users who Tab out of a half-typed date see the browser's completed
   date before they reach the button. Enter then sends that date.
+- A double-click on Create or Save with a half-typed last part sends the
+  browser's completed date. In year/month/day, a day "0" becomes 01. The first
+  click completes the part and sends nothing. The second click comes before
+  the user can see the completed date, and sends it. That date is never "no
+  expiry" and never in the past. It is the lowest value of that part, so the
+  link ends sooner than the date being typed, and the message states the
+  stored date.
 - A day whose 23:59:59 occurs twice (a zone that falls back at midnight) ends
   at the first one. No zone tested here does so.
 - The "not before today" check runs in the browser when the button is used,

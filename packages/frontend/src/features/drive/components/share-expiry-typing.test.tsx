@@ -360,3 +360,99 @@ describe("changing a link's expiry while a date is typed", () => {
     expect(screen.getByText(`Expired ${new Date("2026-11-01T12:00:00").toLocaleDateString()}`)).toBeTruthy();
   });
 });
+
+/**
+ * Chromium settles a half-typed part only as focus leaves the input: a lone
+ * month "0" in an empty input then becomes bad input, and a half-typed part
+ * of a whole date is completed (`completed`).
+ */
+function settleOnBlur(input: HTMLInputElement, completed?: string) {
+  input.addEventListener("blur", () => {
+    setHalfTyped(input, completed === undefined);
+    if (completed !== undefined) input.value = completed;
+  });
+}
+
+describe("a click that leaves focus in the date input", () => {
+  // element.click(), as some assistive technology and automation send it:
+  // no press, and focus stays in the input.
+  it("creates nothing after a lone month 0, which still reads as empty", () => {
+    const input = openCreate();
+    settleOnBlur(input);
+    type(input, TYPING_INTO_EMPTY["month/day/year"].slice(0, 1));
+    expect(document.activeElement).toBe(input);
+    expect(blocked(createButton())).toBe(false);
+    fireEvent.click(createButton());
+    expect(state.create).not.toHaveBeenCalled();
+    expect(blocked(createButton())).toBe(true);
+    expect(note(input)).toBe("Enter a complete date.");
+  });
+
+  it("creates the link with a whole date", () => {
+    const input = openCreate();
+    settleOnBlur(input);
+    type(input, TYPING_INTO_EMPTY["month/day/year"]);
+    fireEvent.click(createButton());
+    expect(state.create.mock.calls.map(([body]) => body)).toEqual([
+      { fileIds: ["file-1"], password: undefined, expiresAt: end("2027-03-15") },
+    ]);
+  });
+
+  it("creates a link without an expiry when nothing was typed", () => {
+    // Focused but untouched: settling leaves the input empty.
+    const input = openCreate();
+    expect(document.activeElement).toBe(input);
+    fireEvent.click(createButton());
+    expect(state.create.mock.calls.map(([body]) => body)).toEqual([{ fileIds: ["file-1"], password: undefined }]);
+  });
+
+  it("saves nothing when settling completes a half-typed month", () => {
+    const input = openEditor(end("2027-11-20"));
+    settleOnBlur(input, "2027-01-20");
+    type(input, [["0", "", true]]);
+    fireEvent.click(saveButton());
+    expect(state.update).not.toHaveBeenCalled();
+    // The completed date is now shown; a second click sends it.
+    expect(input.value).toBe("2027-01-20");
+    fireEvent.click(saveButton());
+    expect(state.update.mock.calls.map(([body]) => body)).toEqual([
+      { linkId: "link-1", expiresAt: end("2027-01-20") },
+    ]);
+  });
+});
+
+describe("a double-click", () => {
+  it("sends one update for Save and one for Remove expiration", () => {
+    const input = openEditor(end(SAVED));
+    fireEvent.change(input, { target: { value: "2027-03-15" } });
+    fireEvent.click(saveButton());
+    fireEvent.click(saveButton());
+    const remove = screen.getByRole("button", { name: "Remove expiration" });
+    fireEvent.click(remove);
+    fireEvent.click(remove);
+    expect(state.update.mock.calls.map(([body]) => body)).toEqual([
+      { linkId: "link-1", expiresAt: end("2027-03-15") },
+      { linkId: "link-1", expiresAt: null },
+    ]);
+  });
+
+  it("sends one create", () => {
+    const input = openCreate();
+    fireEvent.change(input, { target: { value: "2027-03-15" } });
+    fireEvent.click(createButton());
+    fireEvent.click(createButton());
+    expect(state.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows the same request again once the first has failed", () => {
+    state.update.mockImplementation((_body, options) => {
+      options.onError(new Error("Network error"));
+      options.onSettled();
+    });
+    const input = openEditor(end(SAVED));
+    fireEvent.change(input, { target: { value: "2027-03-15" } });
+    fireEvent.click(saveButton());
+    fireEvent.click(saveButton());
+    expect(state.update).toHaveBeenCalledTimes(2);
+  });
+});

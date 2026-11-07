@@ -230,6 +230,13 @@ same user cannot start another backup or restore upload until a short,
 configurable cooldown ends, and gets 429 with Retry-After meanwhile. Normal
 uploads and other users are not affected.
 
+A cooldown that followed only the 408 would be dodged by hanging up just
+before it. After the independent review, the owner accepted the broader
+trigger described below on the same day: any upload that stops short of the
+minimum rate owes a wait in proportion to its shortfall, the first 6 seconds
+of shortfall are forgiven, the wait never exceeds the cooldown, and a 408
+gives the full cooldown. Uploads at or above 16 KiB/s are never charged.
+
 ### Change
 
 One more setting, read at startup like the others (an empty value keeps the
@@ -286,6 +293,24 @@ At the defaults:
 | A 2 KB file, completed after a 10-second pause | about 10 s | 16 s |
 | Client hangs up after 5 s, or a tiny file arrives after a 5-second pause | about 5 s | not refused |
 | Any upload at 16 KiB/s or more | 0 | not refused |
+
+What a legitimate user can see, measured by the independent review of PR
+#209 at the defaults (each case with a fresh user, followed at once by a
+small preview from the same user):
+
+| Upload | Then |
+|---|---|
+| Any upload at or above 16 KiB/s, steady or with network stalls of 10 or 20 seconds that it makes up for; a cancelled or dropped upload at a normal speed; a 400 for a wrong file type or a damaged archive | no wait |
+| A small file that arrives after a pause of up to about 6 seconds | no wait |
+| A small file that arrives after a pause of 8, 15 or 25 seconds | refused for 8, 36 or 76 seconds |
+| A small file over a link slower than 16 KiB/s (100 to 350 KiB at 8 to 12 KiB/s) | no wait, or refused for 2 to 26 seconds |
+| A real 408: for example, a link that stalls for about 40 seconds mid-upload | refused for 120 seconds |
+| A tiny preview while another admin's crafted restore blocks the server for 8 or 12 seconds | refused for 12 or 28 seconds |
+
+Without a 408, no legitimate upload can be refused for more than about 96
+seconds (the 144-second cap less the forgiven 24). The 408 itself has been
+answered since the minimum rate (PR #204); the cooldown only adds the wait
+after it.
 
 However one account times its uploads, it can keep backup slots busy below
 the minimum rate for only about a fifth to a quarter of the time at the

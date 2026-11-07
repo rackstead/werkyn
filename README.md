@@ -678,10 +678,14 @@ Ending a slow upload before its `408` does not avoid it: an upload that stops
 below the minimum rate (cancelled, refused for another reason, or a small file
 finished after a long pause) adds to the user's wait in proportion to the time
 it held its slot without sending, 4 seconds per second at the defaults. Waits
-add up and count down; the first fifth of the cooldown is forgiven, so a pause
-of a few seconds never counts. Uploads at or above the minimum rate, exports
-and other users are not affected. At the defaults, one account can keep slots
-busy below the minimum rate for only about a fifth to a quarter of the time.
+add up and count down, never beyond the cooldown; the first 6 seconds of
+shortfall are forgiven. Measured at the defaults, a small file that arrives
+after a pause of under about 6 seconds owes nothing; after a pause of 8, 15 or
+25 seconds the next upload waits 8, 36 or 76 seconds; a small file over a link
+slower than 16 KiB/s may wait 2 to 26 seconds; and a genuine `408` means 120
+seconds. Uploads at or above the minimum rate, exports and other users are not
+affected. At the defaults, one account can keep slots busy below the minimum
+rate for only about a fifth to a quarter of the time.
 
 The cooldown is per user, so someone with several accounts can still take
 turns between them. A reverse proxy that receives whole uploads before passing

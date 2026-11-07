@@ -30,7 +30,7 @@ whose checks have the same names as the rules below.
 | `time_entry_task_project` | A time entry with a task and a project names the task's project | time entry create/update (`assertTaskInProject`) | Composite FK `TimeEntry(taskId, projectId) -> Task(id, projectId)`, deferred (below) |
 | `task_dependency_project` | A dependency links two different tasks of one project | dependency add, restore | CHECK `TaskDependency_not_self` plus triggers reporting `TaskDependency_same_project` |
 | `task_label_project` | A task's label belongs to the task's project | task create, bulk update, add label, duplicate, template instantiation, restore | Triggers reporting `TaskLabel_same_project` |
-| `custom_field_value_project` | A value's field belongs to the task's project | value write, duplicate, restore | Triggers reporting `CustomFieldValue_same_project` |
+| `custom_field_value_project` | A value's field belongs to the task's project | value write, restore (task duplicate does not copy values) | Triggers reporting `CustomFieldValue_same_project` |
 
 Migration `20261106120100_value_range_constraints`. Report: the queries in
 [Finding the rows](#finding-the-rows) below (the contract-validation doc
@@ -86,7 +86,13 @@ the hours and rate checks also refuse non-finite values.
   labels and custom fields. The application never moves these rows between
   projects; a future "move task to another project" feature has to replace
   these guards. A missing task, label or field is left to the existing
-  foreign keys, which are checked first.
+  foreign keys, which are checked first. The trigger functions run with the
+  search path set to the schema the migrations ran in (that of
+  `DATABASE_URL`), then `pg_temp` (migration
+  `20261106140000_pin_trigger_search_path`). They therefore read that
+  schema's tables whatever the writing session's search path is: a temporary
+  table named `Task`, `Label` or `CustomField` cannot stand in for the real
+  one, and pg_restore's empty search path still finds them.
 - **CHECK** for single-row rules.
 
 ### Not adopted here (follow-ups)
@@ -94,7 +100,7 @@ the hours and rate checks also refuse non-finite values.
 | Candidate | Why not now |
 | --- | --- |
 | `task_assignee_access`, `subtask_assignee_access`, `chat_member_workspace` | They depend on mutable membership. Membership removal and ADMIN demotion clear assignments in the same transaction under the DAT-005 lock order. A database rule would need triggers on member deletes and role changes that join that lock order; it needs its own design and concurrency tests. |
-| A time entry with a task but no project | Not covered by MATCH SIMPLE. A CHECK cannot be deferred and would refuse project deletes whose SET NULL runs before the task cascade. Needs a deferred constraint trigger. The report's `time_entry_task_project` still lists such rows. |
+| A time entry with a task but no project | Not covered by MATCH SIMPLE. A CHECK cannot be deferred and would refuse project deletes whose SET NULL runs before the task cascade. Needs a deferred constraint trigger. The report still lists such rows, under `time_entry_task_project`, or `time_entry_workspace` when the task is in another workspace. The migration does not refuse them, so they need no repair before upgrading. |
 | Custom-field value type and options (`custom-field-value-report`) | The rules (`checkCustomFieldValue`) depend on the field's type and options, which change; option edits migrate values. Enforcing them needs a SQL port of the shared validator or a trigger on both tables. |
 | Date-only text columns (`dueDate`, `startDate`, `date`, `effectiveFrom`, schedule dates) | A real-calendar-day check needs a SQL function, and the scheduler and template instantiation compute dates internally (see DAT-018); verify those writers first. |
 | Rate at most 1,000,000,000 | The request schema caps new rates, but time reports deliberately keep pricing larger finite legacy rates and refuse only costs they cannot represent ([time-report-rounded-costs.md](time-report-rounded-costs.md), tested with rates up to 1e308). A cap in the database would contradict that decision. |
@@ -124,7 +130,11 @@ and deploy again. See docs/remediation/r35-constraints.md.
 
 Nothing is created or changed (the precheck runs before any change, and the
 migration is one transaction, so a later failure also undoes everything
-before it). `prisma migrate deploy` exits with P3018 and
+before it). The report can list more time entries than the migration
+refuses: entries with a task but no project (see the follow-ups above) appear
+under `time_entry_task_project` or `time_entry_workspace` although no rule of
+the migration covers them. The IDs in the migration's message are the rows to
+repair before deploying again. `prisma migrate deploy` exits with P3018 and
 the container does not start; later deploys stop with P3009 until the
 migration is marked rolled back. Repair the rows, run the `resolve` command
 the message names and deploy again.
@@ -170,6 +180,14 @@ immediate key and trigger finds the rows it references; the restore plan
 already drops or remaps foreign references. Time entries are not restored, so
 the deferred keys do not apply to it.
 
+A full `pg_dump` and `pg_restore` creates the keys and triggers after the
+data. A data-only `pg_restore` into a migrated database runs the triggers for
+each table it loads, so the restored rows must satisfy the rules; pg_dump
+orders the tables so that referenced rows come first (it warns about the
+circular key on `File`). As before R35, the `SsoConfig` row that an earlier
+migration seeds has to be deleted first. `--disable-triggers` (superuser)
+skips the keys and triggers for the restore.
+
 ## Locks and timing
 
 Measured on the performance fixture (`scripts/perf/seed.ts`, scale 1: 100k
@@ -199,8 +217,9 @@ deleted task and cleared entry).
 ## Tests
 
 `packages/backend/tests/migrations/structural-constraints.test.mjs` (CI step
-"Structural constraint upgrade") builds two disposable fixtures, one after the
-other, in an empty database migrated to the migration before these two:
+"Structural constraint upgrade", run once in `public` and once with
+`?schema=werkyn_custom`) builds two disposable fixtures, one after the other,
+in an empty database migrated to the migration before these two:
 
 - A legacy fixture with rows that break every rule, written with raw SQL. The
   first migration refuses with the expected rule names, counts and the first
@@ -219,6 +238,10 @@ other, in an empty database migrated to the migration before these two:
   the boundary values are accepted. Deleting a task, project, column,
   template or workspace keeps its behavior, including time entries losing
   their task or project.
+- The trigger functions carry the pinned search path. The same-project and
+  fixed-project checks refuse cross-project rows, and accept valid ones,
+  both with temporary tables named `Task`, `Label` and `CustomField` and
+  with an empty search path, as pg_restore sets.
 - `prisma migrate diff --exit-code` from the migrated database to
   `schema.prisma` finds no drift: the composite keys and their indexes are
   declared as relations, and deferrability, CHECKs and triggers are outside

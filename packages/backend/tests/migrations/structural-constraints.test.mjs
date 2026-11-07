@@ -26,6 +26,9 @@ const PINNED = "20261106140000_pin_trigger_search_path";
 const TRIGGER_FUNCTIONS = [
   "check_custom_field_value_project", "check_task_dependency_project", "check_task_label_project", "refuse_project_change",
 ];
+const BLOB_TRIGGER_FUNCTIONS = [
+  "delete_entity_attachments", "enqueue_attachment_blob_cleanup", "enqueue_file_blob_cleanup",
+];
 const prismaRoot = new URL("../../prisma/", import.meta.url);
 const packagePath = createRequire(import.meta.url).resolve("prisma/package.json");
 const cli = path.resolve(path.dirname(packagePath), JSON.parse(await readFile(packagePath, "utf8")).bin.prisma);
@@ -589,6 +592,73 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
             `INSERT INTO ${quoted}."TaskDependency" (id, "blockedTaskId", "blockingTaskId") VALUES ('x', 't2', 't1')`,
           ])
             await assertAccepted(clean, text, setup);
+        });
+      assert.deepEqual(await catalogSnapshot(clean), cleanCatalog);
+    });
+
+    await t.test("the project guard resolves concatenation in pg_catalog", async () => {
+      const [{ quoted }] = await clean.$queryRaw`SELECT quote_ident(current_schema()) AS quoted`;
+      await assertRefused(clean, `UPDATE ${quoted}."Label" SET "projectId" = 'p2' WHERE id = 'l1'`,
+        "23514", "Label_projectId_fixed", [
+          `CREATE FUNCTION ${quoted}.fixture_name_concat(name, text) RETURNS text LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'schema name concatenation operator was called'; END; $$`,
+          `CREATE OPERATOR ${quoted}.|| (FUNCTION = ${quoted}.fixture_name_concat, LEFTARG = name, RIGHTARG = text)`,
+        ]);
+    });
+
+    await t.test("blob cleanup reads its own schema and uses the built-in text comparison", async (st) => {
+      const [{ quoted }] = await clean.$queryRaw`SELECT quote_ident(current_schema()) AS quoted`;
+      await st.test("cleanup functions run in the migration schema, then pg_temp", () => {
+        assert.deepEqual(
+          cleanCatalog.functions.filter((f) => BLOB_TRIGGER_FUNCTIONS.includes(f.name)),
+          BLOB_TRIGGER_FUNCTIONS.map((name) => ({ name, config: [`search_path=${quoted}, pg_temp`] })),
+        );
+      });
+      const situations = {
+        "temporary Attachment and BlobCleanup tables": [
+          `CREATE TEMP TABLE "Attachment" (LIKE ${quoted}."Attachment" INCLUDING ALL) ON COMMIT DROP`,
+          `CREATE TEMP TABLE "BlobCleanup" (LIKE ${quoted}."BlobCleanup" INCLUDING ALL) ON COMMIT DROP`,
+        ],
+        "an empty caller search path": ["SELECT set_config('search_path', '', true)"],
+        "a schema operator with an exact varchar/text match": [
+          `CREATE FUNCTION ${quoted}.fixture_varchar_equal(varchar, text) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'schema varchar comparison operator was called'; END; $$`,
+          `CREATE OPERATOR ${quoted}.= (FUNCTION = ${quoted}.fixture_varchar_equal, LEFTARG = varchar, RIGHTARG = text)`,
+        ],
+      };
+      for (const [situation, setup] of Object.entries(situations))
+        await st.test(situation, async () => {
+          const rollback = new Error("rollback cleanup fixture");
+          await assert.rejects(clean.$transaction(async (tx) => {
+            await sql(tx, `INSERT INTO ${quoted}."Task" (id, "projectId", "statusId", title, "updatedAt")
+              VALUES ('cleanup-task', 'p1', 's1', 'Cleanup', now())`);
+            await sql(tx, `INSERT INTO ${quoted}."Comment" (id, "taskId", "authorId", body, "updatedAt")
+              VALUES ('cleanup-comment', 'cleanup-task', 'u1', 'Cleanup', now())`);
+            await sql(tx, `INSERT INTO ${quoted}."File" (id, "workspaceId", name, "uploadedById", "storagePath", "thumbnailPath", "updatedAt")
+              VALUES ('cleanup-file', 'w1', 'Cleanup', 'u1', 'cleanup/original', 'cleanup/thumbnail', now())`);
+            await sql(tx, `INSERT INTO ${quoted}."Attachment" (id, "workspaceId", "entityType", "entityId", name, "mimeType", "storagePath", "uploadedById", "fileId") VALUES
+              ('cleanup-task-a', 'w1', 'task', 'cleanup-task', 'Task', 'text/plain', 'cleanup/task', 'u1', NULL),
+              ('cleanup-comment-a', 'w1', 'comment', 'cleanup-comment', 'Comment', 'text/plain', 'cleanup/comment', 'u1', NULL),
+              ('cleanup-linked-a', 'w1', 'task', 'cleanup-task', 'Linked', 'text/plain', 'cleanup/original', 'u1', 'cleanup-file')`);
+            for (const statement of setup) await sql(tx, statement);
+
+            await sql(tx, `DELETE FROM ${quoted}."Task" WHERE id = 'cleanup-task'`);
+            assert.equal((await tx.$queryRawUnsafe(`SELECT count(*)::int AS n FROM ${quoted}."Attachment"
+              WHERE id IN ('cleanup-task-a', 'cleanup-comment-a', 'cleanup-linked-a')`))[0].n, 0);
+            const queued = async () => (await tx.$queryRawUnsafe(`SELECT "storagePath" FROM ${quoted}."BlobCleanup"
+              WHERE "storagePath" LIKE 'cleanup/%' ORDER BY "storagePath"`)).map((r) => r.storagePath);
+            // Linked attachments leave their live Drive file's blob alone.
+            assert.deepEqual(await queued(), ["cleanup/comment", "cleanup/task"]);
+            await sql(tx, `UPDATE ${quoted}."File" SET "storagePath" = 'cleanup/replacement' WHERE id = 'cleanup-file'`);
+            await sql(tx, `DELETE FROM ${quoted}."File" WHERE id = 'cleanup-file'`);
+            assert.deepEqual(await queued(), [
+              "cleanup/comment", "cleanup/original", "cleanup/replacement", "cleanup/task", "cleanup/thumbnail",
+            ]);
+            if (situation.startsWith("temporary")) {
+              assert.equal((await tx.$queryRawUnsafe(`SELECT count(*)::int AS n FROM pg_temp."BlobCleanup"`))[0].n, 0);
+            }
+            throw rollback;
+          }), (error) => error === rollback);
         });
       assert.deepEqual(await catalogSnapshot(clean), cleanCatalog);
     });

@@ -95,6 +95,24 @@ the hours and rate checks also refuse non-finite values.
   one, and pg_restore's empty search path still finds them.
 - **CHECK** for single-row rules.
 
+The blob-cleanup trigger functions `enqueue_file_blob_cleanup`,
+`enqueue_attachment_blob_cleanup` and `delete_entity_attachments` use the
+same schema pin (migration `20261107120000_harden_blob_cleanup_triggers`).
+Deleting a task or comment still removes its attachments and queues legacy
+blobs when the caller has an empty search path or temporary tables named
+`Attachment` and `BlobCleanup`. The project guard and attachment deletion
+cast their non-text operands to `text`, so their operators resolve to the
+exact built-in text operators in `pg_catalog`.
+
+If an operator renames the application schema, update `DATABASE_URL` and
+reapply `ALTER FUNCTION <new_schema>.<function>() SET search_path =
+<new_schema>, pg_temp` to the three cleanup functions and
+`check_task_label_project`, `check_custom_field_value_project`,
+`check_task_dependency_project` and `refuse_project_change` before allowing
+writes. Quote the schema identifier as needed. The pins store the schema
+name as text; a rename does not update them, so otherwise writes that use
+the triggers fail until the pins name the new schema.
+
 ### Not adopted here (follow-ups)
 
 | Candidate | Why not now |

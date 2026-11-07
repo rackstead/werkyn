@@ -51,7 +51,9 @@ process.env.STORAGE_DIR = path.join(root, "storage");
 const { buildApp } = await import("../../src/app.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { backupConcurrency } = await import("../../src/modules/backup/backup-concurrency.ts");
-const { BACKUP_UPLOAD_COOLDOWN_CODE } = await import("../../src/modules/backup/backup-cooldown.ts");
+const { BACKUP_UPLOAD_COOLDOWN_CODE, createBackupUploadCooldown } = await import(
+  "../../src/modules/backup/backup-cooldown.ts"
+);
 const { UNREAD_BODY_GRACE_MS } = await import("../../src/plugins/request-limits.ts");
 
 const suffix = crypto.randomUUID().slice(0, 8);
@@ -206,7 +208,7 @@ before(async () => {
   app = await buildApp({ requestLimits: LIMITS });
   await app.listen({ host: "127.0.0.1", port: 0 });
   port = app.server.address().port;
-  for (const name of ["dripper", "other", "fast", "quitter", "late", "roamer", "returner"]) {
+  for (const name of ["dripper", "other", "fast", "quitter", "late", "roamer", "returner", "locked"]) {
     users[name] = await app.prisma.user.create({
       data: { email: `backup-cooldown-${name}-${suffix}@example.test`, displayName: name, emailVerified: true },
     });
@@ -402,4 +404,43 @@ test("a second server process on the same database refuses the user too", { time
     child.stdin.end("quit\n");
     await exited;
   }
+});
+
+test("a charge that waits for another charge's row lock never lowers the wait stored meanwhile", { timeout: 30_000 }, async () => {
+  // A cooldown of 60 s after a 2 s grace period: a 408 owes 72 s.
+  const cooldown = createBackupUploadCooldown({ cooldownSeconds: 60, graceSeconds: 2 });
+  const errors = [];
+  const request = {
+    server: { prisma: app.prisma },
+    user: { id: users.locked.id },
+    log: { info() {}, error: (fields) => errors.push(fields) },
+  };
+  await cooldown.charge(request, 100);
+  // Another charge holds the user's row, and while the next charge waits for
+  // it, stores the full wait from its own, later clock reading.
+  let locked;
+  const isLocked = new Promise((resolve) => (locked = resolve));
+  const holder = app.prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT 1 FROM "BackupUploadCooldown" WHERE "userId" = ${users.locked.id} FOR UPDATE`;
+      locked();
+      await sleep(1_500);
+      await tx.$executeRaw`
+        UPDATE "BackupUploadCooldown"
+        SET "clearsAt" = (clock_timestamp() AT TIME ZONE 'UTC') + 72000 * interval '1 millisecond'
+        WHERE "userId" = ${users.locked.id}
+      `;
+    },
+    { timeout: 10_000 },
+  );
+  await isLocked;
+  await sleep(100);
+  const waiting = cooldown.charge(request, 10);
+  await holder;
+  await waiting;
+  assert.deepEqual(errors, []);
+  // Capped from the waiting charge's statement start instead, the stored
+  // wait would be about 1.4 s shorter.
+  const left = await owed(users.locked);
+  assert.ok(left > 72_000 - 400, `owes ${Math.round(left)} ms`);
 });

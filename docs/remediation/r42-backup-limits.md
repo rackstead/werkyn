@@ -262,13 +262,17 @@ default):
   refusal. A 408 sets the wait to the cooldown plus that fifth, so it leaves
   exactly the cooldown. No user ever owes more.
 - **Checked before admission.** The refusal comes before the user's request
-  takes a slot or reads its body. Its connection is closed 2 seconds after
-  the answer if the client goes on sending, as for other answers sent before
-  the body has arrived.
+  takes a slot or reads its body. From this check on, any answer sent before
+  the body has arrived (this refusal, a failed check, or a 429 or 503 from the
+  slot limits) closes the connection 2 seconds later if the client goes on
+  sending, as for the other answers above. Before, a busy refusal kept such a
+  connection until the 120-second request deadline.
 - **Recorded before the answer.** The wait is written before the slot is
   released and before the response is sent, so the client's next request
   finds it. If the write fails, the error is logged and the request's own
-  answer is unchanged.
+  answer is unchanged. Concurrent charges for one user add up: a write that
+  waits for another's row lock reads the database clock once it has the row,
+  so it never shortens the wait stored meanwhile.
 - **Per authenticated user,** whether signed in with a session or a personal
   API key; not per IP address. Other users, and the user's exports (which
   upload nothing), are not affected.
@@ -378,17 +382,27 @@ grace period and a 4-second cooldown:
   slots) refuses the user right after their 408 in the first one, without
   taking a slot, and admits another admin; an upload abandoned below the rate
   in the second process makes the first refuse the user.
+- A charge that has to wait 1.5 seconds for another transaction's lock on the
+  user's row, while that transaction stores a full wait from its own later
+  clock reading, leaves that wait in place. Computed from the statement's
+  start instead, it shortened it by about 1.4 seconds (checked by that
+  change).
 
 Run against main's server code (the test's import of the code constant
-replaced by its value), the first, third and fourth tests fail: nothing is
-owed, and the user's next upload is admitted (200) where the test expects
-429. The second passes, as it should.
+replaced by its value, and without the row-lock case, which calls the new
+module directly), the first, third and fourth tests fail: nothing is owed,
+and the user's next upload is admitted (200) where the test expects 429. The
+second passes, as it should.
 
 `tests/backup-cooldown.test.mjs` checks what is asked of the database: a 408
 owes the cooldown plus its fifth (144 seconds at the defaults), a shortfall
 owes cooldown ÷ grace per second and never more than that cap, no shortfall
 writes nothing, a failed write is logged without changing the answer, 0
 reads and writes nothing, and the refusal's status, header, code and message.
+Over a real socket, a refused upload and one whose check fails (500) are both
+disconnected within about 2 seconds of the answer while the client goes on
+sending; registering that only after a successful check kept the failed one
+open (checked by that change).
 `tests/backup-staging.test.mjs` checks the shortfall itself: silence counts
 in full, inside the grace period too; bytes cover their share; it is measured
 up to the stop; at the minimum rate there is none; time the server is not

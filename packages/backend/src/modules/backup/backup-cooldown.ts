@@ -94,9 +94,12 @@ export function createBackupUploadCooldown(policy: BackupUploadCooldownPolicy) {
 
   /**
    * Add `waitMs` to what `userId` owes, up to the cap, and prune rows whose
-   * wait is over (skipping rows another write holds). One statement with one
-   * clock reading, so concurrent charges for a user add up. Returns whole
-   * seconds the user is now refused for (0 when none).
+   * wait is over (skipping rows another write holds). One statement, so
+   * concurrent charges for a user add up: a charge that waits for another's
+   * row lock reads the clock once it has the row (clock_timestamp(), not the
+   * statement's start), so it never caps the wait below what the other
+   * charge stored. Returns whole seconds the user is now refused for (0 when
+   * none).
    */
   async function owe(prisma: PrismaClient, userId: string, waitMs: number): Promise<number> {
     const [row] = await prisma.$queryRaw<Array<{ seconds: number }>>`
@@ -114,15 +117,15 @@ export function createBackupUploadCooldown(policy: BackupUploadCooldownPolicy) {
       INSERT INTO "BackupUploadCooldown" AS c ("userId", "clearsAt")
       VALUES (
         ${userId},
-        (statement_timestamp() AT TIME ZONE 'UTC') + ${waitMs}::float8 * interval '1 millisecond'
+        (clock_timestamp() AT TIME ZONE 'UTC') + ${waitMs}::float8 * interval '1 millisecond'
       )
       ON CONFLICT ("userId") DO UPDATE SET "clearsAt" = LEAST(
-        GREATEST(c."clearsAt", statement_timestamp() AT TIME ZONE 'UTC')
+        GREATEST(c."clearsAt", clock_timestamp() AT TIME ZONE 'UTC')
           + ${waitMs}::float8 * interval '1 millisecond',
-        (statement_timestamp() AT TIME ZONE 'UTC') + ${capMs}::float8 * interval '1 millisecond'
+        (clock_timestamp() AT TIME ZONE 'UTC') + ${capMs}::float8 * interval '1 millisecond'
       )
       RETURNING GREATEST(0, CEIL(
-        EXTRACT(EPOCH FROM (c."clearsAt" - (statement_timestamp() AT TIME ZONE 'UTC')))
+        EXTRACT(EPOCH FROM (c."clearsAt" - (clock_timestamp() AT TIME ZONE 'UTC')))
           - ${allowanceMs / 1000}::float8
       ))::integer AS "seconds"
     `;
@@ -168,17 +171,21 @@ type Handler = (request: FastifyRequest, reply: FastifyReply) => Promise<unknown
 
 /**
  * Refuse the request with a 429 and Retry-After while its user owes a wait,
- * before `handler` (and so before admission) runs. The refused request's
- * body is never read, so its connection is closed shortly after the answer.
+ * before `handler` (and so before admission) runs. A refused request's body
+ * is never read, so its connection is closed shortly after the answer, also
+ * when the check itself fails.
  */
 export function refuseDuringUploadCooldown(
   handler: Handler,
   cooldown: BackupUploadCooldown = backupUploadCooldown,
 ): Handler {
   return async (request, reply) => {
+    // Any answer sent before the body has arrived (this refusal, a failed
+    // check, or a refusal by the admission) closes the connection shortly
+    // after; handleUpload registers the same for the admitted request.
+    closeAfterUnreadBody(request, reply);
     const seconds = await cooldown.retryAfter(request.server.prisma, request.user!.id);
     if (seconds > 0) {
-      closeAfterUnreadBody(request, reply);
       request.log.warn({ retryAfter: seconds }, "Refused a backup upload during its user's cooldown");
       throw new BackupUploadCooldownError(seconds);
     }

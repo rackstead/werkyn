@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import net from "node:net";
 import { test } from "node:test";
 import Fastify from "fastify";
 
@@ -13,6 +14,7 @@ const {
   refuseDuringUploadCooldown,
 } = await import("../src/modules/backup/backup-cooldown.ts");
 const { default: errorsPlugin } = await import("../src/plugins/errors.ts");
+const { UNREAD_BODY_GRACE_MS } = await import("../src/plugins/request-limits.ts");
 
 // The SQL itself runs against PostgreSQL in
 // tests/integration/backup-upload-cooldown.test.mjs; these cases check what
@@ -129,5 +131,68 @@ test("an upload is refused with 429, Retry-After and a code while its user owes 
     assert.equal(handled, 1);
   } finally {
     await app.close();
+  }
+});
+
+test("a refusal, or a failed check, closes an upload still sending shortly after its answer", async (t) => {
+  const multipart = (await import("@fastify/multipart")).default;
+  let failure;
+  const stub = {
+    retryAfter: async () => {
+      if (failure) throw failure;
+      return 9;
+    },
+  };
+  const app = Fastify({ logger: false });
+  await app.register(errorsPlugin);
+  await app.register(multipart);
+  app.post(
+    "/upload",
+    {
+      preHandler: async (request) => {
+        request.user = { id: "user-1" };
+      },
+    },
+    refuseDuringUploadCooldown(async () => ({ ok: true }), stub),
+  );
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  t.after(() => app.close());
+  const { port } = app.server.address();
+
+  /** Send the head and part header of a large upload, then a byte every 100 ms. */
+  async function answerAndClose() {
+    const socket = net.connect(port, "127.0.0.1");
+    socket.on("error", () => {});
+    await new Promise((resolve) => socket.once("connect", resolve));
+    const started = performance.now();
+    const boundary = "cooldown-boundary";
+    socket.write(
+      `POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: 1000000\r\n\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="b.zip"\r\n\r\n`,
+    );
+    const drip = setInterval(() => socket.writable && socket.write("x"), 100);
+    let answeredAt;
+    let head = "";
+    socket.on("data", (chunk) => {
+      head += chunk.toString();
+      answeredAt ??= performance.now() - started;
+    });
+    const closedAt = await Promise.race([
+      new Promise((resolve) => socket.once("close", () => resolve(performance.now() - started))),
+      new Promise((resolve) => setTimeout(resolve, UNREAD_BODY_GRACE_MS + 4_000)),
+    ]);
+    clearInterval(drip);
+    socket.destroy();
+    return { status: Number(head.split(" ")[1]), answeredAt, closedAt };
+  }
+
+  const refused = await answerAndClose();
+  assert.equal(refused.status, 429);
+  failure = new Error("database unavailable");
+  const failed = await answerAndClose();
+  assert.equal(failed.status, 500);
+  for (const { answeredAt, closedAt } of [refused, failed]) {
+    assert.ok(closedAt !== undefined, "the connection was kept while the client went on sending");
+    assert.ok(closedAt - answeredAt < UNREAD_BODY_GRACE_MS + 1_500, `answered ${answeredAt} ms, closed ${closedAt} ms`);
   }
 });

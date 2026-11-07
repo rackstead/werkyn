@@ -305,6 +305,13 @@ function uniqueChildren(
 }
 
 /**
+ * Data boxes compared while locating AVIF item extents, over every check
+ * since the process started. Tests bound the lookup's work with it instead
+ * of timing it.
+ */
+export const avifExtentLookups = { boxesCompared: 0 };
+
+/**
  * Reads `iloc` and refuses any item location outside the simple shape (see
  * `checkAvif`). Offsets and lengths of up to 8 bytes are read as BigInt and
  * compared with the file, so no arithmetic can overflow. Returns the bytes
@@ -344,6 +351,7 @@ function checkAvifItemLocations(
     if (method === 1) return start >= idatRange![0] && end <= idatRange![1];
     let low = 0, high = mdatRanges.length - 1;
     while (low <= high) {
+      avifExtentLookups.boxesCompared++;
       const middle = (low + high) >> 1;
       const [from, to] = mdatRanges[middle];
       if (start < from) high = middle - 1;

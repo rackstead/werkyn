@@ -163,19 +163,33 @@ export async function checkSearchIndexes(
 }
 
 /**
+ * Schedules `recheck` after `ms` and returns a function that cancels it. The
+ * recheck's promise settles once it has run and scheduled the next one.
+ */
+export type RecheckTimer = (recheck: () => Promise<void>, ms: number) => () => void;
+
+/** A timer that does not keep the process alive. */
+const unrefTimer: RecheckTimer = (recheck, ms) => {
+  const timer = setTimeout(recheck, ms);
+  timer.unref();
+  return () => clearTimeout(timer);
+};
+
+/**
  * Runs checkSearchIndexes at startup and, while the client avoids trigram
  * indexes (the check failed, or found trigram indexes on a non-libc
  * database), again `intervalMs` after the previous check finished, until it
  * no longer does: after the indexes are dropped, or once a failed check
  * succeeds. One check runs at a time. A warning is logged only when it
  * differs from the previous one. The timer does not keep the
- * process alive; `stop` ends it.
+ * process alive; `stop` ends it. `timer` replaces the timer, so that tests
+ * decide when rechecks run.
  */
 export async function startSearchIndexCheck(
   prisma: Pick<PrismaClient, "$queryRaw">,
   log: { warn(details: object, message: string): void },
   schema = "public",
-  intervalMs = 60_000,
+  { intervalMs = 60_000, timer = unrefTimer }: { intervalMs?: number; timer?: RecheckTimer } = {},
 ): Promise<{ result: SearchIndexCheck; stop(): void }> {
   let last: string | undefined;
   const once = {
@@ -189,20 +203,19 @@ export async function startSearchIndexCheck(
   // One check at a time: the next is scheduled only after the previous one
   // finished and the client still avoids the indexes.
   let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancel: (() => void) | undefined;
   const schedule = () => {
     if (stopped || !avoidTrigramIndexes.has(prisma)) return;
-    timer = setTimeout(() => {
-      timer = undefined;
-      void checkSearchIndexes(prisma, once, schema, { reportFailure: false }).then(schedule);
+    cancel = timer(() => {
+      cancel = undefined;
+      return checkSearchIndexes(prisma, once, schema, { reportFailure: false }).then(schedule);
     }, intervalMs);
-    timer.unref();
   };
   schedule();
   const stop = () => {
     stopped = true;
-    if (timer) clearTimeout(timer);
-    timer = undefined;
+    cancel?.();
+    cancel = undefined;
   };
   return { result, stop };
 }

@@ -159,6 +159,23 @@ async function issueResetToken(user) {
   return token;
 }
 
+/** Runs at most `size` of the functions passed to it at once, in call order. */
+function permits(size) {
+  let free = size;
+  const waiting = [];
+  return async (work) => {
+    if (free > 0) free--;
+    else await new Promise((resolve) => waiting.push(resolve));
+    try {
+      return await work();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else free++;
+    }
+  };
+}
+
 function cookieOf(response) {
   return response.cookies.find((c) => c.name === "refresh_token" && c.value)
     ?.value;
@@ -734,8 +751,10 @@ test("a change that exhausts its transaction budget is a retryable 503 that chan
 test("a mixed storm of changes, resets, logins and refreshes never deadlocks, and every successful change replaced the hash it verified", async (t) => {
   await createWriteLog();
   try {
+    // Accounts 0 and 1 take every kind of request. Account 2 is only reset,
+    // signed in to and refreshed (the reset lane below).
     const states = [];
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 3; i++) {
       const user = await makeUser();
       const session = await signIn(user);
       // This storm deliberately revokes sessions repeatedly. Use an actual
@@ -768,6 +787,14 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
     };
     const deadlocksBefore = await deadlockCount();
 
+    // The server runs at most two password hashes or checks at once and
+    // refuses the rest at once with a 503 (utils/passwords.ts; covered by
+    // tests/argon2id-passwords.test.mjs). A change, reset or login needs one
+    // at a time, so with at most two of them in flight every one is admitted.
+    // Otherwise, on a slow runner, admission alone could decide the storm,
+    // refusing every reset before it reached the row locks this test is about.
+    const passwordWork = permits(2);
+
     // Copies start from the same known password; a refused copy retries
     // once with the password known by then, as a user would.
     async function changes(state, copies) {
@@ -777,11 +804,8 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
           let current = known;
           for (let attempt = 0; attempt < 2; attempt++) {
             const next = candidatePassword(`storm-change-${i}-${attempt}`);
-            const response = await changePassword(
-              state.user,
-              state.access,
-              current,
-              next,
+            const response = await passwordWork(() =>
+              changePassword(state.user, state.access, current, next),
             );
             record(state, "change", response, { current, next });
             if (response.statusCode === 200) {
@@ -805,7 +829,7 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
         Array.from({ length: copies }, async (_, i) => {
           const token = issued[i % issued.length];
           const next = candidatePassword(`storm-reset-${i}`);
-          const response = await reset(token, next);
+          const response = await passwordWork(() => reset(token, next));
           record(state, "reset", response, { next, token });
           tokens.get(token).push(response.statusCode);
           if (response.statusCode === 200) state.known = next;
@@ -816,7 +840,7 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
       const response = record(
         state,
         "login",
-        await login(state.user, state.known),
+        await passwordWork(() => login(state.user, state.known)),
       );
       if (response.statusCode === 200) state.cookie = cookieOf(response);
     }
@@ -835,21 +859,35 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
       (state) => signInAgain(state),
       (state) => rotate(state),
     ];
-    await Promise.all(
-      Array.from({ length: 4 }, async (_, worker) => {
+    // A successful change ends the account's unused reset links, so on
+    // accounts 0 and 1 a storm can see every reset lose to a change (404).
+    // Account 2's password is never changed: each resets() call on it has
+    // exactly one winner, so the storm always includes successful resets,
+    // racing each other, sign-ins and refreshes while the workers run.
+    const resetLane = [
+      () => resets(states[2], 2, false),
+      () => rotate(states[2]),
+      () => resets(states[2], 2, true),
+      () => signInAgain(states[2]),
+    ];
+    await Promise.all([
+      ...Array.from({ length: 4 }, async (_, worker) => {
         for (let step = 0; step < 8; step++) {
-          const state = states[crypto.randomInt(states.length)];
+          const state = states[crypto.randomInt(2)];
           await operations[
             (worker * 3 + step * 5 + crypto.randomInt(2)) % operations.length
           ](state);
         }
       }),
-    );
+      (async () => {
+        for (let step = 0; step < 8; step++) await resetLane[step % resetLane.length]();
+      })(),
+    ]);
 
     const allowed = {
       change: [200, 400, 503],
       reset: [200, 404, 410, 503],
-      login: [200, 401, 423, 503],
+      login: [200, 401, 423],
       refresh: [200, 401, 409],
     };
     for (const outcome of outcomes) {
@@ -864,17 +902,12 @@ test("a mixed storm of changes, resets, logins and refreshes never deadlocks, an
         );
       if (outcome.kind === "change" && outcome.status === 400)
         assert.deepEqual(JSON.parse(outcome.body), INCORRECT);
+      // Within the admission limit, only a busy account or link answers 503.
       if (outcome.status === 503) {
-        const body = JSON.parse(outcome.body);
-        if (body.message === "Password checks are temporarily unavailable. Try again.") {
-          assert(["change", "reset", "login"].includes(outcome.kind));
-          assert.deepEqual(body, { statusCode: 503, error: "Service Unavailable", message: "Password checks are temporarily unavailable. Try again." });
-        } else {
-          assert(["change", "reset"].includes(outcome.kind));
-          assert.equal(body.message, outcome.kind === "change"
-            ? "This account is busy. Try again in a moment."
-            : "This link is busy. Try again in a moment.");
-        }
+        assert(["change", "reset"].includes(outcome.kind), `${outcome.kind} answered ${outcome.body}`);
+        assert.equal(JSON.parse(outcome.body).message, outcome.kind === "change"
+          ? "This account is busy. Try again in a moment."
+          : "This link is busy. Try again in a moment.");
       }
     }
     const mix = {};

@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { parseCsv, values } from "../fixtures/rfc4180.mjs";
+import { recordQueries } from "./support/query-events.mjs";
 
 if (!process.env.TEST_DATABASE_URL) {
   throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
@@ -32,8 +33,6 @@ const { PrismaClient } = await import("@prisma/client");
 const observerUrl = new URL(process.env.TEST_DATABASE_URL);
 observerUrl.searchParams.set("connection_limit", "1");
 const observer = new PrismaClient({ datasourceUrl: observerUrl.toString(), log: [{ level: "query", emit: "event" }] });
-let recorded = null;
-observer.$on("query", (event) => recorded?.push(event));
 
 let app, workspace, requests = 0;
 const users = {}, tokens = {};
@@ -576,8 +575,7 @@ describe("channel list members", () => {
     }
     await app.prisma.$executeRawUnsafe('ANALYZE "ChatChannelMember"');
 
-    const events = (recorded = []);
-    const channels = await chat.listChannels(observer, workspace.id, users.me.id).finally(() => { recorded = null; });
+    const { result: channels, events } = await recordQueries(observer, (db) => chat.listChannels(db, workspace.id, users.me.id));
     const listed = channels.find((c) => c.id === big.id);
     assert.equal(listed._count.members, 600);
     const order = (await app.prisma.$queryRaw`

@@ -49,21 +49,29 @@ async function snapshot() {
   ]);
 }
 
-/** Earlier successful requests send assignment notifications without awaiting them. */
-async function settleNotifications() {
-  const where = { userId: { in: Object.values(users).map((u) => u.id) } };
-  let previous = -1;
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const current = await app.prisma.notification.count({ where });
-    if (current === previous) return;
-    previous = current;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+/**
+ * Waits until the notifications earlier successful requests queued for these
+ * users can no longer change a snapshot. A request commits its outbox row
+ * (NotificationDelivery) with its writes and runs the first delivery attempt
+ * after responding, without awaiting it. The attempt deletes the row once the
+ * notifications have committed, or records its error and leaves the retry to
+ * the delivery worker, which these tests do not run. So once no row without
+ * an error is left, no notification is still to come.
+ */
+async function drainNotifications() {
+  const where = { recipientIds: { hasSome: Object.values(users).map((u) => u.id) }, lastError: null };
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const pending = await app.prisma.notificationDelivery.findMany({ where, select: { id: true, attempts: true, lockedUntil: true } });
+    if (pending.length === 0) return;
+    assert(Date.now() < deadline, `notification deliveries still pending after 10 s: ${JSON.stringify(pending)}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
 /** Every request must be rejected with one of `codes`, with no row changed and no event sent. */
 async function assertRejectedAtomically(cases, codes = [400]) {
-  await settleNotifications();
+  await drainNotifications();
   const initial = await snapshot();
   events.length = 0;
   for (const [actor, method, url, payload] of cases) {
@@ -274,7 +282,10 @@ test("templates validate stored references and explicit instantiation overrides"
   const legacyTask = fromLegacy.json().data;
   assert.equal(legacyTask.status.id, status.P.id);
   assert.deepEqual(legacyTask.labels.map((l) => l.labelId), [label.P.id]);
-  assert.deepEqual(legacyTask.assignees.map((a) => a.userId), [users.MEMBER.id, users.ADMIN.id]);
+  // A task's assignees have no defined order (none of the task endpoints
+  // orders them; this one follows whatever plan reads TaskAssignee), so
+  // compare them sorted: exactly the valid stored assignees, once each.
+  assert.deepEqual(legacyTask.assignees.map((a) => a.userId).sort(), [users.MEMBER.id, users.ADMIN.id].sort());
   // An editor round trip resubmits exactly what it was shown and keeps every valid reference.
   const resaved = await req("MEMBER", "PATCH", `${templateUrl}/${legacy.id}`, { name: "Legacy template saved", ...valid });
   assert.equal(resaved.statusCode, 200, resaved.body);

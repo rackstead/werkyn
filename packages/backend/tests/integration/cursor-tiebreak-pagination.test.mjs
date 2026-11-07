@@ -10,6 +10,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
+import { recordQueries } from "./support/query-events.mjs";
 
 if (!process.env.TEST_DATABASE_URL) {
   throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
@@ -36,16 +37,9 @@ const { PrismaClient } = await import("@prisma/client");
 const observerUrl = new URL(process.env.TEST_DATABASE_URL);
 observerUrl.searchParams.set("connection_limit", "1");
 const observer = new PrismaClient({ datasourceUrl: observerUrl.toString(), log: [{ level: "query", emit: "event" }] });
-let recorded = null;
-observer.$on("query", (event) => recorded?.push(event));
+/** Every statement `run` sent through the observer, including late query events. */
 async function sqlOf(run) {
-  recorded = [];
-  try {
-    await run(observer);
-    return recorded;
-  } finally {
-    recorded = null;
-  }
+  return (await recordQueries(observer, run)).events;
 }
 /** The page SELECT of `table` must end in LIMIT with `limit + 1` rows. */
 function assertLimited(events, table, limit) {

@@ -18,6 +18,7 @@ import {
   thumbnailWorkers,
 } from "../src/modules/files/thumbnails.ts";
 import {
+  avifExtentLookups,
   checkAvif,
   estimateDecodeBytes,
   jpegMarkers,
@@ -744,12 +745,15 @@ test("container checks stop after a bounded amount of work on crafted files", as
   // 680 Exif items in the last of 2,000 mdat boxes stay within the entry
   // limit; locating their extents is a binary search, not a scan of every
   // box for every item (32 ms before, about 4 ms after, on the test host).
+  // Counted rather than timed: each of the 681 extents compares at most
+  // ceil(log2(2,001)) = 11 boxes, where a scan compares 1,321 to 2,000.
   const small = await solid(64, 32).avif({ effort: 0 }).toBuffer();
   const manyItems = manyItemAvif(small, 680, 2000);
-  const started = performance.now();
+  const comparedBefore = avifExtentLookups.boxesCompared;
   const checked = checkAvif(manyItems);
   assert.deepEqual([checked.codedPixels, checked.iccBytes], [64 * 32, 0]);
-  assert.ok(performance.now() - started < 20, `many items took ${performance.now() - started} ms`);
+  const compared = avifExtentLookups.boxesCompared - comparedBefore;
+  assert.ok(compared > 0 && compared <= 681 * Math.ceil(Math.log2(2000 + 1)), `compared ${compared} data boxes for 681 extents`);
   for (const [name, bytes, outcome] of [["avif", avif, "unsupported"], ["webp", webp, "unsupported"], ["jpeg", segments, "unsupported"]]) {
     assert.deepEqual((await outcomes(() => thumbnailOf(bytes))).delta, { [outcome]: 1 }, name);
   }

@@ -21,7 +21,7 @@ import {
 } from "@tanstack/react-table";
 import { useProjectTasks, type Task } from "@/features/tasks/api";
 import { useStatuses, useProjectMembers, useLabels, useCustomFields } from "@/features/projects/api";
-import { getColumns } from "./columns";
+import { getColumns, type InlineTaskUpdater } from "./columns";
 import { steadyRows, type SeenRow } from "./steady-row";
 import { ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -99,7 +99,7 @@ interface TaskTableProps {
   canEdit: boolean;
   rowSelection: RowSelectionState;
   onRowSelectionChange: (selection: RowSelectionState) => void;
-  onUpdateTask: (id: string, data: Record<string, unknown>) => void;
+  onUpdateTask: InlineTaskUpdater;
 }
 
 export function TaskTable({

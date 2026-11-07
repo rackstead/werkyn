@@ -30,6 +30,13 @@ import { cn } from "@/lib/utils";
 import type { CustomField } from "@/features/projects/api";
 import { useSetCustomFieldValue } from "@/features/projects/api";
 import { useCustomFieldSaver, type CustomFieldInput } from "@/features/tasks/custom-field-save";
+import { useInlineDateSave } from "./use-inline-date-save";
+
+export type InlineTaskUpdater = (
+  id: string,
+  data: Record<string, unknown>,
+  onComplete?: (saved: boolean) => void,
+) => void;
 
 const columnHelper = createColumnHelper<Task>();
 
@@ -49,7 +56,7 @@ function InlineStatusCell({
 }: {
   task: Task;
   statuses: Array<{ id: string; name: string; color: string | null }>;
-  onUpdateTask: (id: string, data: Record<string, unknown>) => void;
+  onUpdateTask: InlineTaskUpdater;
 }) {
   const [editing, setEditing] = useState(false);
   const color = task.status.color ?? "#94a3b8";
@@ -91,7 +98,7 @@ function InlinePriorityCell({
   onUpdateTask,
 }: {
   task: Task;
-  onUpdateTask: (id: string, data: Record<string, unknown>) => void;
+  onUpdateTask: InlineTaskUpdater;
 }) {
   const [editing, setEditing] = useState(false);
 
@@ -131,9 +138,12 @@ export function InlineDueDateCell({
   onUpdateTask,
 }: {
   task: Task;
-  onUpdateTask: (id: string, data: Record<string, unknown>) => void;
+  onUpdateTask: InlineTaskUpdater;
 }) {
   const [editing, setEditing] = useState(false);
+  const date = useInlineDateSave(task.dueDate, (dueDate) =>
+    new Promise<boolean>((resolve) => onUpdateTask(task.id, { dueDate }, resolve)),
+  );
   const isOverdue =
     task.dueDate &&
     task.dueDate < formatDateISO(new Date()) &&
@@ -147,9 +157,9 @@ export function InlineDueDateCell({
           aria-label="Due date"
           // Can be wider than its column; drawn above the next cell.
           className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
-          value={task.dueDate}
+          value={date.value}
           onCommit={(dueDate) => {
-            onUpdateTask(task.id, { dueDate });
+            date.save(dueDate);
             setEditing(false);
           }}
           onKeyDown={(e) => {
@@ -455,6 +465,14 @@ function InlineCustomFieldCell({
     saveValue(newValue);
     setEditing(false);
   };
+  const date = useInlineDateSave(
+    typeof value === "string" ? value : null,
+    (next) => setFieldValue.mutateAsync({ fieldId: field.id, value: next }).then(
+      () => true,
+      () => false,
+    ),
+    field.required,
+  );
 
   switch (field.type) {
     case "CHECKBOX":
@@ -545,8 +563,11 @@ function InlineCustomFieldCell({
             aria-label={field.name}
             // Can be wider than its column; drawn above the next cell.
             className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
-            value={typeof value === "string" ? value : null}
-            onCommit={save}
+            value={date.value}
+            onCommit={(next) => {
+              date.save(next);
+              setEditing(false);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Escape" && !e.currentTarget.hasAttribute("data-pending-edit")) {
                 setEditing(false);
@@ -624,7 +645,7 @@ function InlineCustomFieldCell({
 export function getColumns(options: {
   canEdit: boolean;
   onTaskClick: (taskId: string) => void;
-  onUpdateTask: (id: string, data: Record<string, unknown>) => void;
+  onUpdateTask: InlineTaskUpdater;
   statuses: Array<{ id: string; name: string; color: string | null }>;
   members: Array<{
     id: string;

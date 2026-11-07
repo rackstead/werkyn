@@ -56,6 +56,12 @@ Users of these rules:
   by emptying every part or using the browser picker's Clear. Escape discards
   the pending edit; a second Escape exits the editor.
 
+Inline cells retain the latest requested date while saves are pending and
+send committed edits in order. A quick correction back to the old date is
+therefore saved even before the task has refetched. Failed saves can be
+retried, and already committed edits continue saving if the row or route
+unmounts. Other inline field types keep their existing save behavior.
+
 Clicking a side panel's backdrop blurs the focused field before dismissing
 the panel. A complete typed date is therefore committed before its input
 unmounts; an unfinished edit keeps the stored value, as on any other blur.
@@ -92,6 +98,8 @@ They check that:
 `date-inputs.test.tsx` checks due and custom inline cells in all three part
 orders, Enter/blur, incomplete dates, Escape, deliberate clearing, required
 custom fields and picker changes, as well as the bulk input and Clear.
+Delayed-response cases cover correction back to the old value, stale refetches,
+request ordering, failed-write retries and queued edits surviving unmount.
 `slideover.test.tsx` verifies that backdrop dismissal settles complete,
 incomplete and deliberately cleared date edits before the panel unmounts.
 

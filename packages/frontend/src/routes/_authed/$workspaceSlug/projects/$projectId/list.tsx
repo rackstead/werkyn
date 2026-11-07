@@ -45,7 +45,7 @@ function ListRoute() {
   useRealtime(projectId);
   usePreloadTaskSlideover();
 
-  const { mutate: updateTask } = useUpdateTask();
+  const { mutate: updateTask, mutateAsync: updateTaskAsync } = useUpdateTask();
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
 
   const filters: Record<string, unknown> = {};
@@ -88,10 +88,16 @@ function ListRoute() {
   };
 
   const handleUpdateTask = useCallback(
-    (id: string, data: Record<string, unknown>) => {
-      updateTask({ id, ...data } as Parameters<typeof updateTask>[0]);
+    (id: string, data: Record<string, unknown>, onComplete?: (saved: boolean) => void) => {
+      const input = { id, ...data } as Parameters<typeof updateTask>[0];
+      if (onComplete) {
+        // The promise settles even if navigation unmounts the mutation observer.
+        void updateTaskAsync(input).then(() => onComplete(true), () => onComplete(false));
+      } else {
+        updateTask(input);
+      }
     },
-    [updateTask],
+    [updateTask, updateTaskAsync],
   );
 
   const selectedTaskIds = Object.keys(rowSelection).filter(

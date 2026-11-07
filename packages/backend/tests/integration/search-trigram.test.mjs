@@ -75,6 +75,33 @@ async function searchStatements(run) {
   return events.filter((event) => event.query.startsWith("SELECT ") && event.query.includes(" ILIKE "));
 }
 
+/**
+ * A recheck timer for startSearchIndexCheck that the test fires by hand, so
+ * rechecks run exactly where the test runs them. `intervals` lists the delay
+ * of every recheck scheduled; `pending` is the one scheduled now, if any.
+ */
+function manualRechecks() {
+  const rechecks = {
+    intervals: [],
+    pending: null,
+    timer: (recheck, ms) => {
+      assert.equal(rechecks.pending, null, "one recheck is scheduled at a time");
+      const entry = { recheck };
+      rechecks.pending = entry;
+      rechecks.intervals.push(ms);
+      return () => { if (rechecks.pending === entry) rechecks.pending = null; };
+    },
+    /** Runs the scheduled recheck and returns once it has scheduled the next, if any. */
+    async fire() {
+      const entry = rechecks.pending;
+      assert.ok(entry, "a recheck is scheduled");
+      rechecks.pending = null;
+      await entry.recheck();
+    },
+  };
+  return rechecks;
+}
+
 // Index name: table, columns and operator classes.
 const INDEXES = {
   ChatMessage_content_trgm_idx: ["ChatMessage", "content", "gin_trgm_ops"],
@@ -773,23 +800,21 @@ describe("case folding", () => {
     let calls = 0;
     const counted = { $queryRaw: (...args) => { calls++; return flaky.$queryRaw(...args); } };
     const loopWarnings = [];
-    const loop = await startSearchIndexCheck(counted, { warn: (...a) => loopWarnings.push(a) }, "public", 20);
+    const rechecks = manualRechecks();
+    const loop = await startSearchIndexCheck(counted, { warn: (...a) => loopWarnings.push(a) }, "public", { intervalMs: 20, timer: rechecks.timer });
     try {
       assert.equal(loop.result, "failed");
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      assert.ok(calls >= 3, `rechecked ${calls} times`);
+      await rechecks.fire();
+      await rechecks.fire();
+      assert.equal(calls, 3, "the startup check and two rechecks");
+      assert.deepEqual(rechecks.intervals, [20, 20, 20]);
       assert.equal(searchAvoidsTrigramIndexes(counted), true);
       assert.equal(loopWarnings.length, 1, "failures are reported once");
       failing = false;
-      const deadline = Date.now() + 5_000;
-      while (searchAvoidsTrigramIndexes(counted) && Date.now() < deadline)
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      await rechecks.fire();
       assert.equal(searchAvoidsTrigramIndexes(counted), false);
-      const after = calls;
-      failing = true;
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      assert.equal(calls, after, "no check after the successful one");
-      assert.equal(searchAvoidsTrigramIndexes(counted), false);
+      assert.equal(rechecks.pending, null, "no check after the successful one");
+      assert.equal(rechecks.intervals.length, 3);
     } finally {
       loop.stop();
     }
@@ -975,13 +1000,16 @@ describe("case folding", () => {
       let watch;
       try {
         // The server's startup check, rechecking every 50 ms while it avoids
-        // the indexes.
+        // the indexes; the test runs each recheck itself.
         const warnings = [];
-        watch = await startSearchIndexCheck(checked, { warn: (...a) => warnings.push(a) }, "public", 50);
+        const rechecks = manualRechecks();
+        watch = await startSearchIndexCheck(checked, { warn: (...a) => warnings.push(a) }, "public", { intervalMs: 50, timer: rechecks.timer });
         assert.equal(watch.result, "warned");
         assert.equal(searchAvoidsTrigramIndexes(checked), true);
         // The rechecks repeat no warning while nothing changes.
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        for (let i = 0; i < 3; i++) await rechecks.fire();
+        assert.deepEqual(rechecks.intervals, [50, 50, 50, 50]);
+        assert.equal(searchAvoidsTrigramIndexes(checked), true);
         assert.equal(warnings.length, 1);
         const [details, message] = warnings[0];
         assert.equal(details.collationProvider, "icu");
@@ -1002,17 +1030,23 @@ describe("case folding", () => {
         const lost = await contents(unchecked);
         t.diagnostic(`"οδος" through the restored index: ${JSON.stringify(lost)}`);
         if (version < 180000) assert.ok(lost.length < 3, `the restored index drops matches without the check: ${JSON.stringify(lost)}`);
-        // The operator runs the drop statements while the server runs: the
-        // next recheck reports the plain ICU state once, lifts the fallback
-        // and stops.
-        for (const statement of details.drop) await und.prisma.$executeRawUnsafe(statement);
-        const deadline = Date.now() + 10_000;
-        while (searchAvoidsTrigramIndexes(checked) && Date.now() < deadline)
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        assert.equal(searchAvoidsTrigramIndexes(checked), false);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        // The operator runs the drop statements while the server runs, one
+        // at a time. A recheck between them warns again with the indexes
+        // left and keeps avoiding them.
+        const [firstDrop, ...otherDrops] = details.drop;
+        await und.prisma.$executeRawUnsafe(firstDrop);
+        await rechecks.fire();
+        assert.equal(searchAvoidsTrigramIndexes(checked), true);
         assert.equal(warnings.length, 2, JSON.stringify(warnings.map(([, m]) => m.slice(0, 60))));
-        assert.match(warnings[1][1], /are not created on a database whose default collation provider is icu/);
+        assert.deepEqual([...warnings[1][0].drop].sort(), [...otherDrops].sort());
+        // After the last one, the next recheck reports the plain ICU state
+        // once, lifts the fallback and stops.
+        for (const statement of otherDrops) await und.prisma.$executeRawUnsafe(statement);
+        await rechecks.fire();
+        assert.equal(searchAvoidsTrigramIndexes(checked), false);
+        assert.equal(rechecks.pending, null, "no recheck once the fallback is lifted");
+        assert.equal(warnings.length, 3, JSON.stringify(warnings.map(([, m]) => m.slice(0, 60))));
+        assert.match(warnings[2][1], /are not created on a database whose default collation provider is icu/);
       } finally {
         watch?.stop();
         await Promise.allSettled([unchecked.$disconnect(), checked.$disconnect()]);

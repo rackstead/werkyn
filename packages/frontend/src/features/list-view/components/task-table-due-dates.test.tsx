@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TIME_ZONES, useTimeZone } from "@/test/time-zone";
 import type { Task } from "@/features/tasks/api";
@@ -54,11 +54,11 @@ afterEach(() => { cleanup(); vi.useRealTimers(); });
 describe.each(TIME_ZONES)("actual TaskTable due dates in %s", (zone) => {
   useTimeZone(zone);
   for (const canEdit of [false, true]) {
-    it.each(Object.keys(LOCAL_TODAY) as Array<keyof typeof LOCAL_TODAY>)(`${canEdit ? "editable" : "read-only"} keeps due-today neutral at %s`, (now) => {
+    it.each(Object.keys(LOCAL_TODAY) as Array<keyof typeof LOCAL_TODAY>)(`${canEdit ? "editable" : "read-only"} keeps due-today neutral at %s`, async (now) => {
       vi.useFakeTimers({ toFake: ["Date"], now: new Date(now) });
       const today = LOCAL_TODAY[now][zone], yesterday = offset(today, -1);
       state.tasks = [task("Today task", today), task("Past task", yesterday), task("Completed task", yesterday, true), task("Undated task", null)];
-      const update = vi.fn(), clicked = vi.fn();
+      const update = vi.fn((_id: string, _data: Record<string, unknown>, onComplete?: (saved: boolean) => void) => onComplete?.(true)), clicked = vi.fn();
       render(<TaskTable projectId="p" canEdit={canEdit} rowSelection={{}}
         onRowSelectionChange={vi.fn()} onUpdateTask={update} onTaskClick={clicked} />);
 
@@ -81,9 +81,9 @@ describe.each(TIME_ZONES)("actual TaskTable due dates in %s", (zone) => {
         fireEvent.change(input, { target: { value: offset(today, 2) } });
         fireEvent.click(labelFor("Today task", today).closest("button")!);
         fireEvent.change(rowFor("Today task").querySelector('input[type="date"]')!, { target: { value: "" } });
-        expect(update.mock.calls).toEqual([
+        await waitFor(() => expect(update.mock.calls.map(([id, data]) => [id, data])).toEqual([
           ["Today task", { dueDate: offset(today, 2) }], ["Today task", { dueDate: null }],
-        ]);
+        ]));
       } else {
         fireEvent.click(todayLabel);
         expect(rowFor("Today task").querySelector('input[type="date"]')).toBeNull();

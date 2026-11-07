@@ -4,6 +4,8 @@ import { Toaster, toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./dialog";
 import { Slideover } from "./slideover";
+import { DatePicker } from "@/components/shared/date-picker";
+import { type, setHalfTyped, TYPING_OVER_2026_11_20 } from "@/test/date-typing";
 
 afterEach(cleanup);
 
@@ -26,6 +28,37 @@ function Panel({ onClose }: { onClose: () => void }) {
 }
 
 describe("Slideover", () => {
+  for (const edit of ["complete", "half typed", "cleared"] as const) {
+    it(`settles a ${edit} date before backdrop dismissal unmounts the panel`, async () => {
+      const events: Array<string | null> = [];
+      function DatePanel() {
+        const [open, setOpen] = useState(true);
+        return open && (
+          <Slideover title="Details" onClose={() => {
+            events.push("closed");
+            setOpen(false);
+          }}>
+            <DatePicker label="Due date" value="2026-11-20" onChange={(date) => events.push(date)} />
+          </Slideover>
+        );
+      }
+      render(<DatePanel />);
+      const input = await screen.findByLabelText("Due date") as HTMLInputElement;
+      input.focus();
+      if (edit === "complete") type(input, TYPING_OVER_2026_11_20["month/day/year"]);
+      else {
+        type(input, [[edit === "cleared" ? "Backspace" : "0", "", true]]);
+        if (edit === "cleared") setHalfTyped(input, false);
+      }
+      expect(events).toEqual([]);
+      const backdrop = document.querySelector('[data-slot="slideover-overlay"]')!;
+      fireEvent.pointerDown(backdrop);
+      fireEvent.click(backdrop);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(events).toEqual(edit === "complete" ? ["2027-03-15", "closed"] : edit === "cleared" ? [null, "closed"] : ["closed"]);
+    });
+  }
+
   it("closes only the top layer on Escape and returns focus inside the panel", async () => {
     const onClose = vi.fn();
     render(<Panel onClose={onClose} />);

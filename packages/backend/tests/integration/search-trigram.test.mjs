@@ -28,6 +28,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { recordQueries } from "./support/query-events.mjs";
 
 if (!process.env.TEST_DATABASE_URL)
   throw new Error("Set TEST_DATABASE_URL to a migrated disposable PostgreSQL database");
@@ -68,17 +69,10 @@ const indexed = client(
 );
 // No bitmap scans: GIN indexes cannot be used at all.
 const scanned = client("-c enable_bitmapscan=off");
-let recorded = null;
-indexed.$on("query", (event) => recorded?.push(event));
 /** The SELECT statements with an ILIKE that `run` sent through `indexed`. */
 async function searchStatements(run) {
-  recorded = [];
-  await run();
-  // Query events are delivered asynchronously after each statement.
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  const statements = recorded.filter((event) => event.query.startsWith("SELECT ") && event.query.includes(" ILIKE "));
-  recorded = null;
-  return statements;
+  const { events } = await recordQueries(indexed, run);
+  return events.filter((event) => event.query.startsWith("SELECT ") && event.query.includes(" ILIKE "));
 }
 
 // Index name: table, columns and operator classes.
@@ -1053,11 +1047,8 @@ describe("one-channel chat search", () => {
    * after the service's own settings statement in one transaction.
    */
   async function channelSearchPlan(db, term, channelId) {
-    const all = [];
-    const listener = (event) => all.push(event);
-    db.$on("query", listener);
-    await searchMessages(db, workspaces.main.id, users.member.id, term, channelId, undefined, 20);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const { events: all } = await recordQueries(db, () =>
+      searchMessages(db, workspaces.main.id, users.member.id, term, channelId, undefined, 20));
     const settings = all.find((event) => event.query.includes("set_config('enable_bitmapscan'"));
     const page = all.find((event) => event.query.startsWith("SELECT ") && event.query.includes(" ILIKE ") && event.query.includes("ORDER BY"));
     assert.ok(settings && page, "the service sends the channel-size settings and the page query");

@@ -519,7 +519,8 @@ consumed by exactly one request. Requesting another password-reset link keeps
 earlier unused links valid until their original one-hour expiry, so someone
 else requesting a link cannot interrupt a reset already in progress. A
 successful password reset or password change invalidates the account's other
-unused links. Only SHA-256 digests of these account links
+unused links. A link whose insert finishes after that invalidation is newly
+issued and remains usable. Only SHA-256 digests of these account links
 are stored; outstanding links survive the coordinated upgrade described in
 [docs/remediation/sec-026.md](docs/remediation/sec-026.md).
 

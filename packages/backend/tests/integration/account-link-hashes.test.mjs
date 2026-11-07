@@ -481,6 +481,62 @@ test("a new reset request cannot replace a link whose reset is waiting for the a
   assert.equal((await reset(second)).status, 404);
 });
 
+for (const operation of ["reset", "change"]) {
+  test(`an uncommitted new-link insert racing a password ${operation} sends its link only after it commits`, async () => {
+    const user = await makeUser();
+    const session = await login(user);
+    const { raw: first } = await forgot(user);
+    const name = `account_link_issue_${crypto.randomBytes(5).toString("hex")}`;
+    const key = crypto.randomInt(1, 1_000_000_000);
+    const messagesBefore = smtp.messages.length;
+    let newer;
+    try {
+      await control.$executeRawUnsafe(`
+        CREATE FUNCTION "${name}"() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(${key});
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+      `);
+      await control.$executeRawUnsafe(`
+        CREATE TRIGGER "${name}" AFTER INSERT ON "PasswordResetToken"
+        FOR EACH ROW WHEN (NEW."userId" = '${user.id}')
+        EXECUTE FUNCTION "${name}"()
+      `);
+      await withLock(
+        (tx) => tx.$executeRaw`SELECT pg_advisory_xact_lock(${key}::bigint)`,
+        async (start, waitBlocked) => {
+          start(async () => {
+            newer = await forgot(user);
+          });
+          await waitBlocked();
+          assert.equal(smtp.messages.length, messagesBefore);
+          const result = await bounded(
+            operation === "reset" ? reset(first) : change(user, session),
+          );
+          assert.equal(result.status, 200, result.body);
+          assert.equal(
+            await app.prisma.passwordResetToken.count({
+              where: { userId: user.id, usedAt: null },
+            }),
+            0,
+            "the committed earlier links are invalidated; the pending insert is not visible or emailed",
+          );
+        },
+      );
+      assert.equal(smtp.messages.length, messagesBefore + 1);
+      assert.equal((await reset(first)).status, operation === "reset" ? 410 : 404);
+      // As before this change, an insert finishing after a password
+      // operation is a newly issued link and remains usable.
+      assert.equal((await reset(newer.raw)).status, 200);
+    } finally {
+      await control.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${name}" ON "PasswordResetToken"`);
+      await control.$executeRawUnsafe(`DROP FUNCTION IF EXISTS "${name}"()`);
+    }
+  });
+}
+
 test("successful password change invalidates earlier reset links while keeping other accounts and used records", async () => {
   const user = await makeUser();
   const other = await makeUser();

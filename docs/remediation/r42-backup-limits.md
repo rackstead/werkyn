@@ -320,10 +320,11 @@ too slow. You can upload again in N seconds.", counts it down (the same
 `Retry-After` handling as the sign-in form, PR #201) and keeps the file picker
 and Confirm Restore disabled until the wait has passed. A preview's chosen
 file is cleared so the same file can be chosen again. Other refusals are
-shown as a toast, as before. The page reports every preview and restore
-failure itself, so the app-wide error toast is turned off for these two
-requests: before, each failure was shown twice, and the pause would have come
-with a second, static notice that does not count down.
+shown as a toast, as before. Each preview or restore failure is now reported
+once, by the request itself in place of the app-wide error toast, so it is
+still shown after the admin has left the page; a pause shows only the
+countdown. Before, each failure was shown twice, and the pause would have
+come with a second, static notice that does not count down.
 
 ### Measured
 
@@ -421,9 +422,10 @@ counts 2, 1 and then clears, keeps the file picker disabled and sends nothing
 meanwhile, then previews; a paused restore keeps its preview and disables
 Confirm Restore for 120 seconds, then restores; a workspace-busy 429 and a
 408 are each shown as one toast without a countdown, and the pauses show no
-toast. Against main's backup page all three fail (the third because each
-failure was toasted twice), and so do they with only the app-wide toast left
-on for these requests.
+toast; a preview that fails after the page has been closed is still reported,
+once. Against main's backup page the first three fail (the third because each
+failure was toasted twice) and the fourth passes. With the requests' own
+report replaced by nothing, the third and fourth fail.
 
 ## Remaining limits
 

@@ -429,15 +429,13 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
     setRestoreResult(null);
     previewMutation.mutate(file, {
       onSuccess: (data) => setPreview(data),
+      // Other failures are reported by the hook (backup-api.ts).
       onError: (err) => {
-        if (isBackupUploadPaused(err)) {
-          setPausedBy(err);
-          // Let the same file be chosen again once the wait is over.
-          setRestoreFile(null);
-          if (fileInputRef.current) fileInputRef.current.value = "";
-          return;
-        }
-        toast.error(err.message || "Failed to preview backup");
+        if (!isBackupUploadPaused(err)) return;
+        setPausedBy(err);
+        // Let the same file be chosen again once the wait is over.
+        setRestoreFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
       },
     });
   }
@@ -450,12 +448,9 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
         setPreview(null);
         toast.success("Restore completed successfully");
       },
+      // Other failures are reported by the hook (backup-api.ts).
       onError: (err) => {
-        if (isBackupUploadPaused(err)) {
-          setPausedBy(err);
-          return;
-        }
-        toast.error(err.message || "Restore failed");
+        if (isBackupUploadPaused(err)) setPausedBy(err);
       },
     });
   }

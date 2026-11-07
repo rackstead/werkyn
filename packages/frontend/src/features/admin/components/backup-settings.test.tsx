@@ -32,7 +32,7 @@ vi.mock("@/features/wiki/api", () => ({ useWikiSpaces: () => ({ data: { data: []
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
 
-let responses: Response[];
+let responses: Array<Response | Promise<Response>>;
 let fetchRequest: ReturnType<typeof vi.fn>;
 
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
@@ -201,4 +201,26 @@ it("other refusals are shown once, as a toast without a countdown", async () => 
   );
   expect(toast.error).toHaveBeenCalledTimes(2);
   expect(fileInput().disabled).toBe(false);
+});
+
+it("a failure is still reported once the page has gone", async () => {
+  let fail!: (response: Response) => void;
+  responses.push(new Promise<Response>((resolve) => (fail = resolve)));
+  renderSettings();
+  chooseFile();
+  await vi.waitFor(() => expect(fetchRequest).toHaveBeenCalledTimes(1));
+  cleanup();
+  fail(
+    json(400, {
+      statusCode: 400,
+      error: "Bad Request",
+      message: "Invalid backup ZIP: the archive is damaged or uses unsupported ZIP features",
+    }),
+  );
+  await vi.waitFor(() =>
+    expect(toast.error).toHaveBeenCalledWith(
+      "Invalid backup ZIP: the archive is damaged or uses unsupported ZIP features",
+    ),
+  );
+  expect(toast.error).toHaveBeenCalledTimes(1);
 });

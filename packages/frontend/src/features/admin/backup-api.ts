@@ -1,5 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
-import { api, ApiError } from "@/lib/api-client";
+import { toast } from "sonner";
+import { api, ApiError, isIdentityChangedError } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
 import { apiBase } from "@/lib/api-url";
@@ -44,6 +45,19 @@ export function isBackupUploadPaused(error: unknown): error is ApiError {
   );
 }
 
+/**
+ * Report a failed preview or restore once, in place of the app-wide error
+ * toast. It runs from the mutation's own options, so a failure is reported
+ * even after the backup page has gone or started another upload. A pause is
+ * left to the page, which counts it down while it is shown.
+ */
+function reportUploadFailure(fallback: string) {
+  return (error: Error) => {
+    if (isIdentityChangedError(error) || isBackupUploadPaused(error)) return;
+    toast.error(error.message || fallback);
+  };
+}
+
 export function usePreviewRestore(wid: string) {
   return useMutation({
     mutationFn: async (file: File) => {
@@ -54,10 +68,7 @@ export function usePreviewRestore(wid: string) {
         .json<{ data: RestoreSummary }>();
       return res.data;
     },
-    // The backup page reports each failure itself (a countdown while uploads
-    // are paused, a toast otherwise); this replaces the client-wide error
-    // toast so nothing is shown twice.
-    onError: () => {},
+    onError: reportUploadFailure("Failed to preview backup"),
   });
 }
 
@@ -71,7 +82,6 @@ export function useExecuteRestore(wid: string) {
         .json<{ data: RestoreSummary }>();
       return res.data;
     },
-    // Reported by the backup page, as for the preview.
-    onError: () => {},
+    onError: reportUploadFailure("Restore failed"),
   });
 }

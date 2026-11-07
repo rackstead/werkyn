@@ -198,9 +198,10 @@ async function catalogSnapshot(db) {
   return { constraints, indexes, triggers, functions };
 }
 
+/** The rows of the two R35 migrations; later migrations are not part of this gate. */
 async function migrationRows(db) {
   return db.$queryRaw`SELECT migration_name AS name, finished_at IS NOT NULL AS finished, rolled_back_at IS NOT NULL AS "rolledBack"
-    FROM _prisma_migrations WHERE migration_name >= ${FIRST} ORDER BY started_at`;
+    FROM _prisma_migrations WHERE migration_name IN (${FIRST}, ${SECOND}) ORDER BY started_at`;
 }
 
 /** The precheck names the rule, its row count and its first ten IDs. */

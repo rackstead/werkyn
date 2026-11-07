@@ -753,14 +753,13 @@ test("change, forgot-password and cleanup settle without deadlock and later issu
     (tx) =>
       tx.$queryRaw`SELECT id FROM "PasswordResetToken" WHERE id = ${old.id} FOR UPDATE`,
     async (start, waitBlocked) => {
-      await bounded(
-        start(async () => {
-          newer = await forgot(user);
-          return newer.response;
-        }),
-      );
-      start(() => cleanupExpiredTokensAndAttempts(app.prisma));
+      start(async () => {
+        newer = await forgot(user);
+        return newer.response;
+      });
       await waitBlocked();
+      start(() => cleanupExpiredTokensAndAttempts(app.prisma));
+      await waitBlocked(2);
       const changed = await bounded(start(() => change(user, session)));
       assert.equal(changed.status, 503, changed.body);
     },

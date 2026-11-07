@@ -569,6 +569,9 @@ export async function forgotPassword(prisma: PrismaClient, email: string) {
   // A later request must not revoke a link its recipient is still using.
   // Keep earlier links until their original expiry; a successful reset or
   // password change invalidates all of the account's unused links instead.
+  await prisma.passwordResetToken.deleteMany({
+    where: { userId: user.id, usedAt: null, expiresAt: { lte: new Date() } },
+  });
   const token = generateSecureToken();
   await prisma.passwordResetToken.create({
     data: {
@@ -626,8 +629,8 @@ export async function resetPassword(
   // A request whose token was used or removed meanwhile claims nothing,
   // changes nothing and gets the reuse or invalid-link error. Lock order: user
   // row, reset tokens, families (refresh-sessions.ts). The statements that
-  // lock reset tokens without the user row (the cleanup job deleting tokens)
-  // never wait for a user row.
+  // lock reset tokens without the user row (forgot-password and the cleanup
+  // job deleting expired tokens) never wait for a user row.
   const resetting = prisma.$transaction(async (tx) => {
     await limitLockWaits(tx);
     await tx.$queryRaw`
@@ -656,7 +659,7 @@ export async function resetPassword(
     // The account's other unused links are deleted; a later use of one is
     // answered 404. No other reset can hold one, since it would hold the
     // user row. A locked row is being
-    // deleted by the cleanup job and is skipped rather
+    // deleted by forgot-password or the cleanup job and is skipped rather
     // than waited for, so that the two deletes never wait for each other.
     await tx.$executeRaw`
       DELETE FROM "PasswordResetToken"

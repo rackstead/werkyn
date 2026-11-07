@@ -68,6 +68,9 @@ jobs:
           docker exec "$POSTGRES_CONTAINER" psql -v ON_ERROR_STOP=1 -U audit -d postgres -c 'CREATE DATABASE werkyn_ci_structural_constraints'
           MIGRATION_TEST_DATABASE_URL="postgresql://audit:ci-disposable-only@127.0.0.1:${POSTGRES_PORT}/werkyn_ci_structural_constraints" \
             pnpm --filter @pm/backend exec node --import tsx --test tests/migrations/structural-constraints.test.mjs
+          # Again in another schema (DATABASE_URL's `schema` parameter).
+          MIGRATION_TEST_DATABASE_URL="postgresql://audit:ci-disposable-only@127.0.0.1:${POSTGRES_PORT}/werkyn_ci_structural_constraints?schema=werkyn_custom" \
+            pnpm --filter @pm/backend exec node --import tsx --test tests/migrations/structural-constraints.test.mjs
       - name: Unit and frontend regression tests
         run: pnpm test
       - name: PostgreSQL integration tests

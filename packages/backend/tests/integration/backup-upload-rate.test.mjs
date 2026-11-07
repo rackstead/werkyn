@@ -28,6 +28,10 @@ Object.assign(process.env, {
   BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: String(MIN_RATE),
   BACKUP_UPLOAD_RATE_WINDOW_SECONDS: String(WINDOW_MS / 1000),
   BACKUP_UPLOAD_RATE_GRACE_SECONDS: String(GRACE_MS / 1000),
+  // The cooldown that follows a refusal for the rate is off (0) here, so each
+  // case can upload as the admin the one before refused; it has its own tests
+  // in backup-upload-cooldown.test.mjs.
+  BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: "0",
 });
 // Short HTTP limits (docs/remediation/p03a.md). The request deadline is
 // longer than the grace period, so a request refused before its file starts

@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Link } from "@tanstack/react-router";
 import { ApiError } from "@/lib/api-client";
-import { retryWait, useRetryCountdown } from "../hooks/use-retry-countdown";
+import { retryWait, useRetryCountdown } from "@/hooks/use-retry-countdown";
 
 interface LoginFormProps {
   inviteToken?: string;

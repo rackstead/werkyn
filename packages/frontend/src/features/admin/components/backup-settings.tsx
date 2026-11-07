@@ -15,7 +15,13 @@ import {
 import { useProjects } from "@/features/projects/api";
 import { useChannels, type ChatChannel } from "@/features/chat/api";
 import { useWikiSpaces } from "@/features/wiki/api";
-import { useExportBackup, usePreviewRestore, useExecuteRestore } from "../backup-api";
+import {
+  isBackupUploadPaused,
+  useExportBackup,
+  usePreviewRestore,
+  useExecuteRestore,
+} from "../backup-api";
+import { useRetryCountdown } from "@/hooks/use-retry-countdown";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
 import { BackupScopeNotice } from "./backup-scope-notice";
 
@@ -408,28 +414,44 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
   const [restoreResult, setRestoreResult] = useState<RestoreSummary | null>(null);
   const previewMutation = usePreviewRestore(workspaceId);
   const restoreMutation = useExecuteRestore(workspaceId);
+  // After an upload that was too slow, the server pauses this account's
+  // previews and restores (429 with Retry-After): count the wait down and
+  // keep both from being sent until it has passed.
+  const [pausedBy, setPausedBy] = useState<unknown>(null);
+  const wait = useRetryCountdown(pausedBy);
+  const uploadsPaused = wait > 0;
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || uploadsPaused) return;
     setRestoreFile(file);
     setPreview(null);
     setRestoreResult(null);
     previewMutation.mutate(file, {
       onSuccess: (data) => setPreview(data),
-      onError: (err) => toast.error(err.message || "Failed to preview backup"),
+      // Other failures are reported by the hook (backup-api.ts).
+      onError: (err) => {
+        if (!isBackupUploadPaused(err)) return;
+        setPausedBy(err);
+        // Let the same file be chosen again once the wait is over.
+        setRestoreFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+      },
     });
   }
 
   function handleRestore() {
-    if (!restoreFile) return;
+    if (!restoreFile || uploadsPaused) return;
     restoreMutation.mutate(restoreFile, {
       onSuccess: (data) => {
         setRestoreResult(data);
         setPreview(null);
         toast.success("Restore completed successfully");
       },
-      onError: (err) => toast.error(err.message || "Restore failed"),
+      // Other failures are reported by the hook (backup-api.ts).
+      onError: (err) => {
+        if (isBackupUploadPaused(err)) setPausedBy(err);
+      },
     });
   }
 
@@ -547,14 +569,30 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
         <BackupScopeNotice action="restore" />
 
         <div className="space-y-4">
+          {uploadsPaused && (
+            <div
+              role="status"
+              className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200"
+            >
+              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+              <span>
+                Backup uploads from your account are paused because a recent one
+                was too slow. You can upload again in {wait}{" "}
+                {wait === 1 ? "second" : "seconds"}.
+              </span>
+            </div>
+          )}
+
           <div>
             <Label className="text-sm font-medium mb-1 block">Backup File</Label>
             <input
               ref={fileInputRef}
               type="file"
               accept=".json,.zip"
+              aria-label="Backup file"
+              disabled={uploadsPaused}
               onChange={handleFileSelect}
-              className="block text-sm text-muted-foreground file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 file:cursor-pointer"
+              className="block text-sm text-muted-foreground file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 file:cursor-pointer disabled:opacity-50 disabled:file:cursor-not-allowed"
             />
           </div>
 
@@ -572,7 +610,7 @@ export function BackupSettings({ workspaceId }: BackupSettingsProps) {
               <div className="flex gap-2">
                 <Button
                   onClick={handleRestore}
-                  disabled={restoreMutation.isPending}
+                  disabled={restoreMutation.isPending || uploadsPaused}
                 >
                   {restoreMutation.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />

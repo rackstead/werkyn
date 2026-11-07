@@ -115,6 +115,7 @@ A preview or restore upload, with the default settings:
 | Phase | Bounds |
 |---|---|
 | Request line and headers | 30-second header deadline |
+| Before admission | Refused with a 429 while the user owes a cooldown (below) |
 | From admission until the file part starts | 120-second request deadline (from the start of the request); 60-second transfer idle timeout; the minimum rate after the grace period |
 | The file | 60-second transfer idle timeout; the minimum rate; 1,088 MiB (413). The request deadline no longer applies. |
 | Waiting for the exclusive section, then processing | No client-side bound; a client that leaves while waiting is skipped |
@@ -204,16 +205,269 @@ when the 60-second test timeout ends them. The test of uploads above the
 minimum passes on main, as it should (each test run on its own, since the
 first one leaves the slots held on main).
 
+## Follow-up: a cooldown per user
+
+### Problem
+
+The independent review of the minimum rate (PR #204, finding M1) showed that
+it stops a single slow connection but not a client that starts a new upload
+each time. Three attacker uploads, in three workspaces, sent only their
+request and part headers and reconnected as soon as each was answered 408.
+Another admin, trying a preview in a fourth workspace every 3 seconds for
+100 seconds, got 503 on 33 of 33 tries, as on main before the minimum rate.
+Each slot cost the attacker a few hundred bytes every 30 seconds.
+
+A cooldown that followed only the 408 could be sidestepped the same way: a
+client that hangs up a second before its 408, or that sends the rest of a tiny
+file a second before it, is never refused for its rate. Both are measured
+below.
+
+### Decision
+
+The owner approved a per-user cooldown on 6 November 2026: after a backup or
+restore upload is refused with 408 for falling below the minimum rate, the
+same user cannot start another backup or restore upload until a short,
+configurable cooldown ends, and gets 429 with Retry-After meanwhile. Normal
+uploads and other users are not affected.
+
+A cooldown that followed only the 408 would be dodged by hanging up just
+before it. After the independent review, the owner accepted the broader
+trigger described below on the same day: any upload that stops short of the
+minimum rate owes a wait in proportion to its shortfall, the first 6 seconds
+of shortfall are forgiven, the wait never exceeds the cooldown, and a 408
+gives the full cooldown. Uploads at or above 16 KiB/s are never charged.
+
+### Change
+
+One more setting, read at startup like the others (an empty value keeps the
+default):
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS` | `120` | 0–3600 | How long a user's previews and restores are refused after one of their uploads is refused for its rate. 0 turns the cooldown off. |
+
+- **After a 408 for the rate,** the same user's previews and restores, in any
+  workspace and on any server process, are answered `429 Too Many Requests`
+  for exactly the cooldown, with `Retry-After` in whole seconds, the code
+  `BACKUP_UPLOAD_COOLDOWN` and the message "Backup uploads from your account
+  are paused because a recent one was too slow. Try again in N seconds."
+- **Ending a slow upload first does not avoid it.** Every preview or restore
+  is measured when it stops being received: when its file has been staged,
+  when it is refused for any reason, or when its client goes away. Its
+  shortfall is the time since admission that the bytes received do not cover
+  at the minimum rate (the time minus the bytes divided by the rate; time the
+  server spent not reading, for back-pressure, is left out, as for the rate
+  itself). Each second of shortfall adds cooldown ÷ grace seconds to the
+  user's wait (4 at the defaults), so holding a slot for the whole grace
+  period without sending costs about a full cooldown however the upload ends.
+  An upload that keeps to the minimum has no shortfall and adds nothing.
+- **Small shortfalls are forgiven.** Waits add up and count down in real
+  time. The first fifth of the cooldown is forgiven (24 seconds at the
+  defaults, which is 6 seconds of shortfall): a user is refused only while
+  more than that is owed, and only until it is back to that. The time it takes
+  to receive a small file, or a pause of a few seconds, never leads to a
+  refusal. A 408 sets the wait to the cooldown plus that fifth, so it leaves
+  exactly the cooldown. No user ever owes more.
+- **Checked before admission.** The refusal comes before the user's request
+  takes a slot or reads its body. From this check on, any answer sent before
+  the body has arrived (this refusal, a failed check, or a 429 or 503 from the
+  slot limits) closes the connection 2 seconds later if the client goes on
+  sending, as for the other answers above. Before, a busy refusal kept such a
+  connection until the 120-second request deadline.
+- **Recorded before the answer.** The wait is written before the slot is
+  released and before the response is sent, so the client's next request
+  finds it. If the write fails, the error is logged and the request's own
+  answer is unchanged. Concurrent charges for one user add up: a write that
+  waits for another's row lock reads the database clock once it has the row,
+  so it never shortens the wait stored meanwhile.
+- **Per authenticated user,** whether signed in with a session or a personal
+  API key; not per IP address. Other users, and the user's exports (which
+  upload nothing), are not affected.
+
+At the defaults:
+
+| How a user's upload ends | Shortfall | Then refused for |
+|---|---|---|
+| Refused for its rate (408) | about 30 s or more | 120 s |
+| Client hangs up 29 s after admission, having sent only headers | about 29 s | 92 s |
+| A 2 KB file, completed after a 10-second pause | about 10 s | 16 s |
+| Client hangs up after 5 s, or a tiny file arrives after a 5-second pause | about 5 s | not refused |
+| Any upload at 16 KiB/s or more | 0 | not refused |
+
+What a legitimate user can see, measured by the independent review of PR
+#209 at the defaults (each case with a fresh user, followed at once by a
+small preview from the same user):
+
+| Upload | Then |
+|---|---|
+| Any upload at or above 16 KiB/s, steady or with network stalls of 10 or 20 seconds that it makes up for; a cancelled or dropped upload at a normal speed; a 400 for a wrong file type or a damaged archive | no wait |
+| A small file that arrives after a pause of up to about 6 seconds | no wait |
+| A small file that arrives after a pause of 8, 15 or 25 seconds | refused for 8, 36 or 76 seconds |
+| A small file over a link slower than 16 KiB/s (100 to 350 KiB at 8 to 12 KiB/s) | no wait, or refused for 2 to 26 seconds |
+| A real 408: for example, a link that stalls for about 40 seconds mid-upload | refused for 120 seconds |
+| A tiny preview while another admin's crafted restore blocks the server for 8 or 12 seconds | refused for 12 or 28 seconds |
+
+Without a 408, no legitimate upload can be refused for more than about 96
+seconds (the 144-second cap less the forgiven 24). The 408 itself has been
+answered since the minimum rate (PR #204); the cooldown only adds the wait
+after it.
+
+However one account times its uploads, it can keep backup slots busy below
+the minimum rate for only about a fifth to a quarter of the time at the
+defaults: a slot it held for up to 30 seconds is then refused to it for up to
+2 minutes. Other admins are admitted the rest of the time.
+
+**Why PostgreSQL.** Backup slots are counted per server process, but a user's
+next request can reach any process. The owner decision is that the same user
+cannot start another upload until the cooldown ends, so the wait is kept in
+the database and every process refuses the user; a restart does not clear it
+either. The cost is one primary-key read per preview or restore, and a write
+only for an upload with a shortfall. The new table `BackupUploadCooldown`
+(migration `20261106180000_backup_upload_cooldown`) holds at most one row per
+user: the time the user's wait is paid off. Rows are removed with their user,
+and every write also prunes rows whose wait is over (up to 1,000 at a time,
+skipping rows another write holds), so it holds only users with a recent slow
+upload. Times are read from the database's clock, so clock differences between
+server processes do not matter. The migration only creates the table; older
+servers ignore it.
+
+**Why 120 seconds.** With the 30-second grace period, a cooldown of C lets one
+account hold slots below the minimum for about 30 of every 30 + C seconds:
+a fifth at 120 seconds, a third at 60, a ninth at 240. Longer cooldowns
+protect more, but make an admin whose upload was refused because their link
+dropped wait longer before trying again. Two minutes keeps another admin's
+chance of being admitted at four in five or better, and is about as long as
+the web app already gives a restore (120 seconds).
+
+**The web app.** When a preview or restore is refused this way, the backup page
+shows "Backup uploads from your account are paused because a recent one was
+too slow. You can upload again in N seconds.", counts it down (the same
+`Retry-After` handling as the sign-in form, PR #201) and keeps the file picker
+and Confirm Restore disabled until the wait has passed. A preview's chosen
+file is cleared so the same file can be chosen again. Other refusals are
+shown as a toast, as before. Each preview or restore failure is now reported
+once, by the request itself in place of the app-wide error toast, so it is
+still shown after the admin has left the page; a pause shows only the
+countdown. Before, each failure was shown twice, and the pause would have
+come with a second, static notice that does not count down.
+
+### Measured
+
+The reconnect attack from the PR #204 review, rerun with its harness on main
+(`a6bcc03`) and on this change, side by side, with the production limits and
+default settings (30-second grace period, 120-second cooldown). Three attacker
+uploads, one per workspace, send only their headers; another admin tries a
+preview in a fourth workspace every 3 seconds for 100 seconds. Every
+connection uses its own source address, so the per-address request limit does
+not hide the result.
+
+| Attacker | Main: other admin | This change: other admin | This change: attacker |
+|---|---|---|---|
+| Reconnects at once after every answer (the review's scenario, unchanged) | 503 on 33/33 | 503 on 9, then 200 on 24 | 3 × 408, then 58,163 × 429 |
+| Reconnects when allowed (waits out each `Retry-After`) | 503 on 33/33 | 503 on 9, then 200 on 24 | 3 × 408, 3 × 429 |
+| Hangs up 29 s after admission, before its 408, and reconnects | 503 on 33/33 | 503 on 9, then 200 on 24 | 3 hang-ups, 3 × 429 |
+| Completes a small file 29 s after admission, and reconnects | 503 on 33/33 | 503 on 9, then 200 on 24 | 3 × 200, 3 × 429 |
+
+With this change, the other admin is refused only during the first 30
+seconds, while the attacker's first uploads hold the slots before they can be
+measured, and admitted from then on. No slot, staged file or timer was left
+afterwards in any run.
+
+Over 330 seconds, an attacker that reconnects whenever it is allowed, and one
+that hangs up 29 seconds after admission each time, both hold the slots for 30
+seconds of every 150: the other admin got 503 from 0 to 30 s, 150 to 180 s and
+300 to 330 s, and 200 otherwise (81 of 110 tries).
+
+The same change with a cooldown that follows only the 408 (the shortfall
+charge removed) lets both other attackers through: the one that hangs up 29
+seconds after admission, and the one that completes a small file then, kept
+every slot, and the other admin got 503 on 33 of 33 tries in each case.
+
+Logs and the harness: `round14-r42b-harness/` in the audit evidence.
+
+### Tests
+
+`tests/integration/backup-upload-cooldown.test.mjs` runs the real app on a
+loopback port with PostgreSQL, a minimum of 4,096 bytes a second, a 2-second
+grace period and a 4-second cooldown:
+
+- An upload that drips a byte a second is answered 408 after the grace
+  period. The same user's next upload, at once and in another workspace, gets
+  429 with `Retry-After: 4`, the code and the message, and is never admitted
+  (no call to the admission). A client that goes on sending after that 429 is
+  disconnected about 2 seconds after it. Another admin's restore and preview
+  get 200 meanwhile, and the user's own export gets 200. A second later the
+  wait is shorter, and once it has passed the user's preview gets 200.
+- Fast previews and restores, and fast refusals (a 400 for a `.txt` file, for
+  a missing file and for a damaged archive), leave nothing owed: the next
+  upload gets 200 and the user has no row.
+- A client that sends its part header and hangs up 1.6 seconds after
+  admission, before it could be refused for its rate, owes about 3.2 seconds,
+  and its next upload gets 429 with less than the full cooldown. A client that
+  completes a small file after such a pause gets its preview (200), and its
+  next upload gets 429. A client that hangs up after 0.2 seconds owes less than
+  the allowance and is admitted at once.
+- A second server process (a child process on the same database, with its own
+  slots) refuses the user right after their 408 in the first one, without
+  taking a slot, and admits another admin; an upload abandoned below the rate
+  in the second process makes the first refuse the user.
+- A charge that has to wait 1.5 seconds for another transaction's lock on the
+  user's row, while that transaction stores a full wait from its own later
+  clock reading, leaves that wait in place. Computed from the statement's
+  start instead, it shortened it by about 1.4 seconds (checked by that
+  change).
+
+Run against main's server code (the test's import of the code constant
+replaced by its value, and without the row-lock case, which calls the new
+module directly), the first, third and fourth tests fail: nothing is owed,
+and the user's next upload is admitted (200) where the test expects 429. The
+second passes, as it should.
+
+`tests/backup-cooldown.test.mjs` checks what is asked of the database: a 408
+owes the cooldown plus its fifth (144 seconds at the defaults), a shortfall
+owes cooldown ÷ grace per second and never more than that cap, no shortfall
+writes nothing, a failed write is logged without changing the answer, 0
+reads and writes nothing, and the refusal's status, header, code and message.
+Over a real socket, a refused upload and one whose check fails (500) are both
+disconnected within about 2 seconds of the answer while the client goes on
+sending; registering that only after a successful check kept the failed one
+open (checked by that change).
+`tests/backup-staging.test.mjs` checks the shortfall itself: silence counts
+in full, inside the grace period too; bytes cover their share; it is measured
+up to the stop; at the minimum rate there is none; time the server is not
+reading is left out. `tests/env-validation.test.mjs` checks the default, an
+empty value, 0, 3600 and the refusals of -1, 3601, fractions and words.
+`backup-upload-rate.test.mjs` turns the cooldown off, so its cases can reuse
+the admin an earlier case had refused; that also shows 0 turns it off.
+
+The frontend test `backup-settings.test.tsx` uses the real hooks, the app's
+own query client (with its app-wide mutation error toast), ky client and
+error parsing with a stubbed `fetch`: a paused preview shows the message,
+counts 2, 1 and then clears, keeps the file picker disabled and sends nothing
+meanwhile, then previews; a paused restore keeps its preview and disables
+Confirm Restore for 120 seconds, then restores; a workspace-busy 429 and a
+408 are each shown as one toast without a countdown, and the pauses show no
+toast; a preview that fails after the page has been closed is still reported,
+once. Against main's backup page the first three fail (the third because each
+failure was toasted twice) and the fourth passes. With the requests' own
+report replaced by nothing, the third and fourth fail.
+
 ## Remaining limits
 
-- A client that reconnects after each 408 can keep slots busy while sending
-  almost nothing. Each slow upload is still refused, as specified, after the
-  grace period (30 seconds by default). By starting a new one each time, one
-  client per workspace can hold a slot at a few hundred bytes every 30
-  seconds, and three can hold the server's three. A reverse proxy that
-  receives whole uploads first (recommended) or per-route request limits at
-  the proxy prevent this. A cooldown per user after a 408 is a possible
-  follow-up.
+- A client that reconnects after each 408 can no longer keep slots busy
+  while sending almost nothing: this is closed by the cooldown above, also for
+  a client that hangs up, or completes a small file, just before its 408. What
+  remains:
+  - Each upload is still admitted before it can be measured, so one account
+    can hold up to three slots (one per workspace) for the grace period before
+    its first refusal, and about a fifth to a quarter of the time after that.
+  - The cooldown is per user. Anyone can register (unless registration is
+    restricted) and create workspaces, so someone with several accounts can
+    take turns between them and keep slots busy for longer. A reverse proxy
+    that receives whole uploads before passing them on (recommended) prevents
+    this, since a slot is then taken only once an upload has fully arrived.
+    Per-client request limits at the proxy (nginx `limit_req`, Traefik's
+    `rateLimit`) reduce it, but do not prevent it.
 - A client that sends at or just above the minimum keeps its slot until its
   upload ends: up to about 19 hours for a 1,088 MiB file at the defaults. A
   reverse proxy that receives the whole body before passing it on (nginx by

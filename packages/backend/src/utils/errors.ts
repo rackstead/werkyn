@@ -77,12 +77,18 @@ export class GoneError extends AppError {
   }
 }
 
-/** Refused until a later time; Retry-After carries the whole seconds. */
+/**
+ * Refused until a later time; Retry-After carries the whole seconds. A
+ * `code`, when given, is sent with the response so a client can tell which
+ * limit refused it.
+ */
 export class TooManyRequestsError extends AppError {
   retryAfter: number;
+  code?: string;
 
-  constructor(message: string, retryAfter: number) {
+  constructor(message: string, retryAfter: number, code?: string) {
     super(429, "Too Many Requests", message);
     this.retryAfter = retryAfter;
+    this.code = code;
   }
 }

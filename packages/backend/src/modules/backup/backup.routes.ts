@@ -9,6 +9,7 @@ import {
   restoreHandler,
 } from "./backup.controller.js";
 import { limitBackupRequests } from "./backup-concurrency.js";
+import { refuseDuringUploadCooldown } from "./backup-cooldown.js";
 import { backupStagingDir, prepareBackupStaging } from "./backup-staging.js";
 import { env } from "../../config/env.js";
 
@@ -26,7 +27,10 @@ export default async function backupRoutes(fastify: FastifyInstance) {
   });
 
   // Every backup route is admitted per workspace and per process before it
-  // reads an upload or the database, after the caller is authorized.
+  // reads an upload or the database, after the caller is authorized. A
+  // preview or restore is first refused while its user owes a wait for an
+  // earlier upload below the minimum rate (backup-cooldown.ts), so a refused
+  // upload takes no slot.
   // A backup request may wait its turn or build an export for minutes before
   // it answers, so the socket idle timeout is suspended until its response
   // starts (plugins/request-limits.ts).
@@ -46,7 +50,7 @@ export default async function backupRoutes(fastify: FastifyInstance) {
     url: "/:wid/backup/preview",
     config: { timeouts: { idleBeforeResponse: false } },
     preHandler: [authenticate, authorize("ADMIN")],
-    handler: limitBackupRequests(previewHandler),
+    handler: refuseDuringUploadCooldown(limitBackupRequests(previewHandler)),
   });
 
   // POST /api/workspaces/:wid/backup/restore
@@ -55,6 +59,6 @@ export default async function backupRoutes(fastify: FastifyInstance) {
     url: "/:wid/backup/restore",
     config: { timeouts: { idleBeforeResponse: false } },
     preHandler: [authenticate, authorize("ADMIN")],
-    handler: limitBackupRequests(restoreHandler),
+    handler: refuseDuringUploadCooldown(limitBackupRequests(restoreHandler)),
   });
 }

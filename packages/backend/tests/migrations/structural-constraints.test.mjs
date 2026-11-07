@@ -1,8 +1,9 @@
 // Explicit upgrade gate for the R35 constraint migrations
 // (docs/remediation/r35-constraints.md); not part of the normal integration DB
 // lifecycle. Requires an empty disposable database: it builds a legacy and then
-// a clean fixture in its current schema, recreating that schema in between and
-// at the end.
+// a clean fixture in its current schema (the URL's `schema`, CI runs it in
+// public and in another schema), recreating that schema in between and at the
+// end.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { cp, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
@@ -21,6 +22,10 @@ const { findReferenceIntegrityIssues } = await import("../../src/scripts/referen
 
 const FIRST = "20261106120000_reference_integrity_constraints";
 const SECOND = "20261106120100_value_range_constraints";
+const PINNED = "20261106140000_pin_trigger_search_path";
+const TRIGGER_FUNCTIONS = [
+  "check_custom_field_value_project", "check_task_dependency_project", "check_task_label_project", "refuse_project_change",
+];
 const prismaRoot = new URL("../../prisma/", import.meta.url);
 const packagePath = createRequire(import.meta.url).resolve("prisma/package.json");
 const cli = path.resolve(path.dirname(packagePath), JSON.parse(await readFile(packagePath, "utf8")).bin.prisma);
@@ -192,7 +197,7 @@ async function catalogSnapshot(db) {
     db.$queryRaw`SELECT tgrelid::regclass::text AS tbl, tgname AS name, pg_get_triggerdef(t.oid) AS def
       FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = current_schema() AND NOT t.tgisinternal ORDER BY 1, 2`,
-    db.$queryRaw`SELECT proname AS name FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    db.$queryRaw`SELECT proname AS name, proconfig AS config FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = current_schema() ORDER BY 1`,
   ]);
   return { constraints, indexes, triggers, functions };
@@ -217,28 +222,34 @@ function assertReported(output, key, table, rows) {
  * Runs `text` and returns the database error it fails with. Deferred keys are
  * checked right after the statement (SET CONSTRAINTS ALL IMMEDIATE) so their
  * error carries its SQLSTATE; commit-time refusal is tested separately.
+ * `setup` statements run first in the same transaction, which is rolled back
+ * if the database accepts `text`.
  */
-async function refusal(db, text) {
+async function refusal(db, text, setup = []) {
+  const accepted = new Error("accepted");
   try {
     await db.$transaction(async (tx) => {
+      for (const statement of setup) await tx.$executeRawUnsafe(statement);
       await tx.$executeRawUnsafe(text);
       await tx.$executeRawUnsafe("SET CONSTRAINTS ALL IMMEDIATE");
+      throw accepted;
     });
   } catch (error) {
-    return { code: error.meta?.code, message: String(error.meta?.message ?? error.message) };
+    if (error !== accepted) return { code: error.meta?.code, message: String(error.meta?.message ?? error.message) };
   }
   assert.fail(`expected the database to refuse: ${text}`);
 }
-async function assertRefused(db, text, code, constraint) {
-  const error = await refusal(db, text);
+async function assertRefused(db, text, code, constraint, setup = []) {
+  const error = await refusal(db, text, setup);
   assert.equal(error.code, code, `${text}\n${error.message}`);
   assert(error.message.includes(`"${constraint}"`), `${text} names ${constraint}: ${error.message}`);
 }
 /** Runs `text` in a transaction that is rolled back, so the fixture stays as it was. */
-async function assertAccepted(db, text) {
+async function assertAccepted(db, text, setup = []) {
   const rollback = new Error("rollback");
   await assert.rejects(
     db.$transaction(async (tx) => {
+      for (const statement of setup) await tx.$executeRawUnsafe(statement);
       await tx.$executeRawUnsafe(text);
       await tx.$executeRawUnsafe("SET CONSTRAINTS ALL IMMEDIATE");
       throw rollback;
@@ -388,11 +399,11 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
       });
     });
 
-    await t.test("then both migrations apply", async () => {
+    await t.test("then both migrations apply, and the search path pin after them", async () => {
       const deploy = await prismaCli(["migrate", "deploy", "--schema", currentSchema]);
       assert(deploy.ok, deploy.output);
       const rows = await migrationRows(legacy);
-      assert.deepEqual(rows.filter((r) => r.finished).map((r) => r.name), [FIRST, SECOND]);
+      assert.deepEqual(rows.filter((r) => r.finished).map((r) => r.name), [FIRST, SECOND, PINNED]);
     });
 
     let cleanCatalog, legacyCatalog;
@@ -540,6 +551,42 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
         `UPDATE "UserRate" SET rate = 1e308 WHERE id = 'r1'`,
       ])
         await assertAccepted(clean, text);
+    });
+
+    await t.test("the trigger functions read their own schema's tables whatever the caller's search path", async (st) => {
+      const [{ quoted }] = await clean.$queryRaw`SELECT quote_ident(current_schema()) AS quoted`;
+      st.diagnostic(`schema ${quoted}`);
+      await st.test("each runs with the schema the migrations ran in, then pg_temp", () => {
+        assert.deepEqual(
+          cleanCatalog.functions.filter((f) => TRIGGER_FUNCTIONS.includes(f.name)),
+          TRIGGER_FUNCTIONS.map((name) => ({ name, config: [`search_path=${quoted}, pg_temp`] })),
+        );
+      });
+      const situations = {
+        // Temporary tables come first on a default search path; empty ones
+        // named like the tables the checks read must not hide a violation.
+        "temporary tables named Task, Label and CustomField": ["Task", "Label", "CustomField"].map(
+          (name) => `CREATE TEMP TABLE "${name}" (id text, "projectId" text) ON COMMIT DROP`),
+        // pg_restore writes with an empty search path.
+        "an empty search path, as pg_restore sets": ["SELECT set_config('search_path', '', true)"],
+      };
+      for (const [situation, setup] of Object.entries(situations))
+        await st.test(situation, async () => {
+          for (const [text, constraint] of [
+            [`INSERT INTO ${quoted}."TaskLabel" (id, "taskId", "labelId") VALUES ('x', 't2', 'l2')`, "TaskLabel_same_project"],
+            [`INSERT INTO ${quoted}."CustomFieldValue" (id, "taskId", "fieldId", value) VALUES ('x', 't2', 'f2', '"z"')`, "CustomFieldValue_same_project"],
+            [`INSERT INTO ${quoted}."TaskDependency" (id, "blockedTaskId", "blockingTaskId") VALUES ('x', 't1', 't3')`, "TaskDependency_same_project"],
+            [`UPDATE ${quoted}."Label" SET "projectId" = 'p2' WHERE id = 'l1'`, "Label_projectId_fixed"],
+          ])
+            await assertRefused(clean, text, "23514", constraint, setup);
+          for (const text of [
+            `INSERT INTO ${quoted}."TaskLabel" (id, "taskId", "labelId") VALUES ('x', 't2', 'l1')`,
+            `INSERT INTO ${quoted}."CustomFieldValue" (id, "taskId", "fieldId", value) VALUES ('x', 't2', 'f1', '"ok"')`,
+            `INSERT INTO ${quoted}."TaskDependency" (id, "blockedTaskId", "blockingTaskId") VALUES ('x', 't2', 't1')`,
+          ])
+            await assertAccepted(clean, text, setup);
+        });
+      assert.deepEqual(await catalogSnapshot(clean), cleanCatalog);
     });
 
     await t.test("deleting tasks, projects, columns, templates and workspaces keeps its behavior", async () => {

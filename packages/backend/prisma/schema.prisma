@@ -69,6 +69,7 @@ model User {
   fileShareLinksCreated   FileShareLink[]   @relation("FileShareLinksCreated")
   dashboardPreferences    DashboardPreference[]
   admissionRequests       WorkspaceAdmissionRequest[]
+  backupUploadCooldown    BackupUploadCooldown?
 }
 
 model ApiKey {
@@ -146,6 +147,21 @@ model LoginThrottle {
   generation     BigInt   @default(autoincrement())
 
   @@index([lastFailureAt])
+}
+
+/// The wait a user owes for backup slot time held below the minimum upload
+/// rate: their backup previews and restores are refused while it lasts. At
+/// most one row per user, removed with the user; rows whose wait is over are
+/// pruned whenever one is written. Written only by
+/// modules/backup/backup-cooldown.ts (docs/remediation/r42-backup-limits.md).
+model BackupUploadCooldown {
+  userId   String   @id
+  /// When the wait is fully paid off.
+  clearsAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clearsAt])
 }
 
 model PasswordResetToken {

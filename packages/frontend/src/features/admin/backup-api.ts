@@ -1,5 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
 import type { BackupExportRequest, RestoreSummary } from "@pm/shared";
 import { apiBase } from "@/lib/api-url";
@@ -30,6 +30,18 @@ export function useExportBackup(wid: string) {
       return { blob, filename };
     },
   });
+}
+
+/**
+ * A preview or restore refused (429 with Retry-After) because backup uploads
+ * from this account are paused after one that was too slow.
+ */
+export function isBackupUploadPaused(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.statusCode === 429 &&
+    error.code === "BACKUP_UPLOAD_COOLDOWN"
+  );
 }
 
 export function usePreviewRestore(wid: string) {

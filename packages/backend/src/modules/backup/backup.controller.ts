@@ -25,6 +25,7 @@ import {
   type MinimumUploadRate,
   type StagedUpload,
 } from "./backup-staging.js";
+import { backupUploadCooldown } from "./backup-cooldown.js";
 import { env } from "../../config/env.js";
 import { READ_NO_FOLLOW } from "../../services/storage-paths.js";
 import { closeAfterUnreadBody, liftRequestTimeout } from "../../plugins/request-limits.js";
@@ -152,6 +153,9 @@ export const BACKUP_UPLOAD_MIN_RATE: Readonly<MinimumUploadRate> = Object.freeze
  * Stage the upload on disk, then read and process it in the exclusive
  * section. The staged file is removed on every path before the response is
  * sent, so a client that receives it can start its next backup request.
+ * Once the upload has stopped being received, its user is charged for any
+ * slot time it held below the minimum rate (backup-cooldown.ts), before the
+ * slot is released and the answer sent.
  */
 async function handleUpload(
   request: FastifyRequest,
@@ -163,6 +167,7 @@ async function handleUpload(
   // 413) closes the connection shortly after, whether or not the request
   // deadline was lifted.
   closeAfterUnreadBody(request, reply);
+  let shortfallMs = 0;
   let upload: StagedUpload;
   try {
     upload = await receiveBackupUpload(request, {
@@ -170,20 +175,27 @@ async function handleUpload(
       maxBytes: Math.min(env.MAX_FILE_SIZE, BACKUP_TRANSFER_LIMITS.maxUploadBytes),
       // Admitted: from here a slow-drip client cannot hold the admission.
       minRate: BACKUP_UPLOAD_MIN_RATE,
+      onRateStop: (ms) => (shortfallMs = ms),
       // Authorized, admitted and its file started: the upload is bounded by
       // its own idle timeout, minimum rate and size limit from here on, not
       // by the whole-request deadline.
       onFile: () => liftRequestTimeout(request, reply),
     });
   } catch (error) {
-    if (error instanceof BackupUploadTooSlowError) {
+    const tooSlow = error instanceof BackupUploadTooSlowError;
+    if (tooSlow) {
       request.log.warn(
         { minBytesPerSecond: error.bytesPerSecond },
         "Abandoned a backup upload below the minimum rate",
       );
     }
+    // Refused, failed or abandoned: a client cannot avoid the wait by ending
+    // a slow upload before it is refused.
+    await backupUploadCooldown.charge(request, tooSlow ? "refused" : shortfallMs);
     throw error;
   }
+  // A small file completed late (after a long pause) is charged too.
+  await backupUploadCooldown.charge(request, shortfallMs);
   let summary: RestoreSummary;
   try {
     summary = await logRejection(request, () =>

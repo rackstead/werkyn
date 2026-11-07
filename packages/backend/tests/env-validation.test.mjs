@@ -307,3 +307,12 @@ test("backup upload minimum rate settings have safe defaults and bounded ranges"
     1073741824,
   );
 });
+
+test("the backup upload cooldown defaults to two minutes and 0 turns it off", () => {
+  assert.equal(accepts({}).data.BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS, 120);
+  assert.equal(accepts({ BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: "" }).data.BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS, 120);
+  assert.equal(accepts({ BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: "0" }).data.BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS, 0);
+  assert.equal(accepts({ BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: "3600" }).data.BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS, 3600);
+  for (const value of ["-1", "3601", "1.5", "later"])
+    rejects({ BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: value }, "BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS", /whole number from 0 to 3600/);
+});

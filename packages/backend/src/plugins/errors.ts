@@ -137,6 +137,7 @@ export default fp(async (fastify: FastifyInstance) => {
         }
         if (error instanceof TooManyRequestsError) {
           reply.header("Retry-After", String(error.retryAfter));
+          if (error.code) response.code = error.code;
         }
         return reply.status(error.statusCode).send(response);
       }

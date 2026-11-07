@@ -370,6 +370,41 @@ test("time the server spends not reading is not held against the upload", async 
   assert.equal(reported, true, "silence after the pause was not reported");
 });
 
+test("the shortfall is the reading time the bytes received do not cover at the minimum rate", async () => {
+  const rate = { bytesPerSecond: 1000, windowMs: 400, graceMs: 60_000 };
+  // Silence counts in full, inside the grace period too.
+  const silent = watchRate(rate, () => {});
+  await sleep(300);
+  const before = silent.shortfallMs();
+  assert.ok(before >= 290 && before < 600, `${before}`);
+  // 100 bytes at 1,000 bytes a second cover 100 ms of it.
+  silent.add(100);
+  const after = silent.shortfallMs();
+  assert.ok(after <= before - 90 && after >= before - 100, `${before} then ${after}`);
+  // Measured up to stop(), not after it.
+  silent.stop();
+  const stopped = silent.shortfallMs();
+  await sleep(100);
+  assert.equal(silent.shortfallMs(), stopped);
+  silent.stop();
+  assert.equal(silent.shortfallMs(), stopped);
+
+  // At or above the rate there is none (never less than none).
+  const steady = watchRate(rate, () => {});
+  await feed(steady, 1300, 500);
+  steady.add(10_000);
+  steady.stop();
+  assert.equal(steady.shortfallMs(), 0);
+
+  // Time the server is not reading is left out.
+  const paused = watchRate(rate, () => {});
+  paused.pause();
+  await sleep(300);
+  paused.resume();
+  paused.stop();
+  assert.ok(paused.shortfallMs() < 50, `${paused.shortfallMs()}`);
+});
+
 test("an aborted staging copy stops with the abort reason and leaves no file", async () => {
   const dir = freshDir();
   const source = new PassThrough();

@@ -182,6 +182,11 @@ const envSchema = z.object({
   BACKUP_UPLOAD_MIN_BYTES_PER_SECOND: wholeNumber("BACKUP_UPLOAD_MIN_BYTES_PER_SECOND", 16384, 1, 1073741824),
   BACKUP_UPLOAD_RATE_WINDOW_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_WINDOW_SECONDS", 60, 1, 3600),
   BACKUP_UPLOAD_RATE_GRACE_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_GRACE_SECONDS", 30, 1, 3600),
+  // After an upload is refused for its rate, its user's previews and
+  // restores are refused with a 429 for COOLDOWN seconds. An upload that ends
+  // another way while below the rate adds to that wait in proportion to the
+  // slot time it held (modules/backup/backup-cooldown.ts). 0 turns it off.
+  BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS", 120, 0, 3600),
 }).superRefine((values, ctx) => {
   if (values.LOGIN_BACKOFF_BASE_SECONDS > values.LOGIN_BACKOFF_MAX_SECONDS) {
     ctx.addIssue({

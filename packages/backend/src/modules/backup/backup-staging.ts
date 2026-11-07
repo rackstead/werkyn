@@ -115,6 +115,14 @@ export interface RateWatch {
   resume(): void;
   /** Stop watching. Safe to call more than once. */
   stop(): void;
+  /**
+   * Milliseconds of reading time, from the start until the watch stopped (or
+   * now, while it runs), that the bytes received do not cover at the minimum
+   * rate: 0 when they average at least the minimum over that whole time. A
+   * client that sends nothing for 10 seconds has a 10-second shortfall
+   * whether or not the grace period has ended.
+   */
+  shortfallMs(): number;
 }
 
 /**
@@ -133,6 +141,7 @@ export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateW
   const started = performance.now();
   let total = 0;
   let stopped = false;
+  let stoppedAt: number | undefined;
   let pausedMs = 0;
   let pausedAt: number | undefined;
   /** Milliseconds since the start during which the server was reading. */
@@ -144,6 +153,7 @@ export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateW
     total - samples[0].total < (rate.bytesPerSecond * (reading(now) - samples[0].reading)) / 1000;
   const stop = () => {
     stopped = true;
+    stoppedAt ??= performance.now();
     clearInterval(timer);
   };
   const timer = setInterval(() => {
@@ -174,6 +184,10 @@ export function watchRate(rate: MinimumUploadRate, onTooSlow: () => void): RateW
       pausedAt = undefined;
     },
     stop,
+    shortfallMs() {
+      const covered = (total * 1000) / rate.bytesPerSecond;
+      return Math.max(0, reading(stoppedAt ?? performance.now()) - covered);
+    },
   };
 }
 
@@ -364,6 +378,7 @@ export async function receiveBackupUpload(
     idleTimeoutMs = BACKUP_TRANSFER_LIMITS.idleTimeoutMs,
     minRate,
     onFile,
+    onRateStop,
   }: {
     dir: string;
     maxBytes: number;
@@ -372,6 +387,12 @@ export async function receiveBackupUpload(
     minRate?: MinimumUploadRate;
     /** Called once the file part has started, before it is staged. */
     onFile?: () => void;
+    /**
+     * With `minRate`: called once, when the rate stops being watched (the
+     * file is staged, or the upload has failed), with the upload's shortfall
+     * below the minimum rate since this call (RateWatch.shortfallMs).
+     */
+    onRateStop?: (shortfallMs: number) => void;
   },
 ): Promise<StagedUpload> {
   // The multipart parser reads the request from here on. Until the file part
@@ -443,7 +464,10 @@ export async function receiveBackupUpload(
     }
     return { ...staged, filename: file.filename };
   } finally {
-    rate?.stop();
+    if (rate) {
+      rate.stop();
+      onRateStop?.(rate.shortfallMs());
+    }
     raw.off("data", count);
     raw.off("pause", paused);
     raw.off("resume", resumed);

@@ -615,7 +615,8 @@ volume.
 
 ### Limits per server
 
-Each server process applies these limits. Only the minimum upload rate is
+Each server process applies these limits, except the cooldown, which applies to
+a user on every process. Only the minimum upload rate and the cooldown are
 configurable.
 
 | Limit | Value | When it is exceeded |
@@ -627,6 +628,7 @@ configurable.
 | Export time, image copy included | 10 minutes | `409`, the export can be retried |
 | Upload or download that moves no bytes | 60 seconds | the connection is closed |
 | Upload slower than the minimum rate (below) | 16 KiB/s on average over 60 s, from 30 s after it starts | `408` |
+| A user's previews and restores after an upload below the minimum rate (below) | refused for up to 2 minutes | `429` with `Retry-After` |
 
 A backup request takes its slot before it reads anything and keeps it until it
 has answered; an export keeps it until its download has been handed over in
@@ -657,6 +659,7 @@ reads these optional settings at startup; an empty value keeps the default:
 | `BACKUP_UPLOAD_MIN_BYTES_PER_SECOND` | `16384` | 1–1073741824 | Lowest average rate, in bytes per second |
 | `BACKUP_UPLOAD_RATE_WINDOW_SECONDS` | `60` | 1–3600 | Time the average is taken over; pauses shorter than this are absorbed |
 | `BACKUP_UPLOAD_RATE_GRACE_SECONDS` | `30` | 1–3600 | Time after the upload starts before the rate is checked |
+| `BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS` | `120` | 0–3600 | How long a user's previews and restores are refused after one of their uploads is refused for its rate (0: no cooldown) |
 
 With Docker Compose, add them under the `werkyn` service's `environment`. The
 default, 16 KiB/s (about 130 kbit/s), is below any working broadband or mobile
@@ -666,14 +669,26 @@ minimum to shorten that, or let your reverse proxy receive whole uploads first
 (below). Exports have no minimum download rate. See
 [R42](docs/remediation/r42-backup-limits.md).
 
-The minimum rate does not stop a client that reconnects after each `408`.
-Each slow upload is still refused after the grace period, but by starting a
-new one each time, a client can keep backup slots busy while sending almost
-nothing: a few hundred bytes every 30 seconds per slot at the defaults. To
-prevent that, let a reverse proxy receive whole uploads before passing them on
-(recommended, below), or limit how often one client may call the backup routes
-at the proxy (for example nginx `limit_req` or Traefik's `rateLimit`
-middleware).
+**Cooldown.** So that a client cannot keep backup slots busy by starting a new
+upload after each `408`, the user whose upload was refused for its rate is then
+refused previews and restores, in every workspace and on every server process,
+for `BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS` (2 minutes by default). They get `429
+Too Many Requests` with `Retry-After`, and the backup page counts the wait down.
+Ending a slow upload before its `408` does not avoid it: an upload that stops
+below the minimum rate (cancelled, refused for another reason, or a small file
+finished after a long pause) adds to the user's wait in proportion to the time
+it held its slot without sending, 4 seconds per second at the defaults. Waits
+add up and count down; the first fifth of the cooldown is forgiven, so a pause
+of a few seconds never counts. Uploads at or above the minimum rate, exports
+and other users are not affected. At the defaults, one account can keep slots
+busy below the minimum rate for only about a fifth to a quarter of the time.
+
+The cooldown is per user, so someone with several accounts can still take
+turns between them. A reverse proxy that receives whole uploads before passing
+them on (recommended, below) prevents that, since a slot is then taken only
+once an upload has fully arrived. Limiting how often one client may call the
+backup routes at the proxy (for example nginx `limit_req` or Traefik's
+`rateLimit` middleware) reduces it.
 
 The backup page in the web app waits at most 60 seconds for a preview and 120
 seconds for a restore, upload included. For larger files on slower links, send
@@ -727,7 +742,7 @@ from the rest of the API:
   passing it on (nginx by default, Traefik's buffering middleware) takes slow
   clients off the server's backup slots: the slot is taken only once the
   upload is complete. This also covers clients that reconnect after each
-  `408`. The proxy needs disk space for it.
+  `408`, from one account or several. The proxy needs disk space for it.
 - **Minimum rates.** nginx and Traefik have no minimum transfer rate; Caddy
   2.11.8 and later do, per route. Werkyn's own minimum applies behind any proxy.
 - **Whole-request deadlines** (Traefik's `readTimeout`, 60 s by default in

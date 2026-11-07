@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { writeLegacyRows } from "./support/legacy-rows.mjs";
 
 if (!process.env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL to a migrated, disposable PostgreSQL database");
 process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -74,10 +75,12 @@ before(async () => {
   await app.prisma.taskDependency.createMany({ data: [
     { blockedTaskId: tasks.blocked.id, blockingTaskId: tasks.withSubtasks.id },
     { blockedTaskId: tasks.blocked.id, blockingTaskId: tasks.plain.id },
-    { blockedTaskId: tasks.blocked.id, blockingTaskId: tasks.foreign.id },
     { blockedTaskId: tasks.archived.id, blockingTaskId: tasks.plain.id },
-    { blockedTaskId: tasks.foreign.id, blockingTaskId: tasks.plain.id },
   ] });
+  await writeLegacyRows(app.prisma, (tx) => tx.taskDependency.createMany({ data: [
+    { blockedTaskId: tasks.blocked.id, blockingTaskId: tasks.foreign.id },
+    { blockedTaskId: tasks.foreign.id, blockingTaskId: tasks.plain.id },
+  ] }));
 
   channel = await app.prisma.chatChannel.create({ data: { workspaceId: workspace.id, name: "counts", type: "PUBLIC", createdById: user.id, members: { create: { userId: user.id } } } });
   // Distinct creation times keep the history order (newest first) unambiguous.

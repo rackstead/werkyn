@@ -141,7 +141,7 @@ export function InlineDueDateCell({
   onUpdateTask: InlineTaskUpdater;
 }) {
   const [editing, setEditing] = useState(false);
-  const date = useInlineDateSave(task.dueDate, (dueDate) =>
+  const date = useInlineDateSave(`task:${task.id}:dueDate`, task.dueDate, (dueDate) =>
     new Promise<boolean>((resolve) => onUpdateTask(task.id, { dueDate }, resolve)),
   );
   const isOverdue =
@@ -466,6 +466,7 @@ function InlineCustomFieldCell({
     setEditing(false);
   };
   const date = useInlineDateSave(
+    `task:${task.id}:custom:${field.id}`,
     typeof value === "string" ? value : null,
     (next) => setFieldValue.mutateAsync({ fieldId: field.id, value: next }).then(
       () => true,

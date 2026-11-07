@@ -56,11 +56,14 @@ Users of these rules:
   by emptying every part or using the browser picker's Clear. Escape discards
   the pending edit; a second Escape exits the editor.
 
-Inline cells retain the latest requested date while saves are pending and
-send committed edits in order. A quick correction back to the old date is
+Inline cells for the same identity, task and field share their pending save
+queue across row and route remounts and send committed edits in order. A quick
+correction back to the old date is
 therefore saved even before the task has refetched. Failed saves can be
 retried, and already committed edits continue saving if the row or route
 unmounts. Other inline field types keep their existing save behavior.
+Queues are removed once no mounted cell or pending save remains. Pending
+edits are not dispatched after an identity transition.
 
 Clicking a side panel's backdrop blurs the focused field before dismissing
 the panel. A complete typed date is therefore committed before its input
@@ -100,6 +103,8 @@ orders, Enter/blur, incomplete dates, Escape, deliberate clearing, required
 custom fields and picker changes, as well as the bulk input and Clear.
 Delayed-response cases cover correction back to the old value, stale refetches,
 request ordering, failed-write retries and queued edits surviving unmount.
+Remount cases verify that a new edit cannot overtake an older queued edit;
+identity-transition cases verify that the queue cannot cross accounts.
 `slideover.test.tsx` verifies that backdrop dismissal settles complete,
 incomplete and deliberately cleared date edits before the panel unmounts.
 

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { Task } from "@/features/tasks/api";
 import type { CustomField } from "@/features/projects/api";
 import { leave, setHalfTyped, type, TYPING_OVER_2026_11_20 } from "@/test/date-typing";
+import { changeIdentity } from "@/lib/identity";
 
 const { mutate, fieldMutate } = vi.hoisted(() => ({ mutate: vi.fn(), fieldMutate: vi.fn() }));
 vi.mock("@/features/tasks/api", () => ({
@@ -216,6 +217,37 @@ for (const kind of ["due", "custom"] as const) {
     expect(writes()).toEqual(["2027-05-06", "2026-11-20"]);
     await pending.complete(1);
     expect(pending.stored()).toBe("2026-11-20");
+  });
+
+  it(`inline ${kind} preserves commit order across cell remounts`, async () => {
+    const pending = delayedWrites();
+    const first = editCell(kind, false, pending.send);
+    fireEvent.change(first.input, { target: { value: "2027-05-06" } });
+    fireEvent.click(screen.getByRole("button"));
+    fireEvent.change(first.container.querySelector('input[type="date"]')!, { target: { value: "2026-11-20" } });
+    first.unmount();
+    const second = editCell(kind, false, pending.send);
+    fireEvent.change(second.input, { target: { value: "2029-07-04" } });
+    expect(pending.requests.map((request) => request.value)).toEqual(["2027-05-06"]);
+    await pending.complete(0);
+    expect(pending.requests.map((request) => request.value)).toEqual(["2027-05-06", "2026-11-20"]);
+    await pending.complete(1);
+    expect(pending.requests.map((request) => request.value)).toEqual(["2027-05-06", "2026-11-20", "2029-07-04"]);
+    await pending.complete(2);
+    expect(pending.stored()).toBe("2029-07-04");
+  });
+
+  it(`inline ${kind} never dispatches an old queued edit under a later identity`, async () => {
+    const pending = delayedWrites();
+    const { input, container, unmount } = editCell(kind, false, pending.send);
+    fireEvent.change(input, { target: { value: "2027-05-06" } });
+    fireEvent.click(screen.getByRole("button"));
+    fireEvent.change(container.querySelector('input[type="date"]')!, { target: { value: "2026-11-20" } });
+    unmount();
+    act(() => changeIdentity(null, "other-account"));
+    await pending.complete(0);
+    expect(pending.requests.map((request) => request.value)).toEqual(["2027-05-06"]);
+    act(() => changeIdentity("other-account", null));
   });
 }
 

@@ -1,64 +1,110 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { identityGeneration, subscribeIdentity } from "@/lib/identity";
 
 type DateValue = string | null;
+type Send = (date: DateValue) => Promise<boolean>;
+interface Request {
+  value: DateValue;
+  send: Send;
+}
+interface SaveQueue {
+  key: string;
+  generation: number;
+  value: DateValue;
+  confirmed: DateValue;
+  latest: Request | null;
+  requests: Request[];
+  running: boolean;
+  listeners: Set<() => void>;
+}
 
-/**
- * Keep the latest inline date edit across editor remounts and save edits in
- * order. A refetch may still show the old value while a write is pending;
- * comparing against it would drop a quick correction back to that value.
- */
+// Live cells for one identity/task/field share an order, including across a
+// windowed row or route unmounting and remounting while requests are pending.
+const queues = new Map<string, SaveQueue>();
+
+function release(queue: SaveQueue) {
+  if (!queue.running && queue.listeners.size === 0 && queues.get(queue.key) === queue) {
+    queues.delete(queue.key);
+  }
+}
+
+function show(queue: SaveQueue, value: DateValue) {
+  if (queue.value === value) return;
+  queue.value = value;
+  for (const listener of queue.listeners) listener();
+}
+
+async function drain(queue: SaveQueue) {
+  queue.running = true;
+  while (queue.requests.length) {
+    const request = queue.requests.shift()!;
+    let succeeded = false;
+    try {
+      // The mutation must belong to the identity that committed this edit,
+      // even when it is not created until an earlier request finishes.
+      if (identityGeneration() === queue.generation) {
+        succeeded = await request.send(request.value);
+      }
+    } catch {
+      // Mutation handlers already report the error. Keep retries possible.
+    }
+    if (succeeded) queue.confirmed = request.value;
+    if (queue.latest === request) {
+      queue.latest = null;
+      show(queue, queue.confirmed);
+    }
+  }
+  queue.running = false;
+  release(queue);
+}
+
+/** Keep the latest requested date and save committed edits in order. */
 export function useInlineDateSave(
+  fieldKey: string,
   saved: DateValue,
-  send: (date: DateValue) => Promise<boolean>,
+  send: Send,
   required = false,
 ) {
-  const [, refresh] = useState(0);
-  const rendered = useRef(saved);
-  rendered.current = saved;
-  const confirmed = useRef(saved);
-  const latest = useRef<{ value: DateValue } | null>(null);
-  const queue = useRef<Array<{ value: DateValue; send: typeof send }>>([]);
-  const running = useRef(false);
+  const generation = useSyncExternalStore(subscribeIdentity, identityGeneration);
+  const key = `${generation}:${fieldKey}`;
+  const queue = useMemo(() => {
+    let current = queues.get(key);
+    if (!current) {
+      current = {
+        key, generation, value: saved, confirmed: saved, latest: null,
+        requests: [], running: false, listeners: new Set(),
+      };
+      queues.set(key, current);
+    }
+    return current;
+    // A subsequent saved value is reconciled below, never over pending edits.
+  }, [key, generation]);
+
+  const subscribe = useCallback((listener: () => void) => {
+    queues.set(key, queue);
+    queue.listeners.add(listener);
+    return () => {
+      queue.listeners.delete(listener);
+      release(queue);
+    };
+  }, [key, queue]);
+  const value = useSyncExternalStore(subscribe, () => queue.value);
 
   useEffect(() => {
-    if (running.current) return;
-    // Once local writes have settled, a later server update may come from
-    // another editor and is authoritative again.
-    if (latest.current) {
-      latest.current = null;
-      refresh((version) => version + 1);
-    }
-    confirmed.current = saved;
-  }, [saved]);
+    if (queue.running) return;
+    // Once local writes have settled, later server updates are authoritative.
+    queue.confirmed = saved;
+    show(queue, saved);
+  }, [queue, saved]);
 
-  const drain = async () => {
-    running.current = true;
-    while (queue.current.length) {
-      const entry = queue.current.shift()!;
-      let succeeded = false;
-      try {
-        succeeded = await entry.send(entry.value);
-      } catch {
-        // Mutation handlers already report the error. Keep retries possible.
-      }
-      if (succeeded) confirmed.current = entry.value;
-      if (latest.current === entry) {
-        latest.current = succeeded ? entry : { value: confirmed.current };
-        if (latest.current.value === rendered.current) latest.current = null;
-      }
-    }
-    running.current = false;
-    refresh((version) => version + 1);
+  const save = (next: DateValue) => {
+    if (next === queue.value || (required && next === null)) return;
+    const request = { value: next, send };
+    queue.latest = request;
+    queue.requests.push(request);
+    show(queue, next);
+    if (!queue.running) void drain(queue);
   };
 
-  const current = () => latest.current ? latest.current.value : rendered.current;
-  const save = (value: DateValue) => {
-    if (value === current() || (required && value === null)) return;
-    const entry = { value, send };
-    latest.current = entry;
-    queue.current.push(entry);
-    if (!running.current) void drain();
-  };
-
-  return { value: current(), save };
+  return { value, save };
 }

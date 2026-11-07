@@ -492,8 +492,11 @@ try {
         await page.getByText(share.marker, { exact: true }).waitFor();
         check(`${kind}: rotation revokes and new password succeeds`);
         if (kind === "files") {
-          await mutate(share, {
-            expiresAt: new Date(Date.now() - 1000).toISOString(),
+          // The API refuses an expiry in the past; time passing is
+          // stood in for in the database.
+          await app.prisma.fileShareLink.update({
+            where: { id: share.id },
+            data: { expiresAt: new Date(Date.now() - 1000) },
           });
           await page.reload();
           await page.getByText("Share not found", { exact: true }).waitFor();

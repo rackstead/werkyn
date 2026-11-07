@@ -6,7 +6,7 @@ import type {
   KeyboardEvent,
   MouseEvent,
 } from "react";
-import { committedDate } from "@/lib/date-input";
+import { committedDate, dateInputContent, type DateInputContent } from "@/lib/date-input";
 
 interface DateInputOptions {
   /** The saved date (YYYY-MM-DD), or null for none. */
@@ -184,4 +184,100 @@ export function DateInput({ value, onCommit, onKeyDown, onKeyUp, onBlur, ...prop
       }}
     />
   );
+}
+
+const contentOf = (date: string | null): DateInputContent =>
+  date ? { kind: "date", date } : { kind: "empty" };
+
+const sameContent = (a: DateInputContent, b: DateInputContent) =>
+  a.kind === b.kind && (a.kind !== "date" || b.kind !== "date" || a.date === b.date);
+
+/**
+ * A date input in a form that is sent with a button, such as a share link's
+ * expiry. Unlike `useDateInput`, leaving the input commits and reverts
+ * nothing: the form sends what the input shows when the button is used, so
+ * it must not send while `content` is incomplete.
+ *
+ * Chromium fires no input event while the parts of an empty date input are
+ * typed (the value stays ""), and completes a half-typed part (a month "0"
+ * becomes 01) only as focus leaves the input. The content is therefore read
+ * again on every key and on blur, and `read()` reads the input itself.
+ *
+ * A mouse press on the form's button moves focus, so the browser may complete
+ * a half-typed part between the press and the click, turning an incomplete
+ * input into a date nobody saw. The button takes `submitProps`, and `read()`
+ * returns null for a click whose own press changed the input: that click
+ * sends nothing, and the date now shown needs a second click. The button must
+ * therefore not be `disabled` while the input is incomplete (a disabled
+ * button gets no press, yet still gets the click once the completion enables
+ * it); mark it `aria-disabled` and let the form refuse.
+ */
+export function useDateField(initial: string | null = null) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [value, setValue] = useState(initial ?? "");
+  const [content, setContent] = useState<DateInputContent>(() => contentOf(initial));
+  const [focused, setFocused] = useState(false);
+  // The input's content when the form's button was pressed.
+  const pressed = useRef<DateInputContent | null>(null);
+
+  const update = (next: DateInputContent) =>
+    setContent((prev) => (sameContent(prev, next) ? prev : next));
+
+  const refresh = (input: HTMLInputElement) => {
+    setValue(input.value);
+    const next = dateInputContent(input);
+    update(next);
+    return next;
+  };
+
+  const onRead = (e: { currentTarget: HTMLInputElement }) => {
+    refresh(e.currentTarget);
+  };
+
+  /**
+   * The input's content now, for the form to send, or null when the press on
+   * the form's button changed it (see above).
+   */
+  const read = (): DateInputContent | null => {
+    const before = pressed.current;
+    pressed.current = null;
+    const now = ref.current ? refresh(ref.current) : content;
+    return before && !sameContent(before, now) ? null : now;
+  };
+
+  /** Shows `date`, or empties the input (half-typed parts included). */
+  const set = (date: string | null) => {
+    if (ref.current) ref.current.value = date ?? "";
+    setValue(date ?? "");
+    update(contentOf(date));
+  };
+
+  return {
+    inputProps: {
+      ref,
+      type: "date",
+      value,
+      onChange: onRead,
+      onInput: onRead,
+      onKeyUp: onRead,
+      onFocus: () => {
+        pressed.current = null;
+        setFocused(true);
+      },
+      onBlur: (e: FocusEvent<HTMLInputElement>) => {
+        setFocused(false);
+        refresh(e.currentTarget);
+      },
+    },
+    submitProps: {
+      // Before the press moves focus: the content the user saw.
+      onPointerDown: () => {
+        pressed.current = ref.current ? dateInputContent(ref.current) : content;
+      },
+    },
+    content,
+    focused,
+    read,
+    set,
+  } as const;
 }

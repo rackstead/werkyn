@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isoDateTime } from "./common.js";
+import { futureExpiry } from "./common.js";
 
 export const CreateFileShareSchema = z.object({
   fileIds: z.array(z.string()).min(1, "At least one file required"),
@@ -16,14 +16,16 @@ export type DeleteFileShareInput = z.infer<typeof DeleteFileShareSchema>;
 export const CreateFileShareLinkSchema = z.object({
   fileIds: z.array(z.string()).min(1, "At least one file required"),
   password: z.string().max(100).optional(),
-  expiresAt: isoDateTime().optional(),
+  // Omitted: the link never expires.
+  expiresAt: futureExpiry().optional(),
 });
 export type CreateFileShareLinkInput = z.infer<typeof CreateFileShareLinkSchema>;
 
 export const UpdateFileShareLinkSchema = z.object({
   enabled: z.boolean().optional(),
   password: z.string().max(100).nullable().optional(),
-  expiresAt: isoDateTime().nullable().optional(),
+  // Omitted: unchanged. null removes the expiry; nothing else does.
+  expiresAt: futureExpiry().nullable().optional(),
 });
 export type UpdateFileShareLinkInput = z.infer<typeof UpdateFileShareLinkSchema>;
 

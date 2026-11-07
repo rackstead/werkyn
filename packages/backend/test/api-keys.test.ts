@@ -171,7 +171,7 @@ test("invalid names and expiration values are rejected", async () => {
     { name: " " },
     { name: "x".repeat(101) },
     { expiresInDays: 7 },
-    ...[0, -1, 366, 1.5, "30"].map((expiresInDays) => ({
+    ...[0, -1, 366, 1.5, "30", ""].map((expiresInDays) => ({
       name: "Invalid",
       expiresInDays,
     })),

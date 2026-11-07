@@ -565,14 +565,20 @@ test("file expiry changes revoke grants; expired links reject metadata, verifica
   await assertLocked(share, oldCookie);
   const shortCookie = await validate(share, "Initial-password", 60);
   await assertReadable(share, shortCookie);
-  const expired = await request(
+  // The API refuses an expiry in the past, so the link expires in the
+  // database, as time passing would make it.
+  const refused = await request(
     "PATCH",
     mutationPath(share),
     { expiresAt: new Date(Date.now() - 1000).toISOString() },
     undefined,
     true,
   );
-  assert.equal(expired.statusCode, 200, expired.body);
+  assert.equal(refused.statusCode, 400, refused.body);
+  await app.prisma.fileShareLink.update({
+    where: { id: share.id },
+    data: { expiresAt: new Date(Date.now() - 1000) },
+  });
   for (const [method, url, body] of [
     ["GET", apiPath(share)],
     ["GET", `${apiPath(share)}/${share.file.id}/download`],

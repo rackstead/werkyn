@@ -24,3 +24,19 @@ function focusedInput(): HTMLInputElement | null {
   const active = typeof document === "undefined" ? null : document.activeElement;
   return active instanceof HTMLInputElement && active.type === "date" ? active : null;
 }
+
+/** What a date input holds: nothing, a complete date, or anything else. */
+export type DateInputContent =
+  | { kind: "empty" }
+  | { kind: "date"; date: string }
+  | { kind: "incomplete" };
+
+/**
+ * Reads a date input as `committedDate` does: a part half typed or deleted,
+ * or a year outside 1900–2999 (a partial year), is incomplete, not empty.
+ */
+export function dateInputContent(input: HTMLInputElement): DateInputContent {
+  const date = committedDate(input.value, input);
+  if (date === null) return { kind: "empty" };
+  return date === undefined ? { kind: "incomplete" } : { kind: "date", date };
+}

@@ -12,7 +12,7 @@ export type TimeZone = (typeof TIME_ZONES)[number];
  * Node applies a TZ assignment at once; the check makes a runner that ignored
  * it fail rather than silently test the wrong zone.
  */
-export function useTimeZone(zone: TimeZone) {
+export function useTimeZone(zone: string) {
   let previous: string | undefined;
   beforeAll(() => {
     previous = process.env.TZ;

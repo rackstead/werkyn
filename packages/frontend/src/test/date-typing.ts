@@ -56,3 +56,26 @@ export const TYPING_OVER_2026_11_20: Record<string, Step[]> = {
     ["ArrowRight", "2027-11-20"], ["0", "", true], ["3", "2027-03-20"], ["1", "2027-03-01"], ["5", "2027-03-15"],
   ],
 };
+
+/**
+ * What Chromium reports while 2027-03-15 is typed into an empty date input
+ * (checked in Chromium 141 under en-US, de-DE and ja-JP). Until every part has
+ * a value the input reads "", with bad input, and fires no input event; a lone
+ * month "0" is not even bad input until focus leaves the input. A year typed
+ * last passes through partial years; a day typed last reads as a whole date
+ * (2027-03-01) while its first digit waits for the second.
+ */
+export const TYPING_INTO_EMPTY: Record<string, Step[]> = {
+  "month/day/year": [
+    ["0", ""], ["3", "", true], ["1", "", true], ["5", "", true],
+    ["2", "0002-03-15"], ["0", "0020-03-15"], ["2", "0202-03-15"], ["7", "2027-03-15"],
+  ],
+  "day/month/year": [
+    ["1", "", true], ["5", "", true], ["0", "", true], ["3", "", true],
+    ["2", "0002-03-15"], ["0", "0020-03-15"], ["2", "0202-03-15"], ["7", "2027-03-15"],
+  ],
+  "year/month/day": [
+    ["2", "", true], ["0", "", true], ["2", "", true], ["7", "", true], ["ArrowRight", "", true],
+    ["0", "", true], ["3", "", true], ["1", "2027-03-01"], ["5", "2027-03-15"],
+  ],
+};

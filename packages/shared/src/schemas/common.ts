@@ -80,12 +80,46 @@ const DATETIME_TO_THE_MINUTE = z.iso.datetime({ precision: -1 });
  * 3's `.datetime()` accepted. Zod 4's default requires the seconds.
  */
 export function isoDateTime() {
-  return z
-    .string()
-    .refine(
-      (value) => DATETIME_WITH_SECONDS.safeParse(value).success || DATETIME_TO_THE_MINUTE.safeParse(value).success,
-      "Invalid datetime",
-    );
+  return z.string().refine(isIsoDateTime, "Invalid datetime");
+}
+
+function isIsoDateTime(value: string): boolean {
+  return DATETIME_WITH_SECONDS.safeParse(value).success || DATETIME_TO_THE_MINUTE.safeParse(value).success;
+}
+
+// ─── Expiry instants ────────────────────────────────────
+//
+// Share links and invitations may carry the instant they stop working. Forms
+// send the end of a chosen local calendar day, which in the westernmost time
+// zone (UTC-12) is the following UTC day.
+
+/**
+ * The latest expiry accepted: the end of 2999-12-31 (the last day of
+ * DATE_ONLY_MAX_YEAR) in every time zone, rounded up to the next UTC midnight.
+ */
+export const LATEST_EXPIRY = new Date(Date.UTC(DATE_ONLY_MAX_YEAR + 1, 0, 2));
+
+/**
+ * An expiry: an isoDateTime() still in the future when the request is checked,
+ * and not after LATEST_EXPIRY. An expiry in the past would make a link or
+ * invitation that never works; a later one is no expiry in practice.
+ */
+export function futureExpiry() {
+  return z.string().superRefine((value, ctx) => {
+    if (!isIsoDateTime(value)) {
+      ctx.addIssue({ code: "custom", message: "Invalid datetime" });
+      return;
+    }
+    const at = Date.parse(value);
+    if (!(at > Date.now())) {
+      ctx.addIssue({ code: "custom", message: "Expiration must be in the future" });
+    } else if (at > LATEST_EXPIRY.getTime()) {
+      ctx.addIssue({
+        code: "custom",
+        message: `Expiration must be no later than ${LATEST_EXPIRY.toISOString()}`,
+      });
+    }
+  });
 }
 
 // ─── Numbers ────────────────────────────────────────────

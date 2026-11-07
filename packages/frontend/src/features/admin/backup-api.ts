@@ -54,6 +54,10 @@ export function usePreviewRestore(wid: string) {
         .json<{ data: RestoreSummary }>();
       return res.data;
     },
+    // The backup page reports each failure itself (a countdown while uploads
+    // are paused, a toast otherwise); this replaces the client-wide error
+    // toast so nothing is shown twice.
+    onError: () => {},
   });
 }
 
@@ -67,5 +71,7 @@ export function useExecuteRestore(wid: string) {
         .json<{ data: RestoreSummary }>();
       return res.data;
     },
+    // Reported by the backup page, as for the preview.
+    onError: () => {},
   });
 }

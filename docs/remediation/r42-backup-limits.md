@@ -320,7 +320,10 @@ too slow. You can upload again in N seconds.", counts it down (the same
 `Retry-After` handling as the sign-in form, PR #201) and keeps the file picker
 and Confirm Restore disabled until the wait has passed. A preview's chosen
 file is cleared so the same file can be chosen again. Other refusals are
-shown as before.
+shown as a toast, as before. The page reports every preview and restore
+failure itself, so the app-wide error toast is turned off for these two
+requests: before, each failure was shown twice, and the pause would have come
+with a second, static notice that does not count down.
 
 ### Measured
 
@@ -411,13 +414,16 @@ empty value, 0, 3600 and the refusals of -1, 3601, fractions and words.
 `backup-upload-rate.test.mjs` turns the cooldown off, so its cases can reuse
 the admin an earlier case had refused; that also shows 0 turns it off.
 
-The frontend test `backup-settings.test.tsx` uses the real hooks, ky client
-and error parsing with a stubbed `fetch`: a paused preview shows the message,
+The frontend test `backup-settings.test.tsx` uses the real hooks, the app's
+own query client (with its app-wide mutation error toast), ky client and
+error parsing with a stubbed `fetch`: a paused preview shows the message,
 counts 2, 1 and then clears, keeps the file picker disabled and sends nothing
 meanwhile, then previews; a paused restore keeps its preview and disables
 Confirm Restore for 120 seconds, then restores; a workspace-busy 429 and a
-408 are shown as toasts without a countdown. Against main's backup page, the
-first two fail.
+408 are each shown as one toast without a countdown, and the pauses show no
+toast. Against main's backup page all three fail (the third because each
+failure was toasted twice), and so do they with only the app-wide toast left
+on for these requests.
 
 ## Remaining limits
 

@@ -5,10 +5,12 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RestoreSummary } from "@pm/shared";
 import { useAuthStore } from "@/stores/auth-store";
+// The app's own client, so its client-wide mutation error toast is in play.
+import { queryClient as client } from "@/lib/query-client";
 import { BackupSettings } from "./backup-settings";
 
 vi.hoisted(() => {
@@ -30,7 +32,6 @@ vi.mock("@/features/wiki/api", () => ({ useWikiSpaces: () => ({ data: { data: []
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
 
-let client: QueryClient;
 let responses: Response[];
 let fetchRequest: ReturnType<typeof vi.fn>;
 
@@ -75,7 +76,6 @@ const summary: RestoreSummary = {
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
   useAuthStore.setState(useAuthStore.getInitialState(), true);
-  client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   responses = [];
   fetchRequest = vi.fn(async () => {
     const next = responses.shift();
@@ -149,6 +149,7 @@ it("a paused restore keeps its preview and disables Confirm Restore until the wa
   fireEvent.click(confirm());
   await screen.findByText(pausedText(120));
   expect(confirm().disabled).toBe(true);
+  expect(toast.error).not.toHaveBeenCalled();
   screen.getByText("Restore Preview");
   act(() => vi.advanceTimersByTime(119_000));
   screen.getByText(pausedText(1));
@@ -161,7 +162,7 @@ it("a paused restore keeps its preview and disables Confirm Restore until the wa
   expect(fetchRequest).toHaveBeenCalledTimes(3);
 });
 
-it("other refusals are shown as before, without a countdown", async () => {
+it("other refusals are shown once, as a toast without a countdown", async () => {
   responses.push(
     json(
       429,
@@ -180,6 +181,8 @@ it("other refusals are shown as before, without a countdown", async () => {
       "A backup export or restore is already running for this workspace. Try again shortly.",
     ),
   );
+  // Once: the client-wide mutation error toast is not added to it.
+  expect(toast.error).toHaveBeenCalledTimes(1);
   expect(screen.queryByText(/uploads from your account are paused/)).toBeNull();
   expect(fileInput().disabled).toBe(false);
 
@@ -196,5 +199,6 @@ it("other refusals are shown as before, without a countdown", async () => {
       "The backup upload was too slow and was abandoned. Uploads must average at least 16384 bytes per second.",
     ),
   );
+  expect(toast.error).toHaveBeenCalledTimes(2);
   expect(fileInput().disabled).toBe(false);
 });

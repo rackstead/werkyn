@@ -51,22 +51,20 @@ Users of these rules:
 - The List's bulk due date, with its Clear button. It applies a typed date on
   Enter or blur. Previously a year-first browser applied 2027-03-01 to every
   selected task while 2027-03-15 was being typed.
+- The List's inline due date and custom date cells. They keep the editor open
+  while typing, commit once on Enter or blur, and support deliberate clearing
+  by emptying every part or using the browser picker's Clear. Escape discards
+  the pending edit; a second Escape exits the editor.
+
+Clicking a side panel's backdrop blurs the focused field before dismissing
+the panel. A complete typed date is therefore committed before its input
+unmounts; an unfinished edit keeps the stored value, as on any other blur.
 
 The List's due-date and custom-field filters keep filtering as a date is typed.
 They use the corrected `committedDate()`, so a half-typed part no longer drops
 the filter.
 
 ## Limits
-
-The List's inline due date and custom date cells (`columns.tsx`) still save
-on change and close at the first complete date. With the corrected
-`committedDate()` they no longer save null while typing. They do still save the
-first complete intermediate date, for example 2026-03-20 when 03152027 is typed
-over 2026-11-20, or 2026-11-01 when the day comes first. One Backspace no
-longer clears them; on main it did, through the same `""`. They have no clear
-control of their own, so clearing there is left to the browser picker's clear
-control where it has one; the task panel's clear button and the bulk Clear
-still clear. Using `DateInput` in those cells completes the fix.
 
 Unchanged: the time report range, which already waits for complete dates, and
 the date inputs of the recurring schedule's start and end, a form that submits
@@ -91,8 +89,11 @@ They check that:
 - the clear button discards a date being typed, after a click or after Tab
   moved to it, and focus moving on past it saves the date.
 
-`date-inputs.test.tsx` checks the List cell's half-typed guard and the bulk
-input and Clear.
+`date-inputs.test.tsx` checks due and custom inline cells in all three part
+orders, Enter/blur, incomplete dates, Escape, deliberate clearing, required
+custom fields and picker changes, as well as the bulk input and Clear.
+`slideover.test.tsx` verifies that backdrop dismissal settles complete,
+incomplete and deliberately cleared date edits before the panel unmounts.
 
 `packages/backend/tests/browser/date-input-typing.mjs` runs the production
 build against the API and PostgreSQL in Chromium under the en-US, de-DE and

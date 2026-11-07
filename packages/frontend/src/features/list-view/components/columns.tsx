@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { isHttpUrl } from "@pm/shared";
-import { committedDate } from "@/lib/date-input";
+import { DateInput } from "@/components/shared/date-input";
 import { formatDateISO } from "@/features/time/utils";
 import { createColumnHelper } from "@tanstack/react-table";
 import type { Task } from "@/features/tasks/api";
@@ -142,18 +142,21 @@ export function InlineDueDateCell({
   if (editing) {
     return (
       <div className="flex items-center gap-1">
-        <input
-          type="date"
+        <DateInput
           autoFocus
+          aria-label="Due date"
           // Can be wider than its column; drawn above the next cell.
           className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
-          defaultValue={task.dueDate ?? ""}
-          onChange={(e) => {
-            // Keep editing while a year is still being typed.
-            const dueDate = committedDate(e.target.value);
-            if (dueDate === undefined) return;
+          value={task.dueDate}
+          onCommit={(dueDate) => {
             onUpdateTask(task.id, { dueDate });
             setEditing(false);
+          }}
+          onKeyDown={(e) => {
+            // A pending edit spends its first Escape on discarding it.
+            if (e.key === "Escape" && !e.currentTarget.hasAttribute("data-pending-edit")) {
+              setEditing(false);
+            }
           }}
           onBlur={() => setEditing(false)}
         />
@@ -537,15 +540,17 @@ function InlineCustomFieldCell({
     case "DATE": {
       if (editing) {
         return (
-          <input
-            type="date"
+          <DateInput
             autoFocus
+            aria-label={field.name}
             // Can be wider than its column; drawn above the next cell.
             className="relative z-10 text-xs border border-border rounded px-1 py-0.5 bg-background"
-            defaultValue={typeof value === "string" ? value : ""}
-            onChange={(e) => {
-              const date = committedDate(e.target.value);
-              if (date !== undefined) save(date);
+            value={typeof value === "string" ? value : null}
+            onCommit={save}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && !e.currentTarget.hasAttribute("data-pending-edit")) {
+                setEditing(false);
+              }
             }}
             onBlur={() => setEditing(false)}
           />

@@ -42,6 +42,7 @@ export function Slideover({
   children,
 }: SlideoverProps) {
   const returnFocus = useReturnFocus<HTMLDivElement>({ onCloseAutoFocus });
+  const contentRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   const escapeRef = useRef<KeyboardEvent | null>(null);
   useEffect(() => {
@@ -93,10 +94,18 @@ export function Slideover({
             const target = event.target;
             if (!(target instanceof Element && target.closest('[data-slot="slideover-overlay"]'))) {
               event.preventDefault();
+            } else {
+              // Radix dismisses on pointerdown, before the normal blur. Give
+              // the focused field a chance to settle its edit before unmount.
+              const active = target.ownerDocument.activeElement;
+              if (active instanceof HTMLElement && contentRef.current?.contains(active)) {
+                active.blur();
+              }
             }
           }}
         >
           <motion.div
+            ref={contentRef}
             data-slot="slideover"
             initial={{ x: "100%" }}
             animate={{ x: 0 }}

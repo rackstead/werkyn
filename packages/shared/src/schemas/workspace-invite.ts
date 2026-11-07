@@ -1,11 +1,12 @@
 import { z } from "zod";
-import { INT32_MAX, isoDateTime } from "./common.js";
+import { INT32_MAX, futureExpiry } from "./common.js";
 import { WorkspaceRoleEnum } from "./workspace-member.js";
 
 export const CreateInviteSchema = z.object({
   email: z.string().email("Invalid email address").optional(),
   role: WorkspaceRoleEnum.default("MEMBER"),
-  expiresAt: isoDateTime().optional(),
+  // Omitted: the invitation never expires.
+  expiresAt: futureExpiry().optional(),
   maxUses: z.number().int().min(1).max(INT32_MAX).nullable().optional(),
 });
 export type CreateInviteInput = z.infer<typeof CreateInviteSchema>;

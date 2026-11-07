@@ -24,10 +24,12 @@ label and show overdue styling only for a noncompleted task due before today.
 Editing and clearing retain the existing date-only mutation payloads.
 
 Both create and edit expiry controls in the file-sharing dialog use local
-today as the date input's minimum. Submission still interprets a selected date
-at local 23:59:59 and serializes that instant to ISO. Clearing still omits expiry
-on create and sends null on edit. The minimum is a browser input constraint;
-the API contract and stored expiry instants are unchanged.
+today as the date input's minimum. Submission interprets a selected date at
+local 23:59:59 and serializes that instant to ISO. An empty date on create
+omits the expiry. On edit, only Remove expiration sends null; an emptied or
+half-typed date sends nothing. See
+[share-expiry-typed-date.md](share-expiry-typed-date.md), which also covers
+the API's refusal of past expiries.
 
 These calculations update when the existing components render. No midnight
 timer or subscription is added. API date-only validation still accepts real

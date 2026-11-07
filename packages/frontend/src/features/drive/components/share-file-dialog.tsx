@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, type ReactNode } from "react";
 import {
   useFileShares,
   useFileShareLinks,
@@ -7,6 +7,7 @@ import {
   useCreateFileShareLink,
   useUpdateFileShareLink,
   useDeleteFileShareLink,
+  type FileShareLinkDetail,
 } from "../api";
 import { useWorkspaceMembers } from "@/features/workspaces/api";
 import { UserAvatar } from "@/components/shared/user-avatar";
@@ -35,6 +36,15 @@ import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { toast } from "sonner";
 import { formatDateISO } from "@/features/time/utils";
+import { useDateField } from "@/components/shared/date-input";
+import {
+  LAST_EXPIRY_DATE,
+  describeExpiry,
+  describeExpiryDate,
+  endOfLocalDay,
+  expiryProblem,
+  localExpiryDate,
+} from "../share-expiry";
 
 interface ShareFileDialogProps {
   open: boolean;
@@ -305,6 +315,8 @@ function PeopleTab({
 
 // ─── Link Tab ───────────────────────────────────────────
 
+type ShareLink = FileShareLinkDetail;
+
 function LinkTab({
   workspaceId,
   fileIds,
@@ -322,38 +334,29 @@ function LinkTab({
 
   // For multi-file shares, the query is disabled (no singleFileId).
   // Track links created in this session so they display immediately.
-  const [localLinks, setLocalLinks] = useState<typeof queryLinks>([]);
+  const [localLinks, setLocalLinks] = useState<ShareLink[]>([]);
   const links = singleFileId ? queryLinks : localLinks;
 
-  const createLink = useCreateFileShareLink(workspaceId);
   const updateLink = useUpdateFileShareLink(workspaceId);
   const deleteLink = useDeleteFileShareLink(workspaceId);
 
   const [password, setPassword] = useState("");
-  const [expiresAt, setExpiresAt] = useState("");
   const [showPasswordField, setShowPasswordField] = useState<string | null>(null);
   const [showExpirationField, setShowExpirationField] = useState<string | null>(null);
+  const [showCreateForm, setShowCreateForm] = useState(false);
   const [copiedLinkId, setCopiedLinkId] = useState<string | null>(null);
 
-  const handleCreate = () => {
-    createLink.mutate(
-      {
-        fileIds,
-        password: password.trim() || undefined,
-        expiresAt: expiresAt ? new Date(expiresAt + "T23:59:59").toISOString() : undefined,
-      },
-      {
-        onSuccess: (res) => {
-          setPassword("");
-          setExpiresAt("");
-          if (!singleFileId) {
-            setLocalLinks((prev) => [res.data, ...prev]);
-          }
-          toast.success("Share link created");
-        },
-        onError: (err) => toast.error(err.message || "Failed to create link"),
-      },
-    );
+  const handleCreated = (link: ShareLink) => {
+    setShowCreateForm(false);
+    if (!singleFileId) setLocalLinks((prev) => [link, ...prev]);
+  };
+
+  // A multi-file dialog shows its own copies of the links: they follow what
+  // the server stored.
+  const handleUpdated = (link: ShareLink) => {
+    if (!singleFileId) {
+      setLocalLinks((prev) => prev.map((l) => (l.id === link.id ? link : l)));
+    }
   };
 
   const handleCopyLink = (linkId: string, token: string) => {
@@ -365,31 +368,26 @@ function LinkTab({
   };
 
   const handleToggleEnabled = (linkId: string, currentEnabled: boolean) => {
-    updateLink.mutate({ linkId, enabled: !currentEnabled });
+    updateLink.mutate(
+      { linkId, enabled: !currentEnabled },
+      {
+        onSuccess: (res) => handleUpdated(res.data),
+        onError: (err) => toast.error(err.message || "Failed to update link"),
+      },
+    );
   };
 
   const handleSetPassword = (linkId: string) => {
     updateLink.mutate(
       { linkId, password: password.trim() || null },
       {
-        onSuccess: () => {
+        onSuccess: (res) => {
+          handleUpdated(res.data);
           setPassword("");
           setShowPasswordField(null);
-          toast.success(password.trim() ? "Password set" : "Password removed");
+          toast.success(res.data.hasPassword ? "Password set" : "Password removed");
         },
-      },
-    );
-  };
-
-  const handleSetExpiration = (linkId: string) => {
-    updateLink.mutate(
-      { linkId, expiresAt: expiresAt ? new Date(expiresAt + "T23:59:59").toISOString() : null },
-      {
-        onSuccess: () => {
-          setExpiresAt("");
-          setShowExpirationField(null);
-          toast.success(expiresAt ? "Expiration set" : "Expiration removed");
-        },
+        onError: (err) => toast.error(err.message || "Failed to update password"),
       },
     );
   };
@@ -423,33 +421,11 @@ function LinkTab({
             Create a public link to share {fileIds.length > 1 ? "these files" : "this file"} with
             anyone. They won&apos;t need to sign in.
           </p>
-          <div className="space-y-2">
-            <Label htmlFor="link-password">Password protection (optional)</Label>
-            <Input
-              id="link-password"
-              type="password"
-              placeholder="Leave empty for no password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="link-expiration">Expiration date (optional)</Label>
-            <Input
-              id="link-expiration"
-              type="date"
-              value={expiresAt}
-              min={formatDateISO(new Date())}
-              onChange={(e) => setExpiresAt(e.target.value)}
-            />
-          </div>
-          <Button
-            onClick={handleCreate}
-            disabled={createLink.isPending}
-            className="w-full"
-          >
-            {createLink.isPending ? "Creating..." : "Create link"}
-          </Button>
+          <CreateLinkForm
+            workspaceId={workspaceId}
+            fileIds={fileIds}
+            onCreated={handleCreated}
+          />
         </div>
       ) : (
         <div className="space-y-3">
@@ -543,7 +519,9 @@ function LinkTab({
                     <Label className="text-sm">
                       <span className="flex items-center gap-1.5">
                         <Calendar className="h-3.5 w-3.5" />
-                        Expires {link.expiresAt ? new Date(link.expiresAt).toLocaleDateString() : "(never)"}
+                        {link.expiresAt
+                          ? `${new Date(link.expiresAt) <= new Date() ? "Expired" : "Expires"} ${new Date(link.expiresAt).toLocaleDateString()}`
+                          : "Expires (never)"}
                       </span>
                     </Label>
                     <Button
@@ -559,21 +537,14 @@ function LinkTab({
                     </Button>
                   </div>
                   {showExpirationField === link.id && (
-                    <div className="flex items-center gap-2">
-                      <Input
-                        type="date"
-                        min={formatDateISO(new Date())}
-                        value={expiresAt}
-                        onChange={(e) => setExpiresAt(e.target.value)}
-                      />
-                      <Button
-                        size="sm"
-                        onClick={() => handleSetExpiration(link.id)}
-                        disabled={updateLink.isPending}
-                      >
-                        Save
-                      </Button>
-                    </div>
+                    <LinkExpiryEditor
+                      link={link}
+                      onSaved={(saved) => {
+                        handleUpdated(saved);
+                        setShowExpirationField(null);
+                      }}
+                      update={updateLink}
+                    />
                   )}
                 </div>
 
@@ -594,17 +565,244 @@ function LinkTab({
           })}
 
           {/* Create another link */}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleCreate}
-            disabled={createLink.isPending}
-            className="w-full"
-          >
-            {createLink.isPending ? "Creating..." : "Create another link"}
-          </Button>
+          {showCreateForm ? (
+            <div className="space-y-3 rounded-md border p-3">
+              <CreateLinkForm
+                workspaceId={workspaceId}
+                fileIds={fileIds}
+                onCreated={handleCreated}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowCreateForm(false)}
+                className="w-full"
+              >
+                Cancel
+              </Button>
+            </div>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowCreateForm(true)}
+              className="w-full"
+            >
+              Create another link
+            </Button>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Password and expiry for a new link. An expiry date is sent only when it is
+ * complete and not before today: Create refuses while the date input is half
+ * typed (it is marked disabled), and a link without an expiry needs the date
+ * input left empty or emptied with Clear date. Create is not `disabled` for an
+ * incomplete date; see useDateField.
+ */
+function CreateLinkForm({
+  workspaceId,
+  fileIds,
+  onCreated,
+}: {
+  workspaceId: string;
+  fileIds: string[];
+  onCreated: (link: ShareLink) => void;
+}) {
+  const createLink = useCreateFileShareLink(workspaceId);
+  const [password, setPassword] = useState("");
+  const expiry = useDateField();
+  const problem = expiryProblem(expiry.content);
+
+  const handleCreate = () => {
+    // The input itself decides (see useDateField): null when the press on
+    // this button completed a half-typed date, which then needs a second
+    // click.
+    const content = expiry.read();
+    if (!content || expiryProblem(content)) return;
+    createLink.mutate(
+      {
+        fileIds,
+        password: password.trim() || undefined,
+        ...(content.kind === "date" ? { expiresAt: endOfLocalDay(content.date) } : {}),
+      },
+      {
+        onSuccess: (res) => {
+          setPassword("");
+          expiry.set(null);
+          onCreated(res.data);
+          toast.success(`Share link created. It ${describeExpiry(res.data.expiresAt)}.`);
+        },
+        onError: (err) => toast.error(err.message || "Failed to create link"),
+      },
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-2">
+        <Label htmlFor="link-password">Password protection (optional)</Label>
+        <Input
+          id="link-password"
+          type="password"
+          placeholder="Leave empty for no password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="link-expiration">Expiration date (optional)</Label>
+        <div className="flex items-center gap-2">
+          <Input
+            {...expiry.inputProps}
+            id="link-expiration"
+            min={formatDateISO(new Date())}
+            max={LAST_EXPIRY_DATE}
+            aria-invalid={problem !== null && !expiry.focused}
+            aria-describedby="link-expiration-note"
+          />
+          {expiry.content.kind !== "empty" && (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => expiry.set(null)}
+            >
+              Clear date
+            </Button>
+          )}
+        </div>
+        <ExpiryNote
+          id="link-expiration-note"
+          problem={problem}
+          focused={expiry.focused}
+        >
+          {expiry.content.kind === "date"
+            ? describeExpiryDate(expiry.content.date)
+            : "No expiration: the link works until you disable or remove it."}
+        </ExpiryNote>
+      </div>
+      <Button
+        {...expiry.submitProps}
+        onClick={handleCreate}
+        disabled={createLink.isPending}
+        aria-disabled={problem !== null || undefined}
+        className={cn("w-full", problem !== null && "cursor-not-allowed opacity-50")}
+      >
+        {createLink.isPending ? "Creating..." : "Create link"}
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * Changes an existing link's expiry. Save sends only a complete date that is
+ * not before today; an empty or half-typed input never removes the expiry.
+ * Removing it takes the Remove expiration button.
+ */
+function LinkExpiryEditor({
+  link,
+  onSaved,
+  update,
+}: {
+  link: ShareLink;
+  onSaved: (link: ShareLink) => void;
+  update: ReturnType<typeof useUpdateFileShareLink>;
+}) {
+  const current = link.expiresAt ? localExpiryDate(link.expiresAt) : null;
+  const expiry = useDateField(current);
+  const problem = expiryProblem(expiry.content);
+  const changed = expiry.content.kind === "date" && expiry.content.date !== current;
+
+  const send = (expiresAt: string | null) => {
+    update.mutate(
+      { linkId: link.id, expiresAt },
+      {
+        onSuccess: (res) => {
+          onSaved(res.data);
+          toast.success(`This link now ${describeExpiry(res.data.expiresAt)}.`);
+        },
+        onError: (err) => toast.error(err.message || "Failed to change the expiration"),
+      },
+    );
+  };
+
+  const handleSave = () => {
+    const content = expiry.read();
+    if (content?.kind !== "date" || expiryProblem(content) || content.date === current) return;
+    send(endOfLocalDay(content.date));
+  };
+  const blocked = problem !== null || !changed;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Input
+          {...expiry.inputProps}
+          aria-label="New expiration date"
+          min={formatDateISO(new Date())}
+          max={LAST_EXPIRY_DATE}
+          aria-invalid={problem !== null && !expiry.focused}
+          aria-describedby={`link-expiration-note-${link.id}`}
+        />
+        <Button
+          {...expiry.submitProps}
+          size="sm"
+          onClick={handleSave}
+          disabled={update.isPending}
+          aria-disabled={blocked || undefined}
+          className={cn(blocked && "cursor-not-allowed opacity-50")}
+        >
+          Save
+        </Button>
+      </div>
+      <ExpiryNote
+        id={`link-expiration-note-${link.id}`}
+        problem={problem}
+        focused={expiry.focused}
+      >
+        {expiry.content.kind === "date"
+          ? describeExpiryDate(expiry.content.date)
+          : "Enter the last day the link works."}
+      </ExpiryNote>
+      {link.expiresAt && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => send(null)}
+          disabled={update.isPending}
+        >
+          Remove expiration
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/** The note under an expiry input; a problem shows once focus has left it. */
+function ExpiryNote({
+  id,
+  problem,
+  focused,
+  children,
+}: {
+  id: string;
+  problem: string | null;
+  focused: boolean;
+  children: ReactNode;
+}) {
+  const shown = problem !== null && !focused;
+  return (
+    <p
+      id={id}
+      role={shown ? "alert" : undefined}
+      className={cn("text-xs", shown ? "text-destructive" : "text-muted-foreground")}
+    >
+      {shown ? problem : problem === null ? children : " "}
+    </p>
   );
 }

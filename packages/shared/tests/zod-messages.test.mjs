@@ -8,6 +8,8 @@ import {
   QueryBooleanSchema,
   RegisterSchema,
   SetCustomFieldValueSchema,
+  LATEST_EXPIRY,
+  futureExpiry,
   isoDateTime,
 } from "../dist/index.js";
 
@@ -84,5 +86,27 @@ test("datetimes take optional seconds and fractions, as Zod 3's .datetime() did"
     assert.deepEqual(messages(datetime, value), ["Invalid datetime"], value);
   }
   assert.deepEqual(messages(datetime, 5), ["Expected string, received number"]);
-  assert.equal(CreateInviteSchema.safeParse({ expiresAt: "2026-01-01T00:00Z" }).success, true);
+  assert.equal(CreateInviteSchema.safeParse({ expiresAt: "2999-01-01T00:00Z" }).success, true);
+});
+
+test("an expiry is a datetime in the future, no later than the end of 2999 in every zone", () => {
+  const expiry = futureExpiry();
+  assert.equal(LATEST_EXPIRY.toISOString(), "3000-01-02T00:00:00.000Z");
+  const soon = new Date(Date.now() + 60_000).toISOString();
+  // The end of 2999-12-31 in UTC-12 is the latest a date input can mean.
+  for (const value of [soon, "2999-12-31T23:59Z", "3000-01-01T11:59:59Z", LATEST_EXPIRY.toISOString()]) {
+    assert.equal(expiry.safeParse(value).success, true, value);
+  }
+  for (const value of [new Date(Date.now() - 1000).toISOString(), "2025-12-31T23:59:59.000Z", "0020-03-14T23:59:59.000Z"]) {
+    assert.deepEqual(messages(expiry, value), ["Expiration must be in the future"], value);
+  }
+  for (const value of ["3000-01-02T00:00:00.001Z", "9999-12-31T23:59:59Z"]) {
+    assert.deepEqual(messages(expiry, value), ["Expiration must be no later than 3000-01-02T00:00:00.000Z"], value);
+  }
+  // A malformed value gets one message, not a datetime and a range message.
+  for (const value of ["", "2027-03-14", "2027-02-30T00:00:00Z", "+020271-03-14T00:00:00Z"]) {
+    assert.deepEqual(messages(expiry, value), ["Invalid datetime"], value);
+  }
+  assert.deepEqual(messages(expiry, 5), ["Expected string, received number"]);
+  assert.deepEqual(messages(expiry, null), ["Expected string, received null"]);
 });

@@ -69,9 +69,10 @@ control where it has one; the task panel's clear button and the bulk Clear
 still clear. Using `DateInput` in those cells completes the fix.
 
 Unchanged: the time report range, which already waits for complete dates, and
-the date inputs of forms that submit with a button (share-link expiry,
-recurring schedule start and end). Those forms still read a half-typed date
-as empty when submitted.
+the date inputs of the recurring schedule's start and end, a form that submits
+with a button. That form still reads a half-typed date as empty when
+submitted. The share-link expiry form now refuses a half-typed date; see
+[share-expiry-typed-date.md](share-expiry-typed-date.md).
 
 ## Tests
 

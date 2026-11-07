@@ -833,7 +833,7 @@ test("an account gets at most one new reset link per cooldown; further requests 
     await app.prisma.passwordResetToken.count({ where: { userId: user.id } }),
     1,
   );
-  // Once the cooldown has passed, a new link replaces the old one.
+  // Once the cooldown has passed, a new link leaves the old one usable.
   await app.prisma.passwordResetToken.updateMany({
     where: { userId: user.id },
     data: { createdAt: new Date(Date.now() - 61_000) },
@@ -842,6 +842,6 @@ test("an account gets at most one new reset link per cooldown; further requests 
   assert.equal(sent(), 2);
   assert.equal(
     await app.prisma.passwordResetToken.count({ where: { userId: user.id, usedAt: null } }),
-    1,
+    2,
   );
 });

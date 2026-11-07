@@ -12,6 +12,9 @@ interface SaveQueue {
   generation: number;
   value: DateValue;
   confirmed: DateValue;
+  serverValue: DateValue;
+  serverRevision: number;
+  confirmedRevision: number;
   latest: Request | null;
   requests: Request[];
   running: boolean;
@@ -48,7 +51,15 @@ async function drain(queue: SaveQueue) {
     } catch {
       // Mutation handlers already report the error. Keep retries possible.
     }
-    if (succeeded) queue.confirmed = request.value;
+    if (succeeded) {
+      queue.confirmed = request.value;
+      // Snapshots already seen before this success may predate its write.
+      queue.confirmedRevision = queue.serverRevision;
+    } else if (queue.serverRevision > queue.confirmedRevision) {
+      // A failed write must not restore an older value over a newer refetch.
+      queue.confirmed = queue.serverValue;
+      queue.confirmedRevision = queue.serverRevision;
+    }
     if (queue.latest === request) {
       queue.latest = null;
       show(queue, queue.confirmed);
@@ -72,6 +83,7 @@ export function useInlineDateSave(
     if (!current) {
       current = {
         key, generation, value: saved, confirmed: saved, latest: null,
+        serverValue: saved, serverRevision: 0, confirmedRevision: 0,
         requests: [], running: false, listeners: new Set(),
       };
       queues.set(key, current);
@@ -91,9 +103,14 @@ export function useInlineDateSave(
   const value = useSyncExternalStore(subscribe, () => queue.value);
 
   useEffect(() => {
+    if (queue.serverValue !== saved) {
+      queue.serverValue = saved;
+      queue.serverRevision++;
+    }
     if (queue.running) return;
     // Once local writes have settled, later server updates are authoritative.
     queue.confirmed = saved;
+    queue.confirmedRevision = queue.serverRevision;
     show(queue, saved);
   }, [queue, saved]);
 

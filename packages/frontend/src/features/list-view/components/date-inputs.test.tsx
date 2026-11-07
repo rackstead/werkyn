@@ -249,6 +249,31 @@ for (const kind of ["due", "custom"] as const) {
     expect(pending.requests.map((request) => request.value)).toEqual(["2027-05-06"]);
     act(() => changeIdentity("other-account", null));
   });
+
+  it(`inline ${kind} reopens the newer server date after a pending save fails`, async () => {
+    const pending = delayedWrites();
+    const { input, container, refetch } = editCell(kind, false, pending.send);
+    fireEvent.change(input, { target: { value: "2027-05-06" } });
+    refetch("2029-07-04");
+    await pending.complete(0, false);
+    fireEvent.click(screen.getByRole("button"));
+    const reopened = container.querySelector('input[type="date"]') as HTMLInputElement;
+    expect(reopened.value).toBe("2029-07-04");
+    fireEvent.change(reopened, { target: { value: "2027-05-06" } });
+    await pending.complete(1);
+    expect(pending.stored()).toBe("2027-05-06");
+  });
+
+  it(`inline ${kind} keeps a successful local save ahead of a server snapshot seen while pending`, async () => {
+    const pending = delayedWrites();
+    const { input, container, refetch } = editCell(kind, false, pending.send);
+    fireEvent.change(input, { target: { value: "2027-05-06" } });
+    refetch("2029-07-04");
+    await pending.complete(0);
+    fireEvent.click(screen.getByRole("button"));
+    expect((container.querySelector('input[type="date"]') as HTMLInputElement).value).toBe("2027-05-06");
+    expect(pending.stored()).toBe("2027-05-06");
+  });
 }
 
 it("inline required custom dates keep their saved value when deliberately emptied", () => {

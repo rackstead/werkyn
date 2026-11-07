@@ -60,7 +60,9 @@ Inline cells for the same identity, task and field share their pending save
 queue across row and route remounts and send committed edits in order. A quick
 correction back to the old date is
 therefore saved even before the task has refetched. Failed saves can be
-retried, and already committed edits continue saving if the row or route
+retried; a newer server date received during a failed save is shown when the
+editor reopens. A successful local write takes precedence over snapshots
+already seen while it was pending. Already committed edits continue saving if the row or route
 unmounts. Other inline field types keep their existing save behavior.
 Queues are removed once no mounted cell or pending save remains. Pending
 edits are not dispatched after an identity transition.

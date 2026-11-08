@@ -787,12 +787,17 @@ describe("case folding", () => {
     assert.match(failed[0][1], /Could not check/);
     assert.equal(searchAvoidsTrigramIndexes(flaky), true);
     const silent = [];
-    assert.equal(await checkSearchIndexes(flaky, { warn: (...a) => silent.push(a) }, "public", { reportFailure: false }), "failed");
+    const recovered = [];
+    assert.equal(await checkSearchIndexes(flaky, { warn: (...a) => silent.push(a), info: (...a) => recovered.push(a) }, "public", { reportFailure: false }), "failed");
     assert.deepEqual(silent, []);
+    assert.deepEqual(recovered, []);
     failing = false;
-    assert.equal(await checkSearchIndexes(flaky, { warn: (...a) => silent.push(a) }), "ok");
+    assert.equal(await checkSearchIndexes(flaky, { warn: (...a) => silent.push(a), info: (...a) => recovered.push(a) }), "ok");
     assert.equal(searchAvoidsTrigramIndexes(flaky), false);
     assert.deepEqual(silent, []);
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0][1], "The search-index fallback ended; indexed plans are in use again (docs/remediation/p02c.md)");
+    assert.equal(JSON.stringify(recovered[0][0]), "{}");
     // The startup loop: rechecks one at a time while the check fails, stops
     // after the first success, so a later failure cannot bring the fallback
     // back without anyone checking again.
@@ -800,8 +805,12 @@ describe("case folding", () => {
     let calls = 0;
     const counted = { $queryRaw: (...args) => { calls++; return flaky.$queryRaw(...args); } };
     const loopWarnings = [];
+    const loopInfos = [];
     const rechecks = manualRechecks();
-    const loop = await startSearchIndexCheck(counted, { warn: (...a) => loopWarnings.push(a) }, "public", { intervalMs: 20, timer: rechecks.timer });
+    const loop = await startSearchIndexCheck(counted, {
+      warn: (...a) => loopWarnings.push(a),
+      info: (...a) => loopInfos.push(a),
+    }, "public", { intervalMs: 20, timer: rechecks.timer });
     try {
       assert.equal(loop.result, "failed");
       await rechecks.fire();
@@ -810,11 +819,15 @@ describe("case folding", () => {
       assert.deepEqual(rechecks.intervals, [20, 20, 20]);
       assert.equal(searchAvoidsTrigramIndexes(counted), true);
       assert.equal(loopWarnings.length, 1, "failures are reported once");
+      assert.deepEqual(loopInfos, [], "failed rechecks do not log recovery");
       failing = false;
       await rechecks.fire();
       assert.equal(searchAvoidsTrigramIndexes(counted), false);
       assert.equal(rechecks.pending, null, "no check after the successful one");
       assert.equal(rechecks.intervals.length, 3);
+      assert.equal(loopInfos.length, 1, "recovery is logged once");
+      assert.match(loopInfos[0][1], /fallback ended/);
+      assert.match(loopInfos[0][1], /indexed plans are in use again/);
     } finally {
       loop.stop();
     }
@@ -1002,8 +1015,12 @@ describe("case folding", () => {
         // The server's startup check, rechecking every 50 ms while it avoids
         // the indexes; the test runs each recheck itself.
         const warnings = [];
+        const infos = [];
         const rechecks = manualRechecks();
-        watch = await startSearchIndexCheck(checked, { warn: (...a) => warnings.push(a) }, "public", { intervalMs: 50, timer: rechecks.timer });
+        watch = await startSearchIndexCheck(checked, {
+          warn: (...a) => warnings.push(a),
+          info: (...a) => infos.push(a),
+        }, "public", { intervalMs: 50, timer: rechecks.timer });
         assert.equal(watch.result, "warned");
         assert.equal(searchAvoidsTrigramIndexes(checked), true);
         // The rechecks repeat no warning while nothing changes.
@@ -1047,6 +1064,7 @@ describe("case folding", () => {
         assert.equal(rechecks.pending, null, "no recheck once the fallback is lifted");
         assert.equal(warnings.length, 3, JSON.stringify(warnings.map(([, m]) => m.slice(0, 60))));
         assert.match(warnings[2][1], /are not created on a database whose default collation provider is icu/);
+        assert.deepEqual(infos, [], "the ICU fallback is not a failed-check recovery");
       } finally {
         watch?.stop();
         await Promise.allSettled([unchecked.$disconnect(), checked.$disconnect()]);

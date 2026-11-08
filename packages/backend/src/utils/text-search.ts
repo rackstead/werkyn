@@ -45,6 +45,15 @@ export async function withSearchPlans<const P extends readonly Prisma.PrismaProm
 /** Clients whose database has trigram indexes they must not use. */
 const avoidTrigramIndexes = new WeakSet<object>();
 
+/**
+ * Clients whose catalog check failed. A later "ok" is the recovery: indexed
+ * plans are in use again. An ICU warning is not in this set.
+ */
+const searchIndexCheckFailed = new WeakSet<object>();
+
+const SEARCH_INDEX_RECOVERY =
+  "The search-index fallback ended; indexed plans are in use again (docs/remediation/p02c.md)";
+
 /** Whether withSearchPlans keeps this client's searches off trigram indexes. */
 export function searchAvoidsTrigramIndexes(prisma: object): boolean {
   return avoidTrigramIndexes.has(prisma);
@@ -83,12 +92,18 @@ export type SearchIndexCheck = "ok" | "warned" | "failed";
  *   check succeeds, since the state is unknown. Returns "failed".
  *
  * A successful check on a libc database lets the client use the indexes
- * again. `schema` is the schema of Werkyn's tables (DATABASE_URL's `schema`
- * parameter, `public` by default), not the role's current schema.
+ * again. If this client had failed a check, that success logs once (when
+ * `log.info` is present) that the fallback ended and indexed plans are in
+ * use again. A check that never failed does not. `schema` is the schema of
+ * Werkyn's tables (DATABASE_URL's `schema` parameter, `public` by default),
+ * not the role's current schema.
  */
 export async function checkSearchIndexes(
   prisma: Pick<PrismaClient, "$queryRaw">,
-  log: { warn(details: object, message: string): void },
+  log: {
+    warn(details: object, message: string): void;
+    info?(details: object, message: string): void;
+  },
   schema = "public",
   { reportFailure = true }: { reportFailure?: boolean } = {},
 ): Promise<SearchIndexCheck> {
@@ -116,6 +131,7 @@ export async function checkSearchIndexes(
     provider = { c: "libc", i: "icu", b: "builtin" }[row?.provider ?? "c"] ?? String(row?.provider);
   } catch (error) {
     avoidTrigramIndexes.add(prisma);
+    searchIndexCheckFailed.add(prisma);
     if (reportFailure)
       log.warn(
         { err: error instanceof Error ? error.message : String(error) },
@@ -154,7 +170,16 @@ export async function checkSearchIndexes(
     indexes.some((index) => index.name === name && index.table === table && index.valid && index.plain &&
       index.method === "gin" && index.columns.length === 1 && index.columns[0] === `${column}:gin_trgm_ops`);
   const missing = SEARCH_TRIGRAM_INDEXES.filter(([name, table, column]) => !exact(name, table, column)).map(([name]) => name);
-  if (missing.length === 0) return "ok";
+  if (missing.length === 0) {
+    // Only a failed check recovering to valid indexes. "warned" (indexes
+    // missing, or an ICU database) is not indexed plans coming back, and a
+    // client that never failed does not log.
+    if (searchIndexCheckFailed.has(prisma)) {
+      searchIndexCheckFailed.delete(prisma);
+      log.info?.({}, SEARCH_INDEX_RECOVERY);
+    }
+    return "ok";
+  }
   log.warn(
     { missing, collationProvider: provider },
     "Search trigram indexes are missing, invalid or defined differently; text search reads whole tables (docs/remediation/p02c.md)",
@@ -181,13 +206,18 @@ const unrefTimer: RecheckTimer = (recheck, ms) => {
  * database), again `intervalMs` after the previous check finished, until it
  * no longer does: after the indexes are dropped, or once a failed check
  * succeeds. One check runs at a time. A warning is logged only when it
- * differs from the previous one. The timer does not keep the
- * process alive; `stop` ends it. `timer` replaces the timer, so that tests
- * decide when rechecks run.
+ * differs from the previous one. Info is not deduped here: the recovery
+ * line is logged once per failed client, inside checkSearchIndexes, and
+ * later searches do not log it. The timer does not keep the process alive;
+ * `stop` ends it. `timer` replaces the timer, so that tests decide when
+ * rechecks run.
  */
 export async function startSearchIndexCheck(
   prisma: Pick<PrismaClient, "$queryRaw">,
-  log: { warn(details: object, message: string): void },
+  log: {
+    warn(details: object, message: string): void;
+    info(details: object, message: string): void;
+  },
   schema = "public",
   { intervalMs = 60_000, timer = unrefTimer }: { intervalMs?: number; timer?: RecheckTimer } = {},
 ): Promise<{ result: SearchIndexCheck; stop(): void }> {
@@ -197,6 +227,9 @@ export async function startSearchIndexCheck(
       if (message === last) return;
       last = message;
       log.warn(details, message);
+    },
+    info(details: object, message: string) {
+      log.info(details, message);
     },
   };
   const result = await checkSearchIndexes(prisma, once, schema);

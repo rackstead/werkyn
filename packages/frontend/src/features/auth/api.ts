@@ -74,9 +74,12 @@ export function useRegister(inviteToken?: string) {
         .post("auth/register", {
           json: { ...data, inviteToken },
         })
-        .json<AuthResponse>();
+        .json<AuthResponse | { message: string }>();
     },
     onSuccess: async (res) => {
+      // Privacy-preserving registration answers without a session. The same
+      // message is used whether or not the address already has an account.
+      if (!("data" in res)) return;
       const { user, accessToken, workspaces, admission } = res.data;
       useAuthStore.getState().setAuth(user, accessToken, workspaces);
       await router.invalidate();

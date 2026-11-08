@@ -2,7 +2,7 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import type { ResendVerificationInput } from "@pm/shared";
 import * as authService from "./auth.service.js";
 import { env } from "../../config/env.js";
-import { AppError } from "../../utils/errors.js";
+import { AppError, UnauthorizedError } from "../../utils/errors.js";
 import { endSessions } from "../realtime/realtime.service.js";
 import { expiredLogoutProof } from "./logout-authentication.js";
 import { isBusy, revokeMatchingRefreshFamily } from "./refresh-sessions.js";
@@ -43,6 +43,28 @@ export async function registerHandler(
     displayName: string;
     inviteToken?: string;
   };
+
+  // Off by default. The read is the same for every address. The duplicate-email
+  // conflict and the immediate session stay in register() for that default.
+  if (
+    await authService.privacyPreservingRegistrationEnabled(request.server.prisma)
+  ) {
+    const ssoConfig = await request.server.prisma.ssoConfig.findUnique({
+      where: { id: "singleton" },
+    });
+    if (ssoConfig?.enabled && !ssoConfig.passwordLoginEnabled) {
+      throw new UnauthorizedError(
+        "Password registration is disabled. Please use SSO to sign in.",
+      );
+    }
+    authService.requestPrivacyPreservingRegistration(
+      request.server.prisma,
+      body,
+    );
+    return reply.status(200).send({
+      message: authService.REGISTRATION_PRIVACY_MESSAGE,
+    });
+  }
 
   const result = await authService.register(request.server.prisma, body);
 

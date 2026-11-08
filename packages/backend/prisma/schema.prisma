@@ -205,6 +205,15 @@ model EmailConfig {
   updatedAt   DateTime @updatedAt
 }
 
+// Instance registration policy. Missing or false keeps immediate sign-in.
+// See docs/remediation/a17-registration-privacy.md.
+model RegistrationConfig {
+  id                String   @id @default("singleton")
+  privacyPreserving Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
 // ─── SSO / OIDC ─────────────────────────────────────────
 
 model AuthProvider {

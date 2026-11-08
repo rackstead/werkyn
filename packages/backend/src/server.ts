@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import {
   cleanupExpiredTokensAndAttempts,
   setPasswordResetDrainDeadline,
+  setRegistrationPrivacyDrainDeadline,
 } from "./modules/auth/auth.service.js";
 import { startChatMessageDeliveryWorker } from "./modules/chat/chat-delivery.js";
 import { startNotificationDeliveryWorker } from "./modules/notifications/notification-delivery.js";
@@ -121,10 +122,13 @@ async function start() {
         { name: "search index check", run: async () => searchIndexCheck.stop(), timeoutMs: 100 },
         {
           name: "http server",
-          // Closing waits for password-reset work answered before it ran
-          // (auth.routes.ts), until shortly before the overall deadline.
+          // Closing waits for password-reset and privacy-preserving registration
+          // work answered before it ran (auth.routes.ts), until shortly before
+          // the overall deadline.
           run: (remainingMs) => {
-            setPasswordResetDrainDeadline(Date.now() + Math.max(0, remainingMs - 500));
+            const deadline = Date.now() + Math.max(0, remainingMs - 500);
+            setPasswordResetDrainDeadline(deadline);
+            setRegistrationPrivacyDrainDeadline(deadline);
             return app.close();
           },
         },

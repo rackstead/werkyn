@@ -23,6 +23,27 @@ export function RegisterForm({ inviteToken }: { inviteToken?: string }) {
     registerMutation.mutate(data);
   });
 
+  const result = registerMutation.data;
+  const pendingVerification =
+    registerMutation.isSuccess && result && !("data" in result)
+      ? result.message
+      : null;
+  if (pendingVerification) {
+    return (
+      <div className="space-y-4 text-center">
+        <h2 className="text-lg font-semibold">Check your inbox</h2>
+        <p className="text-sm text-muted-foreground">{pendingVerification}</p>
+        <Link
+          to="/login"
+          search={{ inviteToken }}
+          className="text-sm text-primary hover:underline"
+        >
+          Sign in
+        </Link>
+      </div>
+    );
+  }
+
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <div className="space-y-2">

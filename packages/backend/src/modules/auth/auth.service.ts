@@ -207,6 +207,266 @@ async function createPasswordAccount(
   throw new ConflictError("Concurrent account registration. Please try again.");
 }
 
+export const REGISTRATION_PRIVACY_MESSAGE =
+  "If the address is available, a verification link has been sent. Verify your email before signing in.";
+
+// Answered before any address lookup, like password reset. Work that differs
+// for a new address (create the account and send mail) and an existing one
+// (no writes) must not change the response. The ceiling counts requests, not
+// lookups, so a full window refuses every address alike.
+const REGISTRATION_REQUESTS_PER_MINUTE = 6_000;
+const REGISTRATION_REQUEST_WINDOW_MS = 60_000;
+const VERIFICATION_RESEND_COOLDOWN_MS = 60_000;
+const DEFAULT_REGISTRATION_DRAIN_MS = 5_000;
+const pendingRegistrationWork = new Map<string, Promise<void>>();
+let registrationWindowStart = 0;
+let registrationWindowCount = 0;
+let registrationWindowRefused = 0;
+let registrationDrainDeadline: number | undefined;
+
+export async function privacyPreservingRegistrationEnabled(
+  prisma: PrismaClient,
+) {
+  const config = await prisma.registrationConfig.findUnique({
+    where: { id: "singleton" },
+    select: { privacyPreserving: true },
+  });
+  // A missing row is the default: immediate sign-in, no verification gate.
+  return config?.privacyPreserving === true;
+}
+
+function registrationRequestWait(now: number): number {
+  if (now - registrationWindowStart >= REGISTRATION_REQUEST_WINDOW_MS) {
+    registrationWindowStart = now;
+    registrationWindowCount = 0;
+    registrationWindowRefused = 0;
+  }
+  if (registrationWindowCount >= REGISTRATION_REQUESTS_PER_MINUTE) {
+    registrationWindowRefused += 1;
+    if (registrationWindowRefused === 1) {
+      logger.warn(
+        { event: "registration_privacy_budget_exhausted" },
+        "Too many privacy-preserving registration requests this minute; refusing until the next",
+      );
+    }
+    return Math.max(
+      1,
+      Math.ceil(
+        (registrationWindowStart + REGISTRATION_REQUEST_WINDOW_MS - now) /
+          1000,
+      ),
+    );
+  }
+  registrationWindowCount += 1;
+  return 0;
+}
+
+function trackRegistrationWork(key: string, work: Promise<void>) {
+  const tracked = work.finally(() => {
+    if (pendingRegistrationWork.get(key) === tracked) {
+      pendingRegistrationWork.delete(key);
+    }
+  });
+  pendingRegistrationWork.set(key, tracked);
+  return tracked;
+}
+
+async function issueVerificationEmail(
+  prisma: PrismaClient,
+  userId: string,
+  email: string,
+  inviteToken?: string,
+) {
+  const token = generateSecureToken();
+  await prisma.emailVerificationToken.create({
+    data: {
+      userId,
+      tokenHash: hashToken(token),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    },
+  });
+  await sendVerificationEmail(email, token, inviteToken);
+}
+
+async function sendVerificationIfDue(
+  prisma: PrismaClient,
+  userId: string,
+  email: string,
+) {
+  const recent = await prisma.emailVerificationToken.findFirst({
+    where: {
+      userId,
+      createdAt: { gt: new Date(Date.now() - VERIFICATION_RESEND_COOLDOWN_MS) },
+    },
+    select: { id: true },
+  });
+  if (recent) return;
+  await issueVerificationEmail(prisma, userId, email);
+}
+
+function scheduleUnverifiedSignInVerification(
+  prisma: PrismaClient,
+  userId: string,
+  email: string,
+) {
+  const key = `verify:${userId}`;
+  if (pendingRegistrationWork.has(key)) return;
+  // The sign-in response must not wait on this lookup or the mail. The
+  // promise is tracked now so shutdown still drains it.
+  let start = (_work: Promise<void>) => {};
+  const started = new Promise<void>((resolve) => {
+    start = (work) => {
+      resolve(work.then(() => undefined));
+    };
+  });
+  trackRegistrationWork(key, started);
+  setImmediate(() => {
+    start(
+      sendVerificationIfDue(prisma, userId, email).catch((error) => {
+        logger.error(
+          { err: error },
+          "Verification email after a refused sign-in failed",
+        );
+      }),
+    );
+  });
+}
+
+export function requestPrivacyPreservingRegistration(
+  prisma: PrismaClient,
+  data: {
+    email: string;
+    password: string;
+    displayName: string;
+    inviteToken?: string;
+  },
+) {
+  const wait = registrationRequestWait(Date.now());
+  if (wait > 0) {
+    throw new TooManyRequestsError(
+      `Too many registration requests right now. Try again in ${wait} ${wait === 1 ? "second" : "seconds"}.`,
+      wait,
+    );
+  }
+  const email = data.email.toLowerCase();
+  // A repeat while this address is still being handled adds nothing. The
+  // first request already holds the only work, and the answer is the same.
+  if (pendingRegistrationWork.has(email)) return;
+  trackRegistrationWork(
+    email,
+    completePrivacyPreservingRegistration(prisma, { ...data, email }).catch(
+      (error) => {
+        logger.error({ err: error }, "Privacy-preserving registration failed");
+      },
+    ),
+  );
+}
+
+async function completePrivacyPreservingRegistration(
+  prisma: PrismaClient,
+  data: {
+    email: string;
+    password: string;
+    displayName: string;
+    inviteToken?: string;
+  },
+) {
+  // Hash before the lookup so a new address and an existing one do the same
+  // password work. The hash is stored only when this call creates the account.
+  const passwordHash = await hashPassword(data.password);
+  const existing = await prisma.user.findUnique({
+    where: { email: data.email },
+    select: { id: true },
+  });
+  if (existing) return;
+
+  let created: { user: { id: string; email: string }; isBootstrapAdmin: boolean };
+  try {
+    created = await createPasswordAccount(prisma, {
+      email: data.email,
+      displayName: data.displayName,
+      passwordHash,
+    });
+  } catch (error) {
+    // Lost a race with another create. The account stays as that create left it.
+    if (error instanceof ConflictError) return;
+    throw error;
+  }
+
+  if (data.inviteToken) {
+    try {
+      await admitWithInvite(prisma, {
+        userId: created.user.id,
+        token: data.inviteToken,
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error },
+        "Workspace admission after registration failed",
+      );
+    }
+  }
+
+  // The first account is already verified and can sign in. Everyone else
+  // must open the link; this response does not create a session.
+  if (created.isBootstrapAdmin) return;
+  const invite = data.inviteToken
+    ? await prisma.workspaceInvite.findUnique({
+        where: { token: data.inviteToken },
+        select: { token: true },
+      })
+    : null;
+  await issueVerificationEmail(
+    prisma,
+    created.user.id,
+    created.user.email,
+    invite?.token,
+  );
+}
+
+export async function settleRegistrationPrivacyWork() {
+  while (pendingRegistrationWork.size > 0) {
+    await Promise.allSettled([...pendingRegistrationWork.values()]);
+  }
+}
+
+export function setRegistrationPrivacyDrainDeadline(deadline: number) {
+  registrationDrainDeadline = deadline;
+}
+
+export function registrationPrivacyDrainDeadline() {
+  return registrationDrainDeadline ?? Date.now() + DEFAULT_REGISTRATION_DRAIN_MS;
+}
+
+export async function drainRegistrationPrivacyWork(deadline: number) {
+  if (pendingRegistrationWork.size === 0) return;
+  logger.info(
+    {
+      event: "registration_privacy_requests_draining",
+      pending: pendingRegistrationWork.size,
+    },
+    "Waiting for privacy-preserving registration work in progress",
+  );
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+  });
+  try {
+    await Promise.race([settleRegistrationPrivacyWork(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (pendingRegistrationWork.size > 0) {
+    logger.warn(
+      {
+        event: "registration_privacy_requests_abandoned",
+        abandoned: pendingRegistrationWork.size,
+      },
+      "Shutdown abandoned privacy-preserving registration work; a verification link may not arrive",
+    );
+  }
+}
+
 /**
  * The account whose password this is, or null. An unknown address or an
  * account without a usable password does the same Argon2id work as a wrong
@@ -244,10 +504,15 @@ export async function login(
   const email = data.email.toLowerCase();
 
   // SSO enforcement: reject password login if SSO-only mode. This is the same
-  // for every address, so it is decided before an attempt is counted.
-  const ssoConfig = await prisma.ssoConfig.findUnique({
-    where: { id: "singleton" },
-  });
+  // for every address, so it is decided before an attempt is counted. The
+  // registration policy is read here too, so a later unverified refusal does
+  // not add a lookup the other addresses skip.
+  const [ssoConfig, privacyPreserving] = await Promise.all([
+    prisma.ssoConfig.findUnique({
+      where: { id: "singleton" },
+    }),
+    privacyPreservingRegistrationEnabled(prisma),
+  ]);
   if (ssoConfig?.enabled && !ssoConfig.passwordLoginEnabled) {
     throw new UnauthorizedError(
       "Password login is disabled. Please use SSO to sign in.",
@@ -304,6 +569,15 @@ export async function login(
     undecided,
   );
   if (!user) throw new UnauthorizedError("Invalid email or password");
+
+  // Privacy-preserving registration withholds a session until the address is
+  // verified. The refusal matches any other bad password, and the failure
+  // counted above is left in place, so this is not a successful sign-in and
+  // does not show that the address was registered.
+  if (!user.emailVerified && privacyPreserving) {
+    scheduleUnverifiedSignInVerification(prisma, user.id, user.email);
+    throw new UnauthorizedError("Invalid email or password");
+  }
 
   // A password login replaces the user's other sessions. The user row is held
   // FOR NO KEY UPDATE until the new session commits: a concurrent password

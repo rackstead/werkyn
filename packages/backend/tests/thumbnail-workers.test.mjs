@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
 import { THUMBNAIL_LIMITS } from "../src/modules/files/thumbnail-checks.ts";
+import { cappedThumbnailWorkerCount } from "../src/config/thumbnail-worker-count.ts";
 import { ThumbnailWorkerPool } from "../src/modules/files/thumbnail-workers.ts";
 import {
   avif100Megapixels,
@@ -609,6 +610,38 @@ test("unset THUMBNAIL_WORKERS keeps the CPU pool size and 1 starts one worker", 
   const one = await run("1");
   assert.equal(one.size, 1);
   assert.equal(one.maxActive, one.expected, "admission is unchanged");
+  const two = await run("2");
+  assert.equal(two.size, cappedThumbnailWorkerCount(2, two.expected), "no worker admission will not use");
+  assert.equal(two.maxActive, two.expected);
+  assert.equal(cappedThumbnailWorkerCount(2, 1), 1);
+  assert.equal(cappedThumbnailWorkerCount(1, 2), 1);
+  assert.equal(cappedThumbnailWorkerCount(2, 2), 2);
+});
+
+test("a pong already buffered during a stall is not counted as a hung worker", async () => {
+  const control = path.join(scratch, "stall-none.txt");
+  writeFileSync(control, "");
+  const workers = pool({
+    size: 1,
+    script: answeringWorker("stall-pong.mjs", control),
+    execArgv: [],
+    pingIntervalMs: 60_000,
+    pingTimeoutMs: 30,
+    // Hold the server across the ping timeout, after the ping is written,
+    // so the worker's pong can sit unread until the loop resumes.
+    afterPing() {
+      const until = Date.now() + 80;
+      while (Date.now() < until) {}
+    },
+  });
+  workers.start();
+  await waitFor(() => workers.stats.workers[0]?.state === "ready" && workers.stats.workers[0].pid);
+  const pid = workers.stats.workers[0].pid;
+  const result = await workers.run(small);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(workers.stats.workers[0].pid, pid, "the worker that answered was kept");
+  assert.equal(workers.stats.hung, 0);
+  assert.equal(workers.stats.crashed, 0);
 });
 
 test("a bad THUMBNAIL_WORKERS is rejected before a worker starts", async () => {

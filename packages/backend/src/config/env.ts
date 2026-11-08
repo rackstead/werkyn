@@ -4,6 +4,7 @@ import { logger } from "../utils/logger.js";
 import {
   THUMBNAIL_WORKER_COUNT_MESSAGE,
   thumbnailWorkerCount,
+  useThumbnailWorkerCount,
 } from "./thumbnail-worker-count.js";
 
 function wholeNumber(name: string, fallback: number, min: number, max: number) {
@@ -311,3 +312,5 @@ if (!result.success) {
 for (const warning of result.warnings) logger.warn(warning);
 
 export const env: Env = result.data;
+
+useThumbnailWorkerCount(env.THUMBNAIL_WORKERS);

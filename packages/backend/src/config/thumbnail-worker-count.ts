@@ -30,3 +30,24 @@ export function thumbnailWorkerCount(raw: string | undefined, cpus = os.availabl
   }
   return value;
 }
+
+/** The count env.ts accepted, when that module has already been loaded. */
+let accepted: number | undefined;
+
+/** Remember the count from startup validation so the pool does not parse again. */
+export function useThumbnailWorkerCount(count: number): void {
+  accepted = count;
+}
+
+/**
+ * The count to ask for. After env.ts has validated the variable, that value;
+ * otherwise the same rules applied to `raw` (tests that load the pool alone).
+ */
+export function configuredThumbnailWorkerCount(raw = process.env.THUMBNAIL_WORKERS): number {
+  return accepted ?? thumbnailWorkerCount(raw);
+}
+
+/** The pool never starts a worker admission will not use. */
+export function cappedThumbnailWorkerCount(requested: number, maxActive: number): number {
+  return Math.min(requested, maxActive);
+}

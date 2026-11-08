@@ -77,6 +77,8 @@ export interface ThumbnailWorkerPoolOptions {
    */
   pingIntervalMs?: number;
   pingTimeoutMs?: number;
+  /** Tests only: runs after a ping is written, before the event loop continues. */
+  afterPing?: () => void;
   /** The worker entry point and Node options; derived from this module by default. */
   script?: string;
   execArgv?: string[];
@@ -129,7 +131,14 @@ interface Slot {
   /** Pings an idle worker; cleared once it answers or is replaced. */
   probeTimer: NodeJS.Timeout | null;
   /** The ping this worker has been asked and has not answered. */
-  ping: { id: number; timer: NodeJS.Timeout; promise: Promise<boolean>; finish: (ok: boolean) => void } | null;
+  ping: {
+    id: number;
+    timer: NodeJS.Timeout;
+    /** Runs after I/O, so a pong already buffered is read before a kill. */
+    later: NodeJS.Immediate | null;
+    promise: Promise<boolean>;
+    finish: (ok: boolean) => void;
+  } | null;
 }
 
 export interface ThumbnailWorkerStats {
@@ -497,27 +506,37 @@ export class ThumbnailWorkerPool {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (slot.ping?.id === id) slot.ping = null;
+      if (slot.ping?.id === id) {
+        if (slot.ping.later) clearImmediate(slot.ping.later);
+        slot.ping = null;
+      }
       finish(ok);
     };
     const timer = setTimeout(() => {
       if (slot.ping?.id !== id || slot.child !== child) return;
-      // A decode started inside its own deadline. Missing this ping is not
-      // a reason to kill it; the caller's abort still is.
-      if (slot.state === "busy" || slot.job?.sent) {
+      // Timers run before I/O. After a stall this can fire while the pong
+      // is already buffered; decide only after that read has had its turn.
+      const later = setImmediate(() => {
+        if (slot.ping?.id !== id || slot.child !== child) return;
+        // A decode started inside its own deadline. Missing this ping is not
+        // a reason to kill it; the caller's abort still is.
+        if (slot.state === "busy" || slot.job?.sent) {
+          done(false);
+          return;
+        }
+        const held = slot.job;
+        if (held && !held.sent) {
+          slot.job = null;
+          this.setRef(slot, false);
+        }
         done(false);
-        return;
-      }
-      const held = slot.job;
-      if (held && !held.sent) {
-        slot.job = null;
-        this.setRef(slot, false);
-      }
-      done(false);
-      this.hung(slot);
+        this.hung(slot);
+      });
+      later.unref();
+      if (slot.ping?.id === id) slot.ping.later = later;
     }, this.pingTimeout());
     timer.unref();
-    slot.ping = { id, timer, promise, finish: done };
+    slot.ping = { id, timer, later: null, promise, finish: done };
     channel.write(`${JSON.stringify({ type: "ping", id })}\n`, (error) => {
       if (!error || slot.ping?.id !== id || slot.child !== child) return;
       const held = slot.job;
@@ -528,6 +547,7 @@ export class ThumbnailWorkerPool {
       done(false);
       this.hung(slot);
     });
+    this.options.afterPing?.();
     return promise;
   }
 
@@ -558,6 +578,7 @@ export class ThumbnailWorkerPool {
     slot.probeTimer = null;
     if (slot.ping) {
       clearTimeout(slot.ping.timer);
+      if (slot.ping.later) clearImmediate(slot.ping.later);
       const finish = slot.ping.finish;
       slot.ping = null;
       finish(false);
@@ -632,6 +653,7 @@ export class ThumbnailWorkerPool {
     slot.probeTimer = null;
     if (slot.ping) {
       clearTimeout(slot.ping.timer);
+      if (slot.ping.later) clearImmediate(slot.ping.later);
       const finish = slot.ping.finish;
       slot.ping = null;
       finish(false);

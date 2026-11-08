@@ -200,6 +200,8 @@ export function CalendarView({
     }
 
     const isComplete = task.status.isCompletion;
+    // Assignees arrive in TaskAssignee.id order. The first is the earliest
+    // assignment, and this avatar is the event's assignee color.
     const firstAssignee = task.assignees[0]?.user;
 
     return (

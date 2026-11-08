@@ -115,6 +115,10 @@ export async function listTasks(
 
   const include = {
     assignees: {
+      // TaskAssignee has no createdAt. The id is a cuid assigned at insert,
+      // so ascending id is the earliest assignment. The direction is a
+      // literal so this shared include stays a TaskInclude.
+      orderBy: { id: "asc" as const },
       include: {
         user: {
           select: { id: true, displayName: true, avatarUrl: true },
@@ -297,6 +301,7 @@ export async function createTask(
       },
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },
@@ -326,6 +331,7 @@ export async function getTask(
     where: { id: taskId },
     include: {
       assignees: {
+        orderBy: { id: "asc" },
         include: {
           user: {
             select: {
@@ -391,7 +397,7 @@ export async function updateTaskWithNotifications(
   actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   const existing = await prisma.task.findUnique({
     where: { id: taskId },
-    include: { assignees: true },
+    include: { assignees: { orderBy: { id: "asc" } } },
   });
   if (!existing) {
     throw new NotFoundError("Task not found");
@@ -484,6 +490,7 @@ export async function updateTaskWithNotifications(
       data: updateData,
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },
@@ -642,7 +649,7 @@ export async function moveTaskWithNotifications(
       ? await enqueueTaskNotification(tx, actorId, actorDisplayName, {
         kind: "status", task: updatedTask, statusName: updatedTask.status?.name || "new status",
         recipients: (await tx.taskAssignee.findMany({
-          where: { taskId }, select: { userId: true },
+          where: { taskId }, select: { userId: true }, orderBy: { id: "asc" },
         })).map((assignee) => assignee.userId),
       }) : [];
     return { result: { ...updatedTask, warning }, projectId: updatedTask.projectId, notificationDeliveryIds };
@@ -893,7 +900,7 @@ export async function bulkUpdateTasks(
         archived: true,
         createdAt: true,
         status: { select: { position: true } },
-        assignees: { select: { userId: true } },
+        assignees: { select: { userId: true }, orderBy: { id: "asc" } },
       },
     });
     if (tasks.length !== data.taskIds.length) {
@@ -960,13 +967,32 @@ export async function bulkUpdateTasks(
       });
     }
 
-    // Bulk update assignees (replace)
+    // Replace the set, but keep the rows of people who remain. Their ids are
+    // the assignment order, so submitting the same users again must not mint
+    // new ones. Re-read under a lock: the earlier snapshot is only the
+    // permission check, and a removal that committed after it must still be
+    // restored when that person is requested. Task FOR UPDATE blocks a new
+    // assignment insert. Assignee rows are then locked in id order. Tasks
+    // stay in id order, matching clearAssignments.
     if (data.assigneeIds) {
+      const wanted = data.assigneeIds;
       for (const taskId of taskIds) {
-        await tx.taskAssignee.deleteMany({ where: { taskId } });
-        if (data.assigneeIds.length > 0) {
+        await tx.$queryRaw`SELECT id FROM "Task" WHERE id = ${taskId} FOR UPDATE`;
+        const current = await tx.$queryRaw<Array<{ userId: string }>>`
+          SELECT "userId" FROM "TaskAssignee"
+          WHERE "taskId" = ${taskId}
+          ORDER BY id
+          FOR UPDATE
+        `;
+        const kept = new Set(current.map((assignee) => assignee.userId));
+        const removed = [...kept].filter((userId) => !wanted.includes(userId)).sort();
+        if (removed.length > 0) {
+          await tx.taskAssignee.deleteMany({ where: { taskId, userId: { in: removed } } });
+        }
+        const added = wanted.filter((userId) => !kept.has(userId));
+        if (added.length > 0) {
           await tx.taskAssignee.createMany({
-            data: data.assigneeIds.map((userId) => ({ taskId, userId })),
+            data: added.map((userId) => ({ taskId, userId })),
           });
         }
       }
@@ -1069,7 +1095,7 @@ export async function removeLabel(
   if (actorRole === "MEMBER") {
     const task = await prisma.task.findUnique({
       where: { id: taskId },
-      include: { assignees: true },
+      include: { assignees: { orderBy: { id: "asc" } } },
     });
     if (!task) {
       throw new NotFoundError("Task not found");
@@ -1107,7 +1133,7 @@ export async function duplicateTaskWithNotifications(
   const source = await prisma.task.findUnique({
     where: { id: taskId },
     include: {
-      assignees: true,
+      assignees: { orderBy: { id: "asc" } },
       labels: true,
       subtasks: { orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }] },
     },
@@ -1142,7 +1168,13 @@ export async function duplicateTaskWithNotifications(
       statusId = firstColumn.id;
     }
     const labelIds = await projectLabelIds(tx, source.projectId, source.labels.map((l) => l.labelId));
-    const assigneeIds = await projectAssigneeIds(tx, source.projectId, source.assignees.map((a) => a.userId));
+    const assigneeIds = await projectAssigneeIds(
+      tx,
+      source.projectId,
+      [...source.assignees]
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .map((a) => a.userId),
+    );
     const subtaskAssignees = new Set(await projectAssigneeIds(
       tx,
       source.projectId,
@@ -1172,6 +1204,7 @@ export async function duplicateTaskWithNotifications(
       },
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },

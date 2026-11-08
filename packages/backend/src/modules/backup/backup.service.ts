@@ -729,7 +729,7 @@ async function writeBackupJson(
           db.task.findMany({
             where: { projectId: opt.projectId, ...where },
             include: {
-              assignees: { select: { userId: true } },
+              assignees: { select: { id: true, userId: true }, orderBy: { id: "asc" } },
               labels: { select: { labelId: true } },
               subtasks: { orderBy: { position: "asc" } },
               customFieldValues: true,
@@ -789,7 +789,9 @@ async function writeBackupJson(
             startDate: t.startDate,
             statusRef: t.statusId,
             createdByRef: null as string | null,
-            assignees: t.assignees.map((a) => a.userId),
+            assignees: [...t.assignees]
+              .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+              .map((a) => a.userId),
             labels: t.labels.map((l) => l.labelId),
             subtasks: t.subtasks.map((s) => ({
               _originalId: s.id,

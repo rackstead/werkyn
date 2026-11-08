@@ -99,11 +99,15 @@ before(async () => {
 });
 
 after(async () => {
-  if (workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } }).catch(() => {});
-  // Bootstrap tests in this suite require an empty user table.
-  if (userId) await app.prisma.user.delete({ where: { id: userId } }).catch(() => {});
-  await app?.close();
-  await rm(storageDir, { recursive: true, force: true });
+  try {
+    // Files in this suite run one at a time. The user has to be gone before
+    // the file exits: a later bootstrap file requires an empty user table.
+    if (workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } });
+    if (userId) await app.prisma.user.delete({ where: { id: userId } });
+  } finally {
+    await app?.close();
+    await rm(storageDir, { recursive: true, force: true });
+  }
 });
 
 test("the first board window is not the whole project", async () => {

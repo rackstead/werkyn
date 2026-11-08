@@ -245,8 +245,9 @@ export class StorageRoot {
 
   /**
    * An existing regular file, opened for reading. A link anywhere below the
-   * root is refused; so is a FIFO, device, socket or directory, which is
-   * opened without blocking only to be examined.
+   * root is refused; so is a FIFO, device or directory. A socket fails this
+   * open with ENXIO before it can be examined, and that error alone is
+   * refused the same way. Opening a FIFO never waits for a writer.
    */
   async openFile(storagePath: string): Promise<OpenedFile> {
     const names = this.names(storagePath);
@@ -258,6 +259,9 @@ export class StorageRoot {
       try {
         handle = await fs.open(entry, READ_NO_FOLLOW | constants.O_NONBLOCK);
       } catch (error) {
+        // ENXIO from this open is a socket, or a device node with no device.
+        // Other ENXIO errors in the process are left unchanged.
+        if (errorCode(error) === "ENXIO") throw new StorageRefusedError(storagePath, "not-a-file");
         throw await refusalOf(error, entry, storagePath);
       }
     } finally {

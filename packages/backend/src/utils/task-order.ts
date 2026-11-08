@@ -217,6 +217,253 @@ export async function writeColumnOrder(tx: Db, ordered: readonly { id: string; p
   }
 }
 
+// Moves do not use writeColumnOrder. A column of n tasks was one UPDATE per
+// shifted row. The statements below shift a position range, or renumber a
+// column that is not already 0..n-1, in one statement. Callers hold the
+// project order lock, so a concurrent delete or move cannot land between the
+// shape read and the write. Archived rows are excluded: their positions do
+// not count, and a move must not rewrite them.
+
+const BOARD_POSITION_ORDER = Prisma.sql`position ASC, "createdAt" ASC, id ASC`;
+
+function activeTasks(projectId: string, statusId: string, excludeId?: string) {
+  const column = Prisma.sql`"projectId" = ${projectId} AND "statusId" = ${statusId} AND archived = false`;
+  if (excludeId === undefined) return column;
+  return Prisma.sql`${column} AND id <> ${excludeId}`;
+}
+
+interface ActiveColumnShape {
+  count: number;
+  minPosition: number | null;
+  maxPosition: number | null;
+  distinctPositions: number;
+}
+
+/** One aggregate row. Not the ids of the column. */
+async function activeColumnShape(
+  tx: Db,
+  projectId: string,
+  statusId: string,
+  excludeId?: string,
+): Promise<ActiveColumnShape> {
+  const [row] = await tx.$queryRaw<Array<{
+    count: number | bigint;
+    minPosition: number | bigint | null;
+    maxPosition: number | bigint | null;
+    distinctPositions: number | bigint;
+  }>>`
+    SELECT COUNT(*)::int AS count,
+           MIN(position)::int AS "minPosition",
+           MAX(position)::int AS "maxPosition",
+           COUNT(DISTINCT position)::int AS "distinctPositions"
+    FROM "Task"
+    WHERE ${activeTasks(projectId, statusId, excludeId)}
+  `;
+  const asNumber = (value: number | bigint | null) => (value === null ? null : Number(value));
+  return {
+    count: Number(row.count),
+    minPosition: asNumber(row.minPosition),
+    maxPosition: asNumber(row.maxPosition),
+    distinctPositions: Number(row.distinctPositions),
+  };
+}
+
+/** Positions are exactly the indexes 0..n-1, so a board index is the position. */
+function isDense(shape: ActiveColumnShape) {
+  return shape.count === 0
+    || (shape.minPosition === 0
+      && shape.maxPosition === shape.count - 1
+      && shape.distinctPositions === shape.count);
+}
+
+/** Shift positions strictly after `from` down by one. Dense columns only. */
+async function shiftTailDown(tx: Db, projectId: string, statusId: string, taskId: string, from: number) {
+  await tx.$executeRaw`
+    UPDATE "Task"
+    SET position = position - 1, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE ${activeTasks(projectId, statusId, taskId)} AND position > ${from}
+  `;
+}
+
+/** Shift position >= `to` up by one, excluding `taskId`. Dense columns only. */
+async function shiftFromUp(tx: Db, projectId: string, statusId: string, taskId: string, to: number) {
+  await tx.$executeRaw`
+    UPDATE "Task"
+    SET position = position + 1, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE ${activeTasks(projectId, statusId, taskId)} AND position >= ${to}
+  `;
+}
+
+/**
+ * One statement: the active tasks (except `excludeId`, when given) become
+ * dense board positions. Rows that already have that position are not rewritten.
+ */
+async function renumberActive(tx: Db, projectId: string, statusId: string, excludeId?: string) {
+  await tx.$executeRaw`
+    UPDATE "Task" AS task
+    SET position = ranked.rn, "updatedAt" = CURRENT_TIMESTAMP
+    FROM (
+      SELECT id, (ROW_NUMBER() OVER (ORDER BY ${BOARD_POSITION_ORDER}) - 1)::int AS rn
+      FROM "Task"
+      WHERE ${activeTasks(projectId, statusId, excludeId)}
+    ) AS ranked
+    WHERE task.id = ranked.id AND task.position IS DISTINCT FROM ranked.rn
+  `;
+}
+
+/**
+ * One statement: open index `to` in a column that is not dense, and compact
+ * the other active tasks around it. `to` is an index into those tasks.
+ */
+async function openSparseSlot(tx: Db, projectId: string, statusId: string, taskId: string, to: number) {
+  await tx.$executeRaw`
+    UPDATE "Task" AS task
+    SET position = ranked.rn, "updatedAt" = CURRENT_TIMESTAMP
+    FROM (
+      SELECT id,
+             CASE WHEN idx >= ${to} THEN idx + 1 ELSE idx END AS rn
+      FROM (
+        SELECT id, (ROW_NUMBER() OVER (ORDER BY ${BOARD_POSITION_ORDER}) - 1)::int AS idx
+        FROM "Task"
+        WHERE ${activeTasks(projectId, statusId, taskId)}
+      ) AS ordered
+    ) AS ranked
+    WHERE task.id = ranked.id AND task.position IS DISTINCT FROM ranked.rn
+  `;
+}
+
+/**
+ * One statement for a same-column move on a column that is not already dense.
+ * Tasks outside the index range are compacted to their index; tasks inside
+ * the range take the shifted index. The moved task itself is left for the caller.
+ */
+async function shiftSparseColumn(tx: Db, projectId: string, statusId: string, taskId: string, to: number) {
+  await tx.$executeRaw`
+    WITH ordered AS (
+      SELECT id, (ROW_NUMBER() OVER (ORDER BY ${BOARD_POSITION_ORDER}) - 1)::int AS idx
+      FROM "Task"
+      WHERE ${activeTasks(projectId, statusId)}
+    ),
+    bounds AS (
+      SELECT idx AS from_idx FROM ordered WHERE id = ${taskId}
+    )
+    UPDATE "Task" AS task
+    SET position = shifted.rn, "updatedAt" = CURRENT_TIMESTAMP
+    FROM (
+      SELECT ordered.id,
+             CASE
+               WHEN bounds.from_idx < ${to} AND ordered.idx > bounds.from_idx AND ordered.idx <= ${to}
+                 THEN ordered.idx - 1
+               WHEN bounds.from_idx > ${to} AND ordered.idx >= ${to} AND ordered.idx < bounds.from_idx
+                 THEN ordered.idx + 1
+               ELSE ordered.idx
+             END AS rn
+      FROM ordered
+      CROSS JOIN bounds
+    ) AS shifted
+    WHERE task.id = shifted.id AND task.id <> ${taskId} AND task.position IS DISTINCT FROM shifted.rn
+  `;
+}
+
+export interface TaskMovePlacement {
+  projectId: string;
+  taskId: string;
+  fromStatusId: string;
+  toStatusId: string;
+  /** 0-based index into the destination column. The schema already requires a non-negative integer. */
+  toIndex: number;
+  fromPosition: number;
+  archived: boolean;
+}
+
+/**
+ * Place `taskId` at `toIndex` and leave every active column the move touches
+ * dense at 0..n-1. Returns the position to store on the moved task.
+ *
+ * A dense column is a range update (`position +/- 1` where position is past
+ * the moved index), so a one-slot move does not rewrite the rest of the
+ * column. A column with a gap or a shared position is renumbered in one
+ * statement instead. Neither path reads the column's ids into the client.
+ */
+export async function shiftColumnsForMove(tx: Db, move: TaskMovePlacement): Promise<number> {
+  const sameColumn = move.fromStatusId === move.toStatusId;
+  // An archived task is not an active slot. Moving it compacts a column that
+  // already had a gap, and does not shift the active tasks to make a hole.
+  if (move.archived) {
+    if (!sameColumn) await compactColumn(tx, move.projectId, move.fromStatusId);
+    await compactColumn(tx, move.projectId, move.toStatusId);
+    const shape = await activeColumnShape(tx, move.projectId, move.toStatusId);
+    if (shape.count === 0) return 0;
+    return Math.min(Math.max(move.toIndex, 0), shape.count - 1);
+  }
+  if (sameColumn) return shiftWithinColumn(tx, move);
+  await closeSourceGap(tx, move);
+  return openDestination(tx, move.projectId, move.toStatusId, move.taskId, move.toIndex);
+}
+
+async function shiftWithinColumn(tx: Db, move: TaskMovePlacement): Promise<number> {
+  const shape = await activeColumnShape(tx, move.projectId, move.fromStatusId);
+  const to = shape.count === 0 ? 0 : Math.min(move.toIndex, shape.count - 1);
+  const member = isDense(shape) && move.fromPosition >= 0 && move.fromPosition < shape.count;
+  if (!member) {
+    await shiftSparseColumn(tx, move.projectId, move.fromStatusId, move.taskId, to);
+    return to;
+  }
+  const from = move.fromPosition;
+  if (to < from) {
+    await tx.$executeRaw`
+      UPDATE "Task"
+      SET position = position + 1, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE ${activeTasks(move.projectId, move.fromStatusId, move.taskId)}
+        AND position >= ${to} AND position < ${from}
+    `;
+  } else if (to > from) {
+    await tx.$executeRaw`
+      UPDATE "Task"
+      SET position = position - 1, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE ${activeTasks(move.projectId, move.fromStatusId, move.taskId)}
+        AND position > ${from} AND position <= ${to}
+    `;
+  }
+  return to;
+}
+
+async function closeSourceGap(tx: Db, move: TaskMovePlacement) {
+  const shape = await activeColumnShape(tx, move.projectId, move.fromStatusId);
+  const member = isDense(shape) && move.fromPosition >= 0 && move.fromPosition < shape.count;
+  if (!member) {
+    await renumberActive(tx, move.projectId, move.fromStatusId, move.taskId);
+    return;
+  }
+  // The task is last: nothing after it moves, and the column stays dense.
+  if (move.fromPosition >= shape.count - 1) return;
+  await shiftTailDown(tx, move.projectId, move.fromStatusId, move.taskId, move.fromPosition);
+}
+
+/** Compact active tasks in place. Already-dense columns are not rewritten. */
+async function compactColumn(tx: Db, projectId: string, statusId: string) {
+  const shape = await activeColumnShape(tx, projectId, statusId);
+  if (isDense(shape)) return;
+  await renumberActive(tx, projectId, statusId);
+}
+
+async function openDestination(
+  tx: Db,
+  projectId: string,
+  statusId: string,
+  taskId: string,
+  toIndex: number,
+): Promise<number> {
+  const shape = await activeColumnShape(tx, projectId, statusId, taskId);
+  const to = Math.min(Math.max(toIndex, 0), shape.count);
+  if (isDense(shape)) {
+    if (to < shape.count) await shiftFromUp(tx, projectId, statusId, taskId, to);
+    return to;
+  }
+  await openSparseSlot(tx, projectId, statusId, taskId, to);
+  return to;
+}
+
 /**
  * A reorder must be a permutation of everything it orders: an ID listed twice
  * or left out would leave two items on one position.

@@ -36,6 +36,7 @@ import { scopeTaskDependencyTasks, scopeTaskRelations } from "../../utils/task-s
 import {
   columnTasks,
   nextTaskPosition,
+  shiftColumnsForMove,
   withProjectOrder,
   writeColumnOrder,
 } from "../../utils/task-order.js";
@@ -607,28 +608,33 @@ export async function moveTaskWithNotifications(
   }
 
   // Position from the frontend is a 0-based index into the sorted column.
-  // The columns the move touches are renumbered 0, 1, 2, … so positions match
-  // the frontend's expectations.
+  // The columns the move touches end dense at 0..n-1, so that index stays the
+  // same slot. Archived tasks are not part of the active order.
   return withProjectOrder(prisma, task.projectId, async (tx) => {
     // Every move, status change and column delete of the project waits for
-    // the order lock, so the task's column and both column orders read below
-    // stay current until commit (utils/task-order.ts). The destination column
-    // is then held FOR KEY SHARE like any referenced column.
+    // the order lock, so the task's column read below stays current until
+    // commit (utils/task-order.ts). The destination column is then held
+    // FOR KEY SHARE like any referenced column. A concurrent delete or move
+    // cannot commit while this lock is held.
     await assertProjectStatus(tx, task.projectId, data.statusId);
-    const current = await tx.task.findUnique({ where: { id: taskId }, select: { statusId: true } });
+    const current = await tx.task.findUnique({
+      where: { id: taskId },
+      select: { statusId: true, position: true, archived: true },
+    });
     if (!current) throw new NotFoundError("Task not found");
 
-    // Build the destination order: the others in board order, the task re-inserted at the index.
-    const ordered = await columnTasks(tx, task.projectId, data.statusId, [taskId]);
-    const movedPos = Math.min(data.position, ordered.length);
-    // Written below together with its column.
-    ordered.splice(movedPos, 0, { id: taskId, position: movedPos });
-
-    if (current.statusId !== data.statusId) {
-      // Close the gap in the source column.
-      await writeColumnOrder(tx, await columnTasks(tx, task.projectId, current.statusId, [taskId]));
-    }
-    await writeColumnOrder(tx, ordered);
+    // One range update per dense column, not one UPDATE per shifted task.
+    // The moved row is written after the neighbours so a lock on it is taken
+    // only once the column shift has started.
+    const movedPos = await shiftColumnsForMove(tx, {
+      projectId: task.projectId,
+      taskId,
+      fromStatusId: current.statusId,
+      toStatusId: data.statusId,
+      toIndex: data.position,
+      fromPosition: current.position,
+      archived: current.archived,
+    });
 
     const updatedTask = await tx.task.update({
       where: { id: taskId },

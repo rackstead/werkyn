@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { SenderAddressSchema } from "@pm/shared";
 import { logger } from "../utils/logger.js";
+import {
+  THUMBNAIL_WORKER_COUNT_MESSAGE,
+  thumbnailWorkerCount,
+} from "./thumbnail-worker-count.js";
 
 function wholeNumber(name: string, fallback: number, min: number, max: number) {
   const range = `${name} must be a whole number from ${min} to ${max}`;
@@ -187,6 +191,21 @@ const envSchema = z.object({
   // another way while below the rate adds to that wait in proportion to the
   // slot time it held (modules/backup/backup-cooldown.ts). 0 turns it off.
   BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS: wholeNumber("BACKUP_UPLOAD_RATE_COOLDOWN_SECONDS", 120, 0, 3600),
+
+  // Drive thumbnail decoder processes. Unset keeps one worker on fewer than
+  // four CPUs and two otherwise. 1 runs a single worker (a small pod).
+  // See the README ("Thumbnail memory").
+  THUMBNAIL_WORKERS: z.string().optional().transform((value, ctx) => {
+    try {
+      return thumbnailWorkerCount(value);
+    } catch (error) {
+      ctx.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : THUMBNAIL_WORKER_COUNT_MESSAGE,
+      });
+      return z.NEVER;
+    }
+  }),
 }).superRefine((values, ctx) => {
   if (values.LOGIN_BACKOFF_BASE_SECONDS > values.LOGIN_BACKOFF_MAX_SECONDS) {
     ctx.addIssue({

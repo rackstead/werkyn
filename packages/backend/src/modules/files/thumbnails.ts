@@ -1,4 +1,5 @@
 import os from "node:os";
+import { defaultThumbnailWorkerCount, thumbnailWorkerCount } from "../../config/thumbnail-worker-count.js";
 import { logger } from "../../utils/logger.js";
 import { THUMBNAIL_LIMITS, thumbnailFormat } from "./thumbnail-checks.js";
 import type { DecodeDetails } from "./thumbnail-decode.js";
@@ -35,7 +36,7 @@ export function defaultAdmissionLimits(
   cpus = os.availableParallelism(),
 ): ThumbnailAdmissionLimits {
   return {
-    maxActive: Math.max(1, Math.min(2, Math.floor(cpus / 2))),
+    maxActive: defaultThumbnailWorkerCount(cpus),
     maxQueued: 8,
     queueTimeoutMs: 5_000,
   };
@@ -165,7 +166,10 @@ export const thumbnailOutcomes: Record<ThumbnailOutcome, number> = {
  * show that the workers' own limit holds.
  */
 export const thumbnailWorkers = new ThumbnailWorkerPool({
-  size: thumbnailAdmission.limits.maxActive,
+  // Unset THUMBNAIL_WORKERS keeps one worker per admission turn. Setting it
+  // does not change how many uploads may be admitted, only how many decoder
+  // processes run (1 on a small pod).
+  size: thumbnailWorkerCount(process.env.THUMBNAIL_WORKERS),
   dataLimitBytes: THUMBNAIL_LIMITS.workerDataBytes,
   memoryChecks: !(process.env.NODE_ENV === "test" && process.env.WERKYN_TEST_THUMBNAIL_MEMORY_CHECKS === "off"),
   recycleAboveBytes: THUMBNAIL_LIMITS.workerRecycleBytes,

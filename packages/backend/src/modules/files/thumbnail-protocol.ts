@@ -1,7 +1,8 @@
 /**
  * The wire format between the server and a thumbnail decoder worker, over
- * the socket at the worker's fd 3. Requests are JSON lines. Each reply is
- * one frame:
+ * the socket at the worker's fd 3. Requests are JSON lines: a decode
+ * (`id`, `root`, `path`) or a liveness ping (`{"type":"ping","id":N}`).
+ * Each reply is one frame: a result, `ready`, or `{"type":"pong","id":N}`.
  *
  *   u32 header length | u32 body length | JSON header | body (thumbnail bytes)
  *

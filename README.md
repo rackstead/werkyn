@@ -58,6 +58,23 @@ each invalid variable. See `docs/remediation/ops-009.md` for the accepted format
 reachable and all migrations are applied. `GET /api/health` still reports whether
 the database is reachable.
 
+### Thumbnail memory
+
+Drive thumbnails are decoded in worker processes, not in the server, so one
+image cannot take the whole process down. Two workers can use about 1 GiB beside the server. A 1 GiB container can still fill. Docker kills the worker rather than the server. Kubernetes on cgroup v2 may kill the whole container because of `memory.oom.group`. Give such a deployment more than about 1.25 GiB, or run one worker.
+
+`THUMBNAIL_WORKERS` sets how many decoder processes start. Leave it unset to
+keep today's pool, which follows `os.availableParallelism()`: one worker on
+fewer than four CPUs, and two otherwise. Set it to `1` to run one worker on a
+small pod, or to `2` to run two. Any other value — not a whole number, zero,
+or negative — is rejected at startup and the server does not start. The setting
+does not change how many uploads may wait for a thumbnail. With Docker Compose,
+add it under the `werkyn` service's `environment`.
+
+After a worker is OOM-killed, Docker can report `State.OOMKilled=true` while
+the container keeps running, so an alert on that flag can fire even though the
+server is up.
+
 The container runs the migrations, the server and Dex as the unprivileged user
 `werkyn` (uid 10001). Older images ran as root; on upgrade, the Compose file's
 one-off `werkyn-permissions` service gives the root-owned files in the storage and

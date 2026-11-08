@@ -36,6 +36,15 @@ services:
         condition: service_healthy
     environment:
       <<: *werkyn-data-paths
+      # Drive thumbnails run in worker processes beside the server. Two
+      # workers can use about 1 GiB beside the server. A 1 GiB container can still fill. Docker kills the worker rather than the server. Kubernetes
+      # on cgroup v2 may kill the whole container because of memory.oom.group.
+      # Give such a deployment more than about 1.25 GiB, or run one worker
+      # with THUMBNAIL_WORKERS=1 (unset keeps the usual one or two, from the
+      # CPU count). After a worker is OOM-killed, Docker can report
+      # State.OOMKilled=true while the container keeps running, so an alert
+      # on that flag can fire even though the server is up.
+      # THUMBNAIL_WORKERS: "1"
       NODE_ENV: production
       PORT: 3000
       DATABASE_URL: postgresql://user:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/projectapp

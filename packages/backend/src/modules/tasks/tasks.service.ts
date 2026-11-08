@@ -116,8 +116,9 @@ export async function listTasks(
   const include = {
     assignees: {
       // TaskAssignee has no createdAt. The id is a cuid assigned at insert,
-      // so ascending id is the earliest assignment.
-      orderBy: { id: "asc" },
+      // so ascending id is the earliest assignment. The direction is a
+      // literal so this shared include stays a TaskInclude.
+      orderBy: { id: "asc" as const },
       include: {
         user: {
           select: { id: true, displayName: true, avatarUrl: true },

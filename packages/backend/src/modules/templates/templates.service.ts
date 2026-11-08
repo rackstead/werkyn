@@ -271,6 +271,7 @@ async function createTaskFromTemplateResult(
       },
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },

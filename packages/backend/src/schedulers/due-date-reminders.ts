@@ -47,7 +47,7 @@ export async function processDueDateReminders(
       status: { isCompletion: false },
     },
     include: {
-      assignees: { select: { userId: true } },
+      assignees: { select: { userId: true }, orderBy: { id: "asc" } },
       project: { select: { name: true, workspaceId: true } },
     },
   });

@@ -477,6 +477,7 @@ export async function getMyTasks(
       status: true,
       labels: { include: { label: true } },
       assignees: {
+        orderBy: { id: "asc" },
         include: {
           user: {
             select: { id: true, displayName: true, avatarUrl: true },
@@ -548,6 +549,7 @@ export async function searchTasks(
         status: true,
         labels: { include: { label: true } },
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },
@@ -578,6 +580,7 @@ export async function searchTasks(
           status: true,
           labels: { include: { label: true } },
           assignees: {
+            orderBy: { id: "asc" },
             include: {
               user: {
                 select: { id: true, displayName: true, avatarUrl: true },

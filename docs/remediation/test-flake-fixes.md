@@ -93,7 +93,10 @@ first, so its ID sorts first.
 the test checks (which stored references survive instantiation), and the
 sorted comparison still catches a missing, extra or duplicated assignee.
 Defining an order only for this endpoint would make it the one task
-endpoint with an order; see Limitations.
+endpoint with an order; see Limitations. That order is now defined for
+every assignee read ([task-assignee-order.md](task-assignee-order.md)),
+and the instantiation test expects the stored order: earliest assignment
+first.
 
 **Evidence.** With `TaskAssignee` filled with 30,000 valid assignments and
 analyzed (the planner then reads a task's assignees through the unique
@@ -244,11 +247,9 @@ mixes are the reproduction here, not an injected delay.
 
 ## Limitations
 
-- Task assignees still have no defined order in any endpoint. The calendar
-  colours an event by its first assignee and cards show the first three,
-  so the order shown can differ between a small and a large database. If
-  a fixed order is wanted, it belongs in every assignee `include`, as a
-  separate product change.
+- Task assignee order is defined in
+  [task-assignee-order.md](task-assignee-order.md). The first assignee is
+  the earliest assignment, and the calendar colour follows that assignee.
 - `recordQueries` relies on the pinned Prisma library engine reporting a
   statement before returning its result and delivering its log events in
   order. A Prisma upgrade that changes either would show up as a marker

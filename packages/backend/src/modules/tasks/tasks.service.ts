@@ -115,6 +115,9 @@ export async function listTasks(
 
   const include = {
     assignees: {
+      // TaskAssignee has no createdAt. The id is a cuid assigned at insert,
+      // so ascending id is the earliest assignment.
+      orderBy: { id: "asc" },
       include: {
         user: {
           select: { id: true, displayName: true, avatarUrl: true },
@@ -297,6 +300,7 @@ export async function createTask(
       },
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },
@@ -326,6 +330,7 @@ export async function getTask(
     where: { id: taskId },
     include: {
       assignees: {
+        orderBy: { id: "asc" },
         include: {
           user: {
             select: {
@@ -391,7 +396,7 @@ export async function updateTaskWithNotifications(
   actorRole = (await assertTaskEdit(prisma, taskId, actorId)).role;
   const existing = await prisma.task.findUnique({
     where: { id: taskId },
-    include: { assignees: true },
+    include: { assignees: { orderBy: { id: "asc" } } },
   });
   if (!existing) {
     throw new NotFoundError("Task not found");
@@ -484,6 +489,7 @@ export async function updateTaskWithNotifications(
       data: updateData,
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },
@@ -642,7 +648,7 @@ export async function moveTaskWithNotifications(
       ? await enqueueTaskNotification(tx, actorId, actorDisplayName, {
         kind: "status", task: updatedTask, statusName: updatedTask.status?.name || "new status",
         recipients: (await tx.taskAssignee.findMany({
-          where: { taskId }, select: { userId: true },
+          where: { taskId }, select: { userId: true }, orderBy: { id: "asc" },
         })).map((assignee) => assignee.userId),
       }) : [];
     return { result: { ...updatedTask, warning }, projectId: updatedTask.projectId, notificationDeliveryIds };
@@ -893,7 +899,7 @@ export async function bulkUpdateTasks(
         archived: true,
         createdAt: true,
         status: { select: { position: true } },
-        assignees: { select: { userId: true } },
+        assignees: { select: { userId: true }, orderBy: { id: "asc" } },
       },
     });
     if (tasks.length !== data.taskIds.length) {
@@ -1069,7 +1075,7 @@ export async function removeLabel(
   if (actorRole === "MEMBER") {
     const task = await prisma.task.findUnique({
       where: { id: taskId },
-      include: { assignees: true },
+      include: { assignees: { orderBy: { id: "asc" } } },
     });
     if (!task) {
       throw new NotFoundError("Task not found");
@@ -1107,7 +1113,7 @@ export async function duplicateTaskWithNotifications(
   const source = await prisma.task.findUnique({
     where: { id: taskId },
     include: {
-      assignees: true,
+      assignees: { orderBy: { id: "asc" } },
       labels: true,
       subtasks: { orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }] },
     },
@@ -1142,7 +1148,13 @@ export async function duplicateTaskWithNotifications(
       statusId = firstColumn.id;
     }
     const labelIds = await projectLabelIds(tx, source.projectId, source.labels.map((l) => l.labelId));
-    const assigneeIds = await projectAssigneeIds(tx, source.projectId, source.assignees.map((a) => a.userId));
+    const assigneeIds = await projectAssigneeIds(
+      tx,
+      source.projectId,
+      [...source.assignees]
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .map((a) => a.userId),
+    );
     const subtaskAssignees = new Set(await projectAssigneeIds(
       tx,
       source.projectId,
@@ -1172,6 +1184,7 @@ export async function duplicateTaskWithNotifications(
       },
       include: {
         assignees: {
+          orderBy: { id: "asc" },
           include: {
             user: {
               select: { id: true, displayName: true, avatarUrl: true },

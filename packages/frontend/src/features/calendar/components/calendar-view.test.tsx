@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { Task } from "@/features/tasks/api";
+import { getColor } from "@/components/shared/user-avatar";
 import { CalendarView } from "./calendar-view";
 
 const state = vi.hoisted(() => ({ tasks: [] as Task[] }));
@@ -78,4 +79,29 @@ it("shows the real FullCalendar event tooltip as literal text and destroys Tippy
   );
   expect(instance.state.isDestroyed).toBe(true);
   expect(document.querySelector(".tippy-content")).toBeNull();
+});
+
+it("colours the event from the earliest assignee, not the name that sorts first", () => {
+  const earliest = "Zoe Later";
+  const laterByAssignment = "Aaron First";
+  expect(laterByAssignment < earliest).toBe(true);
+  expect(getColor(earliest)).not.toBe(getColor(laterByAssignment));
+  state.tasks = [
+    {
+      ...state.tasks[0],
+      assignees: [
+        { userId: "zoe", user: { id: "zoe", displayName: earliest, avatarUrl: null } },
+        { userId: "aaron", user: { id: "aaron", displayName: laterByAssignment, avatarUrl: null } },
+      ],
+    } as unknown as Task,
+  ];
+  const { container } = render(
+    <CalendarView projectId="project" editable={false} onTaskClick={() => {}} />,
+  );
+  const event = container.querySelector(".fc-event") as HTMLElement;
+  const avatar = event.querySelector(`[aria-label="${earliest}"]`);
+  expect(avatar).not.toBeNull();
+  expect(event.querySelector(`[aria-label="${laterByAssignment}"]`)).toBeNull();
+  expect(avatar?.className).toContain(getColor(earliest));
+  expect(avatar?.className).not.toContain(getColor(laterByAssignment));
 });

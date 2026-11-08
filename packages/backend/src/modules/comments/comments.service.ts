@@ -88,7 +88,7 @@ export async function createComment(
         id: true,
         projectId: true,
         title: true,
-        assignees: { select: { userId: true } },
+        assignees: { select: { userId: true }, orderBy: { id: "asc" } },
       },
     });
     if (!task) throw new NotFoundError("Task not found");

@@ -282,10 +282,12 @@ test("templates validate stored references and explicit instantiation overrides"
   const legacyTask = fromLegacy.json().data;
   assert.equal(legacyTask.status.id, status.P.id);
   assert.deepEqual(legacyTask.labels.map((l) => l.labelId), [label.P.id]);
-  // A task's assignees have no defined order (none of the task endpoints
-  // orders them; this one follows whatever plan reads TaskAssignee), so
-  // compare them sorted: exactly the valid stored assignees, once each.
-  assert.deepEqual(legacyTask.assignees.map((a) => a.userId).sort(), [users.MEMBER.id, users.ADMIN.id].sort());
+  // Earliest assignment first: the stored list is MEMBER, then ADMIN.
+  assert.deepEqual(legacyTask.assignees.map((a) => a.userId), [users.MEMBER.id, users.ADMIN.id]);
+  assert.deepEqual(
+    legacyTask.assignees.map((a) => a.id),
+    [...legacyTask.assignees.map((a) => a.id)].sort(),
+  );
   // An editor round trip resubmits exactly what it was shown and keeps every valid reference.
   const resaved = await req("MEMBER", "PATCH", `${templateUrl}/${legacy.id}`, { name: "Legacy template saved", ...valid });
   assert.equal(resaved.statusCode, 200, resaved.body);

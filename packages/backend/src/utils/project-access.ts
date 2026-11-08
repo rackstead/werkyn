@@ -51,7 +51,7 @@ export async function assertTaskEdit(
 ) {
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    select: { id: true, projectId: true, assignees: { select: { userId: true } } },
+    select: { id: true, projectId: true, assignees: { select: { userId: true }, orderBy: { id: "asc" } } },
   });
   if (!task) throw new NotFoundError("Task not found");
   const access = await assertProjectAccess(prisma, task.projectId, userId);

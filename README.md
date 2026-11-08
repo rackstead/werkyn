@@ -120,16 +120,17 @@ the server prints at startup (for the default schema: `DROP INDEX
 `public` if it sets one). Until then the server's searches avoid them; it
 notices the drop within a minute, without a restart. If the startup check
 cannot read the catalogs, searches avoid the trigram indexes until a check
-succeeds. Each process rechecks about once a minute while it is avoiding
-them, and a healthy server that passed its first check does not keep
-rechecking. That fallback is not merely as slow as main: turning bitmap
-scans off also disables main's own btree bitmap plans. On the reviewed
-fixture, global no-match search was about 124 ms in the fallback, versus
-11 ms indexed and 64 ms on main. Those figures are that fixture's, not a
-new benchmark. When a failed check later succeeds, the server logs once
-that the fallback ended and indexed plans are in use again. See
-[P02c](docs/remediation/p02c.md), including how to recover a failed migration
-and how to build the indexes beforehand without blocking writes.
+succeeds. Each process rechecks about once a minute only while it is
+avoiding them. A healthy server that passed its first check does not keep
+rechecking. Bitmap scans are off for every search statement, which also
+turns off main's own btree bitmap plans, so the fallback is not merely as
+slow as main. On the reviewed fixture (those measurements, not a new
+benchmark) global no-match search was about 124 ms in the fallback, versus
+11 ms indexed and 64 ms on main. When a check has failed and a later check
+succeeds, the server logs once that the fallback ended and indexed plans
+are in use again. The same statement is under "What operators need to know"
+in [P02c](docs/remediation/p02c.md), which also covers a failed migration
+and building the indexes beforehand without blocking writes.
 
 ## Features
 

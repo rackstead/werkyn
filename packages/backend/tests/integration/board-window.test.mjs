@@ -20,6 +20,7 @@ const { startRefreshSession } = await import("../../src/modules/auth/refresh-ses
 const BIG = 2000;
 let app;
 let token;
+let userId;
 let workspace;
 let project;
 let open;
@@ -42,6 +43,7 @@ before(async () => {
   const user = await app.prisma.user.create({
     data: { email: `board-window-${suffix}@example.test`, displayName: "Board", emailVerified: true },
   });
+  userId = user.id;
   const session = await startRefreshSession(app.prisma, user.id);
   const signedIn = await app.inject({
     method: "POST",
@@ -98,6 +100,8 @@ before(async () => {
 
 after(async () => {
   if (workspace) await app.prisma.workspace.delete({ where: { id: workspace.id } }).catch(() => {});
+  // Bootstrap tests in this suite require an empty user table.
+  if (userId) await app.prisma.user.delete({ where: { id: userId } }).catch(() => {});
   await app?.close();
   await rm(storageDir, { recursive: true, force: true });
 });

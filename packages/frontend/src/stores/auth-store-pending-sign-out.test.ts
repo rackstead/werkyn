@@ -52,11 +52,13 @@ interface Call {
   token: string | null;
   body: unknown;
   recoveryHeader: string | null;
+  completionHeader: string | null;
   cookie: string | null;
 }
 let calls: Call[];
 type Route = (call: Call) => Response | Promise<Response>;
 let routes: Map<string, Route>;
+let oidcProof: { attemptId: string; familyId: string } | null;
 
 function json(status: number, body?: unknown) {
   return new Response(body === undefined ? null : JSON.stringify(body), {
@@ -155,6 +157,13 @@ const defaultRoutes: Record<string, Route> = {
     revoke(family);
     return json(200, { data: { status: "revoked" } });
   },
+  "auth/oidc/complete-session": ({ body, completionHeader, cookie: sent }) => {
+    const family = familyOf(sent);
+    if (completionHeader !== "1") return json(403, {});
+    if (!oidcProof || oidcProof.attemptId !== (body as { attemptId: string }).attemptId ||
+        !family || family.revoked || family.id !== oidcProof.familyId) return json(409, {});
+    return json(200, sessionBody(family));
+  },
 };
 
 const fetchMock = vi.fn(
@@ -169,6 +178,7 @@ const fetchMock = vi.fn(
         request.headers.get("Authorization")?.replace(/^Bearer /, "") ?? null,
       body: text ? JSON.parse(text) : undefined,
       recoveryHeader: request.headers.get("X-Werkyn-Session-Recovery"),
+      completionHeader: request.headers.get("X-Werkyn-OIDC-Completion"),
       cookie,
     };
     calls.push(call);
@@ -280,7 +290,9 @@ beforeEach(() => {
   offline = false;
   calls = [];
   routes = new Map();
+  oidcProof = null;
   localStorage.clear();
+  sessionStorage.clear();
 });
 
 afterEach(async () => {
@@ -292,6 +304,127 @@ afterEach(async () => {
 });
 
 // ─── Scenarios ──────────────────────────────────────────
+
+describe("sign-out recovery follow-ups", () => {
+  it("never adopts a recorded session returned to a different still-open identity", async () => {
+    const lateTab = await openTab();
+    await run(lateTab.whenLoggedOut());
+    const response = await fetch("http://localhost/api/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "alice@example.test", password: "x" }),
+    });
+    const late = (await response.json()).data;
+    const other = await openTab();
+    const bob = await signInWithForm(other, "bob");
+    offline = true;
+    await run(other.useAuthStore.getState().logout());
+    offline = false;
+    lateTab.useAuthStore.getState().setAuth(late.user, late.accessToken, []);
+    await deliverMessages();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(await run(lateTab.useAuthStore.getState().refresh())).toBe(false);
+    expect(lateTab.useAuthStore.getState().user).toBeNull();
+    await deliverMessages();
+    expect(other.useAuthStore.getState().user).toBeNull();
+    expect(pendingKeys()).toHaveLength(1);
+    expect(families.get(bob)!.revoked).toBe(false);
+  });
+
+  it("keeps an unfinished sign-out when only the client clock jumps forward", async () => {
+    const { tab, family } = await signedInTab("alice");
+    offline = true;
+    await run(tab.useAuthStore.getState().logout());
+    offline = false;
+    routes.set("auth/logout/recover", () => json(500, {}));
+    vi.setSystemTime(Date.now() + 40 * 24 * 60 * 60 * 1000);
+    const reloaded = await load();
+    expect(reloaded.useAuthStore.getState().user).toBeNull();
+    expect(pendingKeys()).toHaveLength(1);
+    expect(family.revoked).toBe(false);
+  });
+});
+
+describe("proof-bound SSO completion", () => {
+  async function interruptedSso() {
+    const { tab, family: old } = await signedInTab("alice");
+    offline = true;
+    await run(tab.useAuthStore.getState().logout());
+    offline = false;
+    routes.set("auth/logout/recover", () => json(500, {}));
+    await run(tab.whenLoggedOut());
+    const { beginOidcSignIn } = await import("@/lib/oidc-sign-in");
+    const attemptId = beginOidcSignIn()!;
+    const { family: fresh } = serverSignIn("bob");
+    oidcProof = { attemptId, familyId: fresh.id };
+    const complete = await load();
+    expect(complete.useAuthStore.getState().user).toBeNull();
+    return { complete, old, fresh, attemptId };
+  }
+
+  it("finishes a new SSO sign-in while an old recovery is refused, without refreshing its cookie", async () => {
+    const { complete, old, fresh } = await interruptedSso();
+    const before = cookie;
+    const from = calls.length;
+    expect(await complete.completeOidcSignIn()).toBe(true);
+    expect(complete.useAuthStore.getState().user?.id).toBe("bob");
+    expect(sidOf(complete.useAuthStore.getState().accessToken)).toBe(fresh.id);
+    expect(paths(from)).toEqual(["auth/oidc/complete-session"]);
+    expect(pendingKeys()).toHaveLength(0);
+    expect(cookie).toBe(before);
+    expect(old.revoked).toBe(false);
+    expect(fresh.revoked).toBe(false);
+  });
+
+  it("keeps the sign-out and restores nothing when the current cookie does not match the SSO proof", async () => {
+    const { complete } = await interruptedSso();
+    const { family: other } = serverSignIn("alice");
+    const from = calls.length;
+    expect(await complete.completeOidcSignIn()).toBe(false);
+    expect(complete.useAuthStore.getState().user).toBeNull();
+    expect(pendingKeys()).toHaveLength(1);
+    expect(other.revoked).toBe(false);
+    expect(paths(from)).toEqual(["auth/oidc/complete-session"]);
+  });
+
+  it("keeps a sign-out of the new SSO family made after its redirect snapshot", async () => {
+    const { complete, fresh } = await interruptedSso();
+    const { recordPendingSignOut } = await import("@/lib/pending-sign-out");
+    recordPendingSignOut(fresh.id, "bob");
+    expect(await complete.completeOidcSignIn()).toBe(false);
+    expect(complete.useAuthStore.getState().user).toBeNull();
+    expect(pendingKeys()).toHaveLength(1);
+    expect(pendingKeys()[0]).toContain(fresh.id);
+    expect(fresh.revoked).toBe(false);
+  });
+
+  it("cannot replace a later identity with a delayed SSO completion response", async () => {
+    const { complete } = await interruptedSso();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    routes.set("auth/oidc/complete-session", async (call) => {
+      const response = defaultRoutes["auth/oidc/complete-session"](call);
+      await held;
+      return response;
+    });
+    const completing = complete.completeOidcSignIn();
+    await vi.advanceTimersByTimeAsync(0);
+    const newer = serverSignIn("alice");
+    complete.useAuthStore.getState().setAuth(newer.session.user, newer.session.accessToken, []);
+    release();
+    expect(await completing).toBe(false);
+    expect(complete.useAuthStore.getState().user?.id).toBe("alice");
+    expect(sidOf(complete.useAuthStore.getState().accessToken)).toBe(newer.family.id);
+    expect(newer.family.revoked).toBe(false);
+  });
+
+  it("falls back to ordinary refresh for a legacy callback with no local attempt", async () => {
+    const { family } = serverSignIn("bob");
+    const tab = await openTab();
+    expect(await tab.completeOidcSignIn()).toBe(true);
+    expect(sidOf(tab.useAuthStore.getState().accessToken)).toBe(family.id);
+    expect(paths()).toEqual(["auth/refresh"]);
+  });
+});
 
 describe("a sign-out whose request fails", () => {
   it("is completed by the next page load, which revokes the session and stays signed out", async () => {
@@ -697,7 +830,7 @@ describe("the pending sign-out record", () => {
     expect(pendingKeys()).toHaveLength(0);
   });
 
-  it("expires after the longest lifetime a refresh token can have", async () => {
+  it("retires an old record after the server confirms that the cookie is absent", async () => {
     const { tab, family } = await signedInTab("alice");
     offline = true;
     await run(tab.useAuthStore.getState().logout());
@@ -710,7 +843,7 @@ describe("the pending sign-out record", () => {
     const reloaded = await load();
     expect(reloaded.useAuthStore.getState().user).toBeNull();
     expect(pendingKeys()).toHaveLength(0);
-    expect(paths(from)).not.toContain("auth/logout/recover");
+    expect(paths(from)[0]).toBe("auth/logout/recover");
     expect(family.revoked).toBe(false);
   });
 });

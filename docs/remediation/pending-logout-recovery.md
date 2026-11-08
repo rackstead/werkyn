@@ -9,7 +9,18 @@ any session.
 
 `POST /api/auth/logout/recover` is the server side: it lets a browser retry
 ending one known sign-in session without changing its current cookie. Ordinary
-logout and refresh keep their existing behavior.
+logout with a current access token and refresh keep their existing behavior.
+
+An expired, signature-verified access JWT may also select its own family for
+`POST /api/auth/logout`. This branch requires the existing refresh cookie to
+prove that exact family and checks the JWT's subject against its locked owner.
+It returns 204 without setting or clearing a cookie, including when the cookie
+is absent or belongs to a newer sign-in. It never grants API access, rotates a
+token, or renews a lifetime. Forged, malformed, not-yet-valid, and sessionless
+expired tokens remain refused. This lets a user finish an expired-token
+sign-out even on a page origin not configured for background recovery, without
+the unsafe refresh-then-logout fallback. The recovery route's Origin and
+custom-header requirements below are unchanged.
 
 ## Request and credential boundary
 
@@ -60,8 +71,9 @@ with the existing 4005 session-revoked code. This does not add cross-process
 socket coordination or cancel requests already admitted by authentication.
 Unrelated families and API keys retain their existing policies and lifetimes.
 There is no account-wide revocation, schema change, global CORS change, or new
-cookie policy. Ordinary logout remains cookie-centric and retains its existing
-cookie clearing behavior even if revocation fails.
+cookie policy. Ordinary logout with a current token remains cookie-centric and
+retains its existing cookie clearing behavior even if revocation fails. The
+expired-token branch is family-conditional and never changes cookies.
 
 ## Verification
 
@@ -119,16 +131,21 @@ replaced the cookie. It is never compared
 by account or by time. Every sign-in starts a new family, and the recorded
 family is revoked only when the cookie the browser sends at that moment
 proves it, so a stale record cannot end a sign-in made after it, in this tab or
-another, even by the same account. When the access token has already expired
-(ordinary sign-out answers 401), the sign-out request itself also uses
-conditional recovery, instead of exchanging the cookie for a new token and
-signing out with that; only a token without a session id, from an earlier
-server, still takes that older path.
+another, even by the same account. When the access token has already expired,
+the logout route uses its verified session selector and the matching cookie as
+described above. A client talking to an older server that answers 401 still
+tries conditional recovery; only a token without a session id, from an earlier
+server, takes the older refresh-then-logout path.
 
 **Cross-tab.** Records are shared by every tab of the origin. A tab that
 reloads after another tab's failed sign-out completes it first. A tab that
 missed the sign-out announcement and still holds the session ends it at its
-next refresh instead of renewing it. Completion in several tabs at once is
+next refresh. A late sign-in can leave a different family in memory than the
+one the cookie proves; a refresh response naming a recorded family is also
+refused before it is applied or announced. A broadcast cannot adopt a recorded
+family either. A rotation may already have happened before its returned
+family is known, so the record continues blocking that family until it is
+settled. Completion in several tabs at once is
 safe: each request is settled with `revoked` or `absent`, and none sets a
 cookie. When a sign-in races a completion, the completion carried either the
 old cookie (and revoked only the old session) or the new one (and is told
@@ -138,19 +155,36 @@ overwrite the new one.
 **Bounds.** At most eight records per API are kept, oldest dropped first:
 while a record is pending no session is restored, so a later record follows a
 new sign-in, which replaced the cookie, and older records can no longer match
-it. A record expires eight days after it was written (the seven-day
-refresh-token lifetime plus a day). No tab renews a recorded session, so an
-expired record names a session that can no longer be used from this browser.
+it. A client-clock jump never expires a record: the browser clock cannot prove
+that the server's cookie or family expired. Server settlement or a proven
+replacing sign-in retires it instead, and the eight-record cap bounds storage.
+
+**Single sign-on.** New SSO redirects include an opaque `client_attempt` UUID
+and keep this tab's pre-redirect record snapshot in sessionStorage, scoped to
+the API base. The existing OIDC callback stores a signed, HttpOnly completion
+proof binding that attempt to its newly created family. The completion page
+uses `POST /api/auth/oidc/complete-session`, not ordinary refresh, to obtain a
+session for that proof and the current cookie. Only a successful proof retires
+the snapshotted old records; a record of the new family made while sign-in was
+in flight is kept and prevents adoption. The operation does not rotate or
+change cookies, and failed proof never falls back to ordinary restoration.
+This gives SSO-only installations a fresh-sign-in escape when old recovery is
+unavailable. The server controls proof expiry (60 seconds); there is no local
+wall-clock expiry. A later identity change also prevents a delayed completion
+response from being applied.
 
 **Limits.** Without localStorage (blocked, or quota exhausted) nothing is
 durable and a failed sign-out behaves as before. While a record cannot be
 settled (the server is unreachable, or refuses recovery, for example when the
-page's origin is not `FRONTEND_URL` or in `CORS_ORIGIN`), page loads restore
-nothing, and that includes single sign-on completion, which restores the new
-session the same way; a password sign-in clears it, and so does recovery
-succeeding or the record expiring. `superseded`, `absent` and a replacing
+page's origin is not `FRONTEND_URL` or in `CORS_ORIGIN`), ordinary page loads
+restore nothing. A password sign-in or valid new SSO completion can replace it,
+as can recovery succeeding. Configure `FRONTEND_URL` and `CORS_ORIGIN` for the
+actual frontend origin on every installation, including HTTP LAN installs;
+the OIDC proof endpoint retains its trusted-Origin check. If sessionStorage is
+unavailable, SSO uses the legacy completion path, which still fails closed
+while an old record cannot settle. `superseded`, `absent` and a replacing
 sign-in do not revoke the old family on the server (a password sign-in of the
 same account ends that account's other sessions anyway). It stays valid until
 it expires, but this browser no longer holds a cookie for it. Tabs still
-running an earlier build ignore records. OIDC completion, invitation redirects
-and the cookie rules above are unchanged.
+running an earlier build ignore records. Legacy OIDC callbacks and invitation
+redirects retain their prior behavior.

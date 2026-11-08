@@ -16,6 +16,7 @@ import {
 import oidcRoutes from "./oidc/oidc.routes.js";
 import { validate } from "../../middleware/validate.js";
 import { authenticate } from "../../middleware/authenticate.js";
+import { authenticateLogout } from "./logout-authentication.js";
 import {
   RecoverLogoutSchema,
   requireLogoutRecoveryRequest,
@@ -110,7 +111,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "POST",
     url: "/logout",
-    preHandler: [authenticate],
+    preHandler: [authenticateLogout],
     handler: logoutHandler,
   });
 

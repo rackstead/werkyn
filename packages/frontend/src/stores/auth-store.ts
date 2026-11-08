@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { apiUrl } from "@/lib/api-url";
-import { changeIdentity, identityGeneration } from "@/lib/identity";
+import { changeIdentity, identityGeneration, identitySignal } from "@/lib/identity";
+import { clearOidcSignIn, oidcSignInAttempt } from "@/lib/oidc-sign-in";
 import {
   clearPendingSignOut,
   hasPendingSignOut,
@@ -563,6 +564,13 @@ async function recoverSession(
 export const useAuthStore = create<AuthState>((set, get) => {
   /** Applies a session; an account change resets everything held for the previous one. */
   function applySession(session: Session, epoch: Epoch) {
+    // A late sign-in can leave one family in memory while another family's
+    // cookie is in the browser. Check the returned family, not only the one
+    // this tab held before refreshing, and never publish a signed-out one.
+    if (hasPendingSignOut(sessionIdOf(session.accessToken))) {
+      endSession(epoch);
+      return false;
+    }
     supersededSince = null;
     set({
       user: session.user,
@@ -570,6 +578,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
       workspaces: session.workspaces,
     });
     announce({ type: "refresh", epoch, data: session });
+    return true;
   }
 
   /** Clears the session here and tells other tabs at `epoch` or older. */
@@ -599,6 +608,13 @@ export const useAuthStore = create<AuthState>((set, get) => {
       const { user, accessToken, workspaces } = message.data;
       // Unordered (earlier build): it may only renew this account's token.
       if (legacy && get().user?.id !== user.id) return;
+      const sessionId = sessionIdOf(accessToken);
+      if (hasPendingSignOut(sessionId)) {
+        if (sessionIdOf(get().accessToken) === sessionId)
+          get().expireSession(identityGeneration());
+        wakeRefreshWaiters();
+        return;
+      }
       lastRefreshTime = Date.now();
       supersededSince = null;
       set({ user, accessToken, workspaces });
@@ -744,8 +760,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
             get().user?.id === session.user.id
               ? knownEpoch
               : advanceEpoch(startedAt);
-          applySession(session, epoch);
-          return true;
+          return applySession(session, epoch);
         } catch {
           // A sign-out aborts the refreshes it overtakes.
           return isStale(start) ? overtaken() : false;
@@ -800,3 +815,31 @@ useAuthStore.subscribe((state, previous) => {
   changeIdentity(previousUserId, userId);
   wakeRefreshWaiters();
 });
+
+/** Completes only the SSO attempt whose signed proof matches this cookie. */
+export async function completeOidcSignIn(): Promise<boolean> {
+  const attempt = oidcSignInAttempt();
+  if (!attempt) return useAuthStore.getState().refresh();
+  const start: RefreshStart = { generation: identityGeneration(), epoch: knownEpoch };
+  try {
+    const response = await fetch(apiUrl("auth/oidc/complete-session"), {
+      method: "POST", credentials: "include", signal: identitySignal(),
+      headers: { "Content-Type": "application/json", "X-Werkyn-OIDC-Completion": "1" },
+      body: JSON.stringify({ attemptId: attempt.attemptId }),
+    });
+    if (!response.ok || isStale(start)) return false;
+    const body = (await response.json()) as { data?: Session };
+    if (isStale(start)) return false;
+    const session = body.data;
+    if (!session || typeof session.user?.id !== "string" ||
+        !Array.isArray(session.workspaces) || !sessionIdOf(session.accessToken)) return false;
+    // Proof of a new completed sign-in replaces only its pre-redirect records.
+    // A sign-out made while that request was in flight remains authoritative.
+    recordedBeforeSignIn = attempt.sessionIds;
+    useAuthStore.getState().setAuth(session.user, session.accessToken, session.workspaces);
+    clearOidcSignIn(attempt.attemptId);
+    return useAuthStore.getState().accessToken === session.accessToken;
+  } catch {
+    return false;
+  }
+}

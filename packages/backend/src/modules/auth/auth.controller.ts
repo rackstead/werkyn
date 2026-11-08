@@ -2,6 +2,10 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import type { ResendVerificationInput } from "@pm/shared";
 import * as authService from "./auth.service.js";
 import { env } from "../../config/env.js";
+import { AppError } from "../../utils/errors.js";
+import { endSessions } from "../realtime/realtime.service.js";
+import { expiredLogoutProof } from "./logout-authentication.js";
+import { isBusy, revokeMatchingRefreshFamily } from "./refresh-sessions.js";
 import {
   LOGIN_DEVICE_COOKIE,
   LOGIN_DEVICE_COOKIE_PATH,
@@ -118,6 +122,22 @@ export async function logoutHandler(
   reply: FastifyReply,
 ) {
   const rawToken = request.cookies.refresh_token;
+  const expired = expiredLogoutProof(request);
+  if (expired) {
+    // Expiry no longer grants API access, but its verified signature plus a
+    // matching cookie may still end that exact owned session. Never mutate
+    // cookies here: another sign-in can replace one while this request runs.
+    try {
+      const result = await revokeMatchingRefreshFamily(
+        request.server.prisma, rawToken, expired.sessionId, expired.userId,
+      );
+      if (result.status === "revoked") endSessions([result.familyId]);
+    } catch (error) {
+      if (isBusy(error)) throw new AppError(503, "Service Unavailable", "Sign-out is busy. Try again in a moment.");
+      throw error;
+    }
+    return reply.status(204).send();
+  }
   // The browser drops the cookie even when revoking its family fails; the
   // error is still reported.
   clearRefreshCookie(reply);

@@ -39,6 +39,35 @@ export function resetTransporter() {
   transporter = undefined;
 }
 
+function configuredHost(value: string | null | undefined): string | undefined {
+  const host = value?.trim();
+  return host ? host : undefined;
+}
+
+/**
+ * True when account mail can be sent without the development-only Ethereal
+ * inbox. A database host wins, then SMTP_HOST. A read failure falls through
+ * to the environment the same way delivery does.
+ */
+export async function mailDeliveryConfigured(prisma?: PrismaClient): Promise<boolean> {
+  const db = prisma ?? prismaRef;
+  if (db) {
+    try {
+      const config = await db.emailConfig.findUnique({
+        where: { id: "singleton" },
+        select: { host: true },
+      });
+      if (configuredHost(config?.host)) return true;
+    } catch (error) {
+      logger.warn(
+        { database: describeMailConfigFailure(error) },
+        "Failed to read email config while checking delivery",
+      );
+    }
+  }
+  return Boolean(configuredHost(env.SMTP_HOST));
+}
+
 async function getTransporter(): Promise<{
   transport: Transporter;
   source: MailTransportSource;
@@ -52,14 +81,15 @@ async function getTransporter(): Promise<{
         where: { id: "singleton" },
       });
 
-      if (dbConfig && dbConfig.host) {
+      const dbHost = configuredHost(dbConfig?.host);
+      if (dbConfig && dbHost) {
         const options: TransportOptions & {
           host: string;
           port: number;
           secure: boolean;
           auth?: { user: string; pass: string };
         } = {
-          host: dbConfig.host,
+          host: dbHost,
           port: dbConfig.port,
           secure: dbConfig.secure,
         };
@@ -79,15 +109,16 @@ async function getTransporter(): Promise<{
     }
   }
 
-  // 2. Env var fallback
-  if (env.SMTP_HOST) {
+  // 2. Env var fallback. Whitespace is not a host.
+  const smtpHost = configuredHost(env.SMTP_HOST);
+  if (smtpHost) {
     const options: TransportOptions & {
       host: string;
       port: number;
       secure: boolean;
       auth?: { user: string; pass: string };
     } = {
-      host: env.SMTP_HOST,
+      host: smtpHost,
       port: env.SMTP_PORT,
       secure: env.SMTP_SECURE,
     };

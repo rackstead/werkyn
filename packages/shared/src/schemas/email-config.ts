@@ -44,7 +44,7 @@ export const SenderAddressSchema = z
   .transform((value) => value.trim());
 
 export const UpdateEmailConfigSchema = z.object({
-  host: z.string().max(255).optional(),
+  host: z.string().trim().max(255).optional(),
   port: z.coerce.number().int().min(1).max(65535).optional(),
   secure: z.boolean().optional(),
   user: z.string().max(255).optional(),

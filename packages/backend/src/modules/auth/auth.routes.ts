@@ -11,7 +11,9 @@ import {
 } from "./auth.controller.js";
 import {
   drainPasswordResetRequests,
+  drainRegistrationPrivacyWork,
   passwordResetDrainDeadline,
+  registrationPrivacyDrainDeadline,
 } from "./auth.service.js";
 import oidcRoutes from "./oidc/oidc.routes.js";
 import { validate } from "../../middleware/validate.js";
@@ -31,12 +33,14 @@ import {
 } from "@pm/shared";
 
 export default async function authRoutes(fastify: FastifyInstance) {
-  // Password-reset requests answered before their work finished complete
-  // before the database connection closes (hooks close in reverse order of
-  // registration, and the Prisma plugin registers first), until the
-  // shutdown deadline; work still running then is logged.
+  // Password-reset and privacy-preserving registration requests answered
+  // before their work finished complete before the database connection closes
+  // (hooks close in reverse order of registration, and the Prisma plugin
+  // registers first), until the shutdown deadline; work still running then
+  // is logged.
   fastify.addHook("onClose", async () => {
     await drainPasswordResetRequests(passwordResetDrainDeadline());
+    await drainRegistrationPrivacyWork(registrationPrivacyDrainDeadline());
   });
 
   // OIDC sub-routes

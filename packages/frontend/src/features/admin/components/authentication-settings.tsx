@@ -23,6 +23,10 @@ import {
   useDeleteSsoConnector,
   type SsoConnector,
 } from "../sso-api";
+import {
+  useRegistrationConfig,
+  useUpdateRegistrationConfig,
+} from "../registration-api";
 
 const CONNECTOR_TYPES = [
   { value: "oidc", label: "OIDC (Generic)" },
@@ -94,6 +98,57 @@ const CONNECTOR_FIELDS: Record<string, Array<{ key: string; label: string; type?
   ],
 };
 
+function RegistrationPrivacySetting() {
+  const { data } = useRegistrationConfig();
+  const update = useUpdateRegistrationConfig();
+  const config = data?.data;
+  // The config route is instance-admin only. Hide the control when this
+  // session cannot read it (a workspace admin who is not an instance admin).
+  if (!config) return null;
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <h3 className="text-lg font-medium">Registration</h3>
+        <p className="text-sm text-muted-foreground">
+          Off by default. A new account can sign in immediately, and an
+          address that is already registered is reported as in use. Leave this
+          off when the host has no email delivery.
+        </p>
+      </div>
+      <label className="flex items-center gap-3 cursor-pointer">
+        <input
+          id="privacy-preserving-registration"
+          type="checkbox"
+          checked={config.privacyPreserving}
+          disabled={update.isPending}
+          onChange={() =>
+            update.mutate(
+              { privacyPreserving: !config.privacyPreserving },
+              {
+                onSuccess: () => toast.success("Registration settings updated"),
+                onError: (err) => toast.error(err.message),
+              },
+            )
+          }
+          className="rounded"
+        />
+        <div>
+          <p className="text-sm font-medium">
+            Require email verification before sign-in
+          </p>
+          <p className="text-xs text-muted-foreground">
+            When on, new and existing addresses get the same response. A new
+            account is not signed in until the address is verified, and an
+            existing account is left unchanged. Configure email delivery
+            before turning this on.
+          </p>
+        </div>
+      </label>
+    </div>
+  );
+}
+
 export function AuthenticationSettings() {
   const { data: configData } = useSsoConfig();
   const { data: connectorsData } = useSsoConnectors();
@@ -147,6 +202,7 @@ export function AuthenticationSettings() {
 
   return (
     <div className="space-y-8">
+      <RegistrationPrivacySetting />
       {/* SSO Toggle & Settings */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">

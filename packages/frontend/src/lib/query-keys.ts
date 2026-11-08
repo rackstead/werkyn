@@ -67,6 +67,7 @@ export const queryKeys = {
   userRates: (wid: string) => ["user-rates", { wid }] as const,
   userRate: (wid: string, uid: string) => ["user-rates", { wid, uid }] as const,
   emailConfig: ["email-config"] as const,
+  registrationConfig: ["registration-config"] as const,
   ssoInfo: ["sso-info"] as const,
   ssoConfig: ["sso-config"] as const,
   ssoConnectors: ["sso-connectors"] as const,

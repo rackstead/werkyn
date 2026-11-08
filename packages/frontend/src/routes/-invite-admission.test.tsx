@@ -293,6 +293,26 @@ it("routes registration by its explicit admission result", async () => {
   }
 });
 
+it("does not sign in when registration returns the generic verification response", async () => {
+  respond("POST", "/api/auth/register", () =>
+    json(200, {
+      message:
+        "If the address is available, a verification link has been sent. Verify your email before signing in.",
+    }),
+  );
+  const { result } = renderHook(() => useRegister("invite-token"), { wrapper });
+  await act(() =>
+    result.current.mutateAsync({
+      displayName: "New",
+      email: "new@example.test",
+      password: "Password-123",
+    }),
+  );
+  expect(useAuthStore.getState().user).toBeNull();
+  expect(useAuthStore.getState().accessToken).toBeNull();
+  expect(state.navigate).not.toHaveBeenCalled();
+});
+
 it("continues from email verification only to the fixed invitation route", async () => {
   respond("POST", "/api/auth/verify-email/verify-token", () =>
     json(200, { data: { user: user("applicant") } }),

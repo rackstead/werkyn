@@ -51,6 +51,7 @@ import wikiRoutes from "./modules/wiki/wiki.routes.js";
 import timeRoutes from "./modules/time/time.routes.js";
 import ssoRoutes from "./modules/sso/sso.routes.js";
 import emailRoutes from "./modules/email/email.routes.js";
+import registrationRoutes from "./modules/registration/registration.routes.js";
 import chatRoutes from "./modules/chat/chat.routes.js";
 import backupRoutes from "./modules/backup/backup.routes.js";
 import { broadcast, broadcastToWorkspace, broadcastToUser, broadcastToChannel } from "./modules/realtime/realtime.service.js";
@@ -116,6 +117,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await app.register(timeRoutes, { prefix: "/api" });
   await app.register(ssoRoutes, { prefix: "/api/admin/sso" });
   await app.register(emailRoutes, { prefix: "/api/admin/email" });
+  await app.register(registrationRoutes, { prefix: "/api/admin/registration" });
   await app.register(chatRoutes, { prefix: "/api/chat" });
   await app.register(backupRoutes, { prefix: "/api/workspaces" });
 

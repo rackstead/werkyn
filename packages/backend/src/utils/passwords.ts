@@ -45,11 +45,26 @@ function unavailable() {
   return new AppError(503, "Service Unavailable", "Password checks are temporarily unavailable. Try again.");
 }
 
+/** Tests pause a job after it takes a slot and before the native work. */
+let passwordAdmissionHold: Promise<void> | undefined;
+
+export function setPasswordAdmissionHold(hold: Promise<void> | undefined) {
+  passwordAdmissionHold = hold;
+}
+
+export function passwordAdmissionsInUse() {
+  return active;
+}
+
 /** No waiting native-job queue; keep the permit until the actual job settles. */
 async function admitted<T>(operation: "argon2_hash" | "argon2_verify" | "bcrypt_verify", work: () => Promise<T>): Promise<T> {
   if (active >= MAX_ACTIVE) throw unavailable();
   active++;
-  try { return await work(); }
+  const hold = passwordAdmissionHold;
+  try {
+    if (hold) await hold;
+    return await work();
+  }
   catch {
     // Native error text can contain inputs; keep the diagnostic fixed and local.
     logger.error({ event: "password_native_work_failed", operation }, "Password operation failed");

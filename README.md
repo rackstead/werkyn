@@ -460,8 +460,11 @@ verification or approval is pending, and `403`/`404`/`410` when denied.
 account without writing anything: `not_pending` when approval is required and
 there is no membership and no pending request (for example, after a request was
 declined), or `ready` when approval is not required and the account can join.
-`POST /api/auth/register` always keeps the new account and reports the result in
-`data.admission`; a verification email sent because of an invitation links back
+`POST /api/auth/register` keeps the new account. Unless an instance
+administrator enables privacy-preserving registration (off by default; see
+[docs/remediation/a17-registration-privacy.md](docs/remediation/a17-registration-privacy.md)),
+it signs that account in immediately and reports invite admission in
+`data.admission`. A verification email sent because of an invitation links back
 to that invitation. Open invitations without an email or domain restriction still
 admit unverified accounts. The workspace's default role setting does not change
 the role granted by an invitation.

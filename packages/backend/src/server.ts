@@ -29,7 +29,8 @@ async function start() {
     // (an ICU database); checked before serving, so no search reads indexes
     // that would drop matches. While searches avoid the indexes (the check
     // failed, or restored indexes on an ICU database), it is repeated every
-    // minute until they no longer have to.
+    // minute until they no longer have to. A failed check that later
+    // succeeds logs once that indexed plans are in use again.
     const searchIndexCheck = await startSearchIndexCheck(
       app.prisma,
       app.log,

@@ -89,6 +89,72 @@ export function dropPositionFromOver(
   };
 }
 
+/**
+ * Drop position after a drag preview. dnd-kit often reports the dragged card
+ * as the target once the preview has moved it under the pointer. That is
+ * still a move: the live order says where it landed. The index is the
+ * following card's place in the whole column (the column size when the card
+ * is last), not an index into the mounted window.
+ */
+export function resolveBoardDrop(
+  snapshot: readonly BoardDropColumn[],
+  liveOrders: ReadonlyMap<string, readonly string[]> | null,
+  activeId: string,
+  overId: string,
+  pointer?: { statusId: string; slot: number },
+): { statusId: string; position: number } | null {
+  const columns = snapshot.map((column) => {
+    const order = liveOrders?.get(column.statusId);
+    return order ? { ...column, order } : column;
+  });
+  if (overId !== activeId) return dropPositionFromOver(columns, activeId, overId, pointer);
+  if (!liveOrders) return null;
+  let destStatus = "";
+  let index = -1;
+  for (const [statusId, order] of liveOrders) {
+    const at = order.indexOf(activeId);
+    if (at >= 0) {
+      destStatus = statusId;
+      index = at;
+      break;
+    }
+  }
+  if (index < 0) return null;
+  const origin = snapshot.find((column) => column.columnIndex.has(activeId));
+  const dest = snapshot.find((column) => column.statusId === destStatus);
+  if (!origin || !dest) return null;
+  const liveOrigin = liveOrders.get(origin.statusId);
+  if (origin.statusId === destStatus && liveOrigin && sameIds(origin.order, liveOrigin)) return null;
+  const active = { statusId: origin.statusId, columnIndex: origin.columnIndex.get(activeId) ?? 0 };
+  const live = liveOrders.get(destStatus) ?? [];
+  let following = "";
+  for (let cursor = index + 1; cursor < live.length; cursor++) {
+    if (live[cursor]) {
+      following = live[cursor];
+      break;
+    }
+  }
+  let finalIndex = dest.size;
+  if (following) {
+    const nextIndex = dest.columnIndex.get(following);
+    if (nextIndex === undefined) {
+      if (!dest.aligned) return null;
+      finalIndex = index;
+    } else if (origin.statusId === destStatus && active.columnIndex < nextIndex) {
+      finalIndex = nextIndex - 1;
+    } else {
+      finalIndex = nextIndex;
+    }
+  }
+  return { statusId: destStatus, position: movePosition(active, destStatus, finalIndex, dest.size) };
+}
+
+function sameIds(a: readonly string[], b: readonly string[]) {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return false;
+  return true;
+}
+
 function columnSize(columns: readonly BoardDropColumn[], statusId: string) {
   return columns.find((column) => column.statusId === statusId)?.size ?? 0;
 }

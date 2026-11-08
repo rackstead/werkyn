@@ -6,6 +6,7 @@ import {
   keptBoardCards,
   movePosition,
   previewBoardMove,
+  resolveBoardDrop,
   type BoardDropColumn,
 } from "./board-window";
 import { assembleBoardColumns, type BoardWindowResponse } from "./use-board-columns";
@@ -109,6 +110,23 @@ describe("board drop index", () => {
   it("does not move a card dropped on itself", () => {
     expect(dropPositionFromOver([column("open", ids(5))], "t1", "t1")).toBeNull();
   });
+
+  it("saves a reorder when the pointer is on the dragged card", () => {
+    const open = column("open", ids(5));
+    const live = new Map([["open", ["t0", "t2", "t3", "t1", "t4"]]]);
+    expect(resolveBoardDrop([open], live, "t1", "t1")).toEqual({ statusId: "open", position: 3 });
+    expect(resolveBoardDrop([open], new Map([["open", open.order]]), "t1", "t1")).toBeNull();
+  });
+
+  it("saves a cross-column drag when the pointer is on the dragged card", () => {
+    const open = column("open", ["a", "b"]);
+    const done = column("done", ["d0", "d1"]);
+    const live = new Map<string, readonly string[]>([
+      ["open", ["a"]],
+      ["done", ["d0", "b", "d1"]],
+    ]);
+    expect(resolveBoardDrop([open, done], live, "b", "b")).toEqual({ statusId: "done", position: 1 });
+  });
 });
 
 describe("kept board cards", () => {
@@ -143,6 +161,7 @@ describe("preview reorder", () => {
     const orders = new Map([["open", ["a", "b", "c", "d", "e"]]]);
     const down = previewBoardMove(orders, "b", "d", new Set(["open"]));
     expect(down?.get("open")).toEqual(["a", "c", "d", "b", "e"]);
+    expect(previewBoardMove(orders, "b", "d", new Set(["open"]))?.get("open")).toEqual(down?.get("open"));
     const up = previewBoardMove(orders, "d", "b", new Set(["open"]));
     expect(up?.get("open")).toEqual(["a", "d", "b", "c", "e"]);
   });
@@ -177,6 +196,23 @@ describe("assembleBoardColumns", () => {
     expect(open.tasks.get("t40")?.columnIndex).toBe(40);
     expect(open.tasks.has("t99")).toBe(false);
     expect(columns.get("done")?.order).toEqual(["d0", ""]);
+  });
+
+  it("drops an id from its old slot when a later page places it elsewhere", () => {
+    const first: BoardWindowResponse = {
+      aligned: true,
+      columns: [{ statusId: "open", total: 4, size: 4, offset: 0 }],
+      data: [task("t0", "open", 0), task("t1", "open", 1)],
+    };
+    const moved: BoardWindowResponse = {
+      aligned: true,
+      columns: [{ statusId: "open", total: 4, size: 4, offset: 2, ids: ["t1", "t2"] }],
+      data: [],
+    };
+    const open = assembleBoardColumns([first, moved]).get("open")!;
+    expect(open.order.filter((id) => id === "t1")).toEqual(["t1"]);
+    expect(open.order[2]).toBe("t1");
+    expect(open.order[1]).toBe("");
   });
 });
 

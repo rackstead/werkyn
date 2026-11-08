@@ -102,7 +102,12 @@ export async function listBoardWindow(
   const tasks = loaded.flatMap((column) => column.tasks);
   const indexes = aligned
     ? new Map(tasks.map((task) => [task.id, task.columnIndex]))
-    : await columnIndexes(prisma, projectId, tasks.map((task) => task.id));
+    : await columnIndexes(
+        prisma,
+        projectId,
+        tasks.map((task) => task.id),
+        [...new Set(tasks.map((task) => task.statusId))],
+      );
   const data = (await withTaskCounts(prisma, projectId, tasks)).map((task) => {
     // The include is a TaskInclude, so Prisma will not name the nested
     // payload. The object is the same shape listTasks already scopes.
@@ -198,8 +203,15 @@ async function pair<P, C>(
 }
 
 /** Index of each id in its column's active board order (position, createdAt, id). */
-async function columnIndexes(prisma: PrismaClient, projectId: string, ids: string[]) {
-  if (ids.length === 0) return new Map<string, number>();
+async function columnIndexes(
+  prisma: PrismaClient,
+  projectId: string,
+  ids: string[],
+  statusIds: string[],
+) {
+  if (ids.length === 0 || statusIds.length === 0) return new Map<string, number>();
+  // Only the columns on this page. Ranking every active task in the project
+  // would sort the whole board to number a filtered window.
   const rows = await prisma.$queryRaw<Array<{ id: string; columnIndex: number }>>`
     SELECT id, "columnIndex" FROM (
       SELECT id,
@@ -209,6 +221,7 @@ async function columnIndexes(prisma: PrismaClient, projectId: string, ids: strin
         ) - 1)::int AS "columnIndex"
       FROM "Task"
       WHERE "projectId" = ${projectId} AND archived = false
+        AND "statusId" = ANY(${statusIds})
     ) ranked
     WHERE id = ANY(${ids})
   `;

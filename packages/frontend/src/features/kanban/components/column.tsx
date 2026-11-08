@@ -113,11 +113,30 @@ export function Column({
     if (count > 0) onRangeRef.current(Math.max(0, start), Math.max(0, end));
   }, [count, start, end]);
 
+  const revealHandled = useRef(0);
+  const revealFollow = useRef(false);
   useLayoutEffect(() => {
-    if (!reveal || !scroller) return;
-    onRangeRef.current(Math.max(0, count - BOARD_PAGE_SIZE), Math.max(0, count - 1));
-    scroller.scrollTop = count * BOARD_CARD_ESTIMATE;
-  }, [count, reveal, scroller]);
+    if (!scroller) return;
+    const scrollToEnd = () => {
+      if (count <= 0) return;
+      onRangeRef.current(Math.max(0, count - BOARD_PAGE_SIZE), count - 1);
+      const placed = virtualizer.getOffsetForIndex(Math.max(0, count - 1), "end");
+      scroller.scrollTop = placed?.[0] ?? scroller.scrollHeight;
+    };
+    // Only the quick-add that just succeeded scrolls here, plus one follow
+    // when the new card's page increases the count. Later count changes
+    // (someone else's insert) must leave the reader where they were.
+    if (reveal !== 0 && reveal !== revealHandled.current) {
+      revealHandled.current = reveal;
+      revealFollow.current = true;
+      scrollToEnd();
+      return;
+    }
+    if (revealFollow.current) {
+      revealFollow.current = false;
+      scrollToEnd();
+    }
+  }, [count, reveal, scroller, virtualizer]);
 
   useLayoutEffect(() => {
     if (!pauseAnchor || followIndex === null || !sized) return;

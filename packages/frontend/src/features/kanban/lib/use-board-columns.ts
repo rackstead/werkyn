@@ -72,8 +72,13 @@ export function assembleBoardColumns(pages: readonly BoardWindowResponse[]): Map
       column.aligned = response.aligned;
       const ids = page.ids ?? (byStatus.get(page.statusId) ?? []).map((task) => task.id);
       ids.forEach((id, index) => {
+        if (!id || !column) return;
         const at = page.offset + index;
-        if (at >= 0 && at < column!.order.length) column!.order[at] = id;
+        // A task that moved between pages must not stay in its old slot.
+        for (let slot = 0; slot < column.order.length; slot++) {
+          if (slot !== at && column.order[slot] === id) column.order[slot] = "";
+        }
+        if (at >= 0 && at < column.order.length) column.order[at] = id;
       });
       for (const task of byStatus.get(page.statusId) ?? []) {
         const columnIndex = task.columnIndex ?? (response.aligned ? page.offset : 0);
@@ -144,17 +149,18 @@ export function useBoardColumns(projectId: string, filters?: Record<string, unkn
     })),
   });
 
+  const freshAt = first.dataUpdatedAt;
   const responses: BoardWindowResponse[] = [];
   if (first.data) responses.push(first.data);
-  for (const query of extras) if (query.data) responses.push(query.data);
-  // useQueries returns a new array every render. Rebuilding the columns then
-  // would hand each column a new order array and the window would scroll
-  // back to the top.
-  const signature = JSON.stringify(responses.map((page) => ({
-    aligned: page.aligned,
-    columns: page.columns,
-    tasks: page.data.map((task) => [task.id, task.statusId, task.position, task.updatedAt, task.columnIndex]),
-  })));
+  // A page fetched before the latest first page still has the previous
+  // totals and ids. Using it beside the new first page duplicates cards.
+  for (const query of extras) {
+    if (query.data && query.dataUpdatedAt >= freshAt) responses.push(query.data);
+  }
+  // dataUpdatedAt changes when a refetch replaces the response, including a
+  // label change that does not touch the task row's own timestamp. It does
+  // not walk the id list, so a drag's renders do not stringify every id.
+  const signature = [freshAt, ...extras.map((query) => query.dataUpdatedAt)].join(",");
   const assembled = useRef<{ signature: string; columns: Map<string, AssembledColumn> }>({
     signature: "",
     columns: new Map(),
@@ -210,6 +216,7 @@ export function useBoardColumns(projectId: string, filters?: Record<string, unkn
     columns,
     aligned: first.data?.aligned ?? true,
     isLoading: first.isLoading,
+    isFetching: first.isFetching || extras.some((query) => query.isFetching),
     dataUpdatedAt: first.dataUpdatedAt,
     ensureRange,
   };

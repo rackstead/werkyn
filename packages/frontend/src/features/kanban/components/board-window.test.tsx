@@ -31,6 +31,7 @@ vi.mock("../lib/use-board-columns", () => ({
     aligned: true,
     isLoading: fixture.isLoading,
     dataUpdatedAt: fixture.dataUpdatedAt,
+    isFetching: false,
     ensureRange: fixture.ensureRange,
   }),
 }));

@@ -21,8 +21,8 @@ import { Column } from "./column";
 import { DragOverlayCard } from "./drag-overlay-card";
 import { useBoardColumns, type AssembledColumn } from "../lib/use-board-columns";
 import {
-  dropPositionFromOver,
   previewBoardMove,
+  resolveBoardDrop,
   type BoardDropColumn,
 } from "../lib/board-window";
 
@@ -101,15 +101,18 @@ export function Board({
   const [overIndex, setOverIndex] = useState<{ statusId: string; index: number } | null>(null);
   const [reveal, setReveal] = useState<Record<string, number>>({});
   const snapshot = useRef<BoardDropColumn[]>([]);
+  const originOrders = useRef<Map<string, readonly string[]> | null>(null);
   const indexAt = useRef(new Map<string, (clientY: number) => number>());
   const dropMark = useRef<number | null>(null);
 
   useEffect(() => {
-    if (dropMark.current !== null && board.dataUpdatedAt !== dropMark.current) {
+    // Wait until the pages that were invalidated have settled. Clearing the
+    // preview on the first page alone puts the card back until later pages land.
+    if (dropMark.current !== null && !board.isFetching && board.dataUpdatedAt !== dropMark.current) {
       setLocalOrders(null);
       dropMark.current = null;
     }
-  }, [board.dataUpdatedAt]);
+  }, [board.dataUpdatedAt, board.isFetching]);
 
   const registerIndexAt = useCallback((statusId: string, fn: ((clientY: number) => number) | null) => {
     if (fn) indexAt.current.set(statusId, fn);
@@ -133,6 +136,7 @@ export function Board({
     const task = taskById(String(event.active.id));
     if (!task) return;
     snapshot.current = dropColumns(statuses, board.columns);
+    originOrders.current = new Map(snapshot.current.map((column) => [column.statusId, column.order]));
     setActiveTask(task);
     setLocalOrders(new Map(snapshot.current.map((column) => [column.statusId, [...column.order]])));
   }, [board.columns, statuses, taskById]);
@@ -142,20 +146,25 @@ export function Board({
   const handleDragOver = useCallback((event: DragOverEvent) => {
     const overId = event.over ? String(event.over.id) : "";
     const activeId = String(event.active.id);
-    const current = localOrdersRef.current;
-    if (!overId || !current) return;
-    const next = previewBoardMove(current, activeId, overId, columnIds);
+    const origin = originOrders.current;
+    if (!overId || !origin) return;
+    // Always from the order at drag start, so the same hover does not flip
+    // the preview on the next event.
+    const next = previewBoardMove(origin, activeId, overId, columnIds);
+    const shown = next ?? localOrdersRef.current;
     if (next) {
       localOrdersRef.current = next;
       setLocalOrders(next);
     }
-    if (!columnIds.has(overId)) {
-      for (const [statusId, order] of next ?? current) {
-        const index = order.indexOf(overId);
-        if (index >= 0) {
-          setOverIndex({ statusId, index });
-          break;
-        }
+    if (columnIds.has(overId) || !shown) {
+      setOverIndex(null);
+      return;
+    }
+    for (const [statusId, order] of shown) {
+      const index = order.indexOf(overId);
+      if (index >= 0) {
+        setOverIndex({ statusId, index });
+        break;
       }
     }
   }, [columnIds]);
@@ -176,12 +185,7 @@ export function Board({
     // The pointer slot is an index in the order on screen, which the drag
     // preview may already have changed. Column indexes stay the ones from
     // drag start: that is the list the move API renumbers.
-    const live = localOrdersRef.current;
-    const columns = snapshot.current.map((column) => {
-      const order = live?.get(column.statusId);
-      return order ? { ...column, order } : column;
-    });
-    const drop = dropPositionFromOver(columns, activeId, overId, pointer);
+    const drop = resolveBoardDrop(snapshot.current, localOrdersRef.current, activeId, overId, pointer);
     if (!drop) {
       setLocalOrders(null);
       return;

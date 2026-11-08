@@ -1,4 +1,4 @@
-import { stayedEntries, type ListChange } from "@/lib/stayed-entries";
+import { stayedEntries, type ListChange } from "../../../lib/stayed-entries";
 
 export { stayedEntries, type ListChange };
 

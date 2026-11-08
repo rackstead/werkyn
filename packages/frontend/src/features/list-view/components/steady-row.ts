@@ -1,4 +1,4 @@
-import { stayedEntries, type ListChange } from "@/lib/stayed-entries";
+import { stayedEntries, type ListChange } from "../../../lib/stayed-entries";
 
 /** A row seen in view: its key, its top relative to the view, and its index in the List then. */
 export interface SeenRow {
@@ -38,8 +38,12 @@ export function steadyRows(
   indexOf: (key: string) => number | undefined,
   change?: Omit<ListChange, "indexOf">,
 ): Array<{ key: string; top: number; index: number }> {
-  const inView = new Set(seen.map((row) => row.key));
-  const stayed = change && stayedEntries({ ...change, indexOf }, (key) => inView.has(key));
+  if (seen.length === 0) return [];
+  let stayed: Uint8Array | undefined;
+  if (change) {
+    const inView = new Set(seen.map((row) => row.key));
+    stayed = stayedEntries({ ...change, indexOf }, (key) => inView.has(key));
+  }
   const rows = seen.flatMap((row) => {
     const now = indexOf(row.key);
     return now === undefined || (stayed && (change!.before[row.index] !== row.key || !stayed[row.index]))

@@ -332,7 +332,7 @@ function scheduleUnverifiedSignInVerification(
   });
 }
 
-export function requestPrivacyPreservingRegistration(
+export async function requestPrivacyPreservingRegistration(
   prisma: PrismaClient,
   data: {
     email: string;
@@ -352,13 +352,21 @@ export function requestPrivacyPreservingRegistration(
   // A repeat while this address is still being handled adds nothing. The
   // first request already holds the only work, and the answer is the same.
   if (pendingRegistrationWork.has(email)) return;
+  // The password limiter admits at most two native jobs and rejects the
+  // rest immediately. Take that slot before acknowledging, so a refusal is
+  // the response instead of a success with no account. Every address pays it.
+  const passwordHash = await hashPassword(data.password);
+  if (pendingRegistrationWork.has(email)) return;
   trackRegistrationWork(
     email,
-    completePrivacyPreservingRegistration(prisma, { ...data, email }).catch(
-      (error) => {
-        logger.error({ err: error }, "Privacy-preserving registration failed");
-      },
-    ),
+    completePrivacyPreservingRegistration(prisma, {
+      email,
+      displayName: data.displayName,
+      passwordHash,
+      inviteToken: data.inviteToken,
+    }).catch((error) => {
+      logger.error({ err: error }, "Privacy-preserving registration failed");
+    }),
   );
 }
 
@@ -366,14 +374,13 @@ async function completePrivacyPreservingRegistration(
   prisma: PrismaClient,
   data: {
     email: string;
-    password: string;
     displayName: string;
+    passwordHash: string;
     inviteToken?: string;
   },
 ) {
-  // Hash before the lookup so a new address and an existing one do the same
-  // password work. The hash is stored only when this call creates the account.
-  const passwordHash = await hashPassword(data.password);
+  // The hash was computed before the response. It is stored only for a new
+  // account; an existing account is left unchanged.
   const existing = await prisma.user.findUnique({
     where: { email: data.email },
     select: { id: true },
@@ -385,7 +392,7 @@ async function completePrivacyPreservingRegistration(
     created = await createPasswordAccount(prisma, {
       email: data.email,
       displayName: data.displayName,
-      passwordHash,
+      passwordHash: data.passwordHash,
     });
   } catch (error) {
     // Lost a race with another create. The account stays as that create left it.

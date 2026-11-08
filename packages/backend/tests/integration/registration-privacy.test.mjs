@@ -504,6 +504,67 @@ test("a repeat while registration is still running adds one account and one mess
   await setPrivacy(false);
 });
 
+test("the setting cannot be turned on until email delivery is configured", async () => {
+  const { env } = await import("../../src/config/env.ts");
+  const previousHost = env.SMTP_HOST;
+  const stored = await app.prisma.emailConfig.findUnique({
+    where: { id: "singleton" },
+  });
+  const admin = await app.prisma.user.create({
+    data: {
+      email: nextEmail("mail-admin"),
+      displayName: "Mail admin",
+      emailVerified: true,
+      isInstanceAdmin: true,
+      passwordHash: await hashPassword(EXISTING_PASSWORD),
+    },
+  });
+  env.SMTP_HOST = "";
+  if (stored?.host) {
+    await app.prisma.emailConfig.update({
+      where: { id: "singleton" },
+      data: { host: "" },
+    });
+  }
+  try {
+    await setPrivacy(false);
+    const token = signAccessToken({ sub: admin.id, email: admin.email });
+    const refused = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/registration/config",
+      payload: { privacyPreserving: true },
+      headers: { authorization: `Bearer ${token}` },
+      remoteAddress: nextAddress(),
+    });
+    assert.equal(refused.statusCode, 400, refused.body);
+    assert.match(refused.json().message, /Admin > Email or set SMTP_HOST/);
+    assert.equal(
+      (await app.prisma.registrationConfig.findUnique({ where: { id: "singleton" } }))
+        .privacyPreserving,
+      false,
+    );
+    await setPrivacy(true);
+    const disabled = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/registration/config",
+      payload: { privacyPreserving: false },
+      headers: { authorization: `Bearer ${token}` },
+      remoteAddress: nextAddress(),
+    });
+    assert.equal(disabled.statusCode, 200, disabled.body);
+    assert.equal(disabled.json().data.privacyPreserving, false);
+  } finally {
+    env.SMTP_HOST = previousHost;
+    if (stored) {
+      await app.prisma.emailConfig.update({
+        where: { id: "singleton" },
+        data: { host: stored.host },
+      });
+    }
+    await setPrivacy(false);
+  }
+});
+
 test("SSO-only registration stays the same refusal for every address when privacy is on", async () => {
   await setPrivacy(true);
   await app.prisma.ssoConfig.upsert({

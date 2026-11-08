@@ -39,6 +39,30 @@ export function resetTransporter() {
   transporter = undefined;
 }
 
+/**
+ * True when account mail can be sent without the development-only Ethereal
+ * inbox. A database host wins, then SMTP_HOST. A read failure falls through
+ * to the environment the same way delivery does.
+ */
+export async function mailDeliveryConfigured(prisma?: PrismaClient): Promise<boolean> {
+  const db = prisma ?? prismaRef;
+  if (db) {
+    try {
+      const config = await db.emailConfig.findUnique({
+        where: { id: "singleton" },
+        select: { host: true },
+      });
+      if (config?.host) return true;
+    } catch (error) {
+      logger.warn(
+        { database: describeMailConfigFailure(error) },
+        "Failed to read email config while checking delivery",
+      );
+    }
+  }
+  return Boolean(env.SMTP_HOST);
+}
+
 async function getTransporter(): Promise<{
   transport: Transporter;
   source: MailTransportSource;

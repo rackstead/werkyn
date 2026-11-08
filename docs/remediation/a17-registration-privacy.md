@@ -24,15 +24,20 @@ Registration stays as it is today:
 
 ## On
 
-Turn this on only after email delivery works (Admin → Email, or `SMTP_HOST`).
-Without delivery, a new account cannot receive the link it needs to sign in.
+Turning it on is refused until email delivery is configured (a host saved
+under Admin → Email, or `SMTP_HOST`). The development Ethereal inbox does not
+count. Turning it off stays allowed. Without delivery, a new account cannot
+receive the link it needs to sign in.
 
 Both a new address and an existing address get the same `200` body and no
 session cookie:
 
 > If the address is available, a verification link has been sent. Verify your email before signing in.
 
-The response is sent before the address is looked up. A repeat for an address
+Password hashing runs before that response and is the same work for every
+address. If the password limiter cannot admit the job, the request is refused
+then (503) instead of being acknowledged with no account. The response is sent
+before the address is looked up. A repeat for an address
 whose request is still running adds nothing. Each process accepts at most
 6,000 of these requests a minute and then answers `429` with `Retry-After`
 for every address alike. Shutdown waits for work still running, then logs

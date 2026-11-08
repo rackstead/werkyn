@@ -57,7 +57,10 @@ export async function registerHandler(
         "Password registration is disabled. Please use SSO to sign in.",
       );
     }
-    authService.requestPrivacyPreservingRegistration(
+    // Hash capacity is taken before this 200. A full limiter throws here,
+    // the same way for every address, instead of acknowledging a registration
+    // whose account will never be created.
+    await authService.requestPrivacyPreservingRegistration(
       request.server.prisma,
       body,
     );

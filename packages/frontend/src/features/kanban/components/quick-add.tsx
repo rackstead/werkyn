@@ -5,9 +5,11 @@ import { Plus } from "lucide-react";
 interface QuickAddProps {
   projectId: string;
   statusId: string;
+  /** The new task is appended, past whatever page is loaded. */
+  onCreated?: () => void;
 }
 
-export function QuickAdd({ projectId, statusId }: QuickAddProps) {
+export function QuickAdd({ projectId, statusId, onCreated }: QuickAddProps) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -25,6 +27,7 @@ export function QuickAdd({ projectId, statusId }: QuickAddProps) {
       {
         onSuccess: () => {
           inputRef.current?.focus();
+          onCreated?.();
         },
       },
     );

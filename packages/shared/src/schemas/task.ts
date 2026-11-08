@@ -69,6 +69,13 @@ export const TaskQuerySchema = z.object({
   page: z.coerce.number().int().min(1).max(INT32_MAX).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   view: z.enum(["paginated", "board"]).default("paginated"),
+  // Windowed board read. Without it, view=board still returns every matching
+  // task (List, Calendar, dependency picker). With it, the read is one page
+  // of each column, or of `status` alone. Task bodies are capped at 100;
+  // columnIds pages may ask for up to 500 ids (enforced in listTasks).
+  perColumn: z.coerce.number().int().min(1).max(500).optional(),
+  columnOffset: z.coerce.number().int().min(0).max(INT32_MAX).optional(),
+  columnIds: QueryBooleanSchema.optional(),
 });
 export type TaskQueryInput = z.infer<typeof TaskQuerySchema>;
 

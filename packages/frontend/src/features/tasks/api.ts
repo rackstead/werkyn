@@ -59,6 +59,11 @@ export interface Task {
     };
   }>;
   _count: { subtasks: number; blockedBy: number };
+  /**
+   * Index in the task's active column (board order), set on a windowed board
+   * read. The move API takes this index, not the card's place in the mounted window.
+   */
+  columnIndex?: number;
 }
 
 export interface TaskDetail extends Task {
@@ -80,25 +85,39 @@ export interface TaskDetail extends Task {
 
 // ─── Queries ─────────────────────────────────────────────
 
+export function taskListSearchParams(
+  filters: Record<string, unknown> | undefined,
+  extra?: Record<string, string | number | boolean | undefined>,
+) {
+  const searchParams: Record<string, string> = {};
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value === undefined) continue;
+      searchParams[key] = String(value);
+    }
+  }
+  if (filters) {
+    for (const [key, value] of Object.entries(filters)) {
+      if (value === undefined || value === null || value === "") continue;
+      if (DATE_FILTERS.has(key) && !isDateOnly(String(value))) continue;
+      searchParams[key] = String(value);
+    }
+  }
+  return searchParams;
+}
+
 export function useProjectTasks(
   pid: string,
   filters?: Record<string, unknown>,
 ) {
   return useQuery({
     queryKey: queryKeys.tasks(pid, filters),
-    queryFn: () => {
-      const searchParams: Record<string, string> = { view: "board" };
-      if (filters) {
-        for (const [key, value] of Object.entries(filters)) {
-          if (value === undefined || value === null || value === "") continue;
-          if (DATE_FILTERS.has(key) && !isDateOnly(String(value))) continue;
-          searchParams[key] = String(value);
-        }
-      }
-      return api
-        .get(`projects/${pid}/tasks`, { searchParams })
-        .json<{ data: Task[] }>();
-    },
+    queryFn: () =>
+      api
+        .get(`projects/${pid}/tasks`, {
+          searchParams: taskListSearchParams(filters, { view: "board" }),
+        })
+        .json<{ data: Task[] }>(),
     enabled: !!pid,
   });
 }
@@ -228,8 +247,12 @@ export function useMoveTask(pid: string) {
       // Optimistically update the tasks list, normalizing positions
       // in affected columns to match the backend logic exactly.
       for (const snapshot of snapshots) {
-        const cached = snapshot.data as { data: Task[] } | undefined;
+        const cached = snapshot.data as { data: Task[]; columns?: unknown } | undefined;
         if (!cached?.data || !Array.isArray(cached.data)) continue;
+        // A windowed board page is not the whole column. Rewriting it here
+        // would store window-local positions. The board applies the drop
+        // itself and refetches the pages.
+        if (cached.columns) continue;
 
         const tasks = cached.data;
         const task = tasks.find((t) => t.id === id);

@@ -133,8 +133,11 @@ family is revoked only when the cookie the browser sends at that moment
 proves it, so a stale record cannot end a sign-in made after it, in this tab or
 another, even by the same account. When the access token has already expired,
 the logout route uses its verified session selector and the matching cookie as
-described above. A client talking to an older server that answers 401 still
-tries conditional recovery; only a token without a session id, from an earlier
+described above. A 503 or 429 from that logout is retried with the same delays
+as recovery. A newer announced sign-in or the sign-out deadline stops those
+retries before another logout is sent. The record stays until a 204 or recovery
+settles it. A client talking to an older server that answers 401 still tries
+conditional recovery; only a token without a session id, from an earlier
 server, takes the older refresh-then-logout path.
 
 **Cross-tab.** Records are shared by every tab of the origin. A tab that
@@ -170,8 +173,13 @@ in flight is kept and prevents adoption. The operation does not rotate or
 change cookies, and failed proof never falls back to ordinary restoration.
 This gives SSO-only installations a fresh-sign-in escape when old recovery is
 unavailable. The server controls proof expiry (60 seconds); there is no local
-wall-clock expiry. A later identity change also prevents a delayed completion
-response from being applied.
+wall-clock expiry. A later different family or sign-out prevents a delayed
+completion from replacing it, and neither retires the snapshotted records. If
+another tab already adopted the exact proven family, completion keeps that
+tab's newer token and retires only the snapshot. A failed or invalid proof does
+not restore anything, retire records, or fall back to ordinary refresh. It
+discards the stale attempt, and the completion page can keep a session
+hydration already restored when that session itself has no pending sign-out.
 
 **Limits.** Without localStorage (blocked, or quota exhausted) nothing is
 durable and a failed sign-out behaves as before. While a record cannot be

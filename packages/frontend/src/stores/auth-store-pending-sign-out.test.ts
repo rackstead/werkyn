@@ -54,6 +54,7 @@ interface Call {
   recoveryHeader: string | null;
   completionHeader: string | null;
   cookie: string | null;
+  signal: AbortSignal;
 }
 let calls: Call[];
 type Route = (call: Call) => Response | Promise<Response>;
@@ -180,6 +181,7 @@ const fetchMock = vi.fn(
       recoveryHeader: request.headers.get("X-Werkyn-Session-Recovery"),
       completionHeader: request.headers.get("X-Werkyn-OIDC-Completion"),
       cookie,
+      signal: request.signal,
     };
     calls.push(call);
     if (offline) throw new TypeError("Failed to fetch");
@@ -306,6 +308,52 @@ afterEach(async () => {
 // ─── Scenarios ──────────────────────────────────────────
 
 describe("sign-out recovery follow-ups", () => {
+  it.each([503, 429])("retries a busy expired-token sign-out (%s) without origin-bound recovery", async (status) => {
+    const { family } = serverSignIn("alice");
+    const tab = await openTab();
+    const expired = accessToken("alice", family.id, -60);
+    tab.useAuthStore.getState().setAuth(users.alice, expired, []);
+    let attempts = 0;
+    routes.set("auth/logout", () => {
+      if (++attempts === 1) return json(status, {});
+      revoke(family);
+      return json(204);
+    });
+    routes.set("auth/logout/recover", () => json(403, {}));
+    const from = calls.length;
+    const before = cookie;
+    await run(tab.useAuthStore.getState().logout());
+    expect(paths(from)).toEqual(["auth/logout", "auth/logout"]);
+    expect(calls.slice(from).every((call) => call.token === expired)).toBe(true);
+    expect(family.revoked).toBe(true);
+    expect(pendingKeys()).toHaveLength(0);
+    expect(cookie).toBe(before);
+  });
+
+  it("stops busy sign-out retries when a newer sign-in is announced", async () => {
+    const { tab } = await signedInTab("alice");
+    routes.set("auth/logout", () => json(503, {}));
+    const from = calls.length;
+    const signingOut = tab.useAuthStore.getState().logout();
+    await vi.advanceTimersByTimeAsync(0);
+    const newer = serverSignIn("bob");
+    tab.useAuthStore.getState().setAuth(newer.session.user, newer.session.accessToken, []);
+    await run(signingOut);
+    expect(paths(from)).toEqual(["auth/logout"]);
+    expect(sidOf(tab.useAuthStore.getState().accessToken)).toBe(newer.family.id);
+    expect(newer.family.revoked).toBe(false);
+  });
+
+  it("leaves an exhausted busy sign-out pending after bounded retries", async () => {
+    const { tab, family } = await signedInTab("alice");
+    routes.set("auth/logout", () => json(503, {}));
+    const from = calls.length;
+    await run(tab.useAuthStore.getState().logout());
+    expect(paths(from)).toEqual(Array(5).fill("auth/logout"));
+    expect(pendingKeys()).toHaveLength(1);
+    expect(family.revoked).toBe(false);
+  });
+
   it("never adopts a recorded session returned to a different still-open identity", async () => {
     const lateTab = await openTab();
     await run(lateTab.whenLoggedOut());
@@ -415,6 +463,89 @@ describe("proof-bound SSO completion", () => {
     expect(complete.useAuthStore.getState().user?.id).toBe("alice");
     expect(sidOf(complete.useAuthStore.getState().accessToken)).toBe(newer.family.id);
     expect(newer.family.revoked).toBe(false);
+    expect(pendingKeys()).toHaveLength(1);
+  });
+
+  it("accepts the proof after another tab adopts that exact SSO family", async () => {
+    const { complete, fresh } = await interruptedSso();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    routes.set("auth/oidc/complete-session", async (call) => {
+      const response = defaultRoutes["auth/oidc/complete-session"](call);
+      await held;
+      expect(call.signal.aborted).toBe(false);
+      return response;
+    });
+    const completing = complete.completeOidcSignIn();
+    await vi.advanceTimersByTimeAsync(0);
+    const other = await openTab();
+    const renewed = sessionBody(fresh).data;
+    other.useAuthStore.getState().setAuth(renewed.user, renewed.accessToken, []);
+    await deliverMessages();
+    expect(sidOf(complete.useAuthStore.getState().accessToken)).toBe(fresh.id);
+    release();
+    expect(await completing).toBe(true);
+    expect(complete.useAuthStore.getState().accessToken).toBe(renewed.accessToken);
+    expect(pendingKeys()).toHaveLength(0);
+  });
+
+  it("does not complete proof after the adopted SSO family is signed out", async () => {
+    const { complete, old, fresh } = await interruptedSso();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    routes.set("auth/oidc/complete-session", async (call) => {
+      const response = defaultRoutes["auth/oidc/complete-session"](call);
+      await held;
+      return response;
+    });
+    const completing = complete.completeOidcSignIn();
+    await vi.advanceTimersByTimeAsync(0);
+    const other = await openTab();
+    const renewed = sessionBody(fresh).data;
+    other.useAuthStore.getState().setAuth(renewed.user, renewed.accessToken, []);
+    await deliverMessages();
+    offline = true;
+    await run(other.useAuthStore.getState().logout());
+    await deliverMessages();
+    offline = false;
+    release();
+    expect(await completing).toBe(false);
+    expect(complete.useAuthStore.getState().user).toBeNull();
+    expect(pendingKeys().some((key) => key.endsWith(old.id))).toBe(true);
+    expect(pendingKeys().some((key) => key.endsWith(fresh.id))).toBe(true);
+    expect(fresh.revoked).toBe(false);
+  });
+
+  it.each(["expired proof", "network failure"])("keeps a hydrated session when completion encounters %s", async (failure) => {
+    const { beginOidcSignIn, oidcSignInAttempt } = await import("@/lib/oidc-sign-in");
+    beginOidcSignIn();
+    const { family } = serverSignIn("bob");
+    const tab = await load();
+    const from = calls.length;
+    routes.set("auth/oidc/complete-session", () => {
+      if (failure === "network failure") throw new TypeError("Failed to fetch");
+      return json(409, {});
+    });
+    expect(await tab.completeOidcSignIn()).toBe(true);
+    expect(sidOf(tab.useAuthStore.getState().accessToken)).toBe(family.id);
+    expect(oidcSignInAttempt()).toBeNull();
+    expect(paths(from)).toEqual(["auth/oidc/complete-session"]);
+  });
+
+  it("does not keep a hydrated session whose own sign-out is still pending", async () => {
+    const { beginOidcSignIn, oidcSignInAttempt } = await import("@/lib/oidc-sign-in");
+    beginOidcSignIn();
+    const { family } = serverSignIn("bob");
+    const tab = await load();
+    const { recordPendingSignOut } = await import("@/lib/pending-sign-out");
+    recordPendingSignOut(family.id, "bob");
+    routes.set("auth/oidc/complete-session", () => json(409, {}));
+    const from = calls.length;
+    expect(await tab.completeOidcSignIn()).toBe(false);
+    expect(sidOf(tab.useAuthStore.getState().accessToken)).toBe(family.id);
+    expect(oidcSignInAttempt()).toBeNull();
+    expect(paths(from)).toEqual(["auth/oidc/complete-session"]);
+    expect(pendingKeys()).toHaveLength(1);
   });
 
   it("falls back to ordinary refresh for a legacy callback with no local attempt", async () => {

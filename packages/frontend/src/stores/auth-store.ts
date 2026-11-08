@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { apiUrl } from "@/lib/api-url";
-import { changeIdentity, identityGeneration, identitySignal } from "@/lib/identity";
+import { changeIdentity, identityGeneration } from "@/lib/identity";
 import { clearOidcSignIn, oidcSignInAttempt } from "@/lib/oidc-sign-in";
 import {
   clearPendingSignOut,
@@ -377,13 +377,22 @@ async function revokeSession(
   // Resolves true once the server has settled the sign-out: this browser can
   // no longer restore the session (see completeSignOuts).
   const revoke = async (): Promise<boolean> => {
-    const res = await signOut(accessToken);
+    let res = await signOut(accessToken);
+    // An expired session token can now settle logout itself, even where
+    // origin-bound recovery is unavailable. Retry lock/rate-limit contention
+    // within the existing deadline, without touching a newer announced login.
+    if (sessionId) {
+      for (const delay of RECOVERY_RETRY_DELAYS_MS) {
+        if ((res.status !== 503 && res.status !== 429) || overtaken() || controller.signal.aborted) break;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (overtaken() || controller.signal.aborted) return false;
+        res = await signOut(accessToken);
+      }
+    }
     if (res.ok) return true;
     if (res.status !== 401) return false;
-    // The server only accepts a sign-out with a current access token. When
-    // ours has expired, ask the server to end this session if the cookie
-    // still belongs to it. That request never sets or clears the cookie, so
-    // it cannot replace or end a newer sign-in, from this tab or another.
+    // An older server may reject the expired token. Ask it to end only the
+    // selected family, without replacing or ending a newer browser sign-in.
     if (sessionId) {
       const recovery = await recoverSession(sessionId, controller.signal);
       return recovery !== "unsettled";
@@ -821,18 +830,39 @@ export async function completeOidcSignIn(): Promise<boolean> {
   const attempt = oidcSignInAttempt();
   if (!attempt) return useAuthStore.getState().refresh();
   const start: RefreshStart = { generation: identityGeneration(), epoch: knownEpoch };
+  const alreadyRestored = () => {
+    clearOidcSignIn(attempt.attemptId);
+    const token = useAuthStore.getState().accessToken;
+    // No new restore request and no record retirement without proof. Hydration
+    // may already hold a session; keep it only when that session is not pending.
+    return !isStale(start) && !!token && !hasPendingSignOut(sessionIdOf(token));
+  };
   try {
     const response = await fetch(apiUrl("auth/oidc/complete-session"), {
-      method: "POST", credentials: "include", signal: identitySignal(),
+      // This read changes no cookie or family. Let it finish across a same-
+      // family broadcast; its response is checked against the current identity.
+      method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json", "X-Werkyn-OIDC-Completion": "1" },
       body: JSON.stringify({ attemptId: attempt.attemptId }),
     });
-    if (!response.ok || isStale(start)) return false;
+    if (!response.ok) return alreadyRestored();
     const body = (await response.json()) as { data?: Session };
-    if (isStale(start)) return false;
     const session = body.data;
     if (!session || typeof session.user?.id !== "string" ||
-        !Array.isArray(session.workspaces) || !sessionIdOf(session.accessToken)) return false;
+        !Array.isArray(session.workspaces) || !sessionIdOf(session.accessToken)) return alreadyRestored();
+    const sessionId = sessionIdOf(session.accessToken)!;
+    if (isStale(start)) {
+      const current = useAuthStore.getState();
+      if (current.user?.id !== session.user.id ||
+          sessionIdOf(current.accessToken) !== sessionId || hasPendingSignOut(sessionId)) return false;
+      // Another tab already adopted this exact proven family. Keep its newer
+      // token and epoch, and retire only the pre-redirect sign-out snapshot.
+      for (const recorded of attempt.sessionIds) {
+        if (recorded !== sessionId) clearPendingSignOut(recorded);
+      }
+      clearOidcSignIn(attempt.attemptId);
+      return true;
+    }
     // Proof of a new completed sign-in replaces only its pre-redirect records.
     // A sign-out made while that request was in flight remains authoritative.
     recordedBeforeSignIn = attempt.sessionIds;
@@ -840,6 +870,6 @@ export async function completeOidcSignIn(): Promise<boolean> {
     clearOidcSignIn(attempt.attemptId);
     return useAuthStore.getState().accessToken === session.accessToken;
   } catch {
-    return false;
+    return alreadyRestored();
   }
 }

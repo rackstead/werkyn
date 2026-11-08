@@ -222,7 +222,9 @@ export async function writeColumnOrder(tx: Db, ordered: readonly { id: string; p
 // column that is not already 0..n-1, in one statement. Callers hold the
 // project order lock, so a concurrent delete or move cannot land between the
 // shape read and the write. Archived rows are excluded: their positions do
-// not count, and a move must not rewrite them.
+// not count, and a move must not rewrite them. updatedAt is clock_timestamp(),
+// not the transaction start, so a move that waited on the order lock cannot
+// stamp a row earlier than a shift that already committed.
 
 const BOARD_POSITION_ORDER = Prisma.sql`position ASC, "createdAt" ASC, id ASC`;
 
@@ -280,7 +282,7 @@ function isDense(shape: ActiveColumnShape) {
 async function shiftTailDown(tx: Db, projectId: string, statusId: string, taskId: string, from: number) {
   await tx.$executeRaw`
     UPDATE "Task"
-    SET position = position - 1, "updatedAt" = CURRENT_TIMESTAMP
+    SET position = position - 1, "updatedAt" = clock_timestamp()
     WHERE ${activeTasks(projectId, statusId, taskId)} AND position > ${from}
   `;
 }
@@ -289,7 +291,7 @@ async function shiftTailDown(tx: Db, projectId: string, statusId: string, taskId
 async function shiftFromUp(tx: Db, projectId: string, statusId: string, taskId: string, to: number) {
   await tx.$executeRaw`
     UPDATE "Task"
-    SET position = position + 1, "updatedAt" = CURRENT_TIMESTAMP
+    SET position = position + 1, "updatedAt" = clock_timestamp()
     WHERE ${activeTasks(projectId, statusId, taskId)} AND position >= ${to}
   `;
 }
@@ -301,7 +303,7 @@ async function shiftFromUp(tx: Db, projectId: string, statusId: string, taskId: 
 async function renumberActive(tx: Db, projectId: string, statusId: string, excludeId?: string) {
   await tx.$executeRaw`
     UPDATE "Task" AS task
-    SET position = ranked.rn, "updatedAt" = CURRENT_TIMESTAMP
+    SET position = ranked.rn, "updatedAt" = clock_timestamp()
     FROM (
       SELECT id, (ROW_NUMBER() OVER (ORDER BY ${BOARD_POSITION_ORDER}) - 1)::int AS rn
       FROM "Task"
@@ -318,7 +320,7 @@ async function renumberActive(tx: Db, projectId: string, statusId: string, exclu
 async function openSparseSlot(tx: Db, projectId: string, statusId: string, taskId: string, to: number) {
   await tx.$executeRaw`
     UPDATE "Task" AS task
-    SET position = ranked.rn, "updatedAt" = CURRENT_TIMESTAMP
+    SET position = ranked.rn, "updatedAt" = clock_timestamp()
     FROM (
       SELECT id,
              CASE WHEN idx >= ${to} THEN idx + 1 ELSE idx END AS rn
@@ -348,7 +350,7 @@ async function shiftSparseColumn(tx: Db, projectId: string, statusId: string, ta
       SELECT idx AS from_idx FROM ordered WHERE id = ${taskId}
     )
     UPDATE "Task" AS task
-    SET position = shifted.rn, "updatedAt" = CURRENT_TIMESTAMP
+    SET position = shifted.rn, "updatedAt" = clock_timestamp()
     FROM (
       SELECT ordered.id,
              CASE
@@ -413,14 +415,14 @@ async function shiftWithinColumn(tx: Db, move: TaskMovePlacement): Promise<numbe
   if (to < from) {
     await tx.$executeRaw`
       UPDATE "Task"
-      SET position = position + 1, "updatedAt" = CURRENT_TIMESTAMP
+      SET position = position + 1, "updatedAt" = clock_timestamp()
       WHERE ${activeTasks(move.projectId, move.fromStatusId, move.taskId)}
         AND position >= ${to} AND position < ${from}
     `;
   } else if (to > from) {
     await tx.$executeRaw`
       UPDATE "Task"
-      SET position = position - 1, "updatedAt" = CURRENT_TIMESTAMP
+      SET position = position - 1, "updatedAt" = clock_timestamp()
       WHERE ${activeTasks(move.projectId, move.fromStatusId, move.taskId)}
         AND position > ${from} AND position <= ${to}
     `;

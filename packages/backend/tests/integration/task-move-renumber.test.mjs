@@ -26,6 +26,8 @@ Object.assign(process.env, {
 const { PrismaClient } = await import("@prisma/client");
 const { moveTask, deleteTask } =
   await import("../../src/modules/tasks/tasks.service.ts");
+const { shiftColumnsForMove, withProjectOrder } =
+  await import("../../src/utils/task-order.ts");
 const { recordQueries } = await import("./support/query-events.mjs");
 
 const workspaceIds = [];
@@ -405,6 +407,67 @@ test("an archived task is not an active slot and is not shifted by a move", asyn
   assert.equal(sourceAfter.get(archived.id).archived, true);
   assert.equal(sourceAfter.get(archived.id).statusId, leaving.review.id);
   assert.equal(sourceAfter.get(archived.id).position, 0);
+});
+
+test("a shift that waited does not roll updatedAt backwards", async () => {
+  const f = await fixture(["a", "b", "c", "d"]);
+  let started;
+  const isStarted = new Promise((resolve) => {
+    started = resolve;
+  });
+  let release;
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  // The transaction starts, and its now() freezes, before the other move.
+  const queued = actor.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT 1`;
+      started();
+      await released;
+      await withProjectOrder(tx, f.project.id, async (locked) => {
+        const current = await locked.task.findUnique({
+          where: { id: f.task.c.id },
+          select: { position: true, statusId: true, archived: true },
+        });
+        const position = await shiftColumnsForMove(locked, {
+          projectId: f.project.id,
+          taskId: f.task.c.id,
+          fromStatusId: current.statusId,
+          toStatusId: f.open.id,
+          toIndex: 0,
+          fromPosition: current.position,
+          archived: current.archived,
+        });
+        await locked.task.update({
+          where: { id: f.task.c.id },
+          data: { position },
+        });
+      });
+    },
+    { timeout: 20_000, maxWait: 5_000 },
+  );
+  await isStarted;
+  await sleep(50);
+  await moveTask(actor, f.task.d.id, f.user.id, {
+    statusId: f.open.id,
+    position: 0,
+  });
+  const mid = await actor.task.findUnique({
+    where: { id: f.task.a.id },
+    select: { updatedAt: true },
+  });
+  release();
+  await queued;
+  const after = await actor.task.findUnique({
+    where: { id: f.task.a.id },
+    select: { updatedAt: true, position: true },
+  });
+  assert.ok(
+    after.updatedAt.getTime() >= mid.updatedAt.getTime(),
+    `updatedAt moved backwards: ${mid.updatedAt.toISOString()} -> ${after.updatedAt.toISOString()}`,
+  );
+  assert.deepEqual(await column(f.open.id), ["c", "d", "a", "b"]);
 });
 
 async function lockWaiters(holderPid) {

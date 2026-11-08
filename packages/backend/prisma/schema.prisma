@@ -854,8 +854,8 @@ model BlobCleanup {
   storagePath String   @id
   attempts    Int      @default(0)
   lastError   String?
-  availableAt DateTime @default(now())
-  createdAt   DateTime @default(now())
+  availableAt DateTime @default(now()) @db.Timestamptz(3)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
 
   @@index([availableAt])
 }

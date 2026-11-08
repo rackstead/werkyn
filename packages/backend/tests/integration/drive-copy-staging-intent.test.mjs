@@ -239,7 +239,7 @@ before(async () => {
     await capture("precision-schema-default-before-assert", precisionSchema);
     assert.equal(precisionSchema.length, 2);
     for (const row of precisionSchema) {
-      assert.equal(row.data_type, "timestamp without time zone"); assert.equal(row.datetime_precision, 3);
+      assert.equal(row.data_type, "timestamp with time zone"); assert.equal(row.datetime_precision, 3);
       assert.equal(row.column_default, "CURRENT_TIMESTAMP");
     }
     precisionDefaultsVerified = true;

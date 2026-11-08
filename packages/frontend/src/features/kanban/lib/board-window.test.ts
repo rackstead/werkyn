@@ -118,6 +118,19 @@ describe("board drop index", () => {
     expect(resolveBoardDrop([open], new Map([["open", open.order]]), "t1", "t1")).toBeNull();
   });
 
+  it("does not append when the cards after the drop are not loaded yet", () => {
+    const order = ["t0", "t1", "", "", ""];
+    const open: BoardDropColumn = {
+      statusId: "open",
+      size: 2000,
+      order,
+      columnIndex: new Map([["t0", 0], ["t1", 1]]),
+      aligned: true,
+    };
+    const live = new Map<string, readonly string[]>([["open", ["t1", "t0", "", "", ""]]]);
+    expect(resolveBoardDrop([open], live, "t0", "t0")).toEqual({ statusId: "open", position: 1 });
+  });
+
   it("saves a cross-column drag when the pointer is on the dragged card", () => {
     const open = column("open", ["a", "b"]);
     const done = column("done", ["d0", "d1"]);

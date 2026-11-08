@@ -39,6 +39,9 @@ interface PageRequest {
 
 export function assembleBoardColumns(pages: readonly BoardWindowResponse[]): Map<string, AssembledColumn> {
   const columns = new Map<string, AssembledColumn>();
+  // Where each id currently sits, so a moved id is cleared in one step
+  // instead of scanning the whole column for every id on every page.
+  const slots = new Map<string, Map<string, number>>();
   for (const response of pages) {
     const byStatus = new Map<string, BoardWindowResponse["data"]>();
     for (const task of response.data) {
@@ -66,19 +69,28 @@ export function assembleBoardColumns(pages: readonly BoardWindowResponse[]): Map
           complete: false,
         };
         columns.set(page.statusId, column);
+        const placed = new Map<string, number>();
+        order.forEach((id, slot) => { if (id) placed.set(id, slot); });
+        slots.set(page.statusId, placed);
       }
       column.total = page.total;
       column.size = page.size;
       column.aligned = response.aligned;
+      const placed = slots.get(page.statusId)!;
       const ids = page.ids ?? (byStatus.get(page.statusId) ?? []).map((task) => task.id);
       ids.forEach((id, index) => {
         if (!id || !column) return;
         const at = page.offset + index;
-        // A task that moved between pages must not stay in its old slot.
-        for (let slot = 0; slot < column.order.length; slot++) {
-          if (slot !== at && column.order[slot] === id) column.order[slot] = "";
+        const previous = placed.get(id);
+        if (previous !== undefined && previous !== at && column.order[previous] === id) {
+          column.order[previous] = "";
         }
-        if (at >= 0 && at < column.order.length) column.order[at] = id;
+        if (at >= 0 && at < column.order.length) {
+          const occupant = column.order[at];
+          if (occupant && occupant !== id) placed.delete(occupant);
+          column.order[at] = id;
+          placed.set(id, at);
+        }
       });
       for (const task of byStatus.get(page.statusId) ?? []) {
         const columnIndex = task.columnIndex ?? (response.aligned ? page.offset : 0);

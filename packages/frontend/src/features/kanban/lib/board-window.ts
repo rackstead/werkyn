@@ -134,7 +134,10 @@ export function resolveBoardDrop(
       break;
     }
   }
-  let finalIndex = dest.size;
+  // No loaded card after this one. That is not the end of the column when
+  // later ids have not been fetched yet: an aligned column's preview index
+  // is already the whole-column index.
+  let finalIndex = dest.aligned ? index : dest.size;
   if (following) {
     const nextIndex = dest.columnIndex.get(following);
     if (nextIndex === undefined) {
@@ -145,6 +148,17 @@ export function resolveBoardDrop(
     } else {
       finalIndex = nextIndex;
     }
+  } else if (!dest.aligned) {
+    let preceding = "";
+    for (let cursor = index - 1; cursor >= 0; cursor--) {
+      if (live[cursor] && live[cursor] !== activeId) {
+        preceding = live[cursor];
+        break;
+      }
+    }
+    const prevIndex = preceding ? dest.columnIndex.get(preceding) : undefined;
+    if (prevIndex === undefined) return null;
+    finalIndex = origin.statusId === destStatus && active.columnIndex <= prevIndex ? prevIndex : prevIndex + 1;
   }
   return { statusId: destStatus, position: movePosition(active, destStatus, finalIndex, dest.size) };
 }

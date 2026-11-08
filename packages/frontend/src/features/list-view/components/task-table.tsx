@@ -301,6 +301,20 @@ export function TaskTable({
   );
   const rowIndexRef = useRef(rowIndex);
   rowIndexRef.current = rowIndex;
+  const rowOrder = useMemo(() => listRows.map((row) => row.key), [listRows]);
+  const rowVersions = useMemo(
+    () => new Map(listRows.map((row) => {
+      const task = row.taskId ? rowById.get(row.taskId)?.original : undefined;
+      return [row.key, JSON.stringify(task
+        ? [row.status.position, row.status.id, task.position, task.createdAt, task.id]
+        : [row.status.position, row.status.id])];
+    })),
+    [listRows, rowById],
+  );
+  const rowOrderRef = useRef(rowOrder);
+  rowOrderRef.current = rowOrder;
+  const rowVersionsRef = useRef(rowVersions);
+  rowVersionsRef.current = rowVersions;
   const inView = useRef<{
     scrollTop: number;
     rows: SeenRow[];
@@ -309,6 +323,8 @@ export function TaskTable({
     // The row kept last, and the List it was kept in.
     kept?: string;
     list?: Map<string, number>;
+    order?: readonly string[];
+    versions?: ReadonlyMap<string, string>;
   } | null>(null);
   const keepRowsInView = useCallback(() => {
     const body = bodyRef.current;
@@ -330,7 +346,13 @@ export function TaskTable({
       // keeps them in the rendered range.
       const stayed =
         Math.abs(scrolled) < scroller.clientHeight / 2
-          ? steadyRows(last.rows, (key) => rowIndexRef.current.get(key))
+          ? steadyRows(last.rows, (key) => rowIndexRef.current.get(key),
+              last.order && last.list !== rowIndexRef.current ? {
+                before: last.order,
+                changed: last.versions
+                  ? (key) => last.versions!.get(key) !== rowVersionsRef.current.get(key)
+                  : undefined,
+              } : undefined)
           : [];
       // The first of them still rendered: a short scroll can take the first
       // ones out of the rendered range.
@@ -377,6 +399,8 @@ export function TaskTable({
               scrollTop: scroller.scrollTop,
               rows: [{ key: target.key, top: want, index: target.index }],
               placing: true,
+              order: rowOrderRef.current,
+              versions: rowVersionsRef.current,
             };
             return;
           }
@@ -406,6 +430,8 @@ export function TaskTable({
       rows: rows.length > 0 ? rows : partly,
       kept: keptKey,
       list: rowIndexRef.current,
+      order: rowOrderRef.current,
+      versions: rowVersionsRef.current,
     };
   }, [scroller, virtualizer]);
   // After every render of the table, before the browser paints.

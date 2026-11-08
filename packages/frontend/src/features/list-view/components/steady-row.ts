@@ -1,3 +1,5 @@
+import { stayedEntries, type ListChange } from "@/lib/stayed-entries";
+
 /** A row seen in view: its key, its top relative to the view, and its index in the List then. */
 export interface SeenRow {
   key: string;
@@ -10,6 +12,9 @@ export interface SeenRow {
  * changed, the one to keep in place first, with their indexes now; empty when
  * none of them is in the List any more. The caller keeps the first of them
  * that is still rendered.
+ * When the whole-list change is known, first exclude entries that crossed
+ * other entries using the same order check as Drive. The visible-row weighting
+ * below then retains the List's existing choice among the entries that stayed.
  *
  * Rows added or removed above the view change every seen row's index alike. A
  * row moved by someone (a colleague, a bulk action) changes order with the
@@ -31,10 +36,14 @@ export interface SeenRow {
 export function steadyRows(
   seen: readonly SeenRow[],
   indexOf: (key: string) => number | undefined,
+  change?: Omit<ListChange, "indexOf">,
 ): Array<{ key: string; top: number; index: number }> {
+  const inView = new Set(seen.map((row) => row.key));
+  const stayed = change && stayedEntries({ ...change, indexOf }, (key) => inView.has(key));
   const rows = seen.flatMap((row) => {
     const now = indexOf(row.key);
-    return now === undefined ? [] : [{ key: row.key, top: row.top, was: row.index, index: now }];
+    return now === undefined || (stayed && (change!.before[row.index] !== row.key || !stayed[row.index]))
+      ? [] : [{ key: row.key, top: row.top, was: row.index, index: now }];
   });
   const n = rows.length;
   if (n === 0) return [];

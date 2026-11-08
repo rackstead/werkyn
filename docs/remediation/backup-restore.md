@@ -1,5 +1,10 @@
 # Transactional, validated backup restore (B03, restore side)
 
+The cleanup queue now stores millisecond **absolute** timestamps; see
+[blob-cleanup-timezones.md](blob-cleanup-timezones.md) for the explicit UTC
+legacy conversion and non-UTC/DST coverage. Rounded eligibility remains
+necessary after that representation change.
+
 ## Problem
 
 Backup restore wrote rows one at a time in one transaction and resolved every

@@ -1,5 +1,11 @@
 # Drive copy staging intent
 
+The current queue columns are `TIMESTAMPTZ(3)`. Failure cleanup keeps the
+due-now floor as an absolute timestamp, and retry fences compare the claimed
+instant; see [blob-cleanup-timezones.md](blob-cleanup-timezones.md). The native
+`TIMESTAMP(3)` representation described in the earlier precision note below
+is historical; the rounded eligibility rule and exact claim identity remain.
+
 Drive copy records its freshly planned target path in the durable cleanup queue
 before opening the source and writing target bytes. The current production
 LocalStorageProvider uses the same deterministic path join. Source and destination

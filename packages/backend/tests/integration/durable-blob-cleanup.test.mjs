@@ -405,8 +405,8 @@ async function nonUtcCleanup(t, deletionFails) {
   try {
     await app.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
-      // Use the producer's database clock: Prisma create supplies a UTC wall
-      // timestamp, which may not be due in this transaction-local timezone.
+      // Seed a database-clock due row; Prisma/default producers are also
+      // covered separately against the absolute timestamp column.
       await tx.$executeRaw`
         INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
         VALUES (${storagePath}, CURRENT_TIMESTAMP - interval '1 second')`;
@@ -430,7 +430,7 @@ async function nonUtcCleanup(t, deletionFails) {
       });
       const row = await tx.blobCleanup.findUnique({ where: { storagePath } });
       const [timing] = await tx.$queryRaw`
-        SELECT (EXTRACT(EPOCH FROM ("availableAt" - CURRENT_TIMESTAMP::timestamp(3))) * 1000)::double precision AS "delayMs"
+        SELECT (EXTRACT(EPOCH FROM ("availableAt" - CURRENT_TIMESTAMP::timestamptz(3))) * 1000)::double precision AS "delayMs"
         FROM "BlobCleanup" WHERE "storagePath" = ${storagePath}`;
       const presentAfter = await exists(storagePath);
       const bytesEqual = presentAfter ? Buffer.from(await app.storage.read(storagePath)).equals(bytes) : null;
@@ -466,7 +466,7 @@ test("non-UTC cleanup records deletion errors and the ordinary retry backoff", {
   await nonUtcCleanup(t, true);
 });
 
-// "availableAt" is TIMESTAMP(3): a row made due with CURRENT_TIMESTAMP is
+// "availableAt" is TIMESTAMPTZ(3): a row made due with CURRENT_TIMESTAMP is
 // stored rounded to the nearest millisecond, up to half a millisecond after
 // the clock that wrote it. A failed restore makes its staged files due that
 // way and claims them in the next statement, so on a fast host the claim used
@@ -518,15 +518,110 @@ async function claimingAt(client, instant) {
   const { Prisma } = await import("@prisma/client");
   return new Proxy(client, {
     get(target, key) {
-      if (key !== "$queryRaw") return Reflect.get(target, key);
+      if (key !== "$queryRaw" && key !== "$executeRaw") return Reflect.get(target, key);
       return (strings, ...values) => {
         const fixed = strings.map((s) => s.replaceAll("CURRENT_TIMESTAMP", `TIMESTAMPTZ '${instant}'`));
         assert.notDeepEqual(fixed, [...strings], "the claim reads CURRENT_TIMESTAMP");
-        return target.$queryRaw(Prisma.sql(fixed, ...values));
+        return target[key](Prisma.sql(fixed, ...values));
       };
     },
   });
 }
+
+test("Prisma-staged cleanup is immediate across session timezones", async (t) => {
+  const { PrismaClient } = await import("@prisma/client");
+  const { discardStagedBlobs } = await import("../../src/services/blob-cleanup.ts");
+  for (const zone of ["UTC", "America/Los_Angeles", "Asia/Kathmandu"]) {
+    await t.test(zone, async () => {
+      const url = new URL(process.env.TEST_DATABASE_URL);
+      url.searchParams.set("connection_limit", "1");
+      const client = new PrismaClient({ datasources: { db: { url: url.toString() } } });
+      const storagePath = await blob(workspace.id, ".txt", Buffer.from("Timezone-safe staging cleanup.\n"));
+      try {
+        await client.$executeRawUnsafe(`SET TIME ZONE '${zone}'`);
+        await discardStagedBlobs(client, app.storage, [storagePath], { warn() {}, error() {} });
+        const remaining = await client.$queryRaw`
+          SELECT "availableAt", EXTRACT(EPOCH FROM ("availableAt" - CURRENT_TIMESTAMP))::double precision AS "dueInSeconds"
+          FROM "BlobCleanup" WHERE "storagePath" = ${storagePath}`;
+        t.diagnostic(JSON.stringify({ zone, remaining }));
+        assert.equal(await exists(storagePath), false, "a Prisma-written due-now row must not wait for a timezone offset");
+        assert.deepEqual(remaining, []);
+      } finally {
+        await client.blobCleanup.deleteMany({ where: { storagePath } });
+        await client.$disconnect();
+        await app.storage.delete(storagePath);
+      }
+    });
+  }
+});
+
+test("due times and leases in the first occurrence of the fall-back hour keep their absolute instants", async (t) => {
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  for (const kind of ["due", "lease"]) {
+    await t.test(kind, async () => {
+      const storagePath = await blob(workspace.id, ".txt", Buffer.from("First fall-back occurrence.\n"));
+      try {
+        const result = await app.prisma.$transaction(async (tx) => {
+          await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
+          await tx.$executeRaw`
+            INSERT INTO "BlobCleanup" ("storagePath", "attempts", "availableAt")
+            VALUES (${storagePath}, ${kind === "lease" ? 1 : 0}, TIMESTAMPTZ '2026-11-01 08:15:00.000+00')`;
+          const early = await processBlobCleanup(await claimingAt(tx, "2026-11-01 08:14:59.999+00"), app.storage,
+            { paths: [storagePath], limit: 1, log: { warn() {}, error() {} } });
+          const due = await processBlobCleanup(await claimingAt(tx, "2026-11-01 08:15:00.000+00"), app.storage,
+            { paths: [storagePath], limit: 1, log: { warn() {}, error() {} } });
+          return { early, due };
+        });
+        assert.equal(result.early.claimed, 0);
+        assert.deepEqual(result.due, { claimed: 1, deleted: 1, retained: 0, failed: 0 }, "the first 01:15 must not become the second 01:15");
+        assert.equal(await exists(storagePath), false);
+      } finally {
+        await app.prisma.blobCleanup.deleteMany({ where: { storagePath } });
+        await app.storage.delete(storagePath);
+      }
+    });
+  }
+});
+
+test("cleanup fences keep their claimed instant when the session zone changes during deletion", async (t) => {
+  const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
+  for (const mode of ["retry", "renewed-retry", "retire"]) {
+    await t.test(mode, async () => {
+      const storagePath = await blob(workspace.id, ".txt", Buffer.from("Absolute cleanup fence.\n"));
+      try {
+        const { result, row } = await app.prisma.$transaction(async (tx) => {
+          await tx.$executeRaw`SET LOCAL TIME ZONE 'America/Los_Angeles'`;
+          await tx.$executeRaw`INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+            VALUES (${storagePath}, TIMESTAMPTZ '2026-11-01 08:15:00.000+00')`;
+          const storage = { delete: async (actual) => {
+            assert.equal(actual, storagePath);
+            await tx.$executeRaw`SET LOCAL TIME ZONE 'Asia/Kathmandu'`;
+            if (mode === "retire") return app.storage.delete(actual);
+            if (mode === "renewed-retry")
+              await tx.$executeRaw`UPDATE "BlobCleanup" SET "availableAt" = "availableAt" + interval '1 millisecond'
+                WHERE "storagePath" = ${storagePath}`;
+            throw new Error("Fixed-clock cleanup failure");
+          } };
+          const result = await processBlobCleanup(await claimingAt(tx, "2026-11-01 08:15:00.000+00"), storage,
+            { paths: [storagePath], limit: 1, log: { warn() {}, error() {} } });
+          return { result, row: await tx.blobCleanup.findUnique({ where: { storagePath } }) };
+        });
+        if (mode === "retire") {
+          assert.equal(result.deleted, 1);
+          assert.equal(row, null);
+        } else {
+          assert.equal(result.failed, 1);
+          assert.equal(row.attempts, 1);
+          assert.equal(row.lastError, mode === "retry" ? "Fixed-clock cleanup failure" : null);
+          assert.equal(row.availableAt.toISOString(), mode === "retry" ? "2026-11-01T08:16:00.000Z" : "2026-11-01T08:30:00.001Z");
+        }
+      } finally {
+        await app.prisma.blobCleanup.deleteMany({ where: { storagePath } });
+        await app.storage.delete(storagePath);
+      }
+    });
+  }
+});
 
 // The claim's rounded clock stays an absolute instant. In a non-UTC session a
 // lease taken at 01:45 PDT on the fall-back night ends at 01:00 PST, stored as

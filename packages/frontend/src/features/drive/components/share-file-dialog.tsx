@@ -713,7 +713,7 @@ function CreateLinkForm({
             id="link-expiration"
             min={formatDateISO(new Date())}
             max={LAST_EXPIRY_DATE}
-            aria-invalid={problem !== null && !expiry.focused}
+            aria-invalid={problem !== null && (!expiry.focused || expiry.alertHeld)}
             aria-describedby="link-expiration-note"
           />
           {expiry.content.kind !== "empty" && (
@@ -731,6 +731,7 @@ function CreateLinkForm({
           id="link-expiration-note"
           problem={problem}
           focused={expiry.focused}
+          held={expiry.alertHeld}
         >
           {expiry.content.kind === "date"
             ? describeExpiryDate(expiry.content.date)
@@ -801,7 +802,7 @@ function LinkExpiryEditor({
           aria-label="New expiration date"
           min={formatDateISO(new Date())}
           max={LAST_EXPIRY_DATE}
-          aria-invalid={problem !== null && !expiry.focused}
+          aria-invalid={problem !== null && (!expiry.focused || expiry.alertHeld)}
           aria-describedby={`link-expiration-note-${link.id}`}
         />
         <Button
@@ -819,6 +820,7 @@ function LinkExpiryEditor({
         id={`link-expiration-note-${link.id}`}
         problem={problem}
         focused={expiry.focused}
+        held={expiry.alertHeld}
       >
         {expiry.content.kind === "date"
           ? describeExpiryDate(expiry.content.date)
@@ -838,19 +840,24 @@ function LinkExpiryEditor({
   );
 }
 
-/** The note under an expiry input; a problem shows once focus has left it. */
+/**
+ * The note under an expiry input. A problem shows once focus has left it.
+ * `held` keeps that problem visible when a refusal put focus back on the input.
+ */
 function ExpiryNote({
   id,
   problem,
   focused,
+  held = false,
   children,
 }: {
   id: string;
   problem: string | null;
   focused: boolean;
+  held?: boolean;
   children: ReactNode;
 }) {
-  const shown = problem !== null && !focused;
+  const shown = problem !== null && (!focused || held);
   return (
     <p
       id={id}

@@ -58,6 +58,13 @@ the input, and Chromium marks or completes the half-typed part. If that
 changed what the input holds, the click sends nothing. This follow-up came
 from finding M1 of the PR #211 review.
 
+That blur leaves focus on `document.body` when the activation did not focus
+the button. If the settled value is incomplete, focus returns to the date
+input and the "Enter a complete date." alert stays, so Tab is not required
+to reach the field. A keyboard activation that already focused the button
+is left there. A successful Create or Save does not move focus onto the
+input.
+
 A double-click on Save, or on Remove expiration, used to send the same
 request twice: the second click came before the mutation reported it was
 pending. The dialog now sends a given request once while it is in flight.
@@ -161,6 +168,8 @@ passing would.
   - Create and Save refuse incomplete and past dates;
   - a press that completes a half-typed part sends nothing, and so does a
     click that leaves focus in the input when settling the input changes it;
+  - a refused focus-less click whose settled value is incomplete puts focus
+    back on that date input and keeps the alert; a successful create does not;
   - a double-click sends one request;
   - Clear date and Remove expiration work;
   - messages state the stored expiry;
@@ -200,7 +209,10 @@ passing would.
   reports nothing else.
 - A lone month "0" in an empty input reads as empty until focus leaves the
   input. While it still has focus, Create looks usable. Using it moves focus
-  out of the input, which marks it incomplete, and nothing is sent.
+  out of the input, which marks it incomplete, and nothing is sent. When that
+  leaves focus on the document body, focus returns to the date input and the
+  alert stays. A button that already has focus, and a successful Create, are
+  not moved.
 - Keyboard users who Tab out of a half-typed date see the browser's completed
   date before they reach the button. Enter then sends that date.
 - A double-click on Create or Save with a half-typed last part sends the

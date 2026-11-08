@@ -969,13 +969,22 @@ export async function bulkUpdateTasks(
 
     // Replace the set, but keep the rows of people who remain. Their ids are
     // the assignment order, so submitting the same users again must not mint
-    // new ones. Tasks stay in id order, matching the lock order in
-    // clearAssignments.
+    // new ones. Re-read under a lock: the earlier snapshot is only the
+    // permission check, and a removal that committed after it must still be
+    // restored when that person is requested. Task FOR UPDATE blocks a new
+    // assignment insert. Assignee rows are then locked in id order. Tasks
+    // stay in id order, matching clearAssignments.
     if (data.assigneeIds) {
       const wanted = data.assigneeIds;
       for (const taskId of taskIds) {
-        const current = tasks.find((task) => task.id === taskId);
-        const kept = new Set(current?.assignees.map((assignee) => assignee.userId) ?? []);
+        await tx.$queryRaw`SELECT id FROM "Task" WHERE id = ${taskId} FOR UPDATE`;
+        const current = await tx.$queryRaw<Array<{ userId: string }>>`
+          SELECT "userId" FROM "TaskAssignee"
+          WHERE "taskId" = ${taskId}
+          ORDER BY id
+          FOR UPDATE
+        `;
+        const kept = new Set(current.map((assignee) => assignee.userId));
         const removed = [...kept].filter((userId) => !wanted.includes(userId)).sort();
         if (removed.length > 0) {
           await tx.taskAssignee.deleteMany({ where: { taskId, userId: { in: removed } } });

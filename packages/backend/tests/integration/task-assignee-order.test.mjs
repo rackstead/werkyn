@@ -237,4 +237,17 @@ test("task payloads and the calendar list follow the earliest assignment id", as
   const bulkListed = afterBulk.json().data.find((task) => task.id === taskId);
   assertEarliestFirst(bulkListed, "bulk resubmit");
   assert.deepEqual(bulkListed.assignees.map((row) => row.id), beforeBulk);
+
+  await app.prisma.taskAssignee.deleteMany({ where: { taskId, userId: zoe.id } });
+  const restored = await request("admin", "POST", `/api/projects/${project.id}/tasks/bulk-update`, {
+    taskIds: [taskId],
+    assigneeIds: [aaron.id, zoe.id],
+  });
+  assert.equal(restored.statusCode, 200, restored.body);
+  const afterRestore = await request("admin", "GET", `/api/tasks/${taskId}`);
+  assert.equal(afterRestore.statusCode, 200, afterRestore.body);
+  const restoredRows = afterRestore.json().data.assignees;
+  assert.deepEqual(restoredRows.map((row) => row.userId), [aaron.id, zoe.id]);
+  assert.equal(restoredRows[0].id, beforeBulk[1]);
+  assert.notEqual(restoredRows[1].id, beforeBulk[0]);
 });

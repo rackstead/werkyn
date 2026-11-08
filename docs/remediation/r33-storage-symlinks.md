@@ -78,8 +78,9 @@ All access goes through one helper, `StorageRoot` in
   `O_DIRECTORY | O_NOFOLLOW`, inside the folder opened before it. A link at
   any level is refused.
 - **Reads.** The file is opened with `O_NOFOLLOW | O_NONBLOCK`. It must then
-  be a regular file. A link is refused, and so are a FIFO, socket, device or
-  folder. Opening a FIFO never waits for a writer.
+  be a regular file. A link is refused, and so are a FIFO, device or folder.
+  A socket fails that open with `ENXIO` and is refused the same way. Opening
+  a FIFO never waits for a writer.
 - **Writes.** New files are created with
   `O_CREAT | O_EXCL | O_NOFOLLOW`, and missing folders are made inside
   their opened parent. A write never opens an existing entry. It therefore
@@ -95,18 +96,17 @@ On Linux, a name is resolved inside an open folder by addressing it as
 `/proc/self/fd/<fd>/<name>`. This works like `openat(2)`: if someone renames
 the folder or replaces it with a link after it was checked, the access still
 lands in the folder that was checked. Without `/proc` (macOS development) the
-same checks run on full paths. That narrows the window between check and use
-but cannot close it. The startup log then reports `"access":"path"` and logs a
-warning.
+same checks run on full paths. That path fallback is not race-free: any
+concurrent writer can redirect accesses. The startup log then reports
+`"access":"path"` and logs a warning.
 
 The race was measured with a second process flipping a Drive folder between
-the real folder and a link to an outside folder, for 3 seconds of reads
-(`evidence/round14-r33-race-modes.log`):
-
-| Mode | own file read | refused | missing (mid-flip) | outside file read |
-| --- | --- | --- | --- | --- |
-| `/proc/self/fd` (Linux) | 3,135 | 65 | 3,060 | **0** |
-| path fallback | 2,173 | 67 | 4,322 | 135 |
+the real folder and a link to an outside folder
+(`evidence/round14-r33-race-modes.log`). With `/proc/self/fd` that run read
+nothing outside the folder. A count from one non-atomic flip of the path
+fallback is not a bound on how many accesses a concurrent writer can
+redirect. Production Linux uses `/proc`. Startup still warns when the
+server is in fallback mode.
 
 ### Errors and logs
 
@@ -161,7 +161,8 @@ still is, sent as an `application/octet-stream` attachment.
 
 The `/storage/:ws/uploads/*` route still serves a folder's `index.html` for a
 URL that ends in `/`, and still refuses non-canonical spellings. A folder URL
-without the trailing slash now answers `403` instead of a `301` redirect.
+without the trailing slash answers `403`. Before this refusal, that URL was
+`404`, or `200` serving `index.html` when one existed. It was not a `301`.
 
 The legacy public routes still answer `410`. Public wiki media is still served
 only for URLs that the shared page references.
@@ -248,8 +249,9 @@ Remove FIFOs, sockets and device files. The application never creates them.
 ## Remaining limitations
 
 - **Path fallback.** Without `/proc` (macOS development) the checks run on
-  paths, and a link swapped in during an access can still be followed (see
-  the table above). Production images run on Linux with `/proc`.
+  paths. The path fallback is not race-free: any concurrent writer can
+  redirect accesses. Production images run on Linux with `/proc`, and
+  startup still warns when the server is in fallback mode.
 - **Kept-open staging folder.** The server keeps one descriptor of the
   staging folder open. If that folder is removed while running, its next use
   checks and opens the new folder, and the old descriptor stays open too.
@@ -259,7 +261,8 @@ Remove FIFOs, sockets and device files. The application never creates them.
   root, about five more `open`/`close` calls for a Drive blob. The report
   walks the whole tree.
 - **Folder URLs.** `/storage/:ws/uploads/<folder>` without a trailing slash
-  answers `403` instead of a `301` redirect.
+  answers `403`. Before the refusal it was `404`, or `200` serving
+  `index.html` when one existed, not a `301` redirect.
 
 ## Tests
 
@@ -271,7 +274,8 @@ Remove FIFOs, sockets and device files. The application never creates them.
     workspace folder), each refused for read, `exists`, create and
     delete. Nothing outside the root or in the other workspace changes.
   - A link where a missing folder would be made.
-  - FIFOs and folders, refused without blocking.
+  - FIFOs, sockets and folders, refused without blocking. A missing path
+    stays missing, and a regular file is still read.
   - Hard links.
   - A linked root.
   - Logged refusals.
@@ -279,6 +283,11 @@ Remove FIFOs, sockets and device files. The application never creates them.
     before the read, create or delete.
   - A 3-second race against a process flipping a folder and a link.
   - The report command.
+- **`packages/backend/tests/storage-socket-http.test.mjs`** checks both
+  access modes. A socket, FIFO or directory at a blob path answers `403`.
+  A missing path stays `410` on a Drive read and `404` where that miss is
+  reported as not found. A regular file is still downloaded. An `ENXIO`
+  that is not this open stays `500`.
 - **`packages/backend/tests/integration/storage-symlink-refusal.test.mjs`**
   runs with `STORAGE_DIR` as a link.
   - End to end through the linked root: Drive upload, thumbnail, download,

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fss from "node:fs";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   StorageRefusedError,
   StorageRoot,
@@ -19,7 +21,13 @@ import { LocalStorageProvider, MissingBlobError } from "../src/services/storage.
 const PROC = fss.existsSync("/proc/self/fd");
 const MODES = PROC ? [true, false] : [false];
 const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "werkyn-storage-paths-"));
-after(() => fs.rm(scratch, { recursive: true, force: true }));
+/** Checkout root. A blob socket has to live on a short path (sockaddr_un). */
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const socketScratch = path.join(repoRoot, "t", "sock");
+after(() => Promise.all([
+  fs.rm(scratch, { recursive: true, force: true }),
+  fs.rm(socketScratch, { recursive: true, force: true }),
+]));
 const SECRET = "outside secret: must never be read, written or removed";
 
 let fixtures = 0;
@@ -53,6 +61,37 @@ async function snapshot(dir) {
       : stat.isFile() ? await fs.readFile(full, "utf8") : "dir";
   }
   return entries;
+}
+
+/**
+ * A storage root holding a listening Unix socket at a blob path, plus an
+ * ordinary file beside it. `relative` is the socket. Caller closes it.
+ */
+async function plantSocket() {
+  const base = path.join(socketScratch, `${process.pid}-${++fixtures}`);
+  const root = path.join(base, "r");
+  await fs.mkdir(path.join(root, "a/b"), { recursive: true });
+  await fs.writeFile(path.join(root, "a/b/file.bin"), "own bytes");
+  const socketPath = path.join(root, "a/b/sock");
+  assert.ok(Buffer.byteLength(socketPath) < 107, `socket path is too long: ${socketPath}`);
+  const listener = net.createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      listener.once("error", reject);
+      listener.listen(socketPath, () => resolve());
+    });
+  } catch (error) {
+    await fs.rm(base, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    root,
+    relative: "a/b/sock",
+    close: async () => {
+      await new Promise((resolve) => listener.close(resolve));
+      await fs.rm(base, { recursive: true, force: true });
+    },
+  };
 }
 
 const refused = (reason = "symbolic-link") => (error) => {
@@ -160,14 +199,32 @@ for (const proc of MODES) {
     const f = await fixture();
     execFileSync("mkfifo", [f.at("wsA/files/u1/pipe.bin")]);
     await fs.mkdir(f.at("wsA/files/u1/folder.bin"));
+    // sockaddr_un holds 108 bytes. The shared fixture can be longer than that.
+    const planted = await plantSocket();
     const root = new StorageRoot(f.root, { procFd: proc });
+    const socketRoot = new StorageRoot(planted.root, { procFd: proc });
     const started = performance.now();
-    await assert.rejects(root.openFile("wsA/files/u1/pipe.bin"), refused("not-a-file"));
-    assert.ok(performance.now() - started < 1000, "opening the FIFO did not wait for a writer");
-    await assert.rejects(root.exists("wsA/files/u1/pipe.bin"), refused("not-a-file"));
-    await assert.rejects(root.openFile("wsA/files/u1/folder.bin"), refused("not-a-file"));
-    await assert.rejects(root.unlink("wsA/files/u1/folder.bin"), refused("not-a-file"));
-    assert.ok((await fs.stat(f.at("wsA/files/u1/folder.bin"))).isDirectory());
+    try {
+      await assert.rejects(root.openFile("wsA/files/u1/pipe.bin"), refused("not-a-file"));
+      assert.ok(performance.now() - started < 1000, "opening the FIFO did not wait for a writer");
+      await assert.rejects(root.exists("wsA/files/u1/pipe.bin"), refused("not-a-file"));
+      const socketStarted = performance.now();
+      await assert.rejects(socketRoot.openFile(planted.relative), refused("not-a-file"));
+      assert.ok(performance.now() - socketStarted < 1000, "opening the socket did not block");
+      await assert.rejects(socketRoot.exists(planted.relative), refused("not-a-file"));
+      const opened = await socketRoot.openFile("a/b/file.bin");
+      try {
+        assert.equal((await opened.handle.readFile()).toString(), "own bytes");
+      } finally {
+        await opened.handle.close();
+      }
+      await assert.rejects(socketRoot.openFile("a/b/absent.bin"), { code: "ENOENT" });
+      await assert.rejects(root.openFile("wsA/files/u1/folder.bin"), refused("not-a-file"));
+      await assert.rejects(root.unlink("wsA/files/u1/folder.bin"), refused("not-a-file"));
+      assert.ok((await fs.stat(f.at("wsA/files/u1/folder.bin"))).isDirectory());
+    } finally {
+      await planted.close();
+    }
   });
 
   test(`${mode}: a hard link is an ordinary entry and an existing name is never overwritten`, async () => {

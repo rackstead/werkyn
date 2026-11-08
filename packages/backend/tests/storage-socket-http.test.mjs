@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -85,7 +86,12 @@ function read(server, route, relative) {
   return server.inject({ method: "GET", url });
 }
 
-for (const proc of [true, false]) {
+// Descriptor mode addresses names through /proc/self/fd. Without it, only
+// the path fallback runs, as in storage-paths.test.mjs. The path case always runs.
+const PROC = existsSync("/proc/self/fd");
+const MODES = PROC ? [true, false] : [false];
+
+for (const proc of MODES) {
   const mode = proc ? "descriptor" : "path";
   test(`${mode}: socket, FIFO and directory at a blob path are 403`, async () => {
     const planted = await layout(mode);

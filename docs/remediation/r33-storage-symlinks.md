@@ -283,8 +283,9 @@ Remove FIFOs, sockets and device files. The application never creates them.
     before the read, create or delete.
   - A 3-second race against a process flipping a folder and a link.
   - The report command.
-- **`packages/backend/tests/storage-socket-http.test.mjs`** checks both
-  access modes. A socket, FIFO or directory at a blob path answers `403`.
+- **`packages/backend/tests/storage-socket-http.test.mjs`** runs the
+  descriptor case when `/proc/self/fd` exists, and always runs the path
+  case. A socket, FIFO or directory at a blob path answers `403`.
   A missing path stays `410` on a Drive read and `404` where that miss is
   reported as not found. A regular file is still downloaded. An `ENXIO`
   that is not this open stays `500`.

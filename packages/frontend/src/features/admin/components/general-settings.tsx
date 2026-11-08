@@ -55,11 +55,10 @@ export function GeneralSettings({ workspaceId }: GeneralSettingsProps) {
     }
   }, [settings]);
 
+  // The app-wide mutation handler already toasts this failure. Another
+  // toast here would show that message a second time.
   const handleSaveProfile = () => {
-    updateWorkspace.mutate(
-      { name, slug },
-      { onError: (err) => toast.error(err.message) },
-    );
+    updateWorkspace.mutate({ name, slug });
   };
 
   const handleSaveSettings = () => {
@@ -71,10 +70,7 @@ export function GeneralSettings({ workspaceId }: GeneralSettingsProps) {
         allowedEmailDomains: allowedDomains,
         maxMembers: maxMembers ? parseInt(maxMembers, 10) : null,
       },
-      {
-        onSuccess: () => toast.success("Settings saved"),
-        onError: (err) => toast.error(err.message),
-      },
+      { onSuccess: () => toast.success("Settings saved") },
     );
   };
 

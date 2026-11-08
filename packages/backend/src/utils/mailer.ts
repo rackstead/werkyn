@@ -39,6 +39,11 @@ export function resetTransporter() {
   transporter = undefined;
 }
 
+function configuredHost(value: string | null | undefined): string | undefined {
+  const host = value?.trim();
+  return host ? host : undefined;
+}
+
 /**
  * True when account mail can be sent without the development-only Ethereal
  * inbox. A database host wins, then SMTP_HOST. A read failure falls through
@@ -52,7 +57,7 @@ export async function mailDeliveryConfigured(prisma?: PrismaClient): Promise<boo
         where: { id: "singleton" },
         select: { host: true },
       });
-      if (config?.host) return true;
+      if (configuredHost(config?.host)) return true;
     } catch (error) {
       logger.warn(
         { database: describeMailConfigFailure(error) },
@@ -60,7 +65,7 @@ export async function mailDeliveryConfigured(prisma?: PrismaClient): Promise<boo
       );
     }
   }
-  return Boolean(env.SMTP_HOST);
+  return Boolean(configuredHost(env.SMTP_HOST));
 }
 
 async function getTransporter(): Promise<{
@@ -76,14 +81,15 @@ async function getTransporter(): Promise<{
         where: { id: "singleton" },
       });
 
-      if (dbConfig && dbConfig.host) {
+      const dbHost = configuredHost(dbConfig?.host);
+      if (dbConfig && dbHost) {
         const options: TransportOptions & {
           host: string;
           port: number;
           secure: boolean;
           auth?: { user: string; pass: string };
         } = {
-          host: dbConfig.host,
+          host: dbHost,
           port: dbConfig.port,
           secure: dbConfig.secure,
         };
@@ -103,15 +109,16 @@ async function getTransporter(): Promise<{
     }
   }
 
-  // 2. Env var fallback
-  if (env.SMTP_HOST) {
+  // 2. Env var fallback. Whitespace is not a host.
+  const smtpHost = configuredHost(env.SMTP_HOST);
+  if (smtpHost) {
     const options: TransportOptions & {
       host: string;
       port: number;
       secure: boolean;
       auth?: { user: string; pass: string };
     } = {
-      host: env.SMTP_HOST,
+      host: smtpHost,
       port: env.SMTP_PORT,
       secure: env.SMTP_SECURE,
     };

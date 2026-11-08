@@ -543,6 +543,26 @@ test("the setting cannot be turned on until email delivery is configured", async
         .privacyPreserving,
       false,
     );
+    await app.prisma.emailConfig.upsert({
+      where: { id: "singleton" },
+      create: { id: "singleton", host: "   " },
+      update: { host: "   " },
+    });
+    env.SMTP_HOST = "   ";
+    const whitespace = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/registration/config",
+      payload: { privacyPreserving: true },
+      headers: { authorization: `Bearer ${token}` },
+      remoteAddress: nextAddress(),
+    });
+    assert.equal(whitespace.statusCode, 400, whitespace.body);
+    assert.equal(
+      (await app.prisma.registrationConfig.findUnique({ where: { id: "singleton" } }))
+        .privacyPreserving,
+      false,
+    );
+    env.SMTP_HOST = "";
     await setPrivacy(true);
     const disabled = await app.inject({
       method: "PATCH",
@@ -560,6 +580,8 @@ test("the setting cannot be turned on until email delivery is configured", async
         where: { id: "singleton" },
         data: { host: stored.host },
       });
+    } else {
+      await app.prisma.emailConfig.deleteMany({ where: { id: "singleton" } });
     }
     await setPrivacy(false);
   }

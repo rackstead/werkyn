@@ -6,13 +6,20 @@ import {
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { formatContentDisposition } from "../../utils/content-disposition.js";
 import * as shareService from "./file-shares.service.js";
-import type {
-  CreateFileShareInput,
-  CreateFileShareLinkInput,
-  UpdateFileShareLinkInput,
-  ValidateFileShareLinkInput,
-  SharedFilesQueryInput,
+import {
+  isLegacyFileShareToken,
+  type CreateFileShareInput,
+  type CreateFileShareLinkInput,
+  type UpdateFileShareLinkInput,
+  type ValidateFileShareLinkInput,
+  type SharedFilesQueryInput,
 } from "@pm/shared";
+
+function presentFileShareLink<
+  T extends { token: string; passwordHash: string | null },
+>(link: T) {
+  return { ...shareSummary(link), retired: isLegacyFileShareToken(link.token) };
+}
 
 function getAccessCtx(request: FastifyRequest) {
   return {
@@ -132,7 +139,7 @@ export async function createFileShareLinkHandler(
     body.expiresAt,
   );
 
-  return reply.status(201).send({ data: shareSummary(link) });
+  return reply.status(201).send({ data: presentFileShareLink(link) });
 }
 
 export async function getFileShareLinksHandler(
@@ -148,7 +155,7 @@ export async function getFileShareLinksHandler(
     getAccessCtx(request),
   );
 
-  return reply.send({ data: links.map(shareSummary) });
+  return reply.send({ data: links.map(presentFileShareLink) });
 }
 
 export async function updateFileShareLinkHandler(
@@ -165,7 +172,7 @@ export async function updateFileShareLinkHandler(
     getAccessCtx(request),
   );
 
-  return reply.send({ data: shareSummary(link) });
+  return reply.send({ data: presentFileShareLink(link) });
 }
 
 export async function deleteFileShareLinkHandler(

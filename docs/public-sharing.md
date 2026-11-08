@@ -3,7 +3,9 @@
 Wiki and Drive share passwords are enforced by the server. A protected public GET
 returns a locked response without page content, file names, file IDs or creator
 metadata until the visitor verifies the password. Unprotected links continue to
-work without verification. Existing share tokens and passwords remain valid.
+work without verification. Passwords on current share links remain valid. Drive links issued as
+8-character tokens no longer open and have to be recreated; see
+[remediation/legacy-share-tokens.md](remediation/legacy-share-tokens.md).
 New Drive links get 256-bit tokens; see
 [remediation/drive-share-tokens.md](remediation/drive-share-tokens.md).
 

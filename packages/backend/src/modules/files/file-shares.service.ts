@@ -23,6 +23,7 @@ import {
   deliverNotification,
   enqueueNotification,
 } from "../notifications/notification-delivery.js";
+import { isLegacyFileShareToken } from "@pm/shared";
 
 const NETWORK_ERROR_CODES = new Set([
   "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
@@ -310,8 +311,9 @@ export async function listSharedByMe(
 
 // ─── Public Share Links ─────────────────────────────────
 
-// New links get 32 CSPRNG bytes (256 bits) as 43 URL-safe characters. Links
-// issued earlier keep their shorter tokens and are looked up the same way.
+// New links get 32 CSPRNG bytes (256 bits) as 43 URL-safe characters.
+// An 8-character token is not a credential: public reads miss before the
+// query, the same way an unknown token does. The row itself is kept.
 const SHARE_LINK_TOKEN_BYTES = 32;
 const SHARE_LINK_CREATE_ATTEMPTS = 3;
 
@@ -519,14 +521,26 @@ export async function deleteFileShareLink(
 
 // ─── Public Access (no auth) ────────────────────────────
 
+// One gate for every public read of a presented token. Callers added later
+// must use this (the app Prisma client also misses the same shape).
+async function findPresentedFileShareLink<T>(
+  token: string,
+  load: (token: string) => Promise<T | null>,
+): Promise<T | null> {
+  if (isLegacyFileShareToken(token)) return null;
+  return load(token);
+}
+
 export async function getPublicShareLink(
   prisma: PrismaClient,
   token: string,
   grant?: string,
 ) {
-  const link = await prisma.fileShareLink.findUnique({
-    where: { token },
-  });
+  const link = await findPresentedFileShareLink(token, (presented) =>
+    prisma.fileShareLink.findUnique({
+      where: { token: presented },
+    }),
+  );
 
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 
@@ -574,7 +588,9 @@ export async function validateShareLinkAccess(
   token: string,
   password: string,
 ) {
-  const link = await prisma.fileShareLink.findUnique({ where: { token } });
+  const link = await findPresentedFileShareLink(token, (presented) =>
+    prisma.fileShareLink.findUnique({ where: { token: presented } }),
+  );
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 
   if (link.expiresAt && link.expiresAt <= new Date()) {
@@ -603,12 +619,14 @@ export async function downloadPublicFile(
   fileId: string,
   grant?: string,
 ) {
-  const link = await prisma.fileShareLink.findUnique({
-    where: { token },
-    include: {
-      files: { where: { fileId }, include: { file: true } },
-    },
-  });
+  const link = await findPresentedFileShareLink(token, (presented) =>
+    prisma.fileShareLink.findUnique({
+      where: { token: presented },
+      include: {
+        files: { where: { fileId }, include: { file: true } },
+      },
+    }),
+  );
 
   if (!link || !link.enabled) throw new NotFoundError("Shared files not found");
 

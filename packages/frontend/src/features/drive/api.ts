@@ -734,6 +734,8 @@ export interface FileShareLinkDetail {
   hasPassword: boolean;
   expiresAt: string | null;
   enabled: boolean;
+  /** True when the public URL no longer works and the link must be recreated. */
+  retired?: boolean;
   files: { file: { id: string; name: string; mimeType: string | null; size: number | null } }[];
   createdBy: { id: string; displayName: string; avatarUrl: string | null };
   createdAt: string;

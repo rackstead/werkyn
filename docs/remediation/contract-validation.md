@@ -65,10 +65,12 @@ days. Custom field number values must be finite.
 The global error handler maps Prisma errors to generic responses and never
 returns Prisma's message, which quotes the query, its arguments, source file
 paths and database error text. Unique conflicts return 409, missing records
-404, foreign key conflicts 409, values the column or database cannot accept
+404, foreign key conflicts 409, check violations (SQLSTATE 23514, including
+the R35 checks and triggers) 409 with the same message as a foreign-key
+conflict, values the column or database cannot accept
 (including PostgreSQL data exceptions such as U+0000 in text or JSON) 400,
 and everything else 500 with "An unexpected error occurred". The full error
-is still logged.
+is still logged. See [r35-constraints](r35-constraints.md#effect-on-the-application).
 
 ## Legacy non-finite values in time reports
 

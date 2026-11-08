@@ -118,7 +118,7 @@ the triggers fail until the pins name the new schema.
 | Candidate | Why not now |
 | --- | --- |
 | `task_assignee_access`, `subtask_assignee_access`, `chat_member_workspace` | They depend on mutable membership. Membership removal and ADMIN demotion clear assignments in the same transaction under the DAT-005 lock order. A database rule would need triggers on member deletes and role changes that join that lock order; it needs its own design and concurrency tests. |
-| A time entry with a task but no project | Not covered by MATCH SIMPLE. A CHECK cannot be deferred and would refuse project deletes whose SET NULL runs before the task cascade. Needs a deferred constraint trigger. The report still lists such rows, under `time_entry_task_project`, or `time_entry_workspace` when the task is in another workspace. The migration does not refuse them, so they need no repair before upgrading. |
+| A time entry with a task but no project | Not covered by MATCH SIMPLE. A CHECK cannot be deferred and would refuse project deletes whose SET NULL runs before the task cascade. Needs a deferred constraint trigger. The report does not list these rows: no adopted rule requires a project, so they need no repair before upgrading. A row that breaks a rule that does exist is still listed. |
 | Custom-field value type and options (`custom-field-value-report`) | The rules (`checkCustomFieldValue`) depend on the field's type and options, which change; option edits migrate values. Enforcing them needs a SQL port of the shared validator or a trigger on both tables. |
 | Date-only text columns (`dueDate`, `startDate`, `date`, `effectiveFrom`, schedule dates) | A real-calendar-day check needs a SQL function, and the scheduler and template instantiation compute dates internally (see DAT-018); verify those writers first. |
 | Rate at most 1,000,000,000 | The request schema caps new rates, but time reports deliberately keep pricing larger finite legacy rates and refuse only costs they cannot represent ([time-report-rounded-costs.md](time-report-rounded-costs.md), tested with rates up to 1e308). A cap in the database would contradict that decision. |
@@ -148,10 +148,9 @@ and deploy again. See docs/remediation/r35-constraints.md.
 
 Nothing is created or changed (the precheck runs before any change, and the
 migration is one transaction, so a later failure also undoes everything
-before it). The report can list more time entries than the migration
-refuses: entries with a task but no project (see the follow-ups above) appear
-under `time_entry_task_project` or `time_entry_workspace` although no rule of
-the migration covers them. The IDs in the migration's message are the rows to
+before it). The report lists the rows each of these rules refuses. An entry
+with a task and no project is not one of those rows, and the report does not
+list it. The IDs in the migration's message are the rows to
 repair before deploying again. `prisma migrate deploy` exits with P3018 and
 the container does not start; later deploys stop with P3009 until the
 migration is marked rolled back. Repair the rows, run the `resolve` command
@@ -185,9 +184,17 @@ with a complete reorder of the column, field list, subtasks or wiki siblings.
 ## Effect on the application
 
 None for valid requests: every rule was already enforced before the write.
-A write that still broke a rule would now fail instead of storing the row:
-composite keys as the existing 409 "The request conflicts with a related
-record", checks and triggers as a 500 (both are logged). The read-side
+A write that still broke a rule would now fail instead of storing the row.
+Composite foreign keys, including a deferred time-entry key, are a 409
+"The request conflicts with a related record". A CHECK refusal (SQLSTATE
+23514) and a refusal raised by an R35 trigger are the same 409 and the same
+message. Prisma reports a model write as an unknown request error and a raw
+query as P2010; both carry 23514, and neither is sent to the client. The
+response does not include the query, schema names, constraint names or
+trigger text. The error is logged. Request validation that already answers
+4xx (hours outside 0.01–24, a task that is not in the selected project, a
+label that is not in the task's project) still returns that code, because
+the database is not asked. The read-side
 tolerance for legacy rows (placeholder status, dropped cross-project labels,
 skipped non-finite hours) is unchanged; on a migrated database it can only
 meet rows written with the constraints bypassed.

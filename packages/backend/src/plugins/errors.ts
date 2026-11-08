@@ -74,6 +74,23 @@ function isDataException(sqlState: unknown) {
 }
 
 /**
+ * PostgreSQL 23514 check_violation. A CHECK raises it, and so do the R35
+ * triggers. A model write is an unknown request error whose message quotes
+ * `code: "23514"`; a raw query is P2010 with that SQLSTATE in `meta.code`.
+ * The text names tables and trigger source, so callers must not send it on.
+ */
+function isCheckViolation(error: unknown) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code !== "P2010") return false;
+    return error.meta?.code === "23514" || /Code: `23514`/.test(error.message);
+  }
+  if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+    return /\bcode: "23514"/.test(error.message);
+  }
+  return false;
+}
+
+/**
  * The response for an error thrown by Prisma, or null for any other error.
  * Prisma messages quote the query, its arguments, source file locations and
  * database error text, so they are logged and never sent to clients.
@@ -83,6 +100,10 @@ function prismaErrorResponse(error: unknown): ErrorBody | null {
   // transaction back; the client may retry. Checked first: Prisma reports
   // these under several error classes, most of which would otherwise be a 500.
   if (isRetryableDatabaseError(error)) return PRISMA_REQUEST_ERRORS.P2034;
+  // Same answer as a foreign-key conflict (P2003): the write conflicts with
+  // a stored rule. Checked before the code maps, which have no 23514 entry
+  // and would otherwise answer 500.
+  if (isCheckViolation(error)) return RELATED_CONFLICT;
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     // P2010 wraps a raw query failure and carries its SQLSTATE in meta.code.
     if (error.code === "P2010" && isDataException(error.meta?.code)) {

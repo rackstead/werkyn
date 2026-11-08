@@ -113,7 +113,9 @@ async function insertReferenceViolations(db) {
     ('bad-rc', 'p1', 'tt2', 'DAILY', '2026-01-01', '2026-01-02', now())`);
   await sql(db, `INSERT INTO "TimeEntry" (id, "workspaceId", "userId", "taskId", "projectId", date, hours, "updatedAt") VALUES
     ('bad-e-ws', 'w2', 'u1', NULL, 'p1', '2026-01-01', 1, now()),
-    ('bad-e-task', 'w1', 'u1', 't3', 'p1', '2026-01-01', 1, now())`);
+    ('bad-e-task', 'w1', 'u1', 't3', 'p1', '2026-01-01', 1, now()),
+    ('ok-task-only', 'w1', 'u1', 't1', NULL, '2026-01-01', 1, now()),
+    ('ok-task-foreign', 'w2', 'u1', 't1', NULL, '2026-01-01', 1, now())`);
   await sql(db, `INSERT INTO "TaskDependency" (id, "blockedTaskId", "blockingTaskId") VALUES
     ('bad-d-cross', 't1', 't3'), ('bad-d-self', 't2', 't2')`);
   await sql(db, `INSERT INTO "TaskLabel" (id, "taskId", "labelId") VALUES ('bad-tl', 't1', 'l2')`);
@@ -337,8 +339,10 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
         `prisma migrate resolve --rolled-back ${FIRST}`,
       ])
         assert(deploy.output.includes(text), `${text} in\n${deploy.output}`);
-      // The second migration never ran.
+      // The second migration never ran. A task with no project is not a rule.
       assert(!deploy.output.includes("time_entry_hours"), deploy.output);
+      assert(!deploy.output.includes("ok-task-only"), deploy.output);
+      assert(!deploy.output.includes("ok-task-foreign"), deploy.output);
 
       assert.deepEqual(await catalogSnapshot(legacy), catalog);
       assert.deepEqual(await dataSnapshot(legacy), data);
@@ -356,6 +360,9 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
         const reported = issue.samples.map((s) => s.id);
         for (const id of rows) assert(reported.includes(id), `${key} report lists ${id}`);
       }
+      const listed = new Set(issues.flatMap((issue) => issue.samples.map((sample) => sample.id)));
+      assert.equal(listed.has("ok-task-only"), false);
+      assert.equal(listed.has("ok-task-foreign"), false);
     });
 
     await t.test("with those rows repaired, a failure at the first migration's last statement leaves nothing behind", async (st) => {

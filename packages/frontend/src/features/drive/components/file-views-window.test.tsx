@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DriveFile } from "../api";
+import type { DriveFile, SortBy } from "../api";
 import { FileGridView } from "./file-grid-view";
 import { FileListView } from "./file-list-view";
 
@@ -118,12 +118,14 @@ function Harness({
   selectedIds,
   draggingId,
   hasNextPage = false,
+  sortBy = "name",
 }: {
   files: DriveFile[];
   view?: "list" | "grid";
   selectedIds?: Set<string>;
   draggingId?: string | null;
   hasNextPage?: boolean;
+  sortBy?: SortBy;
 }) {
   const [element, setElement] = useState<HTMLDivElement | null>(null);
   const attach = (node: HTMLDivElement | null) => {
@@ -154,6 +156,7 @@ function Harness({
     scrollElement: element,
     draggingId,
     hasNextPage,
+    sortBy,
     isFetchingNextPage: false,
     canEdit: true,
     selectable: true,
@@ -211,6 +214,44 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("Drive anchoring after unrelated metadata changes", () => {
+  for (const view of ["list", "grid"] as const) {
+    for (const sortBy of ["name", "size", "updatedAt", "uploadedBy"] as const) {
+      it(`keeps the entry under the pointer in ${view}, sorted by ${sortBy}`, async () => {
+        const files = range(0, 1000).map((file, index) => ({
+          ...file, size: index * 100,
+          updatedAt: new Date(Date.UTC(2026, 10, 1) + index * 1000).toISOString(),
+          uploadedBy: { ...file.uploadedBy, displayName: `Uploader ${String(index).padStart(4, "0")}` },
+        }));
+        const { rerender } = render(<Harness files={files} view={view} sortBy={sortBy} />);
+        await scrollTo(view === "list" ? HEAD + 500 * ROW : SORT_BAR + 100 * LINE);
+        const end = view === "list" ? 510 : 515;
+        const split = view === "list" ? 507 : 510;
+        const target = files[split].id;
+        const top = topOf(target);
+        const point = top + 10;
+        const movers = files.slice(500, split).map((file, index) => ({
+          ...file,
+          ...(sortBy === "name" ? { name: `${files[end - 1].name} zz ${index}` }
+            : sortBy === "size" ? { size: files[end - 1].size + index + 1 }
+            : sortBy === "updatedAt" ? { updatedAt: new Date(Date.parse(files[end - 1].updatedAt) + index + 1).toISOString() }
+            : { uploadedBy: { ...file.uploadedBy, displayName: `${files[end - 1].uploadedBy.displayName} zz ${index}` } }),
+        }));
+        const stayers = files.slice(split, end).map((file) => ({
+          ...file,
+          ...(sortBy !== "name" && { name: `New title ${file.name}` }),
+          ...(sortBy !== "size" && { size: file.size + 1 }),
+          ...(sortBy !== "updatedAt" && { updatedAt: "2027-01-01T00:00:00Z" }),
+          ...(sortBy !== "uploadedBy" && { uploadedBy: { ...file.uploadedBy, displayName: "New display name" } }),
+        }));
+        rerender(<Harness files={[...files.slice(0, 500), ...stayers, ...movers, ...files.slice(end)]} view={view} sortBy={sortBy} />);
+        expect(topOf(target)).toBe(top);
+        expect(entryAt(point)).toBe(target);
+      });
+    }
+  }
 });
 
 describe("windowed Drive list", { timeout: 30_000 }, () => {

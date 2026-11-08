@@ -19,6 +19,15 @@ const block = (prefix: string, from: number, count: number, shift: number) =>
   Array.from({ length: count }, (_, i): [string, number, number] => [`${prefix}${i}`, from + i, from + i + shift]);
 
 describe("steadyRows", () => {
+  it("uses the whole-list order instead of following a moved row whose index was offset by inserts", () => {
+    const before = Array.from({ length: 100 }, (_, i) => `r${i}`);
+    const after = [...Array.from({ length: 30 }, (_, i) => `new${i}`), ...before.filter((key) => key !== "r40")];
+    after.splice(40, 0, "r40");
+    const now = new Map(after.map((key, index) => [key, index]));
+    const seen = before.slice(40, 60).map((key, i) => ({ key, index: i + 40, top: i * 41 }));
+    expect(steadyRows(seen, (key) => now.get(key), { before, changed: (key) => key === "r40" })[0].key).toBe("r41");
+  });
+
   it("keeps the first row when rows were added or removed above the view", () => {
     expect(keep(...block("r", 100, 20, 3))).toBe("r0");
     expect(keep(...block("r", 100, 20, -2))).toBe("r0");

@@ -83,7 +83,7 @@ export function FileListView({
   onShare,
   onArchive,
   sharedFileIds,
-  sortBy,
+  sortBy = "name",
   sortOrder,
   onSort,
 }: FileListViewProps) {
@@ -116,9 +116,9 @@ export function FileListView({
   const versionOf = useCallback(
     (id: string) => {
       const index = indexById.get(id);
-      return index === undefined ? undefined : fileVersion(files[index]);
+      return index === undefined ? undefined : fileVersion(files[index], sortBy);
     },
-    [files, indexById],
+    [files, indexById, sortBy],
   );
   // Space held below the entries while they are kept in place at the end of
   // the list until the next page arrives (see KeepInView's onShort). It

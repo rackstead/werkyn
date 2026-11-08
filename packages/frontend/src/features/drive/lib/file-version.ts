@@ -1,12 +1,13 @@
-import type { DriveFile } from "../api";
+import type { DriveFile, SortBy } from "../api";
 
 /**
  * What a folder listing's order depends on for one entry: folders first,
  * then the sort column (name, size, modified, uploaded by), then the ID.
- * Two versions of an entry that give the same string sort the same against
- * the other entries; any change saved on the server also changes
- * `updatedAt`.
+ * A change to an inactive column cannot move the entry. In particular, a
+ * thumbnail update or uploader rename must not mark an entry as moved when
+ * the folder is sorted by name. The JSON tuple preserves nulls and separators.
  */
-export function fileVersion(file: DriveFile): string {
-  return [file.isFolder, file.name, file.size, file.updatedAt, file.uploadedBy?.displayName].join("\u0000");
+export function fileVersion(file: DriveFile, sortBy: SortBy = "name"): string {
+  const value = sortBy === "uploadedBy" ? file.uploadedBy?.displayName ?? null : file[sortBy];
+  return JSON.stringify([file.isFolder, sortBy, value, file.id]);
 }

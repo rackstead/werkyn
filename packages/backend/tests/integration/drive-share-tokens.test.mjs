@@ -456,6 +456,34 @@ test("8-character share tokens no longer grant access and stay removable", async
     await app.prisma.fileShareLink.findMany({ where: { token: short.token } }),
     [],
   );
+  assert.equal(
+    await app.prisma.fileShareLink.count({ where: { token: short.token } }),
+    0,
+  );
+  assert.deepEqual(
+    await app.prisma.fileShareLink.groupBy({
+      by: ["id"],
+      where: { token: short.token },
+    }),
+    [],
+  );
+  const unknownToken = crypto.randomBytes(32).toString("base64url");
+  assert.deepEqual(
+    await app.prisma.fileShareLink.aggregate({
+      where: { token: short.token },
+      _count: true,
+    }),
+    await app.prisma.fileShareLink.aggregate({
+      where: { token: unknownToken },
+      _count: true,
+    }),
+  );
+  assert.equal(
+    await app.prisma.fileShareLinkFile.findFirst({
+      where: { shareLink: { token: short.token } },
+    }),
+    null,
+  );
   const listed = await request(
     "GET",
     `/api/workspaces/${workspace.id}/files/${shortFile.id}/share-links`,

@@ -33,9 +33,12 @@ show that the token used to exist. The public page therefore shows the same
 The check is the token shape, not a list of ids. It runs before the row is
 read in `findPresentedFileShareLink`, which is the only public read of a
 presented Drive share token. The app Prisma client applies the same rule to
-every `FileShareLink` read whose filter requires an 8-character token,
-including a lookup added later. A read that does not ask for that token is
-unchanged. Listings, updates and deletes by id still see the row.
+every direct `FileShareLink` read, including `count`, `aggregate` and
+`groupBy`, and to relation filters on `shareLink`, `fileShareLinks` and
+`fileShareLinksCreated`. `NOT` is boolean: a filter that still requires the
+8-character token misses, and a single negation does not. A read that does
+not ask for that token is unchanged. Listings, updates and deletes by id
+still see the row. Raw SQL is outside this client and is not a public route.
 
 There is no schema migration and no backfill. Existing rows are left in place.
 Inserting another 8-character token later does not make it work.

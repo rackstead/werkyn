@@ -521,8 +521,8 @@ export async function deleteFileShareLink(
 
 // ─── Public Access (no auth) ────────────────────────────
 
-// One gate for every public read of a presented token. Callers added later
-// must use this (the app Prisma client also misses the same shape).
+// One gate for every public read of a presented token. The app Prisma client
+// misses the same shape on direct reads and on share-link relation filters.
 async function findPresentedFileShareLink<T>(
   token: string,
   load: (token: string) => Promise<T | null>,

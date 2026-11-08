@@ -1,7 +1,10 @@
 import fp from "fastify-plugin";
 import { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
-import { decideLegacyShareLookup } from "../modules/files/legacy-share-lookup.js";
+import {
+  decideLegacyShareLookup,
+  scrubNestedShareLinkArgs,
+} from "../modules/files/legacy-share-lookup.js";
 
 const LEGACY_SHARE_READS = new Set([
   "findUnique",
@@ -10,39 +13,47 @@ const LEGACY_SHARE_READS = new Set([
   "findFirstOrThrow",
   "findMany",
   "count",
+  "aggregate",
+  "groupBy",
 ]);
 
-// Every FileShareLink read on the app client misses an 8-character token,
-// including lookups added later. Writes and listings that do not ask for
-// that token are unchanged, so the owner can still see and delete the row.
+// Direct FileShareLink reads miss an 8-character token, including aggregate
+// and groupBy. Relation filters on other models are rewritten the same way.
+// Writes, and listings that do not ask for that token, still see the row.
 function withLegacyShareTokenRejection(base: PrismaClient): PrismaClient {
   return base.$extends({
     query: {
-      fileShareLink: {
-        async $allOperations({ operation, args, query }) {
+      $allModels: {
+        async $allOperations({ model, operation, args, query }) {
+          const nested = scrubNestedShareLinkArgs(args);
+          const next = nested.changed ? nested.args : args;
           if (
+            model !== "FileShareLink" ||
             !LEGACY_SHARE_READS.has(operation) ||
-            !args ||
-            typeof args !== "object" ||
-            !("where" in args)
+            !next ||
+            typeof next !== "object" ||
+            !("where" in next)
           ) {
-            return query(args);
+            return nested.changed ? query(next as typeof args) : query(args);
           }
           const decision = decideLegacyShareLookup(
-            (args as { where?: unknown }).where,
+            (next as { where?: unknown }).where,
           );
-          if (decision.action === "pass") return query(args);
+          if (decision.action === "pass") {
+            return nested.changed ? query(next as typeof args) : query(args);
+          }
           if (decision.action === "rewrite") {
             return query({
-              ...args,
-              where: decision.where as typeof args.where,
-            });
+              ...(next as object),
+              where: decision.where,
+            } as typeof args);
+          }
+          // Impossible row: aggregate and groupBy keep their empty shape.
+          if (operation === "aggregate" || operation === "groupBy" || operation.endsWith("OrThrow")) {
+            return query({ ...(next as object), where: { id: "" } } as typeof args);
           }
           if (operation === "findMany") return [];
           if (operation === "count") return 0;
-          if (operation.endsWith("OrThrow")) {
-            return query({ ...args, where: { id: "" } });
-          }
           return null;
         },
       },

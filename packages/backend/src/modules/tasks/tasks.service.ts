@@ -966,13 +966,23 @@ export async function bulkUpdateTasks(
       });
     }
 
-    // Bulk update assignees (replace)
+    // Replace the set, but keep the rows of people who remain. Their ids are
+    // the assignment order, so submitting the same users again must not mint
+    // new ones. Tasks stay in id order, matching the lock order in
+    // clearAssignments.
     if (data.assigneeIds) {
+      const wanted = data.assigneeIds;
       for (const taskId of taskIds) {
-        await tx.taskAssignee.deleteMany({ where: { taskId } });
-        if (data.assigneeIds.length > 0) {
+        const current = tasks.find((task) => task.id === taskId);
+        const kept = new Set(current?.assignees.map((assignee) => assignee.userId) ?? []);
+        const removed = [...kept].filter((userId) => !wanted.includes(userId)).sort();
+        if (removed.length > 0) {
+          await tx.taskAssignee.deleteMany({ where: { taskId, userId: { in: removed } } });
+        }
+        const added = wanted.filter((userId) => !kept.has(userId));
+        if (added.length > 0) {
           await tx.taskAssignee.createMany({
-            data: data.assigneeIds.map((userId) => ({ taskId, userId })),
+            data: added.map((userId) => ({ taskId, userId })),
           });
         }
       }

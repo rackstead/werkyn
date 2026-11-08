@@ -225,4 +225,16 @@ test("task payloads and the calendar list follow the earliest assignment id", as
   const mine = await request("zoe", "GET", `/api/workspaces/${workspace.id}/my-tasks`);
   assert.equal(mine.statusCode, 200, mine.body);
   assertEarliestFirst(mine.json().data.find((task) => task.id === taskId), "my tasks");
+
+  const beforeBulk = detail.json().data.assignees.map((row) => row.id);
+  const reversed = await request("admin", "POST", `/api/projects/${project.id}/tasks/bulk-update`, {
+    taskIds: [taskId],
+    assigneeIds: [aaron.id, zoe.id],
+  });
+  assert.equal(reversed.statusCode, 200, reversed.body);
+  const afterBulk = await request("admin", "GET", `/api/projects/${project.id}/tasks?view=board`);
+  assert.equal(afterBulk.statusCode, 200, afterBulk.body);
+  const bulkListed = afterBulk.json().data.find((task) => task.id === taskId);
+  assertEarliestFirst(bulkListed, "bulk resubmit");
+  assert.deepEqual(bulkListed.assignees.map((row) => row.id), beforeBulk);
 });

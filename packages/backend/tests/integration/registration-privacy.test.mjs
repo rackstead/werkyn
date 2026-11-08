@@ -29,7 +29,12 @@ Object.assign(process.env, {
 });
 
 const { buildApp } = await import("../../src/app.ts");
-const { hashPassword, verifyPassword } = await import("../../src/utils/passwords.ts");
+const {
+  hashPassword,
+  verifyPassword,
+  setPasswordAdmissionHold,
+  passwordAdmissionsInUse,
+} = await import("../../src/utils/passwords.ts");
 const { signAccessToken } = await import("../../src/utils/tokens.ts");
 const { resetTransporter } = await import("../../src/utils/mailer.ts");
 const { loginSlot, loginThrottle } = await import(
@@ -80,6 +85,7 @@ before(async () => {
 });
 
 after(async () => {
+  setPasswordAdmissionHold(undefined);
   mailGate = Promise.resolve();
   try {
     await settleRegistrationPrivacyWork();
@@ -474,6 +480,115 @@ test("sign-in of an unverified account is refused only while the setting is on, 
     (await app.prisma.user.findUnique({ where: { email: locked } })).passwordHash,
     passwordHash,
   );
+  await setPrivacy(false);
+});
+
+test("an in-flight repeat takes a password-limiter slot before it responds and does not create a second account", async () => {
+  await setPrivacy(true);
+  const existingHash = await hashPassword(EXISTING_PASSWORD);
+  const existing = await app.prisma.user.create({
+    data: {
+      email: nextEmail("held-existing"),
+      displayName: "Held existing",
+      emailVerified: true,
+      passwordHash: existingHash,
+    },
+  });
+  const fresh = nextEmail("held-fresh");
+  let releaseMail = () => {};
+  let releaseHold = () => {};
+  mailGate = new Promise((resolve) => {
+    releaseMail = resolve;
+  });
+  const unavailable = {
+    status: 503,
+    body: {
+      statusCode: 503,
+      error: "Service Unavailable",
+      message: "Password checks are temporarily unavailable. Try again.",
+    },
+    refreshCookie: false,
+    deviceCookie: false,
+  };
+  try {
+    const created = await register(fresh);
+    assert.equal(created.statusCode, 200, created.body);
+    const createdDeadline = performance.now() + 5000;
+    while ((await app.prisma.user.count({ where: { email: fresh } })) < 1) {
+      if (performance.now() > createdDeadline) {
+        assert.fail("the in-flight registration did not create its account");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const hold = new Promise((resolve) => {
+      releaseHold = resolve;
+    });
+    setPasswordAdmissionHold(hold);
+    let settled = false;
+    const repeat = register(fresh).then((response) => {
+      settled = true;
+      return response;
+    });
+    const slotDeadline = performance.now() + 5000;
+    while (passwordAdmissionsInUse() < 1) {
+      if (settled) {
+        assert.fail("in-flight repeat responded before taking a password-limiter slot");
+      }
+      if (performance.now() > slotDeadline) {
+        assert.fail("in-flight repeat never took a password-limiter slot");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(settled, false, "the response arrived while its limiter slot was still held");
+    releaseHold();
+    setPasswordAdmissionHold(undefined);
+    const repeated = await repeat;
+    assert.deepEqual(answered(repeated), {
+      status: 200,
+      body: { message: REGISTRATION_PRIVACY_MESSAGE },
+      refreshCookie: false,
+      deviceCookie: false,
+    });
+    assert.equal(await app.prisma.user.count({ where: { email: fresh } }), 1);
+
+    let releaseFull = () => {};
+    const fullHold = new Promise((resolve) => {
+      releaseFull = resolve;
+    });
+    setPasswordAdmissionHold(fullHold);
+    const fillers = [hashPassword(PASSWORD), hashPassword(PASSWORD)];
+    try {
+      const fillDeadline = performance.now() + 5000;
+      while (passwordAdmissionsInUse() < 2) {
+        if (performance.now() > fillDeadline) assert.fail("could not fill the password limiter");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const [againNew, againExisting] = await Promise.all([
+        register(fresh),
+        register(existing.email, { password: PASSWORD }),
+      ]);
+      assert.deepEqual(answered(againNew), unavailable);
+      assert.deepEqual(answered(againExisting), unavailable);
+    } finally {
+      releaseFull();
+      setPasswordAdmissionHold(undefined);
+      await Promise.all(fillers);
+    }
+  } finally {
+    releaseHold();
+    setPasswordAdmissionHold(undefined);
+    releaseMail();
+    mailGate = Promise.resolve();
+  }
+  await settleRegistrationPrivacyWork();
+  assert.equal(await app.prisma.user.count({ where: { email: fresh } }), 1);
+  assert.equal(
+    (await app.prisma.user.findUnique({ where: { id: existing.id } })).passwordHash,
+    existingHash,
+  );
+  assert.equal(await sessionsOf(fresh), 0);
+  assert.equal(await sessionsOf(existing.email), 0);
   await setPrivacy(false);
 });
 

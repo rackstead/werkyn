@@ -349,13 +349,14 @@ export async function requestPrivacyPreservingRegistration(
     );
   }
   const email = data.email.toLowerCase();
-  // A repeat while this address is still being handled adds nothing. The
-  // first request already holds the only work, and the answer is the same.
-  if (pendingRegistrationWork.has(email)) return;
-  // The password limiter admits at most two native jobs and rejects the
-  // rest immediately. Take that slot before acknowledging, so a refusal is
-  // the response instead of a success with no account. Every address pays it.
+  // Hash before the pending check. A new address keeps that key until mail
+  // finishes; an existing address does not. Returning here would make the
+  // repeat faster for the new address, and a full limiter would answer it
+  // 200 while the existing address got 503. Every address, including this
+  // repeat, takes a slot first. The hash is stored only if this call creates
+  // the account.
   const passwordHash = await hashPassword(data.password);
+  // The first request already holds the only account write.
   if (pendingRegistrationWork.has(email)) return;
   trackRegistrationWork(
     email,

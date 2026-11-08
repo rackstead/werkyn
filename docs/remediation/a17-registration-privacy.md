@@ -35,10 +35,11 @@ session cookie:
 > If the address is available, a verification link has been sent. Verify your email before signing in.
 
 Password hashing runs before that response and is the same work for every
-address. If the password limiter cannot admit the job, the request is refused
-then (503) instead of being acknowledged with no account. The response is sent
-before the address is looked up. A repeat for an address
-whose request is still running adds nothing. Each process accepts at most
+address, including a repeat while that address is still being created. If the
+password limiter cannot admit the job, the request is refused then (503)
+instead of being acknowledged with no account. The response is sent before the
+address is looked up. The repeat does not start a second account or change an
+existing password. Each process accepts at most
 6,000 of these requests a minute and then answers `429` with `Retry-After`
 for every address alike. Shutdown waits for work still running, then logs
 and abandons whatever is left.

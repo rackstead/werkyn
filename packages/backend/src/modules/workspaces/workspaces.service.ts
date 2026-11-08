@@ -8,7 +8,7 @@ import type {
   ActivityLogQueryInput,
   MyTasksQueryInput,
 } from "@pm/shared";
-import { ACTIVITY_COUNT_LIMIT } from "@pm/shared";
+import { ACTIVITY_COUNT_LIMIT, hasUnpairedSurrogate } from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
 import { projectAccessWhere } from "../../utils/project-access.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
@@ -364,6 +364,8 @@ function encodeMyTasksCursor(row: MyTasksPosition) {
 //   for a number outside it.
 // - A JSON string can carry a lone UTF-16 surrogate escape, which Prisma
 //   cannot send (a 500), or NUL, which PostgreSQL refuses in text.
+//   The cursor is base64 in the query string, not an HTTP JSON body, so the
+//   body parser does not see it.
 const INT4_MIN = -(2 ** 31);
 const INT4_MAX = 2 ** 31 - 1;
 
@@ -371,7 +373,7 @@ const isInt4 = (value: unknown): value is number =>
   Number.isInteger(value) && (value as number) >= INT4_MIN && (value as number) <= INT4_MAX;
 
 const isText = (value: unknown): value is string =>
-  typeof value === "string" && !value.includes("\u0000") && !/\p{Cs}/u.test(value);
+  typeof value === "string" && !value.includes("\u0000") && !hasUnpairedSurrogate(value);
 
 function decodeMyTasksCursor(cursor: string, sort: MyTasksQueryInput["sort"]): MyTasksPosition {
   try {

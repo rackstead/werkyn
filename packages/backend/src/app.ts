@@ -56,6 +56,7 @@ import chatRoutes from "./modules/chat/chat.routes.js";
 import backupRoutes from "./modules/backup/backup.routes.js";
 import { broadcast, broadcastToWorkspace, broadcastToUser, broadcastToChannel } from "./modules/realtime/realtime.service.js";
 import { env } from "./config/env.js";
+import { installJsonBodyParser } from "./plugins/json-body.js";
 import { setPrisma } from "./utils/mailer.js";
 
 export interface BuildAppOptions {
@@ -72,6 +73,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
     // they respond, each bounded instead (see plugins/request-limits.ts).
     ...requestLimitServerOptions(limits),
   });
+  // Before any encapsulated context copies the root parsers.
+  installJsonBodyParser(app);
 
   // Plugins (order matters)
   await app.register(requestLimitsPlugin, { limits });

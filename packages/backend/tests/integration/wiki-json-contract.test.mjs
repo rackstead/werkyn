@@ -387,10 +387,17 @@ async function refused(method, url, data, field, pageId) {
     `Refused write must have no effects: HTTP ${response.status}`,
   );
   const body = result(response, 400);
-  assert.ok(
-    body.details?.some((detail) => detail.field === field),
-    response.body,
-  );
+  // An unpaired surrogate is refused by the HTTP JSON parser, before a route
+  // can name a field. NUL and depth still fail that route's own validation.
+  if (field === "json-body") {
+    assert.equal(body.message, "The request contains a character that cannot be stored");
+    assert.equal(body.details, undefined);
+  } else {
+    assert.ok(
+      body.details?.some((detail) => detail.field === field),
+      response.body,
+    );
+  }
   assert.doesNotMatch(
     response.body,
     /Prisma|recursion|SELECT|INSERT|UPDATE|stack|leaf|secret/,
@@ -474,16 +481,19 @@ test("comment selections at 121 levels fit the backup envelope; 122 levels are r
   }
 });
 
-test("unrepresentable string values and member names have field errors before writes", async (t) => {
+test("unrepresentable string values and member names are refused before writes", async (t) => {
   const page = await create();
   for (const bad of ["secret\u0000", "secret\ud800", "secret\udfff"]) {
+    // NUL still reaches route validation. A lone surrogate is refused while
+    // the JSON body is parsed, so the route cannot name a field.
+    const reported = bad.includes("\u0000") ? null : "json-body";
     for (const value of [{ nested: [bad] }, { nested: { [bad]: "value" } }]) {
       await t.test(`create ${JSON.stringify(value)}`, () =>
         refused(
           "POST",
           `/wiki/spaces/${space.id}/pages`,
           { title: "Invalid", content: value },
-          "content",
+          reported ?? "content",
         ),
       );
       await t.test(`update ${JSON.stringify(value)}`, () =>
@@ -491,7 +501,7 @@ test("unrepresentable string values and member names have field errors before wr
           "PATCH",
           `/wiki/pages/${page.id}`,
           { content: value },
-          "content",
+          reported ?? "content",
           page.id,
         ),
       );
@@ -505,7 +515,7 @@ test("unrepresentable string values and member names have field errors before wr
               highlightId: "h",
               [field]: value,
             },
-            field,
+            reported ?? field,
             page.id,
           ),
         );

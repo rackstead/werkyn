@@ -9,13 +9,60 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-// A well-formed surrogate pair is one code point with the u flag. Other C0
-// characters and Unicode normalization forms are valid JSON storage text.
-const UNSTORABLE = /[\u0000\p{Cs}]/u;
+// A well-formed surrogate pair is one code point with the u flag, so \p{Cs}
+// matches only an unpaired half. Other C0 characters and Unicode
+// normalization forms are valid JSON storage text. U+0000 is unstorable on
+// its own and is not an unpaired surrogate.
+const UNPAIRED_SURROGATE = /\p{Cs}/u;
 const INVALID_VALUE = "Must be a JSON value with finite numbers";
 const INVALID_TEXT = "Contains a character that cannot be stored";
 const INVALID_MEMBER =
   "Contains an object member that cannot be stored literally";
+
+/** True when `value` contains an unpaired UTF-16 surrogate. */
+export function hasUnpairedSurrogate(value: string): boolean {
+  return UNPAIRED_SURROGATE.test(value);
+}
+
+function hasUnstorableText(value: string): boolean {
+  return value.includes("\u0000") || hasUnpairedSurrogate(value);
+}
+
+/**
+ * True when a string or object member name in `value` has an unpaired
+ * surrogate. U+0000 is ignored. Data properties only: accessors are not
+ * invoked. The walk is iterative so nesting cannot overflow the call stack.
+ */
+export function jsonValueHasUnpairedSurrogate(value: unknown): boolean {
+  const stack: unknown[] = [value];
+  const seen = new WeakSet<object>();
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (typeof current === "string") {
+      if (hasUnpairedSurrogate(current)) return true;
+      continue;
+    }
+    if (current === null || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index++) {
+        const property = Object.getOwnPropertyDescriptor(
+          current,
+          String(index),
+        );
+        if (property && "value" in property) stack.push(property.value);
+      }
+      continue;
+    }
+    for (const key of Object.keys(current)) {
+      if (hasUnpairedSurrogate(key)) return true;
+      const property = Object.getOwnPropertyDescriptor(current, key);
+      if (property && "value" in property) stack.push(property.value);
+    }
+  }
+  return false;
+}
 
 /**
  * The locked Prisma serializer copies ordinary object members into `{}` and
@@ -93,7 +140,7 @@ export function jsonStorageIssue(
           : memberKeys(value),
       });
     } else if (typeof value === "string") {
-      if (UNSTORABLE.test(value)) return INVALID_TEXT;
+      if (hasUnstorableText(value)) return INVALID_TEXT;
     } else if (typeof value === "number") {
       if (!Number.isFinite(value)) return INVALID_VALUE;
     } else if (value !== null && typeof value !== "boolean") {
@@ -109,7 +156,7 @@ export function jsonStorageIssue(
         stack.pop();
         continue;
       }
-      if (UNSTORABLE.test(key.value)) return INVALID_TEXT;
+      if (hasUnstorableText(key.value)) return INVALID_TEXT;
       const property = Object.getOwnPropertyDescriptor(frame.value, key.value);
       if (!property || !("value" in property)) return INVALID_VALUE;
       value = property.value;

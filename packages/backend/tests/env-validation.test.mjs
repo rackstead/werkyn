@@ -197,6 +197,30 @@ test("an invalid LOG_LEVEL is reported instead of crashing the logger", () => {
   assert.doesNotMatch(result.stderr, /unknown level/);
 });
 
+test("THUMBNAIL_WORKERS keeps the CPU default and rejects a bad count", async () => {
+  const { defaultThumbnailWorkerCount } = await import("../src/config/thumbnail-worker-count.ts");
+  const expected = defaultThumbnailWorkerCount();
+  assert.equal(accepts({}).data.THUMBNAIL_WORKERS, expected);
+  assert.equal(accepts({ THUMBNAIL_WORKERS: "" }).data.THUMBNAIL_WORKERS, expected);
+  assert.equal(accepts({ THUMBNAIL_WORKERS: " " }).data.THUMBNAIL_WORKERS, expected);
+  assert.equal(accepts({ THUMBNAIL_WORKERS: "1" }).data.THUMBNAIL_WORKERS, 1);
+  assert.equal(accepts({ THUMBNAIL_WORKERS: "2" }).data.THUMBNAIL_WORKERS, 2);
+  for (const value of ["0", "-1", "1.5", "2.0", "3", "nope", "1e1"]) {
+    const result = rejects({ THUMBNAIL_WORKERS: value }, "THUMBNAIL_WORKERS", /whole number from 1 to 2/);
+    assert.equal(JSON.stringify(result.errors).includes(value), false, value);
+  }
+});
+
+test("THUMBNAIL_WORKERS is rejected at startup without echoing the value", () => {
+  const value = "not-a-worker-count";
+  const result = startWith({ ...base, THUMBNAIL_WORKERS: value });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /Invalid environment variables/);
+  assert.match(result.stdout, /THUMBNAIL_WORKERS/);
+  assert.match(result.stdout, /whole number from 1 to 2/);
+  assert.equal((result.stdout + result.stderr).includes(value), false);
+});
+
 test("login backoff settings have safe defaults, bounded ranges and a consistent order", () => {
   const { data } = accepts({});
   assert.equal(data.LOGIN_BACKOFF_THRESHOLD, 5);

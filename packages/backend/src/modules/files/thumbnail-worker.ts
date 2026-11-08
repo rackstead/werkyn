@@ -13,12 +13,15 @@ import { MAX_REQUEST_BYTES, encodeFrame } from "./thumbnail-protocol.js";
  *   node thumbnail-worker.js [--no-memory-checks]
  */
 
-/** Decode `path`, below the trusted directory `root` (the storage root). */
-export type WorkerRequest = { id: number; root: string; path: string };
+/** A decode, or a liveness ping the server sends while this worker is idle. */
+export type WorkerRequest =
+  | { id: number; root: string; path: string }
+  | { type: "ping"; id: number };
 
 /** Frame headers; a successful result's thumbnail is the frame body. */
 export type WorkerMessage =
   | { type: "ready"; pid: number; dataLimitBytes: number | null; oomScoreAdj: number | null }
+  | { type: "pong"; id: number }
   | ({ type: "result"; id: number; memory: WorkerMemory } & (
     | { ok: true; details: DecodeDetails }
     | { ok: false; outcome: Exclude<DecodeResult, { ok: true }>["outcome"]; details: DecodeDetails }
@@ -80,7 +83,7 @@ function memory(): WorkerMemory {
 const memoryChecks = !process.argv.includes("--no-memory-checks");
 let jobs = Promise.resolve();
 
-async function handle(request: WorkerRequest) {
+async function handle(request: Extract<WorkerRequest, { path: string }>) {
   const result = await thumbnailFromFile({ root: request.root, path: request.path }, { memoryChecks });
   // Free the source and decoder buffers now rather than at V8's next
   // collection, so the next decode starts from the worker's own size.
@@ -99,7 +102,14 @@ channel.on("data", (chunk: Buffer) => {
   for (let end = pending.indexOf("\n"); end !== -1; end = pending.indexOf("\n")) {
     const request = JSON.parse(pending.slice(0, end)) as WorkerRequest;
     pending = pending.slice(end + 1);
-    jobs = jobs.then(() => handle(request));
+    // Answer a ping on the event loop, not behind a decode. A worker stuck
+    // in native code cannot reach this, which is how the server notices it.
+    if ("type" in request) {
+      channel.write(encodeFrame({ type: "pong", id: request.id }));
+      continue;
+    }
+    const decode = request;
+    jobs = jobs.then(() => handle(decode));
   }
 });
 

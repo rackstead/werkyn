@@ -1,4 +1,5 @@
 import os from "node:os";
+import { cappedThumbnailWorkerCount, configuredThumbnailWorkerCount, defaultThumbnailWorkerCount } from "../../config/thumbnail-worker-count.js";
 import { logger } from "../../utils/logger.js";
 import { THUMBNAIL_LIMITS, thumbnailFormat } from "./thumbnail-checks.js";
 import type { DecodeDetails } from "./thumbnail-decode.js";
@@ -35,7 +36,7 @@ export function defaultAdmissionLimits(
   cpus = os.availableParallelism(),
 ): ThumbnailAdmissionLimits {
   return {
-    maxActive: Math.max(1, Math.min(2, Math.floor(cpus / 2))),
+    maxActive: defaultThumbnailWorkerCount(cpus),
     maxQueued: 8,
     queueTimeoutMs: 5_000,
   };
@@ -164,8 +165,22 @@ export const thumbnailOutcomes: Record<ThumbnailOutcome, number> = {
  * "test") makes them skip the container checks and memory estimate, to
  * show that the workers' own limit holds.
  */
+// Ask for the validated count, but never more processes than admission can
+// use. On fewer than four CPUs that is one, so THUMBNAIL_WORKERS=2 does not
+// leave an idle worker using memory.
+const requestedThumbnailWorkers = configuredThumbnailWorkerCount();
+const thumbnailWorkerSize = cappedThumbnailWorkerCount(requestedThumbnailWorkers, thumbnailAdmission.limits.maxActive);
+if (requestedThumbnailWorkers > thumbnailWorkerSize) {
+  logger.info(
+    { requested: requestedThumbnailWorkers, workers: thumbnailWorkerSize },
+    "THUMBNAIL_WORKERS is above the number of thumbnail turns; not starting the extra worker",
+  );
+}
+
 export const thumbnailWorkers = new ThumbnailWorkerPool({
-  size: thumbnailAdmission.limits.maxActive,
+  // Unset THUMBNAIL_WORKERS keeps one worker per admission turn. Setting 1
+  // runs a single process on a small pod. Admission limits are unchanged.
+  size: thumbnailWorkerSize,
   dataLimitBytes: THUMBNAIL_LIMITS.workerDataBytes,
   memoryChecks: !(process.env.NODE_ENV === "test" && process.env.WERKYN_TEST_THUMBNAIL_MEMORY_CHECKS === "off"),
   recycleAboveBytes: THUMBNAIL_LIMITS.workerRecycleBytes,

@@ -14,7 +14,10 @@ import type { WorkerRequest } from "./thumbnail-worker.js";
  * image that needs more memory than its estimate said fails or ends that
  * worker, never the server. A worker that crashes or is killed at the
  * deadline is replaced at once; a worker that keeps failing to start is
- * restarted later and later. See docs/remediation/r19.md.
+ * restarted later and later. An idle worker that does not answer a ping
+ * is replaced without waiting for the next decode's deadline; a worker
+ * busy with a decode is not pinged and is not killed for it.
+ * See docs/remediation/r19.md.
  *
  * The limit is RLIMIT_DATA, which counts a process's heap, anonymous
  * mappings and thread stacks but not the address space V8 reserves, so
@@ -67,6 +70,15 @@ export interface ThumbnailWorkerPoolOptions {
   recycleAboveBytes?: number;
   /** How long close() and retiring wait for a worker to exit before killing it (250 ms). */
   closeGraceMs?: number;
+  /**
+   * How often an idle worker is pinged, and how long its pong may take
+   * (each 1 s). A miss replaces that worker. Far inside the 12 s decode
+   * deadline, and never applied to a worker that is already decoding.
+   */
+  pingIntervalMs?: number;
+  pingTimeoutMs?: number;
+  /** Tests only: runs after a ping is written, before the event loop continues. */
+  afterPing?: () => void;
   /** The worker entry point and Node options; derived from this module by default. */
   script?: string;
   execArgv?: string[];
@@ -112,10 +124,21 @@ interface Slot {
   restartTimer: NodeJS.Timeout | null;
   startTimer: NodeJS.Timeout | null;
   /** Why the current worker is being stopped, when the pool asked it to. */
-  stopping: "retire" | "timeout" | "start-timeout" | "close" | "violation" | null;
+  stopping: "retire" | "timeout" | "start-timeout" | "close" | "violation" | "hung" | null;
   /** How the worker broke the reply protocol, if it did. */
   violation: string | null;
   exited: Promise<void> | null;
+  /** Pings an idle worker; cleared once it answers or is replaced. */
+  probeTimer: NodeJS.Timeout | null;
+  /** The ping this worker has been asked and has not answered. */
+  ping: {
+    id: number;
+    timer: NodeJS.Timeout;
+    /** Runs after I/O, so a pong already buffered is read before a kill. */
+    later: NodeJS.Immediate | null;
+    promise: Promise<boolean>;
+    finish: (ok: boolean) => void;
+  } | null;
 }
 
 export interface ThumbnailWorkerStats {
@@ -127,6 +150,8 @@ export interface ThumbnailWorkerStats {
   spawned: number;
   crashed: number;
   timedOut: number;
+  /** Idle workers replaced because they did not answer a ping. */
+  hung: number;
   recycled: number;
   jobs: number;
 }
@@ -139,8 +164,9 @@ export class ThumbnailWorkerPool {
   private started = false;
   private closed = false;
   private nextJob = 1;
+  private nextPing = 1;
   private readonly waiting: Array<() => void> = [];
-  private readonly counts = { spawned: 0, crashed: 0, timedOut: 0, recycled: 0, jobs: 0 };
+  private readonly counts = { spawned: 0, crashed: 0, timedOut: 0, hung: 0, recycled: 0, jobs: 0 };
   private reportedLimit: number | null = null;
   private announced = false;
 
@@ -148,6 +174,7 @@ export class ThumbnailWorkerPool {
     this.slots = Array.from({ length: options.size }, () => ({
       state: "stopped", child: null, channel: null, job: null, failures: 0, readyAt: 0,
       restartTimer: null, startTimer: null, stopping: null, violation: null, exited: null,
+      probeTimer: null, ping: null,
     }));
     const ownFile = fileURLToPath(import.meta.url);
     const typescript = ownFile.endsWith(".ts");
@@ -182,25 +209,72 @@ export class ThumbnailWorkerPool {
     this.start();
     let resolve!: (result: WorkerResult) => void;
     const done = new Promise<WorkerResult>((settle) => { resolve = settle; });
-    const job: Job = { id: this.nextJob++, file, resolve, timedOut: false, sent: false };
-    const slot = await this.reserveSlot(job, signal);
-    if (!slot) {
-      return signal?.aborted
-        ? { ok: false, outcome: "timed-out", details: { reason: "waiting for a thumbnail worker" } }
-        : failed(this.closed ? "thumbnail workers are shut down" : "thumbnail workers are restarting after repeated start failures");
-    }
-    this.counts.jobs++;
-    this.setRef(slot, true);
-    const abort = () => this.abort(slot, job);
-    job.resolve = (result) => {
-      signal?.removeEventListener("abort", abort);
-      resolve(result);
+    let settled = false;
+    const job: Job = {
+      id: this.nextJob++,
+      file,
+      resolve: (result) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", abort);
+        resolve(result);
+      },
+      timedOut: false,
+      sent: false,
+    };
+    // The slot can change when an idle worker fails its ping and the decode
+    // is tried on another worker.
+    const abort = () => {
+      const slot = this.slots.find((candidate) => candidate.job === job);
+      if (slot) this.abort(slot, job);
+      else if (!settled) {
+        job.timedOut = true;
+        job.resolve({ ok: false, outcome: "timed-out", details: { reason: "waiting for a thumbnail worker" } });
+      }
     };
     if (signal?.aborted) abort();
-    else {
-      signal?.addEventListener("abort", abort, { once: true });
-      // A starting worker is sent the job once it is ready.
-      if (slot.state === "ready") this.send(slot, job);
+    else signal?.addEventListener("abort", abort, { once: true });
+
+    let counted = false;
+    while (!settled) {
+      const slot = await this.reserveSlot(job, signal);
+      if (settled) break;
+      if (!slot) {
+        job.resolve(signal?.aborted
+          ? { ok: false, outcome: "timed-out", details: { reason: "waiting for a thumbnail worker" } }
+          : failed(this.closed ? "thumbnail workers are shut down" : "thumbnail workers are restarting after repeated start failures"));
+        break;
+      }
+      if (!counted) {
+        this.counts.jobs++;
+        counted = true;
+      }
+      this.setRef(slot, true);
+      // Just started: ready is the proof of life, and the job is sent then.
+      // Already idle: ping first, so a hung worker is replaced inside the
+      // ping timeout instead of the decode deadline.
+      if (slot.state === "starting") break;
+      if (slot.state !== "ready" || !slot.child) {
+        slot.job = null;
+        this.setRef(slot, false);
+        job.resolve(failed("thumbnail worker could not start"));
+        break;
+      }
+      const child = slot.child;
+      const alive = await this.prove(slot);
+      if (settled) {
+        if (slot.state === "ready" && !slot.job) this.armProbe(slot);
+        break;
+      }
+      if (alive && slot.job === job && slot.state === "ready" && slot.child === child && !job.timedOut) {
+        this.send(slot, job);
+        break;
+      }
+      if (slot.job === job) {
+        slot.job = null;
+        this.setRef(slot, false);
+        if (slot.state === "ready") this.armProbe(slot);
+      }
     }
     return done;
   }
@@ -213,6 +287,7 @@ export class ThumbnailWorkerPool {
     await Promise.all(this.slots.map(async (slot) => {
       if (slot.restartTimer) clearTimeout(slot.restartTimer);
       slot.restartTimer = null;
+      this.clearProbe(slot);
       const child = slot.child;
       if (!child) return;
       slot.stopping = "close";
@@ -275,6 +350,7 @@ export class ThumbnailWorkerPool {
     slot.restartTimer = null;
     slot.stopping = null;
     slot.violation = null;
+    this.clearProbe(slot);
     slot.state = "starting";
     const node = [process.execPath, ...this.execArgv, "--v8-pool-size=1", "--expose-gc", this.script];
     if (this.options.memoryChecks === false) node.push("--no-memory-checks");
@@ -374,7 +450,22 @@ export class ThumbnailWorkerPool {
         );
       }
       if (slot.job) this.send(slot, slot.job);
-      else this.wakeWaiter();
+      else {
+        this.armProbe(slot);
+        this.wakeWaiter();
+      }
+      return;
+    }
+    if (message.type === "pong") {
+      // Only the ping we just sent, and only from an idle worker. Anything
+      // else is the worker speaking out of turn.
+      if (slot.state !== "ready" || !slot.ping || message.id !== slot.ping.id) {
+        return this.violated(slot, "an unexpected pong");
+      }
+      clearTimeout(slot.ping.timer);
+      const finish = slot.ping.finish;
+      slot.ping = null;
+      finish(true);
       return;
     }
     const job = slot.job;
@@ -392,12 +483,122 @@ export class ThumbnailWorkerPool {
       this.stop(slot, "retire");
     } else {
       this.setRef(slot, false);
+      this.armProbe(slot);
       this.wakeWaiter();
     }
   }
 
+  /** Asks an idle worker to prove it can still read the channel. */
+  private prove(slot: Slot): Promise<boolean> {
+    if (slot.ping) return slot.ping.promise;
+    const child = slot.child;
+    const channel = slot.channel;
+    if (!child || !channel || slot.state !== "ready") return Promise.resolve(false);
+    if (slot.probeTimer) {
+      clearTimeout(slot.probeTimer);
+      slot.probeTimer = null;
+    }
+    const id = this.nextPing++;
+    let settled = false;
+    let finish!: (ok: boolean) => void;
+    const promise = new Promise<boolean>((resolve) => { finish = resolve; });
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (slot.ping?.id === id) {
+        if (slot.ping.later) clearImmediate(slot.ping.later);
+        slot.ping = null;
+      }
+      finish(ok);
+    };
+    const timer = setTimeout(() => {
+      if (slot.ping?.id !== id || slot.child !== child) return;
+      // Timers run before I/O. After a stall this can fire while the pong
+      // is already buffered; decide only after that read has had its turn.
+      const later = setImmediate(() => {
+        if (slot.ping?.id !== id || slot.child !== child) return;
+        // A decode started inside its own deadline. Missing this ping is not
+        // a reason to kill it; the caller's abort still is.
+        if (slot.state === "busy" || slot.job?.sent) {
+          done(false);
+          return;
+        }
+        const held = slot.job;
+        if (held && !held.sent) {
+          slot.job = null;
+          this.setRef(slot, false);
+        }
+        done(false);
+        this.hung(slot);
+      });
+      later.unref();
+      if (slot.ping?.id === id) slot.ping.later = later;
+    }, this.pingTimeout());
+    timer.unref();
+    slot.ping = { id, timer, later: null, promise, finish: done };
+    channel.write(`${JSON.stringify({ type: "ping", id })}\n`, (error) => {
+      if (!error || slot.ping?.id !== id || slot.child !== child) return;
+      const held = slot.job;
+      if (held && !held.sent) {
+        slot.job = null;
+        this.setRef(slot, false);
+      }
+      done(false);
+      this.hung(slot);
+    });
+    this.options.afterPing?.();
+    return promise;
+  }
+
+  /** Replaces an idle worker that did not answer. A busy worker is left alone. */
+  private hung(slot: Slot) {
+    if (this.closed || slot.state !== "ready") return;
+    this.stop(slot, "hung");
+  }
+
+  /** Pings again once this idle worker has been quiet for the interval. */
+  private armProbe(slot: Slot) {
+    if (slot.probeTimer) clearTimeout(slot.probeTimer);
+    slot.probeTimer = null;
+    if (this.closed || slot.state !== "ready" || slot.job || slot.ping) return;
+    const timer = setTimeout(() => {
+      slot.probeTimer = null;
+      if (this.closed || slot.state !== "ready" || slot.job || slot.ping) return;
+      void this.prove(slot).then((ok) => {
+        if (ok && slot.state === "ready" && !slot.job && !slot.ping) this.armProbe(slot);
+      });
+    }, this.pingInterval());
+    timer.unref();
+    slot.probeTimer = timer;
+  }
+
+  private clearProbe(slot: Slot) {
+    if (slot.probeTimer) clearTimeout(slot.probeTimer);
+    slot.probeTimer = null;
+    if (slot.ping) {
+      clearTimeout(slot.ping.timer);
+      if (slot.ping.later) clearImmediate(slot.ping.later);
+      const finish = slot.ping.finish;
+      slot.ping = null;
+      finish(false);
+    }
+  }
+
+  private pingInterval() {
+    return this.options.pingIntervalMs ?? 1_000;
+  }
+
+  private pingTimeout() {
+    return this.options.pingTimeoutMs ?? 1_000;
+  }
+
   private send(slot: Slot, job: Job) {
     if (slot.job !== job || job.timedOut || slot.state !== "ready" || !slot.channel) return;
+    if (slot.probeTimer) {
+      clearTimeout(slot.probeTimer);
+      slot.probeTimer = null;
+    }
     slot.state = "busy";
     job.sent = true;
     const request: WorkerRequest = { id: job.id, ...thumbnailFileLocation(job.file) };
@@ -414,7 +615,10 @@ export class ThumbnailWorkerPool {
       slot.job = null;
       job.resolve({ ok: false, outcome: "timed-out", details: { reason: "waiting for a thumbnail worker to start" } });
       this.setRef(slot, false);
-      if (slot.state === "ready") this.wakeWaiter();
+      if (slot.state === "ready") {
+        this.armProbe(slot);
+        this.wakeWaiter();
+      }
       return;
     }
     this.counts.timedOut++;
@@ -445,6 +649,15 @@ export class ThumbnailWorkerPool {
   ) {
     if (slot.child !== child) return;
     if (slot.startTimer) clearTimeout(slot.startTimer);
+    if (slot.probeTimer) clearTimeout(slot.probeTimer);
+    slot.probeTimer = null;
+    if (slot.ping) {
+      clearTimeout(slot.ping.timer);
+      if (slot.ping.later) clearImmediate(slot.ping.later);
+      const finish = slot.ping.finish;
+      slot.ping = null;
+      finish(false);
+    }
     const wasStarting = slot.state === "starting";
     const reason = slot.stopping;
     const violation = slot.violation;
@@ -475,9 +688,10 @@ export class ThumbnailWorkerPool {
         job.resolve({ ok: false, outcome: "timed-out", details });
       } else if (reason === "close") {
         job.resolve(failed("thumbnail workers are shut down", details));
-      } else if (!job.sent) {
+      } else if (!job.sent && reason !== "hung") {
+        // A hung idle worker never saw this decode; run() tries another slot.
         job.resolve(failed("thumbnail worker could not start", details));
-      } else {
+      } else if (job.sent) {
         this.counts.crashed++;
         const how = violation
           ? `sent ${violation}`
@@ -485,7 +699,11 @@ export class ThumbnailWorkerPool {
         job.resolve({ ok: false, outcome: "crashed", details: { ...details, reason: `worker ${how}` } });
       }
     }
-    if (reason === "timeout" || reason === "retire" || reason === "close") {
+    if (reason === "timeout" || reason === "retire" || reason === "close" || reason === "hung") {
+      if (reason === "hung") {
+        this.counts.hung++;
+        logger.warn({ ...details }, "Thumbnail worker did not answer a liveness check; replacing it");
+      }
       this.respawn(slot);
       return;
     }

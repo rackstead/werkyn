@@ -47,6 +47,44 @@ test("deadlocks and serialization failures are retryable under every Prisma erro
   assert.equal(isRetryableDatabaseError(undefined), false);
 });
 
+test("a check violation is the same 409 as a foreign-key conflict and leaks nothing", async () => {
+  const app = Fastify({ logger: false });
+  await app.register(errorsPlugin);
+  let next;
+  app.get("/fail", async () => {
+    throw next;
+  });
+  await app.ready();
+  const safe = {
+    statusCode: 409,
+    error: "Conflict",
+    message: "The request conflicts with a related record",
+  };
+  const check = new Prisma.PrismaClientUnknownRequestError(
+    'Invalid `prisma.taskLabel.create()` invocation:\nError occurred during query execution:\nConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError { code: "23514", message: "new row for relation \\"TaskLabel\\" violates constraint \\"TaskLabel_same_project\\": task t1 and label l2 belong to different projects", severity: "ERROR", detail: None, column: None, hint: None }), transient: false })',
+    { clientVersion },
+  );
+  const rawCheck = new Prisma.PrismaClientKnownRequestError(
+    'Raw query failed. Code: `23514`. Message: `ERROR: new row for relation "TimeEntry" violates check constraint "TimeEntry_hours_range"`',
+    { code: "P2010", clientVersion, meta: { code: "23514", message: 'violates check constraint "TimeEntry_hours_range"' } },
+  );
+  try {
+    for (const error of [check, rawCheck]) {
+      next = error;
+      const response = await app.inject({ method: "GET", url: "/fail" });
+      assert.equal(response.statusCode, 409);
+      assert.deepEqual(response.json(), safe);
+      assert.doesNotMatch(response.body, /23514|TaskLabel|TimeEntry|violates|SELECT|plpgsql/);
+    }
+    next = unknown("XX000");
+    assert.equal((await app.inject({ method: "GET", url: "/fail" })).statusCode, 500);
+    next = unknown("22021");
+    assert.equal((await app.inject({ method: "GET", url: "/fail" })).statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
 test("the error handler answers a deadlock with the retryable 409 and no internals", async () => {
   const app = Fastify({ logger: false });
   await app.register(errorsPlugin);

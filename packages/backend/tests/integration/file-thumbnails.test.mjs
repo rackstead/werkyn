@@ -466,7 +466,8 @@ for (const recognized of [true, false]) test(`failed File insert retains durable
   const saveStream = app.storage.saveStream, save = app.storage.save, remove = app.storage.delete;
   let installed = false;
   try {
-    await app.prisma.$executeRawUnsafe(`CREATE FUNCTION ${fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.name='${filename}' THEN RAISE EXCEPTION 'Owned thumbnail insert fault' USING ERRCODE='23514'; END IF; RETURN NEW; END $$`);
+    // An internal insert fault, not a check violation. SQLSTATE 23514 is a client conflict.
+    await app.prisma.$executeRawUnsafe(`CREATE FUNCTION ${fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.name='${filename}' THEN RAISE EXCEPTION 'Owned thumbnail insert fault' USING ERRCODE='P0001'; END IF; RETURN NEW; END $$`);
     await app.prisma.$executeRawUnsafe(`CREATE TRIGGER ${fault} BEFORE INSERT ON "File" FOR EACH ROW EXECUTE FUNCTION ${fault}()`); installed = true;
     app.storage.saveStream = async function (...args) { const r = await saveStream.apply(this, args); staged.push(r.storagePath); return r; };
     app.storage.save = async function (...args) { const r = await save.apply(this, args); staged.push(r); return r; };

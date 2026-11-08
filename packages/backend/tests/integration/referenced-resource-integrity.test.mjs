@@ -416,7 +416,7 @@ test("deleting a status never relinks another project's task", async () => {
 
 test("the integrity report finds legacy relationships without writing", async () => {
   const { findReferenceIntegrityIssues } = await import("../../src/scripts/reference-integrity-report.js");
-  const [legacy, dependency, mismatched, foreignEntry] = await writeLegacyRows(app.prisma, async (tx) => {
+  const [legacy, dependency, mismatched, foreignEntry, taskOnly, taskOnlyForeign] = await writeLegacyRows(app.prisma, async (tx) => {
     const legacy = await tx.task.create({ data: {
       projectId: P.id, statusId: status.Q.id, title: "Report target", position: 20,
       assignees: { create: [{ userId: users.FOREIGN.id }, { userId: users.SIBLING.id }] },
@@ -429,6 +429,8 @@ test("the integrity report finds legacy relationships without writing", async ()
       await tx.taskDependency.create({ data: { blockedTaskId: legacy.id, blockingTaskId: task.R.id } }),
       await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.P.id, projectId: Q.id } }),
       await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-22", hours: 1, taskId: task.R.id, projectId: R.id } }),
+      await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-23", hours: 1, taskId: task.P.id } }),
+      await tx.timeEntry.create({ data: { workspaceId: W.id, userId: users.ADMIN.id, date: "2026-10-24", hours: 1, taskId: task.R.id } }),
     ];
   });
   const rate = await app.prisma.userRate.create({ data: { workspaceId: W.id, userId: users.FOREIGN.id, rate: 1, effectiveFrom: "2026-01-01" } });
@@ -450,6 +452,10 @@ test("the integrity report finds legacy relationships without writing", async ()
   assert.deepEqual(forLegacy("subtask_assignee_access").map((s) => s.reason), ["not_workspace_member"]);
   assert(ids("time_entry_task_project").includes(mismatched.id));
   assert(ids("time_entry_workspace").includes(foreignEntry.id));
+  assert(!ids("time_entry_task_project").includes(taskOnly.id));
+  assert(!ids("time_entry_workspace").includes(taskOnly.id));
+  assert(!ids("time_entry_task_project").includes(taskOnlyForeign.id));
+  assert(!ids("time_entry_workspace").includes(taskOnlyForeign.id));
   assert(ids("user_rate_workspace").includes(rate.id));
   assert(ids("task_template_reference").includes(badTemplate.id));
   for (const issue of report.issues) {

@@ -120,7 +120,11 @@ const CHECKS: Check[] = [
       LEFT JOIN "Project" p ON p.id = e."projectId"
       LEFT JOIN "Task" t ON t.id = e."taskId"
       LEFT JOIN "Project" tp ON tp.id = t."projectId"
-      WHERE p."workspaceId" <> e."workspaceId" OR tp."workspaceId" <> e."workspaceId"`,
+      -- A task with no project is allowed (MATCH SIMPLE). The task's workspace
+      -- is compared only when the entry also names a project, which is the
+      -- row the deferred key checks.
+      WHERE p."workspaceId" <> e."workspaceId"
+        OR (e."projectId" IS NOT NULL AND tp."workspaceId" <> e."workspaceId")`,
   },
   {
     key: "time_entry_task_project",
@@ -131,7 +135,9 @@ const CHECKS: Check[] = [
       FROM "TimeEntry" e
       JOIN "Task" t ON t.id = e."taskId"
       JOIN "Project" tp ON tp.id = t."projectId"
-      WHERE tp."workspaceId" = e."workspaceId" AND e."projectId" IS DISTINCT FROM t."projectId"
+      WHERE tp."workspaceId" = e."workspaceId"
+        AND e."projectId" IS NOT NULL
+        AND e."projectId" <> t."projectId"
         AND NOT EXISTS (
           SELECT 1 FROM "Project" p WHERE p.id = e."projectId" AND p."workspaceId" <> e."workspaceId"
         )`,

@@ -350,18 +350,19 @@ test("a token collision with an existing link draws again and creates the link o
   // The password stored on the retried insert is the one the caller set.
   const granted = await verify(link.token, PASSWORD);
   assert.equal(granted.response.statusCode, 200, granted.response.body);
-  // The colliding links still resolve to their own files.
-  for (const [row, file] of [
-    [existing[0], first],
-    [existing[1], second],
-  ]) {
-    const view = await publicView(row.token);
-    assert.equal(view.statusCode, 200, view.body);
-    assert.deepEqual(
-      view.json().data.files.map((entry) => entry.file.id),
-      [file.id],
-    );
-  }
+  // The stored 8-character collider is not a credential. The 43-character
+  // collider still resolves to its own file, and neither existing row changes.
+  const legacyView = await publicView(existing[0].token);
+  const missingView = await publicView(crypto.randomBytes(32).toString("base64url"));
+  assert.equal(legacyView.statusCode, 404);
+  assert.equal(legacyView.body, missingView.body);
+  assert.equal(legacyView.headers["cache-control"], missingView.headers["cache-control"]);
+  const currentView = await publicView(existing[1].token);
+  assert.equal(currentView.statusCode, 200, currentView.body);
+  assert.deepEqual(
+    currentView.json().data.files.map((entry) => entry.file.id),
+    [second.id],
+  );
 });
 
 test("three token collisions return a controlled 409 and write nothing", async () => {
@@ -405,14 +406,107 @@ test("a non-token unique conflict is not retried and rolls back the link", async
   assert.deepEqual(await workspaceRows(), before);
 });
 
-test("links issued before this change keep resolving and revoking over HTTP", async () => {
+function missShape(response) {
+  return {
+    status: response.statusCode,
+    cache: response.headers["cache-control"] ?? null,
+    pragma: response.headers.pragma ?? null,
+    cookie: response.headers["set-cookie"] ?? null,
+    body: response.body,
+  };
+}
+
+/** Opening, download and password checks match an unknown token exactly. */
+async function assertUnknownToken(token, fileId) {
+  const unknown = crypto.randomBytes(32).toString("base64url");
+  const absent = crypto.randomBytes(6).toString("base64url");
+  const pairs = [
+    [await publicView(token), await publicView(unknown)],
+    [await publicView(token), await publicView(absent)],
+    [await publicDownload(token, fileId), await publicDownload(unknown, fileId)],
+    [
+      (await verify(token, PASSWORD)).response,
+      (await verify(unknown, PASSWORD)).response,
+    ],
+  ];
+  for (const [left, right] of pairs) {
+    assert.deepEqual(missShape(left), missShape(right));
+    assert.equal(left.statusCode, 404);
+    assert.equal(left.json().message, "Shared files not found");
+  }
+}
+
+test("8-character share tokens no longer grant access and stay removable", async () => {
   const shortFile = await makeFile("existing-short");
   const short = await insertExistingLink(
     crypto.randomBytes(6).toString("base64url"),
     [shortFile],
   );
   assert.equal(short.token.length, 8);
-  await assertPublicLifecycle(short, shortFile, { protectedLink: false });
+  // The row is still addressable by id, and a direct token read misses.
+  assert.equal(
+    await app.prisma.fileShareLink.findUnique({ where: { token: short.token } }),
+    null,
+  );
+  assert.equal(
+    (await app.prisma.fileShareLink.findUnique({ where: { id: short.id } })).token,
+    short.token,
+  );
+  assert.deepEqual(
+    await app.prisma.fileShareLink.findMany({ where: { token: short.token } }),
+    [],
+  );
+  assert.equal(
+    await app.prisma.fileShareLink.count({ where: { token: short.token } }),
+    0,
+  );
+  assert.deepEqual(
+    await app.prisma.fileShareLink.groupBy({
+      by: ["id"],
+      where: { token: short.token },
+    }),
+    [],
+  );
+  const unknownToken = crypto.randomBytes(32).toString("base64url");
+  assert.deepEqual(
+    await app.prisma.fileShareLink.aggregate({
+      where: { token: short.token },
+      _count: true,
+    }),
+    await app.prisma.fileShareLink.aggregate({
+      where: { token: unknownToken },
+      _count: true,
+    }),
+  );
+  assert.equal(
+    await app.prisma.fileShareLinkFile.findFirst({
+      where: { shareLink: { token: short.token } },
+    }),
+    null,
+  );
+  const listed = await request(
+    "GET",
+    `/api/workspaces/${workspace.id}/files/${shortFile.id}/share-links`,
+    { auth: true },
+  );
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data.length, 1);
+  assert.equal(listed.json().data[0].token, short.token);
+  assert.equal(listed.json().data[0].retired, true);
+  assert.equal(listed.json().data[0].enabled, true);
+  assert.equal(listed.body.includes("passwordHash"), false);
+  await assertUnknownToken(short.token, shortFile.id);
+
+  // Re-enabling does not restore the public URL.
+  const enabled = await request(
+    "PATCH",
+    `/api/workspaces/${workspace.id}/file-share-links/${short.id}`,
+    { payload: { enabled: true }, auth: true },
+  );
+  assert.equal(enabled.statusCode, 200, enabled.body);
+  assert.equal(enabled.json().data.retired, true);
+  assert.equal(enabled.json().data.token, short.token);
+  await assertUnknownToken(short.token, shortFile.id);
 
   const protectedFile = await makeFile("existing-protected");
   const created = await createLink({
@@ -420,25 +514,51 @@ test("links issued before this change keep resolving and revoking over HTTP", as
     password: PASSWORD,
   });
   assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().data.retired, false);
+  assert.match(created.json().data.token, TOKEN);
   // Keep the issued password hash; give the row a pre-change 8-character token.
   const protectedShort = await app.prisma.fileShareLink.update({
     where: { id: created.json().data.id },
     data: { token: crypto.randomBytes(6).toString("base64url") },
   });
   assert.equal(protectedShort.token.length, 8);
-  const listed = await request(
+  const protectedList = await request(
     "GET",
     `/api/workspaces/${workspace.id}/files/${protectedFile.id}/share-links`,
     { auth: true },
   );
-  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(protectedList.statusCode, 200, protectedList.body);
   assert.deepEqual(
-    listed.json().data.map((entry) => entry.token),
-    [protectedShort.token],
+    protectedList.json().data.map((entry) => ({
+      token: entry.token,
+      retired: entry.retired,
+      hasPassword: entry.hasPassword,
+    })),
+    [{ token: protectedShort.token, retired: true, hasPassword: true }],
   );
-  await assertPublicLifecycle(protectedShort, protectedFile, {
-    protectedLink: true,
-  });
+  assert.equal(protectedList.body.includes("passwordHash"), false);
+  // A correct password must not reveal that the link existed.
+  await assertUnknownToken(protectedShort.token, protectedFile.id);
+
+  const deleted = await request(
+    "DELETE",
+    `/api/workspaces/${workspace.id}/file-share-links/${short.id}`,
+    { auth: true },
+  );
+  assert.equal(deleted.statusCode, 204, deleted.body);
+  assert.equal(
+    await app.prisma.fileShareLink.findUnique({ where: { id: short.id } }),
+    null,
+  );
+  await assertUnknownToken(short.token, shortFile.id);
+
+  const replacement = await createLink({ fileIds: [shortFile.id] });
+  assert.equal(replacement.statusCode, 201, replacement.body);
+  assert.match(replacement.json().data.token, TOKEN);
+  assert.equal(replacement.json().data.retired, false);
+  const opened = await publicView(replacement.json().data.token);
+  assert.equal(opened.statusCode, 200, opened.body);
+  assert.equal(opened.json().data.authorized, true);
 });
 
 test("new links: public access, password grants and revocation over HTTP", async () => {

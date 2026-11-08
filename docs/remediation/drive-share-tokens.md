@@ -71,11 +71,14 @@ a separate product decision.
 
 ## Existing links
 
-No token is rotated, expired or invalidated. Links created before this change
-keep their 8-character tokens and resolve through the same lookup, with the
-same password, grant, expiry, disable and delete behaviour. There is no upgrade step, and running older code
-against a database that already holds 43-character tokens also works, because
-the lookup treats the token as an opaque string.
+The entropy change above did not rotate or invalidate links that already
+existed. A later change does. Eight-character tokens no longer grant access;
+the rows stay so owners can see and remove them, and new links are still the
+256-bit tokens described here. See
+[legacy-share-tokens.md](legacy-share-tokens.md). Running older code against a
+database that already holds 43-character tokens still works, because that
+lookup treats the token as an opaque string. The current application does not
+treat an 8-character token as one.
 
 ## Tests
 
@@ -90,22 +93,23 @@ real PostgreSQL through the HTTP routes (Fastify inject):
    8-character and a 43-character token exist) hits the real unique index; the
    request retries once with a fresh draw and returns 201, the password is
    hashed once, existing rows are unchanged and the new link has exactly its
-   two files.
+   two files. The 8-character row does not open. The 43-character row does.
 3. Three forced collisions return the controlled 409 after exactly three draws
    and one password hash, with no link or join rows written.
 4. A duplicate `fileId` (the other unique constraint) is not retried: one draw,
    the existing 409, nothing written.
-5. Links with 8-character tokens, one unprotected and one password protected,
-   still resolve: locked metadata, refused download, wrong and correct password,
-   grant cookie, content, download bytes, disable (404), re-enable (old grant
-   spent), delete (404), and the management list still returns their tokens.
+5. Links with 8-character tokens used to resolve, with the same password,
+   grant, disable and delete behaviour as a new link. That case now expects
+   them to miss like an unknown token. See
+   [legacy-share-tokens.md](legacy-share-tokens.md).
 6. Newly created unprotected and protected links pass the same public access,
    password grant and revocation sequence.
 
-Before the change, cases 1, 2, 3 and 6 fail (8-character tokens; a real
-collision returns 409 instead of retrying; one attempt with the generic
-message) and cases 4 and 5 pass as controls. Retrying any unique conflict
-fails case 4; hashing the password per attempt fails cases 2 and 3.
+Before the 256-bit change, cases 1, 2, 3 and 6 failed (8-character tokens; a
+real collision returned 409 instead of retrying; one attempt with the generic
+message) and case 4 passed as a control. Case 5 fails on that older behaviour
+as well, because an 8-character token must not open. Retrying any unique
+conflict fails case 4; hashing the password per attempt fails cases 2 and 3.
 
 The entropy check is by construction (the token is the full 32-byte draw), not
 a statistical test of the random source. Collisions are forced by substituting

@@ -25,6 +25,7 @@ export * from "./schemas/recurring.js";
 export * from "./schemas/common.js";
 export * from "./schemas/file.js";
 export * from "./schemas/file-share.js";
+export { isLegacyFileShareToken } from "./file-share-token.js";
 export * from "./schemas/team-folder.js";
 export * from "./schemas/attachment.js";
 export * from "./schemas/wiki.js";

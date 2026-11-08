@@ -35,6 +35,7 @@ import {
 import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { toast } from "sonner";
+import { isLegacyFileShareToken } from "@pm/shared";
 import { formatDateISO } from "@/features/time/utils";
 import { useDateField } from "@/components/shared/date-input";
 import {
@@ -431,9 +432,27 @@ function LinkTab({
         <div className="space-y-3">
           {links.map((link) => {
             const shareUrl = `${window.location.origin}/share/files/${link.token}`;
+            const retired = link.retired === true || isLegacyFileShareToken(link.token);
 
             return (
               <div key={link.id} className="space-y-3 rounded-md border p-3">
+                {retired ? (
+                  <div className="space-y-2">
+                    <p className="text-sm text-destructive" role="status">
+                      This public link no longer works. It uses a retired link
+                      format and cannot be turned back on. Remove it and create
+                      a new link.
+                    </p>
+                    <Input
+                      readOnly
+                      disabled
+                      value={shareUrl}
+                      aria-label="Retired share link"
+                      className="text-xs font-mono"
+                    />
+                  </div>
+                ) : (
+                  <>
                 {/* Link + copy */}
                 <div className="flex items-center gap-2">
                   <Input
@@ -547,6 +566,8 @@ function LinkTab({
                     />
                   )}
                 </div>
+                  </>
+                )}
 
                 {/* Delete */}
                 <div className="border-t pt-2">

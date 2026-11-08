@@ -255,6 +255,7 @@ export async function revokeMatchingRefreshFamily(
   prisma: PrismaClient,
   rawToken: string | undefined,
   expectedFamilyId: string,
+  expectedUserId?: string,
 ): Promise<ConditionalRevocationResult> {
   if (!rawToken) return { status: "absent" };
   const tokenHash = hashToken(rawToken);
@@ -263,7 +264,9 @@ export async function revokeMatchingRefreshFamily(
     const familyId = await findFamilyId(tx, tokenHash);
     if (!familyId) return { status: "absent" };
     if (familyId !== expectedFamilyId) return { status: "superseded" };
-    if (!(await lockFamily(tx, familyId))) return { status: "absent" };
+    const family = await lockFamily(tx, familyId);
+    if (!family || (expectedUserId !== undefined && family.userId !== expectedUserId))
+      return { status: "absent" };
     await revokeLockedFamily(tx, familyId, "logout");
     return { status: "revoked", familyId };
   }, refreshTransactionOptions);

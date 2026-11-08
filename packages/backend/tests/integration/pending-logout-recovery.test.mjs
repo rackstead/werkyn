@@ -5,6 +5,7 @@ import { after, before, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import jwt from "jsonwebtoken";
 
 // Real HTTP, PostgreSQL family locks, and local WebSocket clients. This server
 // prerequisite does not implement persistent browser logout intent or SSO ordering.
@@ -175,6 +176,80 @@ const recover = (sessionId, cookie, extra = {}) =>
     headers: trusted,
     ...extra,
   });
+
+function expiredAccess(person, session, changes = {}) {
+  return jwt.sign({ sub: person.id, email: person.email, sid: session.sid, ...changes }, process.env.JWT_SECRET,
+    { algorithm: "HS256", expiresIn: -60 });
+}
+
+test("expired-token conditional logout ends its matching family from an unconfigured page origin", async () => {
+  const person = await user();
+  const session = await login(person);
+  const token = expiredAccess(person, session);
+  assert.equal((await request("GET", "/api/users/me", { token })).status, 401);
+  const response = await request("POST", "/api/auth/logout", {
+    token, cookie: session.cookie, headers: { origin: "http://lan.example.test:3000" },
+  });
+  assert.equal(response.status, 204, response.body);
+  noCookie(response);
+  assert.ok((await record(session.sid)).revokedAt);
+  assert.equal((await state(session.sid)).tokens.length, 0);
+});
+
+for (const sameAccount of [true, false])
+  test(`expired-token conditional logout preserves a newer ${sameAccount ? "same-account" : "different-account"} cookie`, async () => {
+    const person = await user();
+    const old = await login(person);
+    const newer = await secondSession(sameAccount ? person : await user());
+    const before = await state(newer.sid);
+    const response = await heldFamily(newer.sid, () => request("POST", "/api/auth/logout", {
+      token: expiredAccess(person, old), cookie: newer.cookie, headers: { origin: "http://lan.example.test:3000" },
+    }));
+    assert.equal(response.status, 204, response.body);
+    noCookie(response);
+    assert.deepEqual(await state(newer.sid), before);
+    assert.equal((await record(old.sid)).revokedAt, null);
+  });
+
+test("expired-token conditional logout accepts retained rotated proof and ends its successor", async () => {
+  const person = await user();
+  const session = await login(person);
+  const rotated = await request("POST", "/api/auth/refresh", { cookie: session.cookie });
+  assert.equal(rotated.status, 200, rotated.body);
+  const response = await request("POST", "/api/auth/logout", {
+    token: expiredAccess(person, session), cookie: session.cookie,
+  });
+  assert.equal(response.status, 204, response.body);
+  noCookie(response);
+  assert.equal((await state(session.sid)).tokens.length, 0);
+  assert.equal((await request("POST", "/api/auth/refresh", { cookie: rotated.cookie })).status, 401);
+});
+
+test("expired-token conditional logout requires signed session and owner claims", async () => {
+  const person = await user();
+  const session = await login(person);
+  const before = await state(session.sid);
+  const invalid = [
+    undefined,
+    "invalid-token",
+    jwt.sign({ sub: person.id, sid: session.sid }, "another-signing-key", { expiresIn: -60 }),
+    expiredAccess(person, session, { sid: undefined }),
+    expiredAccess(person, session, { sid: "not-a-uuid" }),
+  ];
+  for (const token of invalid) {
+    const response = await request("POST", "/api/auth/logout", { token, cookie: session.cookie });
+    assert.equal(response.status, 401, response.body);
+    noCookie(response);
+    assert.deepEqual(await state(session.sid), before);
+  }
+  const other = await user();
+  const wrongSubject = await request("POST", "/api/auth/logout", {
+    token: expiredAccess(person, session, { sub: other.id }), cookie: session.cookie,
+  });
+  assert.equal(wrongSubject.status, 204, wrongSubject.body);
+  noCookie(wrongSubject);
+  assert.deepEqual(await state(session.sid), before);
+});
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function state(id) {
   return {

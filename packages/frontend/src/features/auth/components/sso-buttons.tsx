@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { apiUrl } from "@/lib/api-url";
 import { whenLoggedOut } from "@/stores/auth-store";
+import { beginOidcSignIn } from "@/lib/oidc-sign-in";
 
 interface SsoConnectorInfo {
   connectorId: string;
@@ -23,12 +24,13 @@ const CONNECTOR_ICONS: Record<string, string> = {
 };
 
 /** Where the browser goes to start single sign-on with a connector. */
-export function ssoLoginUrl(connectorId: string, returnUrl?: string) {
+export function ssoLoginUrl(connectorId: string, returnUrl?: string, attemptId?: string | null) {
   const params = new URLSearchParams();
   params.set("connector_id", connectorId);
   if (returnUrl) {
     params.set("return_url", returnUrl);
   }
+  if (attemptId) params.set("client_attempt", attemptId);
   return apiUrl("auth/oidc/login", params);
 }
 
@@ -36,7 +38,7 @@ export function SsoButtons({ connectors, returnUrl }: SsoButtonsProps) {
   const handleSsoLogin = async (connectorId: string) => {
     // Leaving the page would cancel a sign-out still revoking its session.
     await whenLoggedOut();
-    window.location.href = ssoLoginUrl(connectorId, returnUrl);
+    window.location.href = ssoLoginUrl(connectorId, returnUrl, beginOidcSignIn());
   };
 
   return (

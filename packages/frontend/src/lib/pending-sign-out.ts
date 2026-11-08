@@ -28,14 +28,11 @@ import { apiPrefixUrl } from "./api-url";
 //   oldest. Signing out again needs a session again, and while a record is
 //   pending none is restored, so a newer record follows a new sign-in, which
 //   replaced the cookie: older records can no longer match it.
-// - a record expires PENDING_SIGN_OUT_TTL_MS after it was written. Refresh
-//   tokens expire 7 days after they are issued, and no tab renews a session
-//   that has a record, so by then the session cannot be used from here.
+// Records are retired only by server settlement or a proven newer sign-in.
+// The client clock cannot establish that the server's cookie has expired.
 
 const PREFIX = "pm-auth-signout:v1:";
 
-/** The 7-day refresh-token lifetime, plus a day of margin. */
-export const PENDING_SIGN_OUT_TTL_MS = 8 * 24 * 60 * 60 * 1000;
 export const MAX_PENDING_SIGN_OUTS = 8;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -99,15 +96,12 @@ function parse(sessionId: string, raw: string | null): PendingSignOut {
   }
 }
 
-const expired = (record: PendingSignOut, now: number) =>
-  record.at !== null && now - record.at > PENDING_SIGN_OUT_TTL_MS;
-
 /**
- * This API's records, newest first. Expired records, and keys that name no
- * session, are removed. A record whose value cannot be read is kept (its key
+ * This API's records, newest first. Keys that name no session are removed.
+ * A record whose value cannot be read is kept (its key
  * names the session) and counts as the oldest.
  */
-export function pendingSignOuts(now = Date.now()): PendingSignOut[] {
+export function pendingSignOuts(_now?: number): PendingSignOut[] {
   const store = storage();
   if (!store) return [];
   const records: PendingSignOut[] = [];
@@ -123,7 +117,7 @@ export function pendingSignOuts(now = Date.now()): PendingSignOut[] {
       const record = UUID.test(sessionId)
         ? parse(sessionId, store.getItem(key))
         : null;
-      if (!record || expired(record, now)) store.removeItem(key);
+      if (!record) store.removeItem(key);
       else records.push(record);
     }
   } catch {
@@ -144,7 +138,7 @@ export function recordPendingSignOut(
   const store = storage();
   if (!store) return false;
   try {
-    const others = pendingSignOuts(now).filter(
+    const others = pendingSignOuts().filter(
       (record) => record.sessionId !== sessionId,
     );
     for (const old of others.slice(MAX_PENDING_SIGN_OUTS - 1)) {
@@ -172,12 +166,12 @@ export function clearPendingSignOut(sessionId: string): void {
 /** Whether a sign-out of `sessionId` is recorded and not yet settled. */
 export function hasPendingSignOut(
   sessionId: string | null,
-  now = Date.now(),
+  _now?: number,
 ): boolean {
   if (!sessionId) return false;
   try {
     const raw = storage()?.getItem(scopePrefix() + sessionId) ?? null;
-    return raw !== null && !expired(parse(sessionId, raw), now);
+    return raw !== null;
   } catch {
     return false;
   }

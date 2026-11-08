@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_PENDING_SIGN_OUTS,
-  PENDING_SIGN_OUT_TTL_MS,
   clearPendingSignOut,
   hasPendingSignOut,
   pendingSignOuts,
@@ -103,22 +102,17 @@ describe("pending sign-out records", () => {
     expect(keys()).toHaveLength(MAX_PENDING_SIGN_OUTS);
   });
 
-  it("expires records after the refresh-token lifetime, with a day of margin", () => {
+  it("does not treat a client-clock jump as proof that the server session expired", () => {
     recordPendingSignOut(sid(1), "alice", NOW);
     recordPendingSignOut(sid(2), "alice", NOW + 1000);
-    expect(PENDING_SIGN_OUT_TTL_MS).toBeGreaterThanOrEqual(
-      8 * 24 * 60 * 60 * 1000,
-    );
-    expect(hasPendingSignOut(sid(1), NOW + PENDING_SIGN_OUT_TTL_MS)).toBe(true);
-    expect(hasPendingSignOut(sid(1), NOW + PENDING_SIGN_OUT_TTL_MS + 1)).toBe(
-      false,
-    );
+    const later = NOW + 40 * 24 * 60 * 60 * 1000;
+    expect(hasPendingSignOut(sid(1), later)).toBe(true);
     expect(
-      pendingSignOuts(NOW + PENDING_SIGN_OUT_TTL_MS + 1).map(
+      pendingSignOuts(later).map(
         (r) => r.sessionId,
       ),
-    ).toEqual([sid(2)]);
-    expect(keys()).toHaveLength(1);
+    ).toEqual([sid(2), sid(1)]);
+    expect(keys()).toHaveLength(2);
   });
 
   it("keeps a record whose value is unreadable, as the oldest, and drops keys that name no session", () => {
@@ -130,7 +124,7 @@ describe("pending sign-out records", () => {
       { sessionId: sid(2), userId: "alice", at: NOW },
       { sessionId: sid(1), userId: null, at: null },
     ]);
-    expect(hasPendingSignOut(sid(1), NOW + 10 * PENDING_SIGN_OUT_TTL_MS)).toBe(
+    expect(hasPendingSignOut(sid(1), NOW + 400 * 24 * 60 * 60 * 1000)).toBe(
       true,
     );
     expect(localStorage.getItem(prefix + "not-a-session")).toBeNull();

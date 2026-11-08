@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate, useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { z } from "zod";
-import { useAuthStore } from "@/stores/auth-store";
+import { completeOidcSignIn, useAuthStore } from "@/stores/auth-store";
 
 const searchSchema = z.object({
   return_url: z.string().optional(),
@@ -18,11 +18,9 @@ function OidcCompletePage() {
   const router = useRouter();
 
   useEffect(() => {
-    // The refresh token cookie was set by the backend callback.
-    // Call refresh to get the access token + user data.
-    useAuthStore
-      .getState()
-      .refresh()
+    // The callback's signed proof binds completion to this new sign-in,
+    // including when an earlier failed sign-out still blocks ordinary restore.
+    completeOidcSignIn()
       .then((success) => {
         if (success) {
           // Force TanStack Router to re-evaluate all beforeLoad hooks

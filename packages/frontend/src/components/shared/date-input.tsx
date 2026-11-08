@@ -216,15 +216,25 @@ const sameContent = (a: DateInputContent, b: DateInputContent) =>
  * (`element.click()`, as some assistive technology and automation send it).
  * Nothing has settled the input then: a lone month "0" in an empty input
  * still reads as empty. `read()` therefore settles the input itself by
- * moving focus out of it, and returns null when that changed it.
+ * moving focus out of it, and returns null when that changed it. Blurring
+ * that way leaves focus on `document.body`. When the settled value is
+ * incomplete, focus returns to the input and `alertHeld` stays set so the
+ * note under it keeps the alert. A button that already has focus is left
+ * alone, and a read that is sent does not move focus.
  */
 export function useDateField(initial: string | null = null) {
   const ref = useRef<HTMLInputElement>(null);
   const [value, setValue] = useState(initial ?? "");
   const [content, setContent] = useState<DateInputContent>(() => contentOf(initial));
   const [focused, setFocused] = useState(false);
+  // The refusal above returned focus to an incomplete input. The note keeps
+  // its alert until the input is no longer incomplete.
+  const [alertHeld, setAlertHeld] = useState(false);
   // The input's content when the form's button was pressed.
   const pressed = useRef<DateInputContent | null>(null);
+  // read() is blurring and maybe focusing the input. An event from that must
+  // not drop the alert that the same read is holding.
+  const settling = useRef(false);
 
   const update = (next: DateInputContent) =>
     setContent((prev) => (sameContent(prev, next) ? prev : next));
@@ -237,12 +247,17 @@ export function useDateField(initial: string | null = null) {
   };
 
   const onRead = (e: { currentTarget: HTMLInputElement }) => {
-    refresh(e.currentTarget);
+    const next = refresh(e.currentTarget);
+    // A later edit that finishes or clears the date drops the held alert.
+    // Staying incomplete keeps it: the refusal is still the reason.
+    if (!settling.current && next.kind !== "incomplete") setAlertHeld(false);
   };
 
   /**
    * The input's content once settled, for the form to send, or null when the
    * press on the form's button, or settling the input, changed it (see above).
+   * An incomplete date settled by blurring, when that leaves focus on
+   * `document.body`, is focused again.
    */
   const read = (): DateInputContent | null => {
     const input = ref.current;
@@ -250,8 +265,20 @@ export function useDateField(initial: string | null = null) {
     // What was shown: at the press, or now when nothing was pressed.
     const before = pressed.current ?? dateInputContent(input);
     pressed.current = null;
-    if (input.ownerDocument.activeElement === input) input.blur();
+    const doc = input.ownerDocument;
+    const hadFocus = doc.activeElement === input;
+    settling.current = true;
+    if (hadFocus) input.blur();
     const now = refresh(input);
+    // Only an activation that was still in the input: a focused button is
+    // not blurred, and a value that can be sent is not focused.
+    if (hadFocus && now.kind === "incomplete" && doc.activeElement === doc.body) {
+      setAlertHeld(true);
+      input.focus();
+    } else if (now.kind !== "incomplete") {
+      setAlertHeld(false);
+    }
+    settling.current = false;
     return sameContent(before, now) ? now : null;
   };
 
@@ -260,6 +287,7 @@ export function useDateField(initial: string | null = null) {
     if (ref.current) ref.current.value = date ?? "";
     setValue(date ?? "");
     update(contentOf(date));
+    setAlertHeld(false);
   };
 
   return {
@@ -287,6 +315,7 @@ export function useDateField(initial: string | null = null) {
     },
     content,
     focused,
+    alertHeld,
     read,
     set,
   } as const;

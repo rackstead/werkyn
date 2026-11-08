@@ -388,6 +388,21 @@ describe("a click that leaves focus in the date input", () => {
     expect(note(input)).toBe("Enter a complete date.");
   });
 
+  it("returns focus to the date input after a refused focus-less activation", () => {
+    const input = openCreate();
+    settleOnBlur(input);
+    type(input, TYPING_INTO_EMPTY["month/day/year"].slice(0, 1));
+    expect(document.activeElement).toBe(input);
+    // No press, so the click leaves focus in the input until read() settles it.
+    fireEvent.click(createButton());
+    expect(state.create).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+    expect(document.activeElement).toBe(input);
+    expect(note(input)).toBe("Enter a complete date.");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByRole("alert").textContent).toBe("Enter a complete date.");
+  });
+
   it("creates the link with a whole date", () => {
     const input = openCreate();
     settleOnBlur(input);
@@ -396,6 +411,32 @@ describe("a click that leaves focus in the date input", () => {
     expect(state.create.mock.calls.map(([body]) => body)).toEqual([
       { fileIds: ["file-1"], password: undefined, expiresAt: end("2027-03-15") },
     ]);
+    // A successful create is not moved onto the date input.
+    expect(document.activeElement).not.toBe(input);
+  });
+
+  it("keeps focus on a button a keyboard activation already focused", () => {
+    const input = openCreate();
+    settleOnBlur(input);
+    type(input, TYPING_INTO_EMPTY["month/day/year"].slice(0, 1));
+    const button = createButton();
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    fireEvent.click(button);
+    expect(state.create).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(button);
+    expect(note(input)).toBe("Enter a complete date.");
+  });
+
+  it("leaves a successful keyboard create on the button", () => {
+    const input = openCreate();
+    fireEvent.change(input, { target: { value: "2027-03-15" } });
+    const button = createButton();
+    button.focus();
+    fireEvent.click(button);
+    expect(state.create).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(button);
+    expect(document.activeElement).not.toBe(input);
   });
 
   it("creates a link without an expiry when nothing was typed", () => {
@@ -414,10 +455,24 @@ describe("a click that leaves focus in the date input", () => {
     expect(state.update).not.toHaveBeenCalled();
     // The completed date is now shown; a second click sends it.
     expect(input.value).toBe("2027-01-20");
+    // Settling produced a date, not an incomplete one, so focus is not put back.
+    expect(document.activeElement).not.toBe(input);
     fireEvent.click(saveButton());
     expect(state.update.mock.calls.map(([body]) => body)).toEqual([
       { linkId: "link-1", expiresAt: end("2027-01-20") },
     ]);
+  });
+
+  it("returns focus to the editor date after a refused focus-less activation", () => {
+    const input = openEditor(end("2027-11-20"));
+    settleOnBlur(input);
+    type(input, [["0", "", true]]);
+    fireEvent.click(saveButton());
+    expect(state.update).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+    expect(document.activeElement).toBe(input);
+    expect(note(input)).toBe("Enter a complete date.");
+    expect(screen.getByRole("alert").textContent).toBe("Enter a complete date.");
   });
 });
 

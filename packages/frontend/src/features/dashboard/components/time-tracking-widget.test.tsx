@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TIME_ZONES, useTimeZone } from "@/test/time-zone";
 import { TimeTrackingWidget } from "./time-tracking-widget";
@@ -6,12 +6,20 @@ import { TimeTrackingWidget } from "./time-tracking-widget";
 const state = vi.hoisted(() => ({
   entries: [] as Array<{ id: string; date: string; hours: number; project: null }>,
   ranges: [] as unknown[][],
+  isError: false,
+  refetch: vi.fn(),
 }));
 
 vi.mock("@/features/time/api", () => ({
   useTimeEntries: (...args: unknown[]) => {
     state.ranges.push(args);
-    return { data: state.entries, isLoading: false };
+    return {
+      data: state.isError ? undefined : state.entries,
+      isLoading: false,
+      isError: state.isError,
+      isFetching: false,
+      refetch: state.refetch,
+    };
   },
 }));
 vi.mock("@/stores/auth-store", () => ({
@@ -20,6 +28,8 @@ vi.mock("@/stores/auth-store", () => ({
 
 beforeEach(() => {
   state.ranges = [];
+  state.isError = false;
+  state.refetch = vi.fn();
   state.entries = [
     { id: "sun", date: "2026-11-01", hours: 3, project: null },
     { id: "mon", date: "2026-11-02", hours: 2, project: null },
@@ -46,6 +56,16 @@ const LOCAL_DAY: Record<string, Record<(typeof TIME_ZONES)[number], [string, str
     "America/Los_Angeles": ["2026-11-01", "2026-10-26"],
   },
 };
+
+it("does not present a failed page as zero hours", () => {
+  state.isError = true;
+  render(<TimeTrackingWidget workspaceId="w" />);
+  expect(screen.queryByText("Today")).toBeNull();
+  expect(screen.queryByText("0.0h")).toBeNull();
+  expect(screen.getByRole("alert").textContent).toMatch(/Could not load time entries/);
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  expect(state.refetch).toHaveBeenCalled();
+});
 
 describe.each(TIME_ZONES)("dashboard time tracking in %s", (zone) => {
   useTimeZone(zone);

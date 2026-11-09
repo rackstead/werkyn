@@ -51,7 +51,13 @@ export function TimesheetPage({
       ? undefined
       : userId ?? user?.id;
 
-  const { data: entries = [], isLoading } = useTimeEntries(
+  const {
+    data: entries = [],
+    isLoading,
+    isError,
+    isFetching,
+    refetch,
+  } = useTimeEntries(
     workspaceId,
     startDate,
     endDate,
@@ -173,15 +179,27 @@ export function TimesheetPage({
         onToday={handleToday}
       />
 
-      {currentView === "all" && !userId && (
+      {isError ? (
+        <div role="alert" className="space-y-2 border rounded-lg p-8">
+          <p className="text-sm text-destructive">Could not load time entries.</p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => refetch()}
+            disabled={isFetching}
+          >
+            Try again
+          </Button>
+        </div>
+      ) : currentView === "all" && !userId ? (
         <AllMembersView
           workspaceId={workspaceId}
           entries={entries}
           onSelectUser={handleSelectUser}
         />
-      )}
+      ) : null}
 
-      {(currentView === "my" || userId) && (
+      {!isError && (currentView === "my" || userId) && (
         <>
           {userId && currentView === "all" && (
             <div className="flex items-center gap-2">

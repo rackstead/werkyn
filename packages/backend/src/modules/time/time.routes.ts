@@ -40,7 +40,8 @@ export default async function timeRoutes(fastify: FastifyInstance) {
 
   // GET /api/workspaces/:wid/time/entries?startDate&endDate&userId?&cursor?&limit?
   // One page in date, createdAt, id order. Default page size is 100 (maximum 500).
-  // Omit cursor for the first page; nextCursor is null on the last page.
+  // Omit cursor for the first page. nextCursor carries that page's last sort
+  // position and is null on the last page. A malformed cursor is a 400.
   fastify.route({
     method: "GET",
     url: "/workspaces/:wid/time/entries",

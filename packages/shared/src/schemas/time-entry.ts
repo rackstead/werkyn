@@ -42,8 +42,8 @@ export const TimeEntryQuerySchema = z.object({
   startDate: dateOnly("startDate"),
   endDate: dateOnly("endDate"),
   userId: z.string().optional(),
-  /** ID of the last entry on the previous page. Omit it for the first page. */
-  cursor: z.string().min(1).max(200).optional(),
+  /** Opaque `nextCursor` of the previous page. It carries the sort position, not only the id. */
+  cursor: z.string().min(1).max(1024).optional(),
   /**
    * Page size. An omitted cursor and limit return the first
    * TIME_ENTRY_PAGE_DEFAULT entries, not every entry in the range.

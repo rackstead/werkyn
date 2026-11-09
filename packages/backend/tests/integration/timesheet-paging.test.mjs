@@ -142,7 +142,10 @@ async function walk(actor, extra = {}) {
       `page has ${body.data.length} rows, limit ${limit}`,
     );
     if (body.data.length < limit) assert.equal(body.nextCursor, null);
-    if (body.nextCursor) assert.equal(body.nextCursor, body.data.at(-1).id);
+    if (body.nextCursor) {
+      assert.equal(typeof body.nextCursor, "string");
+      assert.notEqual(body.nextCursor, body.data.at(-1).id);
+    }
     seen.push(...body.data.map((row) => row.id));
     cursor = body.nextCursor ?? undefined;
     pages += 1;
@@ -343,7 +346,13 @@ test("an omitted cursor returns the first page, not the whole range", async () =
   const body = first.json();
   assert.equal(body.data.length, PAGE_DEFAULT);
   assert.ok(body.data.length < member.length);
-  assert.equal(body.nextCursor, member[PAGE_DEFAULT - 1]);
+  assert.equal(typeof body.nextCursor, "string");
+  const second = await get("MEMBER", entriesUrl({}, body.nextCursor));
+  assert.equal(second.statusCode, 200, second.body);
+  assert.deepEqual(
+    second.json().data.map((row) => row.id),
+    member.slice(PAGE_DEFAULT, PAGE_DEFAULT * 2),
+  );
   assert.deepEqual(
     body.data.map((row) => row.id),
     member.slice(0, PAGE_DEFAULT),
@@ -421,37 +430,99 @@ test("walking every page matches the full id list for that user and range", asyn
   assert.equal(plain.task, null);
 });
 
+async function cursorAfterId(actor, id) {
+  let cursor;
+  for (let page = 0; page < 800; page += 1) {
+    const res = await get(actor, entriesUrl({ limit: 1 }, cursor));
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json();
+    if (body.data[0]?.id === id) return body.nextCursor;
+    cursor = body.nextCursor ?? undefined;
+    if (!cursor) break;
+  }
+  throw new Error(`no page ended on ${id}`);
+}
+
 test("cursors inside a shared timestamp do not skip or repeat rows", async () => {
   const member = await expectedIds("MEMBER");
-  const page = await get("MEMBER", entriesUrl({ limit: 3 }, "e0100"));
+  const afterTie = await cursorAfterId("MEMBER", "e0100");
+  const page = await get("MEMBER", entriesUrl({ limit: 3 }, afterTie));
   assert.equal(page.statusCode, 200, page.body);
   assert.deepEqual(
     page.json().data.map((row) => row.id),
     ["e0101", "e0102", "e0103"],
   );
-  assert.equal(page.json().nextCursor, "e0103");
 
   const admin = await expectedIds("ADMIN");
   const hiddenAt = admin.indexOf("h0001");
-  const afterHidden = await get("ADMIN", entriesUrl({ limit: 2 }, "h0001"));
+  const afterHidden = await get(
+    "ADMIN",
+    entriesUrl({ limit: 2 }, await cursorAfterId("ADMIN", "h0001")),
+  );
   assert.deepEqual(
     afterHidden.json().data.map((row) => row.id),
     admin.slice(hiddenAt + 1, hiddenAt + 3),
   );
 
-  const last = await get("MEMBER", entriesUrl({ limit: 2 }, member.at(-1)));
-  assert.deepEqual(last.json(), { data: [], nextCursor: null });
-  for (const cursor of [
-    "cmissingcursor000000000000",
-    "x0000",
-    "b0000",
-    "h0001",
-    "o0001",
-  ]) {
+  assert.equal(await cursorAfterId("MEMBER", member.at(-1)), null);
+  for (const cursor of ["not-a-cursor", "e0100", "h0001", "b0000"]) {
     const res = await get("MEMBER", entriesUrl({ limit: 2 }, cursor));
-    assert.equal(res.statusCode, 200, res.body);
-    assert.deepEqual(res.json(), { data: [], nextCursor: null }, cursor);
+    assert.equal(res.statusCode, 400, `${cursor} -> ${res.statusCode} ${res.body}`);
   }
+});
+
+test("deleting or re-dating the cursor row does not end or skip the list", async () => {
+  const member = await expectedIds("MEMBER");
+  const first = await get("MEMBER", entriesUrl({ limit: 5 }));
+  const boundaryId = first.json().data.at(-1).id;
+  const cursor = first.json().nextCursor;
+  const stored = await app.prisma.timeEntry.findUnique({ where: { id: boundaryId } });
+  await app.prisma.timeEntry.delete({ where: { id: boundaryId } });
+  try {
+    const next = await get("MEMBER", entriesUrl({ limit: 3 }, cursor));
+    assert.equal(next.statusCode, 200, next.body);
+    const rest = member.filter((id) => id !== boundaryId);
+    const start = rest.indexOf(member[member.indexOf(boundaryId) + 1]);
+    assert.deepEqual(
+      next.json().data.map((row) => row.id),
+      rest.slice(start, start + 3),
+    );
+  } finally {
+    await app.prisma.timeEntry.create({
+      data: {
+        id: stored.id,
+        workspaceId: stored.workspaceId,
+        userId: stored.userId,
+        taskId: stored.taskId,
+        projectId: stored.projectId,
+        date: stored.date,
+        hours: stored.hours,
+        description: stored.description,
+        billable: stored.billable,
+        createdAt: stored.createdAt,
+      },
+    });
+  }
+
+  const tieCursor = await cursorAfterId("MEMBER", "e0100");
+  await app.prisma.timeEntry.update({
+    where: { id: "e0100" },
+    data: { date: "2026-06-20" },
+  });
+  try {
+    const next = await get("MEMBER", entriesUrl({ limit: 3 }, tieCursor));
+    assert.equal(next.statusCode, 200, next.body);
+    assert.deepEqual(
+      next.json().data.map((row) => row.id),
+      ["e0101", "e0102", "e0103"],
+    );
+  } finally {
+    await app.prisma.timeEntry.update({
+      where: { id: "e0100" },
+      data: { date: "2026-06-15" },
+    });
+  }
+  assert.deepEqual(await walk("MEMBER", { limit: 50 }), member);
 });
 
 test("page queries read limit + 1 rows", async () => {
@@ -499,11 +570,12 @@ test("rows inserted on the cursor timestamp are not skipped or repeated", async 
       pages += 1;
       if (!cursor) break;
       if (pages <= 3) {
+        const boundaryId = body.data.at(-1).id;
         const row = await app.prisma.timeEntry.findUnique({
-          where: { id: cursor },
+          where: { id: boundaryId },
           select: { date: true, createdAt: true },
         });
-        const [lower, upper] = idsAround(cursor);
+        const [lower, upper] = idsAround(boundaryId);
         await app.prisma.timeEntry.createMany({
           data: [lower, upper].map((id) => ({
             id,
@@ -584,6 +656,7 @@ test("invalid cursors and page sizes are rejected", async () => {
     { limit: "nope" },
     { cursor: "" },
     { cursor: "x".repeat(201) },
+    { cursor: "x".repeat(1025) },
   ]) {
     const res = await get("MEMBER", entriesUrl(extra));
     assert.equal(

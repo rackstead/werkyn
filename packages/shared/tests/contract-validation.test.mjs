@@ -93,7 +93,8 @@ test("timesheet queries default to the first page of 100", () => {
   assert.equal(TimeEntryQuerySchema.safeParse({ ...range, limit: "0" }).success, false);
   assert.equal(TimeEntryQuerySchema.safeParse({ ...range, limit: String(TIME_ENTRY_PAGE_MAX + 1) }).success, false);
   assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "" }).success, false);
-  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "x".repeat(201) }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "x".repeat(1025) }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "x".repeat(80) }).success, true);
 });
 
 test("recurrence create and update require the day the frequency needs", () => {

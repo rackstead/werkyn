@@ -124,6 +124,8 @@ export interface TimeReport {
  * Every entry in the date range. The server returns one page at a time
  * (100 when `limit` is omitted, at most TIME_ENTRY_PAGE_MAX). This follows
  * `nextCursor` so the timesheet and the week widget still list the whole range.
+ * A failed page rejects the query. Callers must show that failure, not an
+ * empty week.
  */
 export function useTimeEntries(
   workspaceId: string,

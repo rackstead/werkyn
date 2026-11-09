@@ -1,6 +1,8 @@
 import type { Prisma, PrismaClient, WorkspaceRole } from "@prisma/client";
 import {
   TIME_ENTRY_PAGE_DEFAULT,
+  hasUnpairedSurrogate,
+  isDateOnly,
   type CreateTimeEntryInput,
   type UpdateTimeEntryInput,
   type TimeEntryQuery,
@@ -14,6 +16,59 @@ const ENTRY_ORDER: Prisma.TimeEntryOrderByWithRelationInput[] = [
   { createdAt: "asc" },
   { id: "asc" },
 ];
+
+/** Sort position carried by a cursor, so it does not depend on the row still being there. */
+type EntryPosition = { date: string; createdAt: string; id: string };
+
+const isCursorText = (value: unknown, max: number): value is string =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= max &&
+  !value.includes("\u0000") &&
+  !hasUnpairedSurrogate(value);
+
+function encodeEntryCursor(row: { date: string; createdAt: Date; id: string }) {
+  const position: EntryPosition = {
+    date: row.date,
+    createdAt: row.createdAt.toISOString(),
+    id: row.id,
+  };
+  return Buffer.from(JSON.stringify([position.date, position.createdAt, position.id])).toString("base64url");
+}
+
+function decodeEntryCursor(cursor: string): { date: string; createdAt: Date; id: string } {
+  try {
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!Array.isArray(value) || value.length !== 3) throw new Error("shape");
+    const [date, createdAt, id] = value;
+    if (typeof date !== "string" || typeof createdAt !== "string") throw new Error("fields");
+    const parsed = new Date(createdAt);
+    if (
+      !isDateOnly(date) ||
+      !isCursorText(id, 200) ||
+      Number.isNaN(parsed.getTime()) ||
+      parsed.toISOString() !== createdAt
+    ) {
+      throw new Error("fields");
+    }
+    return { date, createdAt: parsed, id };
+  } catch {
+    throw new ValidationError("Validation failed", [
+      { field: "cursor", message: "Invalid cursor: use the nextCursor of the previous page" },
+    ]);
+  }
+}
+
+/** Rows after the cursor's stored position. The cursor row itself is not required. */
+function entriesAfter(at: { date: string; createdAt: Date; id: string }): Prisma.TimeEntryWhereInput {
+  return {
+    OR: [
+      { date: { gt: at.date } },
+      { date: at.date, createdAt: { gt: at.createdAt } },
+      { date: at.date, createdAt: at.createdAt, id: { gt: at.id } },
+    ],
+  };
+}
 
 /** Both nullable relations can carry project content, including legacy mismatches. */
 export function timeEntryProjectWhere(workspaceId: string, userId: string): Prisma.TimeEntryWhereInput {
@@ -161,9 +216,10 @@ export async function deleteEntry(
 /**
  * One page of entries in the date range, ordered by date, createdAt, then id.
  * Omit `cursor` for the first page. The page size is `limit`, or
- * TIME_ENTRY_PAGE_DEFAULT (100) when the caller omits it. `nextCursor` is the
- * last row's id, or null on the last page. A cursor that is not an entry of
- * this list gives an empty page.
+ * TIME_ENTRY_PAGE_DEFAULT (100) when the caller omits it. `nextCursor` carries
+ * the last row's sort position and is null on the last page. A malformed
+ * cursor is rejected. Deleting or re-dating that row does not end the list or
+ * move the boundary, because the position was stored when the cursor was issued.
  */
 export async function listEntries(
   prisma: PrismaClient,
@@ -179,27 +235,22 @@ export async function listEntries(
       ? undefined
       : userId;
 
-  const where: Prisma.TimeEntryWhereInput = {
-    workspaceId,
-    ...timeEntryProjectWhere(workspaceId, userId),
-    ...(filterUserId ? { userId: filterUserId } : {}),
-    date: {
-      gte: query.startDate,
-      lte: query.endDate,
+  const filters: Prisma.TimeEntryWhereInput[] = [
+    {
+      workspaceId,
+      ...timeEntryProjectWhere(workspaceId, userId),
+      ...(filterUserId ? { userId: filterUserId } : {}),
+      date: {
+        gte: query.startDate,
+        lte: query.endDate,
+      },
     },
-  };
-
-  if (query.cursor) {
-    const scopedCursor = await prisma.timeEntry.findFirst({
-      where: { AND: [where, { id: query.cursor }] },
-      select: { id: true },
-    });
-    if (!scopedCursor) return { data: [], nextCursor: null };
-  }
+  ];
+  if (query.cursor) filters.push(entriesAfter(decodeEntryCursor(query.cursor)));
 
   const limit = query.limit ?? TIME_ENTRY_PAGE_DEFAULT;
   const rows = await prisma.timeEntry.findMany({
-    where,
+    where: { AND: filters },
     include: {
       user: { select: { id: true, displayName: true, avatarUrl: true } },
       task: { select: { id: true, title: true } },
@@ -207,12 +258,12 @@ export async function listEntries(
     },
     orderBy: ENTRY_ORDER,
     take: limit + 1,
-    ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
   });
   const hasMore = rows.length > limit;
   if (hasMore) rows.pop();
+  const last = rows.at(-1);
   return {
     data: rows,
-    nextCursor: hasMore ? rows[rows.length - 1].id : null,
+    nextCursor: hasMore && last ? encodeEntryCursor(last) : null,
   };
 }

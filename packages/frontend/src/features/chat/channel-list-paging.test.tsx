@@ -4,11 +4,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 const transport = vi.hoisted(() => ({
-  calls: [] as Array<{ path: string; searchParams: Record<string, string> }>,
+  calls: [] as Array<{ path: string; searchParams: Record<string, string>; signal?: AbortSignal }>,
   respond: (() => ({ data: [], nextCursor: null })) as (
     path: string,
     searchParams: Record<string, string>,
-  ) => { data: Array<{ id: string }>; nextCursor: string | null },
+    signal?: AbortSignal,
+  ) => { data: Array<{ id: string }>; nextCursor: string | null } | Promise<{ data: Array<{ id: string }>; nextCursor: string | null }>,
 }));
 
 vi.mock("@/lib/api-client", async (original) => {
@@ -16,11 +17,12 @@ vi.mock("@/lib/api-client", async (original) => {
   return {
     ...real,
     api: {
-      get: (path: string, options: { searchParams?: Record<string, string> } = {}) => ({
+      get: (path: string, options: { searchParams?: Record<string, string>; signal?: AbortSignal } = {}) => ({
         json: async () => {
           const searchParams = { ...(options.searchParams ?? {}) };
-          transport.calls.push({ path, searchParams });
-          return transport.respond(path, searchParams);
+          transport.calls.push({ path, searchParams, signal: options.signal });
+          if (options.signal?.aborted) throw options.signal.reason ?? new DOMException("The request was aborted", "AbortError");
+          return transport.respond(path, searchParams, options.signal);
         },
       }),
     },
@@ -55,4 +57,30 @@ it("follows channel pages until nextCursor is null", async () => {
   await waitFor(() => expect(result.current.isSuccess).toBe(true));
   expect(result.current.data?.data.map((channel) => channel.id)).toEqual(["a", "b"]);
   expect(transport.calls.map((call) => call.searchParams.cursor)).toEqual([undefined, "a"]);
+  expect(transport.calls.every((call) => call.signal)).toBe(true);
+});
+
+it("fails when a page is still outstanding after the walk cap", async () => {
+  let n = 0;
+  transport.respond = () => {
+    n += 1;
+    return { data: [{ id: `c${n}` }], nextCursor: `c${n}` };
+  };
+  const { result } = renderHook(() => useChannels("w"), { wrapper });
+  await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 5000 });
+  expect(result.current.data).toBeUndefined();
+  expect(transport.calls).toHaveLength(200);
+});
+
+it("does not request another page after the query is cancelled", async () => {
+  transport.respond = (_path, _params, signal) => new Promise((_resolve, reject) => {
+    signal?.addEventListener("abort", () => {
+      reject(signal.reason ?? new DOMException("The request was aborted", "AbortError"));
+    }, { once: true });
+  });
+  const { unmount } = renderHook(() => useChannels("w"), { wrapper });
+  await waitFor(() => expect(transport.calls).toHaveLength(1));
+  unmount();
+  await waitFor(() => expect(transport.calls[0]?.signal?.aborted).toBe(true));
+  expect(transport.calls).toHaveLength(1);
 });

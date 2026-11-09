@@ -291,6 +291,80 @@ test("walking either list at page size 1 and at the default returns today's visi
   assert.equal(Number(httpUnread.data.find((row) => row.channelId === zzz).count), 1);
 });
 
+function planNodes(plan) {
+  const nodes = [];
+  const walk = (node) => {
+    if (!node) return;
+    nodes.push(node);
+    for (const child of node.Plans ?? []) walk(child);
+  };
+  walk(plan["QUERY PLAN"][0].Plan);
+  return nodes;
+}
+
+test("channel and DM pages use the name order indexes", async () => {
+  const bulk = [];
+  const memberships = [];
+  for (let i = 0; i < 4000; i += 1) {
+    const id = `bulk-${suffix}-${String(i).padStart(5, "0")}`;
+    bulk.push({
+      id,
+      workspaceId: other.id,
+      name: `n-${String(i).padStart(5, "0")}`,
+      type: i % 2 === 0 ? "PUBLIC" : "PRIVATE",
+      createdById: users.stranger.id,
+      createdAt: T,
+      updatedAt: T,
+    });
+    if (i % 2 === 1 && i < 200) memberships.push({
+      channelId: id, userId: users.stranger.id, joinedAt: T, lastReadAt: T,
+    });
+  }
+  for (let i = 0; i < 2000; i += 1) {
+    const id = `bulk-dm-${suffix}-${String(i).padStart(5, "0")}`;
+    bulk.push({
+      id,
+      workspaceId: other.id,
+      name: i < 1000 ? null : "same-dm",
+      type: "DM",
+      createdById: users.stranger.id,
+      createdAt: T,
+      updatedAt: T,
+    });
+    if (i % 3 === 0) memberships.push({
+      channelId: id, userId: users.stranger.id, joinedAt: T, lastReadAt: T,
+    });
+  }
+  for (let offset = 0; offset < bulk.length; offset += 1000) {
+    await app.prisma.chatChannel.createMany({ data: bulk.slice(offset, offset + 1000) });
+  }
+  await app.prisma.chatChannelMember.createMany({ data: memberships });
+  await app.prisma.$executeRawUnsafe('ANALYZE "ChatChannel", "ChatChannelMember"');
+
+  const first = await recordQueries(observer, (db) => chat.listChannels(db, other.id, users.stranger.id, undefined, 50));
+  const cursor = first.result.nextCursor;
+  const later = await recordQueries(observer, (db) => chat.listChannels(db, other.id, users.stranger.id, cursor, 50));
+  const dms = await recordQueries(observer, (db) => chat.listDms(db, other.id, users.stranger.id, undefined, 20));
+  const plans = [];
+  for (const recorded of [first, later, dms]) {
+    const page = recorded.events.find((event) => /ORDER BY[\s\S]*"name"[\s\S]*NULLS LAST/i.test(event.query));
+    assert.ok(page, recorded.events.map((event) => event.query).join("\n---\n"));
+    const explained = await app.prisma.$queryRawUnsafe(
+      `EXPLAIN (FORMAT JSON) ${page.query}`,
+      ...JSON.parse(page.params),
+    );
+    plans.push(explained[0]);
+  }
+  const described = plans.map((plan) => planNodes(plan).map((node) => `${node["Node Type"]}:${node["Index Name"] ?? ""}`).join(" > "));
+  for (const description of described) {
+    assert.equal(description.includes("Sort"), false, description);
+    assert.match(description, /^Limit:/, description);
+  }
+  assert.match(described[0], /ChatChannel_workspaceId_name_id_idx/);
+  assert.match(described[1], /ChatChannel_workspaceId_name_id_idx/);
+  assert.match(described[2], /ChatChannel_workspaceId_type_name_id_idx/);
+});
+
 test("a row inserted beside an equal name is not skipped or repeated", async () => {
   const url = `/api/chat/${home.id}/channels`;
   const first = await ok(withPaging(url, 1));

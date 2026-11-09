@@ -1258,6 +1258,8 @@ model ChatChannel {
   messages   ChatMessage[]
 
   @@index([workspaceId, type])
+  @@index([workspaceId, name, id])
+  @@index([workspaceId, type, name, id])
 }
 
 model ChatChannelMember {

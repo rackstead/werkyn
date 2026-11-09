@@ -70,13 +70,6 @@ async function chatListPage(
   return { where: { AND: [where, chatListAfter(at)] }, empty: false as const };
 }
 
-function pageResult<T extends { id: string }>(rows: T[], limit: number) {
-  const hasMore = rows.length > limit;
-  if (hasMore) rows.pop();
-  const last = rows.at(-1);
-  return { data: rows, nextCursor: hasMore && last ? last.id : null };
-}
-
 /**
  * One page of channels the caller can see. Ordered by name ascending, with
  * channels that have no name last, then id, so equal names are not skipped
@@ -93,21 +86,25 @@ export async function listChannels(
 ) {
   const page = await chatListPage(prisma, visibleChannelWhere(workspaceId, userId), cursor);
   if (page.empty) return { data: [], nextCursor: null };
+  // Count members for this page only. Prisma's `_count` include joins a count
+  // of every channel's members and then sorts, so LIMIT would not bound the read.
   const fetched = await prisma.chatChannel.findMany({
     where: page.where,
-    include: {
-      _count: { select: { members: true } },
-    },
     orderBy: CHAT_LIST_ORDER,
     take: limit + 1,
   });
   const hasMore = fetched.length > limit;
   const channels = hasMore ? fetched.slice(0, limit) : fetched;
-  const members = await memberPreviews(prisma, channels.map((c) => c.id));
+  const ids = channels.map((channel) => channel.id);
+  const [members, counts] = await Promise.all([
+    memberPreviews(prisma, ids),
+    memberCounts(prisma, ids),
+  ]);
   const last = channels.at(-1);
   return {
     data: channels.map((channel) => ({
       ...channel,
+      _count: { members: counts.get(channel.id) ?? 0 },
       members: members.get(channel.id) ?? [],
     })),
     nextCursor: hasMore && last ? last.id : null,
@@ -125,6 +122,18 @@ export async function listChannels(
  * channel at the average membership and, next to many small channels, reads
  * and sorts all members of a large one.
  */
+async function memberCounts(prisma: PrismaClient, channelIds: string[]) {
+  const counts = new Map<string, number>();
+  if (channelIds.length === 0) return counts;
+  const rows = await prisma.$queryRaw<Array<{ channelId: string; count: number }>>`
+    SELECT "channelId", count(*)::int AS "count"
+    FROM "ChatChannelMember"
+    WHERE "channelId" = ANY(${channelIds}::text[])
+    GROUP BY "channelId"`;
+  for (const row of rows) counts.set(row.channelId, row.count);
+  return counts;
+}
+
 async function memberPreviews(prisma: PrismaClient, channelIds: string[]) {
   const byChannel = new Map<string, MemberPreview[]>();
   if (channelIds.length === 0) return byChannel;
@@ -393,7 +402,9 @@ export async function listDms(
   };
   const page = await chatListPage(prisma, where, cursor);
   if (page.empty) return { data: [], nextCursor: null };
-  const channels = await prisma.chatChannel.findMany({
+  // A DM include is every member, so the count is that list's length. A
+  // `_count` include would join a count of every channel before LIMIT.
+  const fetched = await prisma.chatChannel.findMany({
     where: page.where,
     include: {
       members: {
@@ -403,12 +414,20 @@ export async function listDms(
           },
         },
       },
-      _count: { select: { members: true } },
     },
     orderBy: CHAT_LIST_ORDER,
     take: limit + 1,
   });
-  return pageResult(channels, limit);
+  const hasMore = fetched.length > limit;
+  const channels = hasMore ? fetched.slice(0, limit) : fetched;
+  const last = channels.at(-1);
+  return {
+    data: channels.map((channel) => ({
+      ...channel,
+      _count: { members: channel.members.length },
+    })),
+    nextCursor: hasMore && last ? last.id : null,
+  };
 }
 
 // ─── Messages ──────────────────────────────────────────

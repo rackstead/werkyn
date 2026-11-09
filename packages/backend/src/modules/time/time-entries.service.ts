@@ -1,7 +1,74 @@
 import type { Prisma, PrismaClient, WorkspaceRole } from "@prisma/client";
-import type { CreateTimeEntryInput, UpdateTimeEntryInput, TimeEntryQuery } from "@pm/shared";
+import {
+  TIME_ENTRY_PAGE_DEFAULT,
+  hasUnpairedSurrogate,
+  isDateOnly,
+  type CreateTimeEntryInput,
+  type UpdateTimeEntryInput,
+  type TimeEntryQuery,
+} from "@pm/shared";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
 import { assertProjectAccess, projectAccessWhere } from "../../utils/project-access.js";
+
+/** Timesheet order. The id makes rows that share a date and createdAt stable. */
+const ENTRY_ORDER: Prisma.TimeEntryOrderByWithRelationInput[] = [
+  { date: "asc" },
+  { createdAt: "asc" },
+  { id: "asc" },
+];
+
+/** Sort position carried by a cursor, so it does not depend on the row still being there. */
+type EntryPosition = { date: string; createdAt: string; id: string };
+
+const isCursorText = (value: unknown, max: number): value is string =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= max &&
+  !value.includes("\u0000") &&
+  !hasUnpairedSurrogate(value);
+
+function encodeEntryCursor(row: { date: string; createdAt: Date; id: string }) {
+  const position: EntryPosition = {
+    date: row.date,
+    createdAt: row.createdAt.toISOString(),
+    id: row.id,
+  };
+  return Buffer.from(JSON.stringify([position.date, position.createdAt, position.id])).toString("base64url");
+}
+
+function decodeEntryCursor(cursor: string): { date: string; createdAt: Date; id: string } {
+  try {
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!Array.isArray(value) || value.length !== 3) throw new Error("shape");
+    const [date, createdAt, id] = value;
+    if (typeof date !== "string" || typeof createdAt !== "string") throw new Error("fields");
+    const parsed = new Date(createdAt);
+    if (
+      !isDateOnly(date) ||
+      !isCursorText(id, 200) ||
+      Number.isNaN(parsed.getTime()) ||
+      parsed.toISOString() !== createdAt
+    ) {
+      throw new Error("fields");
+    }
+    return { date, createdAt: parsed, id };
+  } catch {
+    throw new ValidationError("Validation failed", [
+      { field: "cursor", message: "Invalid cursor: use the nextCursor of the previous page" },
+    ]);
+  }
+}
+
+/** Rows after the cursor's stored position. The cursor row itself is not required. */
+function entriesAfter(at: { date: string; createdAt: Date; id: string }): Prisma.TimeEntryWhereInput {
+  return {
+    OR: [
+      { date: { gt: at.date } },
+      { date: at.date, createdAt: { gt: at.createdAt } },
+      { date: at.date, createdAt: at.createdAt, id: { gt: at.id } },
+    ],
+  };
+}
 
 /** Both nullable relations can carry project content, including legacy mismatches. */
 export function timeEntryProjectWhere(workspaceId: string, userId: string): Prisma.TimeEntryWhereInput {
@@ -146,6 +213,14 @@ export async function deleteEntry(
   return prisma.timeEntry.delete({ where: { id: entryId } });
 }
 
+/**
+ * One page of entries in the date range, ordered by date, createdAt, then id.
+ * Omit `cursor` for the first page. The page size is `limit`, or
+ * TIME_ENTRY_PAGE_DEFAULT (100) when the caller omits it. `nextCursor` carries
+ * the last row's sort position and is null on the last page. A malformed
+ * cursor is rejected. Deleting or re-dating that row does not end the list or
+ * move the boundary, because the position was stored when the cursor was issued.
+ */
 export async function listEntries(
   prisma: PrismaClient,
   workspaceId: string,
@@ -160,8 +235,8 @@ export async function listEntries(
       ? undefined
       : userId;
 
-  return prisma.timeEntry.findMany({
-    where: {
+  const filters: Prisma.TimeEntryWhereInput[] = [
+    {
       workspaceId,
       ...timeEntryProjectWhere(workspaceId, userId),
       ...(filterUserId ? { userId: filterUserId } : {}),
@@ -170,11 +245,25 @@ export async function listEntries(
         lte: query.endDate,
       },
     },
+  ];
+  if (query.cursor) filters.push(entriesAfter(decodeEntryCursor(query.cursor)));
+
+  const limit = query.limit ?? TIME_ENTRY_PAGE_DEFAULT;
+  const rows = await prisma.timeEntry.findMany({
+    where: { AND: filters },
     include: {
       user: { select: { id: true, displayName: true, avatarUrl: true } },
       task: { select: { id: true, title: true } },
       project: { select: { id: true, name: true, color: true } },
     },
-    orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+    orderBy: ENTRY_ORDER,
+    take: limit + 1,
   });
+  const hasMore = rows.length > limit;
+  if (hasMore) rows.pop();
+  const last = rows.at(-1);
+  return {
+    data: rows,
+    nextCursor: hasMore && last ? encodeEntryCursor(last) : null,
+  };
 }

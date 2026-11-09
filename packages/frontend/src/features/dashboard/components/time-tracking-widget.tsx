@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { useTimeEntries, type TimeEntry } from "@/features/time/api";
 import { formatDateISO, getMonday } from "@/features/time/utils";
 import { useAuthStore } from "@/stores/auth-store";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Clock } from "lucide-react";
@@ -19,7 +20,12 @@ export function TimeTrackingWidget({ workspaceId }: TimeTrackingWidgetProps) {
   const today = formatDateISO(now);
   const weekStart = formatDateISO(getMonday(now));
 
-  const { data: entries, isLoading } = useTimeEntries(workspaceId, weekStart, today, userId);
+  const { data: entries, isLoading, isError, isFetching, refetch } = useTimeEntries(
+    workspaceId,
+    weekStart,
+    today,
+    userId,
+  );
 
   const { hoursToday, hoursThisWeek, projectBreakdown } = useMemo(() => {
     const list: TimeEntry[] = entries ?? [];
@@ -65,6 +71,13 @@ export function TimeTrackingWidget({ workspaceId }: TimeTrackingWidgetProps) {
             </div>
             <Skeleton className="h-4 w-3/4" />
             <Skeleton className="h-4 w-1/2" />
+          </div>
+        ) : isError ? (
+          <div role="alert" className="space-y-2">
+            <p className="text-sm text-destructive">Could not load time entries.</p>
+            <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
+              Try again
+            </Button>
           </div>
         ) : (
           <div className="space-y-4">

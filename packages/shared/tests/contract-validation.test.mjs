@@ -4,6 +4,9 @@ import {
   CreateRecurringSchema,
   CreateTaskSchema,
   CreateTimeEntrySchema,
+  TIME_ENTRY_PAGE_DEFAULT,
+  TIME_ENTRY_PAGE_MAX,
+  TimeEntryQuerySchema,
   SetCustomFieldValueSchema,
   SetUserRateSchema,
   UpdateRecurringSchema,
@@ -77,6 +80,21 @@ test("schemas apply the text, date and number rules to their fields", () => {
   assert.equal(SetCustomFieldValueSchema.safeParse({ value: Infinity }).success, false);
   assert.equal(SetCustomFieldValueSchema.safeParse({ value: "multi\nline" }).success, true);
   assert.equal(SetCustomFieldValueSchema.safeParse({ value: ["a\u0000"] }).success, false);
+});
+
+test("timesheet queries default to the first page of 100", () => {
+  const range = { startDate: "2026-06-01", endDate: "2026-06-07" };
+  const parsed = TimeEntryQuerySchema.parse(range);
+  assert.equal(TIME_ENTRY_PAGE_DEFAULT, 100);
+  assert.equal(parsed.limit, TIME_ENTRY_PAGE_DEFAULT);
+  assert.equal(parsed.cursor, undefined);
+  assert.equal(TimeEntryQuerySchema.parse({ ...range, limit: "25", cursor: "entry-1" }).limit, 25);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, limit: String(TIME_ENTRY_PAGE_MAX) }).success, true);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, limit: "0" }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, limit: String(TIME_ENTRY_PAGE_MAX + 1) }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "" }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "x".repeat(1025) }).success, false);
+  assert.equal(TimeEntryQuerySchema.safeParse({ ...range, cursor: "x".repeat(80) }).success, true);
 });
 
 test("recurrence create and update require the day the frequency needs", () => {

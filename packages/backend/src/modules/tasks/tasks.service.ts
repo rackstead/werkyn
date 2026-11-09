@@ -40,6 +40,7 @@ import {
   withProjectOrder,
   writeColumnOrder,
 } from "../../utils/task-order.js";
+import { listBoardWindow } from "./board-window.js";
 
 type TaskNotification = {
   task: { id: string; projectId: string; title: string };
@@ -152,8 +153,13 @@ export async function listTasks(
     { id: "asc" },
   ];
 
+  if (query.view === "board" && query.perColumn) {
+    return listBoardWindow(prisma, projectId, query, where, include, orderBy);
+  }
+
   if (query.view === "board") {
-    // Board view: return all non-archived tasks, no pagination
+    // Board view: return all non-archived tasks, no pagination.
+    // The board page does not use this branch; it sends perColumn.
     const boardQuery = prisma.task.findMany({
       where: { ...where, archived: false },
       include,
@@ -200,7 +206,7 @@ export async function listTasks(
  * project. Counted here for the listed tasks only: for a list, Prisma's
  * `_count` include joins a count over every subtask and dependency row.
  */
-async function withTaskCounts<T extends { id: string }>(
+export async function withTaskCounts<T extends { id: string }>(
   prisma: PrismaClient,
   projectId: string,
   tasks: T[],

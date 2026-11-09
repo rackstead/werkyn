@@ -2,6 +2,11 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useUIStore } from "@/stores/ui-store";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { useState, useRef, useEffect } from "react";
+import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog";
+import {
+  AVATAR_ACCEPT,
+  avatarFileProblem,
+} from "@/components/shared/avatar-crop";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { PanelLeft, LogOut, Search, Camera, Settings, Shield } from "lucide-react";
 import { SearchCommand } from "@/features/search/components/search-command";
@@ -37,6 +42,9 @@ export function Topbar() {
   const workspaceId = membership?.workspace.id;
 
   const [searchOpen, setSearchOpen] = useState(false);
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarSaving, setAvatarSaving] = useState(false);
+  const avatarSavingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadFile = useUploadFile();
 
@@ -58,12 +66,33 @@ export function Topbar() {
     navigate({ to: "/login" });
   };
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const chooseAvatar = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    e.target.value = "";
+    if (!file || !workspaceId) return;
+    const problem = avatarFileProblem(file);
+    if (problem) {
+      toast.error(problem);
+      return;
+    }
+    setAvatarFile(file);
+  };
+
+  const dismissAvatar = () => {
+    if (avatarSavingRef.current) return;
+    setAvatarFile(null);
+  };
+
+  const saveAvatar = async (cropped: File) => {
+    if (avatarSavingRef.current || !workspaceId) return;
+    avatarSavingRef.current = true;
+    setAvatarSaving(true);
     try {
-      if (!workspaceId) return;
-      const result = await uploadFile.mutateAsync({ file, purpose: "avatar", workspaceId });
+      const result = await uploadFile.mutateAsync({
+        file: cropped,
+        purpose: "avatar",
+        workspaceId,
+      });
       const res = await api
         .patch("users/me", {
           json: { avatarUrl: result.data.url },
@@ -73,15 +102,20 @@ export function Topbar() {
         .json<{ data: { id: string; avatarUrl: string } }>();
       const currentUser = useAuthStore.getState().user;
       if (currentUser?.id === res.data.id) {
-        useAuthStore.setState({ user: { ...currentUser, avatarUrl: res.data.avatarUrl } });
+        useAuthStore.setState({
+          user: { ...currentUser, avatarUrl: res.data.avatarUrl },
+        });
       }
       toast.success("Avatar updated");
+      setAvatarFile(null);
     } catch {
       // Only the account that chose the picture hears that it failed.
       if (useAuthStore.getState().user?.id === user?.id)
         toast.error("Failed to upload avatar");
+    } finally {
+      avatarSavingRef.current = false;
+      setAvatarSaving(false);
     }
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   return (
@@ -178,9 +212,17 @@ export function Topbar() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/jpeg,image/png,image/gif,image/webp"
+        accept={AVATAR_ACCEPT}
         className="hidden"
-        onChange={handleAvatarUpload}
+        onChange={chooseAvatar}
+      />
+
+      <AvatarCropDialog
+        file={avatarFile}
+        saving={avatarSaving}
+        onCancel={dismissAvatar}
+        onConfirm={saveAvatar}
+        onError={(message) => toast.error(message)}
       />
 
       {workspaceId && workspaceSlug && (

@@ -33,10 +33,27 @@ export const UpdateTimeEntrySchema = z.object({
 });
 export type UpdateTimeEntryInput = z.infer<typeof UpdateTimeEntrySchema>;
 
+/** Timesheet page size when `limit` is omitted (`GET /workspaces/:wid/time/entries`). */
+export const TIME_ENTRY_PAGE_DEFAULT = 100;
+/** Largest timesheet page one request can ask for. */
+export const TIME_ENTRY_PAGE_MAX = 500;
+
 export const TimeEntryQuerySchema = z.object({
   startDate: dateOnly("startDate"),
   endDate: dateOnly("endDate"),
   userId: z.string().optional(),
+  /** ID of the last entry on the previous page. Omit it for the first page. */
+  cursor: z.string().min(1).max(200).optional(),
+  /**
+   * Page size. An omitted cursor and limit return the first
+   * TIME_ENTRY_PAGE_DEFAULT entries, not every entry in the range.
+   */
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(TIME_ENTRY_PAGE_MAX)
+    .default(TIME_ENTRY_PAGE_DEFAULT),
 });
 export type TimeEntryQuery = z.infer<typeof TimeEntryQuerySchema>;
 

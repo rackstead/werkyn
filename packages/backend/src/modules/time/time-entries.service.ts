@@ -1,7 +1,19 @@
 import type { Prisma, PrismaClient, WorkspaceRole } from "@prisma/client";
-import type { CreateTimeEntryInput, UpdateTimeEntryInput, TimeEntryQuery } from "@pm/shared";
+import {
+  TIME_ENTRY_PAGE_DEFAULT,
+  type CreateTimeEntryInput,
+  type UpdateTimeEntryInput,
+  type TimeEntryQuery,
+} from "@pm/shared";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../utils/errors.js";
 import { assertProjectAccess, projectAccessWhere } from "../../utils/project-access.js";
+
+/** Timesheet order. The id makes rows that share a date and createdAt stable. */
+const ENTRY_ORDER: Prisma.TimeEntryOrderByWithRelationInput[] = [
+  { date: "asc" },
+  { createdAt: "asc" },
+  { id: "asc" },
+];
 
 /** Both nullable relations can carry project content, including legacy mismatches. */
 export function timeEntryProjectWhere(workspaceId: string, userId: string): Prisma.TimeEntryWhereInput {
@@ -146,6 +158,13 @@ export async function deleteEntry(
   return prisma.timeEntry.delete({ where: { id: entryId } });
 }
 
+/**
+ * One page of entries in the date range, ordered by date, createdAt, then id.
+ * Omit `cursor` for the first page. The page size is `limit`, or
+ * TIME_ENTRY_PAGE_DEFAULT (100) when the caller omits it. `nextCursor` is the
+ * last row's id, or null on the last page. A cursor that is not an entry of
+ * this list gives an empty page.
+ */
 export async function listEntries(
   prisma: PrismaClient,
   workspaceId: string,
@@ -160,21 +179,40 @@ export async function listEntries(
       ? undefined
       : userId;
 
-  return prisma.timeEntry.findMany({
-    where: {
-      workspaceId,
-      ...timeEntryProjectWhere(workspaceId, userId),
-      ...(filterUserId ? { userId: filterUserId } : {}),
-      date: {
-        gte: query.startDate,
-        lte: query.endDate,
-      },
+  const where: Prisma.TimeEntryWhereInput = {
+    workspaceId,
+    ...timeEntryProjectWhere(workspaceId, userId),
+    ...(filterUserId ? { userId: filterUserId } : {}),
+    date: {
+      gte: query.startDate,
+      lte: query.endDate,
     },
+  };
+
+  if (query.cursor) {
+    const scopedCursor = await prisma.timeEntry.findFirst({
+      where: { AND: [where, { id: query.cursor }] },
+      select: { id: true },
+    });
+    if (!scopedCursor) return { data: [], nextCursor: null };
+  }
+
+  const limit = query.limit ?? TIME_ENTRY_PAGE_DEFAULT;
+  const rows = await prisma.timeEntry.findMany({
+    where,
     include: {
       user: { select: { id: true, displayName: true, avatarUrl: true } },
       task: { select: { id: true, title: true } },
       project: { select: { id: true, name: true, color: true } },
     },
-    orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+    orderBy: ENTRY_ORDER,
+    take: limit + 1,
+    ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
   });
+  const hasMore = rows.length > limit;
+  if (hasMore) rows.pop();
+  return {
+    data: rows,
+    nextCursor: hasMore ? rows[rows.length - 1].id : null,
+  };
 }

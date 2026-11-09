@@ -172,8 +172,11 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // The column virtualizer notifies on a timer. Let that run before the
+  // jsdom window is torn down, or CI reports window is not defined.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete (HTMLElement.prototype as { scrollTo?: unknown }).scrollTo;

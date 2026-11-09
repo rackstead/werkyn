@@ -272,8 +272,9 @@ export async function listSharedByMe(
   limit = 50,
 ) {
   // Not a member: the same error as the other file lists. The page queries
-  // below would otherwise just return no rows.
-  await fileAccessRole(prisma, { ...ctx, workspaceId });
+  // below would otherwise just return no rows. Hydration uses this predicate
+  // again so a file trashed or revoked after the key query is not returned.
+  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
   const userSql = Prisma.sql`${userId}`;
   const workspaceSql = Prisma.sql`${workspaceId}`;
@@ -356,7 +357,12 @@ export async function listSharedByMe(
     memberIds.length === 0
       ? []
       : prisma.fileShare.findMany({
-          where: { id: { in: memberIds } },
+          where: {
+            id: { in: memberIds },
+            workspaceId,
+            sharedById: userId,
+            file: { AND: [readable], trashedAt: null },
+          },
           include: {
             file: shareFileInclude,
             sharedWith: {
@@ -372,7 +378,11 @@ export async function listSharedByMe(
     linkIds.length === 0
       ? []
       : prisma.fileShareLinkFile.findMany({
-          where: { id: { in: linkIds } },
+          where: {
+            id: { in: linkIds },
+            shareLink: { workspaceId, createdById: userId },
+            file: { AND: [readable], trashedAt: null },
+          },
           include: {
             file: shareFileInclude,
             shareLink: { select: { createdAt: true } },

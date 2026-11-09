@@ -23,9 +23,12 @@ receive every matching task.
   background so a column of thousands can be anchored without shipping
   every card. A card body is fetched when its display slot is near the
   view.
-- **Mounted cards.** Each column is its own scroll container. Its height
-  is the board region under the filter bar (and never the height of every
-  card), so the page `<main>` does not scroll the cards. The column mounts
+- **Mounted cards.** Each column is its own scroll container. The board
+  fills the height `<main>` has left under the top bar, including when an
+  email or offline banner is showing, so the column and the board controls
+  stay on screen. That height is the board region under the filter bar,
+  never the height of every card, so the page `<main>` does not scroll the
+  cards. The column mounts
   the cards in that viewport, 4 above and 4 below (`BOARD_OVERSCAN`), plus
   the dragged card and the cards next to it so keyboard drag still has a
   drop target. Scrolling the column, not the page, mounts the cards that

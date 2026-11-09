@@ -57,7 +57,7 @@ function WorkspaceLayout() {
       <div className="flex h-screen flex-col">
         <OfflineBanner />
         <EmailVerificationBanner />
-        <div className="flex flex-1 overflow-hidden">
+        <div className="flex min-h-0 flex-1 overflow-hidden">
           <Sidebar
             projects={projects}
             wikiSpaces={wikiSpaces}
@@ -65,9 +65,9 @@ function WorkspaceLayout() {
             onCreateProject={() => setCreateOpen(true)}
             onCreateSpace={() => setCreateSpaceOpen(true)}
           />
-          <div className="flex flex-1 flex-col overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <Topbar />
-            <main className="flex-1 overflow-y-auto">
+            <main className="min-h-0 flex-1 overflow-y-auto">
               <ErrorBoundary>
                 <Outlet />
               </ErrorBoundary>

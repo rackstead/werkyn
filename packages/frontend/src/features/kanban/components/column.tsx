@@ -62,14 +62,11 @@ function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
   if (Math.abs(moved) >= 1) node.scrollTop += moved;
 }
 
-/** Distance from one seen card to the next, so an unmounted card can be followed. */
-function rowStride(rows: readonly SeenRow[]) {
-  for (let index = 1; index < rows.length; index++) {
-    const gap = rows[index].index - rows[index - 1].index;
-    const delta = rows[index].top - rows[index - 1].top;
-    if (gap > 0 && delta > 0) return delta / gap;
-  }
-  return BOARD_CARD_ESTIMATE;
+/** Height of one rendered card, excluding the spacer above an unmeasured range. */
+function measuredStride(node: HTMLElement) {
+  const card = node.querySelector<HTMLElement>("[data-column-index]");
+  const height = card?.getBoundingClientRect().height ?? 0;
+  return height > 0 ? height : BOARD_CARD_ESTIMATE;
 }
 
 export function Column({
@@ -116,9 +113,9 @@ export function Column({
     rangeExtractor,
     getItemKey,
   });
-  // Cards sit in normal flow. A card that is taller than the estimate already
-  // pushes the cards under it; correcting here as well would move them twice.
-  if (sized) virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+  // A card taller than the estimate already pushes the cards under it.
+  // Adjusting the scroll here as well would move them twice.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
 
   const setRef = useCallback((node: HTMLDivElement | null) => {
     setNodeRef(node);
@@ -182,15 +179,19 @@ export function Column({
   orderRef.current = order;
   const complete = column?.complete ?? false;
   const seen = useRef<{ scrollTop: number; rows: SeenRow[]; order: readonly string[]; complete: boolean } | null>(null);
+  // The card we just chose to keep, until a later measurement lands it there.
+  const hold = useRef<{ key: string; top: number; scrollTop: number } | null>(null);
   const keepInView = useCallback(() => {
     const node = scroller;
     if (!node) return;
     if (pauseAnchor) {
       seen.current = null;
+      hold.current = null;
       return;
     }
     const current = orderRef.current;
     const last = seen.current;
+    let armed = false;
     if (last && node.scrollTop > 0) {
       let scrolled = node.scrollTop - last.scrollTop;
       const endOffset = node.scrollHeight - node.clientHeight;
@@ -222,13 +223,34 @@ export function Column({
         if (still && card) placeCard(node, card, still.top - scrolled);
       }
       if (kept) {
+        const want = kept.top - scrolled;
+        armed = true;
+        hold.current = { key: kept.key, top: want, scrollTop: node.scrollTop };
         const card = findCard(node, kept.key);
         if (card) {
-          placeCard(node, card, kept.top - scrolled);
+          placeCard(node, card, want);
         } else {
           const previous = last.rows.find((row) => row.key === kept.key);
           const shift = previous ? kept.index - previous.index : 0;
-          if (shift !== 0) node.scrollTop += shift * rowStride(last.rows);
+          if (shift !== 0) node.scrollTop += shift * measuredStride(node);
+        }
+        hold.current.scrollTop = node.scrollTop;
+      }
+    }
+    if (hold.current && !armed) {
+      const held = hold.current;
+      const card = findCard(node, held.key);
+      if (card) {
+        const top = card.getBoundingClientRect().top - node.getBoundingClientRect().top;
+        const drift = node.scrollTop - held.scrollTop;
+        // A scroll that carries the card with it is the reader, not a measurement.
+        if (Math.abs(drift) > 1 && Math.abs(top - (held.top - drift)) < 2) {
+          hold.current = null;
+        } else {
+          placeCard(node, card, held.top);
+          const placed = card.getBoundingClientRect().top - node.getBoundingClientRect().top;
+          if (Math.abs(placed - held.top) < 1) hold.current = null;
+          else hold.current = { ...held, scrollTop: node.scrollTop };
         }
       }
     }
@@ -288,9 +310,9 @@ export function Column({
   });
   const tasks = column?.tasks;
 
-  // Height-capped so the column's own scroller is the one that moves.
+  // Fills the board height, so this scroller is the one that moves.
   return (
-    <div className="flex h-full max-h-[calc(100dvh-9rem)] min-h-0 w-72 flex-shrink-0 flex-col overflow-hidden">
+    <div className="flex h-full min-h-0 w-72 flex-shrink-0 flex-col overflow-hidden">
       <div className="flex items-center gap-2 px-2 pb-3">
         <div
           className="h-3 w-3 rounded-full shrink-0"

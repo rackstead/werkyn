@@ -53,15 +53,15 @@ function ProjectLayout() {
     );
   }
 
-  // The board's columns are the scroll containers. The page <main> stays the
-  // scroller for the list and the calendar, which grow with their content.
+  // The board fills <main>, which is already shorter when a workspace
+  // banner is showing. The list and the calendar keep growing inside <main>.
   const boardLocked = pathEnd === "board";
 
   return (
     <div
       className={
         boardLocked
-          ? "flex h-[calc(100dvh-3rem)] min-h-0 flex-col overflow-hidden"
+          ? "flex h-full min-h-0 flex-col overflow-hidden"
           : "flex flex-1 flex-col overflow-hidden"
       }
     >

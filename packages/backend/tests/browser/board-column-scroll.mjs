@@ -1,7 +1,7 @@
 // Chromium regression for the board column scrollport
 // (docs/remediation/board-windowing.md). A stubbed offsetHeight does not
 // count: this opens the production build. Run from packages/backend against
-// a migrated loopback database whose name is werkyn_audit_boardfix_r15:
+// a migrated loopback database whose name is werkyn_audit_boardfix2_r15:
 //
 //   TEST_DATABASE_URL=... PLAYWRIGHT_MODULE=... CHROMIUM_EXECUTABLE=... \
 //     node --import tsx tests/browser/board-column-scroll.mjs
@@ -10,14 +10,14 @@
 // The fixture removes its own user and workspace. Only loopback is allowed.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const OPEN_N = 2000;
 const database = new URL(process.env.TEST_DATABASE_URL ?? "invalid:");
 assert.equal(database.hostname, "127.0.0.1");
-assert.equal(database.pathname, "/werkyn_audit_boardfix_r15");
+assert.equal(database.pathname, "/werkyn_audit_boardfix2_r15");
 Object.assign(process.env, {
   DATABASE_URL: database.toString(),
   NODE_ENV: "test",
@@ -31,7 +31,9 @@ Object.assign(process.env, {
 const backend = path.resolve(import.meta.dirname, "../..");
 const frontend = path.resolve(backend, "../frontend");
 const root = path.resolve(backend, "../..");
-const scratch = await mkdtemp(path.join(root, ".tmp", "board-scroll-"));
+const scratchRoot = path.join(root, ".tmp");
+await mkdir(scratchRoot, { recursive: true });
+const scratch = await mkdtemp(path.join(scratchRoot, "board-scroll-"));
 process.env.STORAGE_DIR = path.join(scratch, "storage");
 
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
@@ -63,7 +65,7 @@ async function createFixture(prisma) {
       email: `board-scroll-${suffix}@fixture.invalid`,
       passwordHash,
       displayName: "Board Scroll",
-      emailVerified: true,
+      emailVerified: false,
     },
   });
   created.userIds.push(owner.id);
@@ -205,7 +207,7 @@ async function main() {
   app = await buildApp();
   await app.listen({ host: "127.0.0.1", port: 0 });
   const identity = await app.prisma.$queryRaw`SELECT current_database() AS name`;
-  assert.equal(identity[0].name, "werkyn_audit_boardfix_r15");
+  assert.equal(identity[0].name, "werkyn_audit_boardfix2_r15");
   const fixture = await createFixture(app.prisma);
   vite = await preview({
     root: frontend,
@@ -313,6 +315,32 @@ async function main() {
   assert.ok(
     settled.mainScrollHeight - settled.mainClientHeight < 80,
     `page scroller grew (${settled.mainScrollHeight} / ${settled.mainClientHeight})`,
+  );
+  const fit = await page.evaluate((statusId) => {
+    const viewH = window.innerHeight;
+    const box = (el) => (el ? el.getBoundingClientRect() : null);
+    const banner = [...document.querySelectorAll("span")].find((el) =>
+      (el.textContent ?? "").includes("Please verify your email address"),
+    );
+    const button = [...document.querySelectorAll("button")].find((el) => el.textContent?.includes("New Task"));
+    const scroller = document.querySelector(`[data-scroller="${statusId}"]`);
+    return {
+      viewH,
+      bannerTop: box(banner)?.top ?? null,
+      bannerBottom: box(banner)?.bottom ?? null,
+      buttonTop: box(button)?.top ?? null,
+      buttonBottom: box(button)?.bottom ?? null,
+      scrollerTop: box(scroller)?.top ?? null,
+      scrollerBottom: box(scroller)?.bottom ?? null,
+    };
+  }, openId);
+  report.fit = fit;
+  log("fit", JSON.stringify(fit));
+  assert.ok(fit.bannerBottom > 0, "email banner is not on screen");
+  assert.ok(fit.buttonTop >= 0 && fit.buttonBottom <= fit.viewH + 1, `New Task is off screen (${fit.buttonTop}..${fit.buttonBottom})`);
+  assert.ok(
+    fit.scrollerTop >= 0 && fit.scrollerBottom <= fit.viewH + 1,
+    `column extends past the page (${fit.scrollerTop}..${fit.scrollerBottom} of ${fit.viewH})`,
   );
   const firstIds = new Set(painted.cards.map((card) => card.id));
   const firstMax = Math.max(...painted.cards.map((card) => card.columnIndex));

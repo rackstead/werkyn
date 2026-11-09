@@ -379,32 +379,33 @@ test("lastUsedAt is written at most once a minute and never on rejection", async
   );
   assert.equal(API_KEY_LAST_USED_WRITE_INTERVAL_MS, 60_000);
   const windowMs = API_KEY_LAST_USED_WRITE_INTERVAL_MS;
-  await app.prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS "ApiKeyLastUsedWriteLog" (
-      "id" BIGSERIAL PRIMARY KEY,
-      "keyId" TEXT NOT NULL,
-      "lastUsedAt" TIMESTAMP(3)
-    )
-  `);
-  await app.prisma.$executeRawUnsafe(`
-    CREATE OR REPLACE FUNCTION log_api_key_last_used_write() RETURNS trigger
-    LANGUAGE plpgsql AS $$
-    BEGIN
-      IF NEW."lastUsedAt" IS DISTINCT FROM OLD."lastUsedAt" THEN
-        INSERT INTO "ApiKeyLastUsedWriteLog" ("keyId", "lastUsedAt")
-        VALUES (NEW.id, NEW."lastUsedAt");
-      END IF;
-      RETURN NEW;
-    END
-    $$
-  `);
-  await app.prisma.$executeRawUnsafe(`
-    CREATE TRIGGER log_api_key_last_used_write
-    BEFORE UPDATE ON "ApiKey"
-    FOR EACH ROW
-    EXECUTE FUNCTION log_api_key_last_used_write()
-  `);
   try {
+    await removeLastUsedWriteLog();
+    await app.prisma.$executeRawUnsafe(`
+      CREATE TABLE "ApiKeyLastUsedWriteLog" (
+        "id" BIGSERIAL PRIMARY KEY,
+        "keyId" TEXT NOT NULL,
+        "lastUsedAt" TIMESTAMP(3)
+      )
+    `);
+    await app.prisma.$executeRawUnsafe(`
+      CREATE FUNCTION log_api_key_last_used_write() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW."lastUsedAt" IS DISTINCT FROM OLD."lastUsedAt" THEN
+          INSERT INTO "ApiKeyLastUsedWriteLog" ("keyId", "lastUsedAt")
+          VALUES (NEW.id, NEW."lastUsedAt");
+        END IF;
+        RETURN NEW;
+      END
+      $$
+    `);
+    await app.prisma.$executeRawUnsafe(`
+      CREATE TRIGGER log_api_key_last_used_write
+      BEFORE UPDATE ON "ApiKey"
+      FOR EACH ROW
+      EXECUTE FUNCTION log_api_key_last_used_write()
+    `);
     const created = await createKey({ name: "Throttle" });
     const first = await useApiKey(created.key);
     assert.equal(first.statusCode, 200, first.body);
@@ -523,17 +524,57 @@ test("lastUsedAt is written at most once a minute and never on rejection", async
     assert.equal(malformed.statusCode, 401, malformed.body);
     assert.equal(await lastUsedWriteTotal(), writesBeforeUnknown);
   } finally {
-    await app.prisma.$executeRawUnsafe(
-      `DROP TRIGGER IF EXISTS log_api_key_last_used_write ON "ApiKey"`,
-    );
-    await app.prisma.$executeRawUnsafe(
-      `DROP FUNCTION IF EXISTS log_api_key_last_used_write()`,
-    );
-    await app.prisma.$executeRawUnsafe(
-      `DROP TABLE IF EXISTS "ApiKeyLastUsedWriteLog"`,
-    );
+    await removeLastUsedWriteLog();
   }
 });
+
+test("a key that expires while its lookup is in flight is rejected", async () => {
+  const { verifyApiKey } = await import(
+    "../src/modules/api-keys/api-keys.service.js"
+  );
+  const token = `wk_${"ab".repeat(32)}`;
+  const expiresAt = new Date(Date.now() + 100);
+  let writes = 0;
+  const prisma = {
+    apiKey: {
+      async findUnique() {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return {
+          id: "expired-in-flight",
+          userId: owner.id,
+          expiresAt,
+          revokedAt: null,
+          lastUsedAt: null,
+        };
+      },
+      async updateMany() {
+        writes += 1;
+        return { count: 1 };
+      },
+    },
+  };
+  await assert.rejects(
+    () => verifyApiKey(prisma as never, token),
+    (error: unknown) => {
+      assert.equal((error as { statusCode?: number }).statusCode, 401);
+      assert.match(String((error as Error).message), /Invalid or expired API key/);
+      return true;
+    },
+  );
+  assert.equal(writes, 0);
+});
+
+async function removeLastUsedWriteLog() {
+  await app.prisma.$executeRawUnsafe(
+    `DROP TRIGGER IF EXISTS log_api_key_last_used_write ON "ApiKey"`,
+  );
+  await app.prisma.$executeRawUnsafe(
+    `DROP FUNCTION IF EXISTS log_api_key_last_used_write()`,
+  );
+  await app.prisma.$executeRawUnsafe(
+    `DROP TABLE IF EXISTS "ApiKeyLastUsedWriteLog"`,
+  );
+}
 
 async function useApiKey(token: string) {
   return request({

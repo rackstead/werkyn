@@ -66,7 +66,6 @@ export async function verifyApiKey(prisma: PrismaClient, token: string) {
   if (!/^wk_[a-f0-9]{64}$/.test(token)) {
     throw new UnauthorizedError("Invalid or expired API key");
   }
-  const now = new Date();
   const record = await prisma.apiKey.findUnique({
     where: { tokenHash: hashToken(token) },
     select: {
@@ -77,6 +76,9 @@ export async function verifyApiKey(prisma: PrismaClient, token: string) {
       lastUsedAt: true,
     },
   });
+  // Judge expiry after the lookup returns. A key that expires while the
+  // read is in flight is rejected, and lastUsedAt is not refreshed.
+  const now = new Date();
   if (
     !record ||
     record.revokedAt ||

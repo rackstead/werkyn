@@ -245,13 +245,13 @@ function afterResponseId(
   cursorId?: string,
 ): Prisma.Sql {
   if (!cursorAt || cursorId === undefined) return Prisma.empty;
-  return Prisma.sql`AND (
-    ${createdAt} < ${cursorAt}
-    OR (
-      ${createdAt} = ${cursorAt}
-      AND ${responseId} COLLATE "C" < ${cursorId} COLLATE "C"
-    )
-  )`;
+  // `createdAt <= cursor` is the same set as the tie-break below, and lets the
+  // (owner, createdAt) index start at the cursor instead of walking newer rows.
+  return Prisma.sql`AND ${createdAt} <= ${cursorAt}
+    AND (
+      ${createdAt} < ${cursorAt}
+      OR ${responseId} COLLATE "C" < ${cursorId} COLLATE "C"
+    )`;
 }
 
 function bySharedByMeOrder(

@@ -575,7 +575,9 @@ describe("channel list members", () => {
     }
     await app.prisma.$executeRawUnsafe('ANALYZE "ChatChannelMember"');
 
-    const { result: channels, events } = await recordQueries(observer, (db) => chat.listChannels(db, workspace.id, users.me.id));
+    const { result, events } = await recordQueries(observer, (db) => chat.listChannels(db, workspace.id, users.me.id, undefined, 100));
+    const channels = result.data;
+    assert.equal(result.nextCursor, null);
     const listed = channels.find((c) => c.id === big.id);
     assert.equal(listed._count.members, 600);
     const order = (await app.prisma.$queryRaw`

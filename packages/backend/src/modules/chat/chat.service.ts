@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "@prisma/client";
-import { CHANNEL_LIST_MEMBER_LIMIT, CHANNEL_MEMBER_PAGE_DEFAULT } from "@pm/shared";
+import {
+  CHANNEL_LIST_MEMBER_LIMIT,
+  CHANNEL_MEMBER_PAGE_DEFAULT,
+  CHAT_LIST_PAGE_DEFAULT,
+  hasUnpairedSurrogate,
+} from "@pm/shared";
 import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors.js";
 import { assertChannelAccess, assertWorkspaceRecipients } from "./chat-access.js";
 import { revokeChannelAccess } from "../realtime/realtime.service.js";
@@ -9,30 +14,104 @@ import { withSearchPlans } from "../../utils/text-search.js";
 
 // ─── Channels ──────────────────────────────────────────
 
+/** Name, then id. Null names sort last, matching PostgreSQL NULLS LAST. */
+const CHAT_LIST_ORDER: Prisma.ChatChannelOrderByWithRelationInput[] = [
+  { name: { sort: "asc", nulls: "last" } },
+  { id: "asc" },
+];
+
+/**
+ * Rows after `at` in CHAT_LIST_ORDER. Name is nullable, and Prisma's cursor
+ * omits LIMIT for a nullable order column, so the page uses `take: limit + 1`
+ * with this condition instead.
+ */
+function chatListAfter(at: { name: string | null; id: string }): Prisma.ChatChannelWhereInput {
+  if (at.name === null) return { name: null, id: { gt: at.id } };
+  return {
+    OR: [
+      { name: { gt: at.name } },
+      { name: at.name, id: { gt: at.id } },
+      { name: null },
+    ],
+  };
+}
+
+function cursorIsStorable(cursor: string): boolean {
+  return cursor.length > 0
+    && cursor.length <= 200
+    && !cursor.includes("\u0000")
+    && !hasUnpairedSurrogate(cursor);
+}
+
+/** Public channels, plus private channels and DMs the caller belongs to. */
+function visibleChannelWhere(workspaceId: string, userId: string): Prisma.ChatChannelWhereInput {
+  return {
+    workspaceId,
+    OR: [
+      { type: "PUBLIC" },
+      { members: { some: { userId } } },
+    ],
+  };
+}
+
+/** The caller's filter, or an empty page when `cursor` is not in that list. */
+async function chatListPage(
+  prisma: PrismaClient,
+  where: Prisma.ChatChannelWhereInput,
+  cursor: string | undefined,
+) {
+  if (cursor !== undefined && !cursorIsStorable(cursor)) return { where, empty: true as const };
+  if (!cursor) return { where, empty: false as const };
+  const at = await prisma.chatChannel.findFirst({
+    where: { AND: [where, { id: cursor }] },
+    select: { id: true, name: true },
+  });
+  if (!at) return { where, empty: true as const };
+  return { where: { AND: [where, chatListAfter(at)] }, empty: false as const };
+}
+
+function pageResult<T extends { id: string }>(rows: T[], limit: number) {
+  const hasMore = rows.length > limit;
+  if (hasMore) rows.pop();
+  const last = rows.at(-1);
+  return { data: rows, nextCursor: hasMore && last ? last.id : null };
+}
+
+/**
+ * One page of channels the caller can see. Ordered by name ascending, with
+ * channels that have no name last, then id, so equal names are not skipped
+ * or repeated. Omit `cursor` for the first page. The page size is `limit`,
+ * or CHAT_LIST_PAGE_DEFAULT (50) when the caller omits it. Each row keeps
+ * its fields, including `_count.members` and the member preview.
+ */
 export async function listChannels(
   prisma: PrismaClient,
   workspaceId: string,
   userId: string,
+  cursor?: string,
+  limit = CHAT_LIST_PAGE_DEFAULT,
 ) {
-  // Public channels + private/DM channels user is a member of
-  const channels = await prisma.chatChannel.findMany({
-    where: {
-      workspaceId,
-      OR: [
-        { type: "PUBLIC" },
-        { members: { some: { userId } } },
-      ],
-    },
+  const page = await chatListPage(prisma, visibleChannelWhere(workspaceId, userId), cursor);
+  if (page.empty) return { data: [], nextCursor: null };
+  const fetched = await prisma.chatChannel.findMany({
+    where: page.where,
     include: {
       _count: { select: { members: true } },
     },
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    orderBy: CHAT_LIST_ORDER,
+    take: limit + 1,
   });
+  const hasMore = fetched.length > limit;
+  const channels = hasMore ? fetched.slice(0, limit) : fetched;
   const members = await memberPreviews(prisma, channels.map((c) => c.id));
-  return channels.map((channel) => ({
-    ...channel,
-    members: members.get(channel.id) ?? [],
-  }));
+  const last = channels.at(-1);
+  return {
+    data: channels.map((channel) => ({
+      ...channel,
+      members: members.get(channel.id) ?? [],
+    })),
+    nextCursor: hasMore && last ? last.id : null,
+  };
 }
 
 /**
@@ -294,17 +373,28 @@ export async function findOrCreateDm(
   return channel;
 }
 
+/**
+ * One page of DMs the caller belongs to, in the same name-then-id order as
+ * the channel list. Omit `cursor` for the first page of CHAT_LIST_PAGE_DEFAULT
+ * (50) rows. A DM the caller is not in is not a cursor and is not listed.
+ * Each row keeps its members and `_count.members`.
+ */
 export async function listDms(
   prisma: PrismaClient,
   workspaceId: string,
   userId: string,
+  cursor?: string,
+  limit = CHAT_LIST_PAGE_DEFAULT,
 ) {
-  return prisma.chatChannel.findMany({
-    where: {
-      workspaceId,
-      type: "DM",
-      members: { some: { userId } },
-    },
+  const where: Prisma.ChatChannelWhereInput = {
+    workspaceId,
+    type: "DM",
+    members: { some: { userId } },
+  };
+  const page = await chatListPage(prisma, where, cursor);
+  if (page.empty) return { data: [], nextCursor: null };
+  const channels = await prisma.chatChannel.findMany({
+    where: page.where,
     include: {
       members: {
         include: {
@@ -315,8 +405,10 @@ export async function listDms(
       },
       _count: { select: { members: true } },
     },
-    orderBy: { updatedAt: "desc" },
+    orderBy: CHAT_LIST_ORDER,
+    take: limit + 1,
   });
+  return pageResult(channels, limit);
 }
 
 // ─── Messages ──────────────────────────────────────────

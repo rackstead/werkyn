@@ -9,6 +9,7 @@ import type {
   ChatMessageQueryInput,
   ChatBookmarkQueryInput,
   ChannelMemberQueryInput,
+  ChatListQueryInput,
   ToggleReactionInput,
   PinMessageInput,
   ArchiveChannelInput,
@@ -26,12 +27,31 @@ export async function listChannelsHandler(
   reply: FastifyReply,
 ) {
   const { wid } = request.params as { wid: string };
+  const query = request.query as ChatListQueryInput;
   const channels = await chatService.listChannels(
     request.server.prisma,
     wid,
     request.user!.id,
+    query.cursor,
+    query.limit,
   );
-  return reply.send({ data: channels });
+  return reply.send(channels);
+}
+
+export async function listDmsHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const { wid } = request.params as { wid: string };
+  const query = request.query as ChatListQueryInput;
+  const channels = await chatService.listDms(
+    request.server.prisma,
+    wid,
+    request.user!.id,
+    query.cursor,
+    query.limit,
+  );
+  return reply.send(channels);
 }
 
 export async function getChannelHandler(

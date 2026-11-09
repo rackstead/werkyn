@@ -1,4 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+
+type ReportDb = PrismaClient | Prisma.TransactionClient;
 import {
   REPORT_ENTRY_TOTAL_LIMIT,
   type TimeReportEntriesQuery,
@@ -8,6 +10,7 @@ import * as userRatesService from "./user-rates.service.js";
 import { timeEntryProjectWhere } from "./time-entries.service.js";
 import { batches } from "../../utils/graph-limits.js";
 import { currencyFractionDigits, reportMoneyDecimal, reportMoneyNumber, roundedCostUnits } from "./report-money.js";
+import { queryReportAggregate, queryReportPage } from "./report-totals.js";
 import {
   csvDecimal,
   csvExactDecimal,
@@ -108,11 +111,23 @@ class CostAccumulator {
       this.unratedBillableHours += entry.hours;
       return;
     }
-    const previous = this.amounts.get(priced.currency);
-    this.amounts.set(priced.currency, {
-      units: (previous?.units ?? 0n) + priced.units,
-      fractionDigits: priced.costFractionDigits,
+    this.addUnits(priced.currency, priced.units, priced.costFractionDigits);
+  }
+
+  /** Adds already-rounded minor units. A zero total still keeps the currency bucket. */
+  addUnits(currency: string, units: bigint, fractionDigits: number) {
+    const previous = this.amounts.get(currency);
+    if (previous && previous.fractionDigits !== fractionDigits) {
+      throw new Error("Report currency changed fraction digits");
+    }
+    this.amounts.set(currency, {
+      units: (previous?.units ?? 0n) + units,
+      fractionDigits,
     });
+  }
+
+  addUnratedHours(hours: number) {
+    this.unratedBillableHours += hours;
   }
 
   totals(): CostTotals {
@@ -214,7 +229,7 @@ const ENTRY_ROW = {
  * end date only bounds which entries are included, never which rate applies.
  */
 async function entryPricing(
-  prisma: PrismaClient,
+  prisma: ReportDb,
   workspaceId: string,
   entries: readonly EntryRow[],
 ) {
@@ -292,7 +307,7 @@ const NAME_BATCH = 10_000;
  * these rows only, instead of joining every entry of the report.
  */
 async function entryNames(
-  prisma: PrismaClient,
+  prisma: ReportDb,
   entries: readonly EntryRow[],
   labels: { userIds?: string[]; projectIds?: string[] } = {},
 ): Promise<EntryNames> {
@@ -334,6 +349,103 @@ function groupLabel(groupBy: ReportFilters["groupBy"], key: string, names: Entry
  * caps them across groups (groups keep report order and later groups get
  * fewer or none); "all" returns every entry (CSV export).
  */
+function costTotals(rows: { currency: string; units: bigint; fractionDigits: number }[], unratedHours: number): CostTotals {
+  const costs = new CostAccumulator();
+  for (const row of rows) costs.addUnits(row.currency, row.units, row.fractionDigits);
+  costs.addUnratedHours(unratedHours);
+  return costs.totals();
+}
+
+/**
+ * Totals are summed in the database with the same per-entry rounding as
+ * roundedCostUnits. Only the entries the response lists are loaded.
+ */
+async function buildAggregatedReport(
+  prisma: PrismaClient,
+  workspaceId: string,
+  userId: string,
+  query: ReportFilters,
+  entryLimit: number,
+) {
+  return prisma.$transaction(async (tx) => {
+  const totals = await queryReportAggregate(tx, workspaceId, userId, query);
+  const summaryRow = totals.find((row) => row.kind === 1);
+  if (!summaryRow) throw new Error("Report summary total was not returned");
+  const groupRows = totals.filter((row) => row.kind === 0 && row.groupKey !== null);
+  const currencyRows = totals.filter((row) => row.kind === 2 && row.groupKey !== null && row.currency !== null && row.fractionDigits !== null);
+  let budget = REPORT_ENTRY_TOTAL_LIMIT;
+  const limits: { key: string; take: number }[] = [];
+  for (const group of groupRows) {
+    const take = Math.min(group.entryCount, entryLimit, budget);
+    budget -= take;
+    if (take > 0) limits.push({ key: group.groupKey!, take });
+  }
+  const page = await queryReportPage(tx, workspaceId, userId, query, limits);
+  const skippedEntries = await tx.timeEntry.count({
+    where: { ...reportWhere(workspaceId, userId, query), NOT: { hours: userRatesService.FINITE_FLOAT } },
+  });
+  const shown = new Map<string, EntryRow[]>();
+  for (const row of page) {
+    const entries = shown.get(row.groupKey) ?? [];
+    entries.push({
+      id: row.id,
+      userId: row.userId,
+      projectId: row.projectId,
+      taskId: row.taskId,
+      date: row.date,
+      hours: row.hours,
+      billable: row.billable,
+      description: row.description,
+    });
+    shown.set(row.groupKey, entries);
+  }
+  const listed = [...shown.values()].flat();
+  const [price, names] = await Promise.all([
+    entryPricing(tx, workspaceId, listed),
+    entryNames(tx, listed, {
+      userIds: query.groupBy === "user" ? groupRows.map((group) => group.groupKey!) : [],
+      projectIds: query.groupBy === "project" ? groupRows.map((group) => group.groupKey!).filter((key) => key !== NO_PROJECT) : [],
+    }),
+  ]);
+  const currenciesOf = (key: string) => currencyRows
+    .filter((row) => row.groupKey === key)
+    .map((row) => ({ currency: row.currency!, units: row.units, fractionDigits: row.fractionDigits! }));
+  const reportGroups: ReportGroup[] = groupRows.map((group) => {
+    const entries = (shown.get(group.groupKey!) ?? []).map((entry) => reportEntry(entry, names, price(entry)));
+    const hasMoreEntries = entries.length < group.entryCount;
+    return {
+      key: group.groupKey!,
+      label: groupLabel(query.groupBy, group.groupKey!, names),
+      totalHours: group.totalHours,
+      billableHours: group.billableHours,
+      nonBillableHours: group.nonBillableHours,
+      ...costTotals(currenciesOf(group.groupKey!), group.unratedHours),
+      entries,
+      entryCount: group.entryCount,
+      hasMoreEntries,
+      nextEntryCursor: hasMoreEntries ? (entries.at(-1)?.id ?? null) : null,
+    };
+  });
+  return {
+    groups: reportGroups,
+    summary: {
+      totalHours: summaryRow.totalHours,
+      billableHours: summaryRow.billableHours,
+      nonBillableHours: summaryRow.nonBillableHours,
+      ...costTotals(
+        currencyRows.map((row) => ({ currency: row.currency!, units: row.units, fractionDigits: row.fractionDigits! })),
+        summaryRow.unratedHours,
+      ),
+      skippedEntries,
+    },
+  };
+  }, {
+    isolationLevel: "RepeatableRead",
+    maxWait: 10_000,
+    timeout: 60_000,
+  });
+}
+
 async function buildReport(
   prisma: PrismaClient,
   workspaceId: string,
@@ -341,6 +453,9 @@ async function buildReport(
   query: ReportFilters,
   entryLimit: number | "all",
 ) {
+  if (entryLimit !== "all") {
+    return buildAggregatedReport(prisma, workspaceId, userId, query, entryLimit);
+  }
   const where = reportWhere(workspaceId, userId, query);
   const all = entryLimit === "all";
 

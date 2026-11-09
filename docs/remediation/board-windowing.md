@@ -52,8 +52,9 @@ receive every matching task.
   the old offset. An id page that drops a card which is still in the column
   is not followed. A finished order that no longer has the card, and a
   finished reorder whose visible cards shifted by different amounts, both
-  correct the view. A scroll of more than half the column is the reader
-  leaving that card.
+  correct the view. A scroll of more than half the column, with the order
+  unchanged, is the reader leaving that card. A nudge that arrives with the
+  new rows is not.
   The choice uses `stayedEntries`
   (`lib/stayed-entries.ts`), over the column's id order, the same helper
   the List and Drive use. While that id list is still loading, only a

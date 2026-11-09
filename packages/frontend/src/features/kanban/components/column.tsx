@@ -62,10 +62,28 @@ function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
   if (Math.abs(moved) >= 1) node.scrollTop += moved;
 }
 
-function rememberSize(sizes: Map<string, number>, id: string | null | undefined, height: number) {
+function rememberSize(
+  sizes: Map<string, number>,
+  id: string | null | undefined,
+  height: number,
+  allowShrink = true,
+) {
   if (!id || !(height > 0)) return;
-  // The card on screen is this tall now, including after a title or label is removed.
+  const prev = sizes.get(id) ?? 0;
+  // A scroll can measure a card as it leaves the window. An edit while the
+  // column is still replaces a height that got shorter.
+  if (!allowShrink && prev > height) return;
   sizes.set(id, height);
+}
+
+function leading(order: readonly string[], index: number, sizes: Map<string, number>) {
+  let sum = 0;
+  const end = Math.max(0, Math.min(index, order.length));
+  for (let i = 0; i < end; i++) {
+    const size = sizes.get(order[i] ?? "");
+    sum += size && size > 0 ? size : BOARD_CARD_ESTIMATE;
+  }
+  return sum;
 }
 
 type MeasuredVirtualizer = {
@@ -153,13 +171,14 @@ export function Column({
     overscan: BOARD_OVERSCAN,
     rangeExtractor,
     getItemKey,
-    measureElement: (element, entry) => {
+    measureElement: (element, entry, instance) => {
       const node = element as HTMLElement;
       const block = entry?.borderBoxSize?.[0]?.blockSize;
       const height = Math.max(node.offsetHeight, typeof block === "number" ? Math.round(block) : 0);
       const id = node.querySelector("[data-task-id]")?.getAttribute("data-task-id");
-      rememberSize(sizesRef.current, id, height);
-      return height;
+      const scrolling = Boolean((instance as { isScrolling?: boolean } | undefined)?.isScrolling);
+      rememberSize(sizesRef.current, id, height, !scrolling);
+      return id ? (sizesRef.current.get(id) ?? height) : height;
     },
   });
   // The list below is positioned from these offsets. Apply them before paint,
@@ -247,7 +266,12 @@ export function Column({
     }
     for (const wrap of node.querySelectorAll<HTMLElement>("[data-index]")) {
       const id = wrap.querySelector("[data-task-id]")?.getAttribute("data-task-id");
-      rememberSize(sizesRef.current, id, Math.max(wrap.offsetHeight, Math.round(wrap.getBoundingClientRect().height)));
+      // Mounted cards report the height on screen, including after an edit.
+      rememberSize(
+        sizesRef.current,
+        id,
+        Math.max(wrap.offsetHeight, Math.round(wrap.getBoundingClientRect().height)),
+      );
     }
     const current = orderRef.current;
     const last = seen.current;
@@ -275,17 +299,19 @@ export function Column({
       const missing = orderChanged && last.rows.some((row) => indexOf(row.key) === undefined);
       // An id page can omit a card that is still in the column. A finished
       // order that lacks the id has deleted it or moved it to another column.
-      if (smallScroll && missing && !complete && !(heldNow && heldIndex !== undefined)) return;
+      // The browser may nudge scrollTop while the new rows commit. That nudge
+      // is not the reader, and a half-loaded id list is not the order to follow.
+      if (orderChanged && missing && !complete && !(heldNow && heldIndex !== undefined)) return;
       // Keep the card already chosen until the rest of an incomplete refetch
       // arrives, instead of whichever card this page still has mounted.
-      if (smallScroll && heldNow && heldIndex !== undefined && orderChanged) {
+      if (orderChanged && heldNow && heldIndex !== undefined) {
         kept = { key: heldNow.key, top: heldNow.top, index: heldIndex };
-      } else if (smallScroll && unanimous) {
+      } else if (orderChanged && unanimous) {
         kept = (last.complete && complete ? keptBoardCards(last.rows, last.order, indexOf)[0] : undefined)
           ?? { key: shifts[0].row.key, top: shifts[0].row.top, index: shifts[0].now };
-      } else if (smallScroll && orderChanged && last.complete && complete) {
+      } else if (orderChanged && last.complete && complete) {
         kept = keptBoardCards(last.rows, last.order, indexOf)[0];
-      } else if (smallScroll && orderChanged && shifts.length > 0) {
+      } else if (orderChanged && shifts.length > 0) {
         // Visible cards disagree, and the id list is still loading.
         return;
       } else if (smallScroll && sameIds(last.order, current)) {
@@ -303,13 +329,16 @@ export function Column({
         correcting.current = true;
         hold.current = { key: kept.key, top: want, scrollTop: node.scrollTop };
         const card = findCard(node, kept.key);
-        const item = measurementsFromSizes(virtualizer, sizesRef.current)[kept.index];
-        if (card) {
+        const oldIndex = last.order.indexOf(kept.key);
+        const grew = leading(current, kept.index, sizesRef.current)
+          - (oldIndex < 0 ? 0 : leading(last.order, oldIndex, sizesRef.current));
+        measurementsFromSizes(virtualizer, sizesRef.current);
+        if (Math.abs(grew) >= 1) {
+          // Each card above keeps the height measured while it was on screen.
+          // Start from the saved scroll, not a nudge the browser already applied.
+          node.scrollTop = Math.max(0, last.scrollTop + grew);
+        } else if (card) {
           placeCard(node, card, want);
-        } else if (item) {
-          // The card is outside the mounted window. Its offset is the sum of
-          // the measured heights above it, including cards that are not mounted.
-          node.scrollTop = Math.max(0, item.start - want);
         }
         if (hold.current) hold.current.scrollTop = node.scrollTop;
       }
@@ -324,25 +353,14 @@ export function Column({
         // A scroll that carries the card with it is the reader, not a measurement.
         if (!correcting.current && Math.abs(drift) > 1 && Math.abs(top - (held.top - drift)) < 2) {
           hold.current = null;
-        } else {
+        } else if (!correcting.current) {
           placeCard(node, card, held.top);
           hold.current = { ...held, scrollTop: node.scrollTop };
         }
-      } else if (!card && index >= 0) {
+      } else if (!card && index >= 0 && !correcting.current) {
         const drift = node.scrollTop - held.scrollTop;
         // Page Down or the scrollbar left this card on purpose.
-        if (!correcting.current && Math.abs(drift) >= node.clientHeight / 2) {
-          hold.current = null;
-        } else {
-          const item = measurementsFromSizes(virtualizer, sizesRef.current)[index];
-          if (item) {
-            const next = Math.max(0, item.start - held.top);
-            if (Math.abs(node.scrollTop - next) >= 1) {
-              node.scrollTop = next;
-              hold.current = { ...held, scrollTop: node.scrollTop };
-            }
-          }
-        }
+        if (Math.abs(drift) >= node.clientHeight / 2) hold.current = null;
       }
     }
     const viewTop = node.getBoundingClientRect().top;
@@ -418,7 +436,7 @@ export function Column({
       <div
         ref={setRef}
         data-scroller={status.id}
-        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg p-1"
+        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg p-1 [overflow-anchor:none] [&_*]:[overflow-anchor:none]"
       >
         <SortableContext items={ids} strategy={verticalListSortingStrategy}>
           {rendered.map(({ index, gapBefore }) => {

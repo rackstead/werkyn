@@ -91,13 +91,17 @@ async function walk(url, between) {
  * `cursor` and one just after it.
  */
 function idsAround(cursor) {
-  assert.match(cursor, /^[a-z0-9]+$/);
+  // Link rows are addressed as `link-<id>`. Neighbours stay in that form so
+  // the response id, not only the stored id, sorts next to the cursor.
+  const prefix = cursor.startsWith("link-") ? "link-" : "";
+  const body = prefix ? cursor.slice(prefix.length) : cursor;
+  assert.match(body, /^[a-z0-9]+$/);
   const tail = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
   const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
-  let i = cursor.length - 1;
-  while (i > 0 && cursor[i] === "0") i -= 1;
-  const lower = cursor.slice(0, i) + alphabet[alphabet.indexOf(cursor[i]) - 1] + "z" + tail;
-  return [lower, `${cursor}0${tail}`];
+  let i = body.length - 1;
+  while (i > 0 && body[i] === "0") i -= 1;
+  const lower = body.slice(0, i) + alphabet[alphabet.indexOf(body[i]) - 1] + "z" + tail;
+  return [prefix + lower, `${prefix}${body}0${tail}`];
 }
 
 function assertExactlyOnce(seen, expected, label) {
@@ -474,5 +478,258 @@ describe("channel members", () => {
   test("the page query applies LIMIT", async () => {
     const first = await chat.listMembers(app.prisma, channel.id, undefined, 5);
     assertLimited(await sqlOf((db) => chat.listMembers(db, channel.id, first.nextCursor, 5)), "ChatChannelMember", 5);
+  });
+});
+
+describe("files shared by me", () => {
+  const share = async (createdAt, sharedById = owner.id, id = undefined, sharedWithId = peer.id) => {
+    const file = await app.prisma.file.create({ data: {
+      workspaceId: workspace.id, name: "sent", uploadedById: sharedById, ownerId: sharedById, size: 1n,
+    } });
+    return app.prisma.fileShare.create({ data: {
+      id, workspaceId: workspace.id, fileId: file.id, sharedById, sharedWithId, createdAt,
+    } });
+  };
+  const linkFile = async (createdAt, extra = {}, id = undefined) => {
+    const file = await app.prisma.file.create({ data: {
+      workspaceId: workspace.id, name: "linked", uploadedById: owner.id, ownerId: owner.id, size: 2n,
+    } });
+    const link = await app.prisma.fileShareLink.create({ data: {
+      workspaceId: workspace.id, createdById: owner.id, createdAt,
+      token: extra.token ?? crypto.randomBytes(32).toString("base64url"),
+      enabled: extra.enabled,
+      passwordHash: extra.passwordHash,
+      expiresAt: extra.expiresAt,
+      files: { create: { id, fileId: file.id } },
+    } });
+    return app.prisma.fileShareLinkFile.findFirstOrThrow({ where: { shareLinkId: link.id } });
+  };
+
+  let hiddenId, trashedId;
+  before(async () => {
+    for (const seconds of [0, 0, 0, 0, -3, 4]) await share(at(seconds));
+    for (const seconds of [0, 0, 6]) await linkFile(at(seconds));
+    // One link, several files: the tie-break is the link-file id, not a second timestamp.
+    const sharedLink = await app.prisma.fileShareLink.create({ data: {
+      workspaceId: workspace.id, createdById: owner.id, createdAt: at(0),
+      token: crypto.randomBytes(32).toString("base64url"),
+      files: { create: [0, 1, 2].map(() => ({ file: { create: {
+        workspaceId: workspace.id, name: "multi", uploadedById: owner.id, ownerId: owner.id, size: 3n,
+      } } })) },
+    } });
+    assert.equal(await app.prisma.fileShareLinkFile.count({ where: { shareLinkId: sharedLink.id } }), 3);
+    // These stay listed. Paging must not start hiding them.
+    await linkFile(at(0), { enabled: false });
+    await linkFile(at(0), { passwordHash: "not-checked-here" });
+    await linkFile(at(1), { token: crypto.randomBytes(6).toString("base64url"), expiresAt: new Date("2020-01-01T00:00:00Z") });
+    const hiddenFile = await app.prisma.file.create({ data: {
+      workspaceId: workspace.id, name: "not-readable", uploadedById: uploader.id, ownerId: uploader.id, size: 1n,
+    } });
+    hiddenId = (await app.prisma.fileShare.create({ data: {
+      workspaceId: workspace.id, fileId: hiddenFile.id, sharedById: owner.id, sharedWithId: peer.id, createdAt: at(0),
+    } })).id;
+    const trashed = await share(at(0));
+    trashedId = trashed.id;
+    await app.prisma.file.update({ where: { id: trashed.fileId }, data: { trashedAt: new Date() } });
+  });
+
+  /** Today's rows for this user: member shares and link files, including disabled, password and legacy links. */
+  async function fullOrder() {
+    return (await app.prisma.$queryRaw`
+      SELECT id FROM (
+        SELECT s.id, s."createdAt" AS at
+        FROM "FileShare" s JOIN "File" f ON f.id = s."fileId"
+        WHERE s."workspaceId" = ${workspace.id} AND s."sharedById" = ${owner.id}
+          AND f."ownerId" = ${owner.id} AND f."teamFolderId" IS NULL AND f."trashedAt" IS NULL
+          AND NOT EXISTS (SELECT 1 FROM "TeamFolder" t WHERE t."folderId" = f.id)
+        UNION ALL
+        SELECT 'link-' || lf.id, l."createdAt" AS at
+        FROM "FileShareLinkFile" lf
+        JOIN "FileShareLink" l ON l.id = lf."shareLinkId"
+        JOIN "File" f ON f.id = lf."fileId"
+        WHERE l."workspaceId" = ${workspace.id} AND l."createdById" = ${owner.id}
+          AND f."ownerId" = ${owner.id} AND f."teamFolderId" IS NULL AND f."trashedAt" IS NULL
+          AND NOT EXISTS (SELECT 1 FROM "TeamFolder" t WHERE t."folderId" = f.id)
+      ) rows ORDER BY at DESC, id DESC`).map((r) => r.id);
+  }
+
+  test("pages traverse equal timestamps exactly once, with inserts, old cursors and scope", async () => {
+    await checkList({
+      name: "shared by me",
+      url: (limit) => `/api/workspaces/${workspace.id}/files/shared-by-me?limit=${limit}`,
+      expected: fullOrder,
+      insertAt: async (cursor, ids) => {
+        if (cursor.startsWith("link-")) {
+          const row = await app.prisma.fileShareLinkFile.findUniqueOrThrow({ where: { id: cursor.slice("link-".length) } });
+          const created = [];
+          for (const responseId of ids) {
+            const file = await app.prisma.file.create({ data: {
+              workspaceId: workspace.id, name: "linked-insert", uploadedById: owner.id, ownerId: owner.id, size: 2n,
+            } });
+            await app.prisma.fileShareLinkFile.create({ data: {
+              id: responseId.slice("link-".length), shareLinkId: row.shareLinkId, fileId: file.id,
+            } });
+            created.push(responseId);
+          }
+          return created;
+        }
+        const row = await app.prisma.fileShare.findUniqueOrThrow({ where: { id: cursor } });
+        return Promise.all(ids.map(async (id) => (await share(row.createdAt, owner.id, id)).id));
+      },
+      foreignCursor: async () => (await share(at(0), peer.id)).id,
+    });
+    const seen = await walk(`/api/workspaces/${workspace.id}/files/shared-by-me?limit=5`);
+    assert.ok(!seen.includes(hiddenId), "an unreadable source stays out of the list");
+    assert.ok(!seen.includes(trashedId), "a trashed source stays out of the list");
+    assert.ok(seen.some((id) => id.startsWith("link-")), "link rows stay in the walked list");
+  });
+
+  test("a later id at the cursor time is not repeated and an earlier one is not skipped", async () => {
+    const first = await get(`/api/workspaces/${workspace.id}/files/shared-by-me?limit=2`);
+    assert.equal(first.statusCode, 200, first.body);
+    const cursor = first.json().nextCursor;
+    assert.equal(typeof cursor, "string");
+    const row = cursor.startsWith("link-")
+      ? await app.prisma.fileShareLinkFile.findUniqueOrThrow({
+          where: { id: cursor.slice("link-".length) }, include: { shareLink: true },
+        })
+      : await app.prisma.fileShare.findUniqueOrThrow({ where: { id: cursor } });
+    const createdAt = cursor.startsWith("link-") ? row.shareLink.createdAt : row.createdAt;
+    const [afterCursor, beforeCursor] = idsAround(cursor);
+    if (cursor.startsWith("link-")) {
+      for (const responseId of [afterCursor, beforeCursor]) {
+        const file = await app.prisma.file.create({ data: {
+          workspaceId: workspace.id, name: "cursor-insert", uploadedById: owner.id, ownerId: owner.id, size: 2n,
+        } });
+        await app.prisma.fileShareLinkFile.create({ data: {
+          id: responseId.slice("link-".length), shareLinkId: row.shareLinkId, fileId: file.id,
+        } });
+      }
+    } else {
+      await share(createdAt, owner.id, afterCursor);
+      await share(createdAt, owner.id, beforeCursor);
+    }
+    const next = await get(`/api/workspaces/${workspace.id}/files/shared-by-me?limit=100&cursor=${encodeURIComponent(cursor)}`);
+    const ids = next.json().data.map((r) => r.id);
+    assert.ok(ids.includes(afterCursor), "the id that sorts after the cursor was skipped");
+    assert.ok(!ids.includes(beforeCursor), "the id that sorts before the cursor was repeated");
+  });
+
+  test("the page query applies LIMIT", async () => {
+    const ctx = { userId: owner.id, workspaceId: workspace.id, workspaceRole: "MEMBER" };
+    const [first] = (await shares.listSharedByMe(app.prisma, workspace.id, ctx, undefined, 2)).data;
+    const events = await sqlOf((db) => shares.listSharedByMe(db, workspace.id, ctx, first.id, 2));
+    assertLimited(events, "FileShare", 2);
+    assertLimited(events, "FileShareLinkFile", 2);
+  });
+
+  test("an omitted cursor returns the first page and every page size walks the full id set", async () => {
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 10);
+    const bulk = await app.prisma.user.create({ data: {
+      email: `tiebreak-bulk-${suffix}@example.test`, displayName: "bulk", emailVerified: true,
+    } });
+    const session = await startRefreshSession(app.prisma, bulk.id);
+    familyIds.push(session.familyId);
+    try {
+      await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: bulk.id, role: "MEMBER" } });
+      const signedIn = await app.inject({
+        method: "POST", url: "/api/auth/refresh", cookies: { refresh_token: session.refreshToken },
+      });
+      assert.equal(signedIn.statusCode, 200, signedIn.body);
+      const bulkToken = signedIn.json().data.accessToken;
+      const memberCount = 140;
+      const linkCount = 80;
+      const owned = Array.from({ length: memberCount + linkCount }, (_, i) => ({
+        id: `f${suffix}${i.toString(36).padStart(4, "0")}`,
+        workspaceId: workspace.id, name: `bulk-${i}`, uploadedById: bulk.id, ownerId: bulk.id, size: 1n,
+      }));
+      await app.prisma.file.createMany({ data: owned });
+      await app.prisma.fileShare.createMany({ data: owned.slice(0, memberCount).map((f, i) => ({
+        id: `s${suffix}${i.toString(36).padStart(4, "0")}`,
+        workspaceId: workspace.id, fileId: f.id, sharedById: bulk.id,
+        sharedWithId: i % 2 === 0 ? owner.id : peer.id,
+        createdAt: at(i % 7),
+      })) });
+      const links = Array.from({ length: 20 }, (_, i) => ({
+        id: `l${suffix}${i.toString(36).padStart(4, "0")}`,
+        workspaceId: workspace.id, createdById: bulk.id, createdAt: at(i % 7),
+        token: i === 3 ? crypto.randomBytes(6).toString("base64url") : crypto.randomBytes(32).toString("base64url"),
+        enabled: i !== 0,
+        passwordHash: i === 1 ? "hash" : null,
+        expiresAt: i === 2 ? new Date("2020-01-01T00:00:00Z") : null,
+      }));
+      await app.prisma.fileShareLink.createMany({ data: links });
+      const keptLinkIds = [];
+      await app.prisma.fileShareLinkFile.createMany({ data: owned.slice(memberCount).map((f, i) => {
+        const id = `lf${suffix}${i.toString(36).padStart(4, "0")}`;
+        if (i < 4) keptLinkIds.push(`link-${id}`);
+        return { id, shareLinkId: links[i % links.length].id, fileId: f.id };
+      }) });
+      const hiddenFile = await app.prisma.file.create({ data: {
+        workspaceId: workspace.id, name: "bulk-hidden", uploadedById: uploader.id, ownerId: uploader.id, size: 1n,
+      } });
+      const hidden = await app.prisma.fileShare.create({ data: {
+        workspaceId: workspace.id, fileId: hiddenFile.id, sharedById: bulk.id, sharedWithId: owner.id,
+      } });
+      const trashedFile = await app.prisma.file.create({ data: {
+        workspaceId: workspace.id, name: "bulk-trashed", uploadedById: bulk.id, ownerId: bulk.id, size: 1n, trashedAt: new Date(),
+      } });
+      const trashed = await app.prisma.fileShare.create({ data: {
+        workspaceId: workspace.id, fileId: trashedFile.id, sharedById: bulk.id, sharedWithId: owner.id,
+      } });
+
+      const full = (await app.prisma.$queryRaw`
+        SELECT id FROM (
+          SELECT s.id, s."createdAt" AS at
+          FROM "FileShare" s JOIN "File" f ON f.id = s."fileId"
+          WHERE s."workspaceId" = ${workspace.id} AND s."sharedById" = ${bulk.id}
+            AND f."ownerId" = ${bulk.id} AND f."trashedAt" IS NULL
+          UNION ALL
+          SELECT 'link-' || lf.id, l."createdAt" AS at
+          FROM "FileShareLinkFile" lf
+          JOIN "FileShareLink" l ON l.id = lf."shareLinkId"
+          JOIN "File" f ON f.id = lf."fileId"
+          WHERE l."workspaceId" = ${workspace.id} AND l."createdById" = ${bulk.id}
+            AND f."ownerId" = ${bulk.id} AND f."trashedAt" IS NULL
+        ) rows ORDER BY at DESC, id DESC`).map((r) => r.id);
+      assert.ok(full.length >= 200, `fixture has ${full.length} shares`);
+      assert.ok(keptLinkIds.every((id) => full.includes(id)), "disabled, password, expired and legacy links stay listed");
+      assert.ok(!full.includes(hidden.id) && !full.includes(trashed.id));
+
+      const call = (url) => app.inject({
+        method: "GET", url,
+        headers: { authorization: `Bearer ${bulkToken}` },
+        remoteAddress: `10.84.${Math.floor(++requests / 250)}.${(requests % 250) + 1}`,
+      });
+      const first = await call(`/api/workspaces/${workspace.id}/files/shared-by-me`);
+      assert.equal(first.statusCode, 200, first.body);
+      assert.equal(first.json().data.length, 50, `first page of unpaged ${full.length}`);
+      assert.equal(typeof first.json().nextCursor, "string");
+      console.log(`shared-by-me paging: unpaged=${full.length} first=${first.json().data.length}`);
+
+      async function walkLimit(limit) {
+        const seen = [];
+        let cursor, pages = 0;
+        do {
+          const url = `/api/workspaces/${workspace.id}/files/shared-by-me${limit ? `?limit=${limit}` : ""}`;
+          const res = await call(withCursor(url, cursor));
+          assert.equal(res.statusCode, 200, res.body);
+          const body = res.json();
+          seen.push(...body.data.map((row) => row.id));
+          cursor = body.nextCursor ?? undefined;
+          pages += 1;
+          assert.ok(pages < 500, "pagination must terminate");
+        } while (cursor);
+        return seen;
+      }
+      for (const limit of [undefined, 17, 50, 100]) {
+        const seen = await walkLimit(limit);
+        assert.equal(new Set(seen).size, seen.length, `limit ${limit ?? "default"} repeated a row`);
+        assert.deepEqual(seen, full, `limit ${limit ?? "default"} does not match the full list`);
+      }
+      assert.equal((await call(`/api/workspaces/${workspace.id}/files/shared-by-me?limit=101`)).statusCode, 400);
+    } finally {
+      await app.prisma.user.delete({ where: { id: bulk.id } });
+    }
   });
 });

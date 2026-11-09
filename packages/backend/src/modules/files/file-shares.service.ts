@@ -19,6 +19,7 @@ import {
   fileReadWhere,
   type AccessContext,
 } from "./file-access.js";
+import { fileReadable } from "./file-read-scope.js";
 import {
   deliverNotification,
   enqueueNotification,
@@ -223,89 +224,219 @@ export async function listSharedWithMe(
   };
 }
 
+// Link rows are already returned as `link-${FileShareLinkFile.id}`. That
+// response id is the cursor and the tie-break, shared with member-share ids.
+const SHARED_BY_ME_LINK_PREFIX = "link-";
+
+const shareFileInclude = {
+  include: {
+    uploadedBy: {
+      select: { id: true, displayName: true, avatarUrl: true },
+    },
+  },
+} as const;
+
+// COLLATE "C" is UTF-8 byte order, which matches JavaScript string order for
+// well-formed text. The database collation must not decide the tie-break.
+/**
+ * The column is `timestamp(3)` without time zone. Prisma reads that wall
+ * clock as a UTC `Date` and would bind it back as `timestamptz`, which a
+ * non-UTC session TimeZone then shifts. Compare the same clock as
+ * `timestamp` without time zone.
+ */
+function storedTimestamp(value: Date): Prisma.Sql {
+  return Prisma.sql`(${value.toISOString()}::timestamptz AT TIME ZONE 'UTC')::timestamp(3)`;
+}
+
+function afterResponseId(
+  createdAt: Prisma.Sql,
+  responseId: Prisma.Sql,
+  cursorAt?: Date,
+  cursorId?: string,
+): Prisma.Sql {
+  if (!cursorAt || cursorId === undefined) return Prisma.empty;
+  const at = storedTimestamp(cursorAt);
+  // `createdAt <= cursor` is the same set as the tie-break below, and lets the
+  // (owner, createdAt) index start at the cursor instead of walking newer rows.
+  return Prisma.sql`AND ${createdAt} <= ${at}
+    AND (
+      ${createdAt} < ${at}
+      OR ${responseId} COLLATE "C" < ${cursorId} COLLATE "C"
+    )`;
+}
+
+function bySharedByMeOrder(
+  a: { id: string; createdAt: Date },
+  b: { id: string; createdAt: Date },
+): number {
+  const byTime = b.createdAt.getTime() - a.createdAt.getTime();
+  if (byTime !== 0) return byTime;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? 1 : -1;
+}
+
 export async function listSharedByMe(
   prisma: PrismaClient,
   workspaceId: string,
   ctx: AccessContext,
-  _cursor?: string,
-  _limit = 50,
+  cursor?: string,
+  limit = 50,
 ) {
+  // Not a member: the same error as the other file lists. The page queries
+  // below would otherwise just return no rows. Hydration uses this predicate
+  // again so a file trashed or revoked after the key query is not returned.
   const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
-  // Query both member shares and public link shares in parallel
-  const [memberShares, linkShareFiles] = await Promise.all([
-    prisma.fileShare.findMany({
-      where: {
-        workspaceId,
-        sharedById: userId,
-        file: { AND: [readable], trashedAt: null },
-      },
-      include: {
-        file: {
-          include: {
-            uploadedBy: {
-              select: { id: true, displayName: true, avatarUrl: true },
-            },
-          },
-        },
-        sharedWith: {
-          select: { id: true, displayName: true, avatarUrl: true, email: true },
-        },
-      },
-      orderBy: { createdAt: "desc" },
-    }),
-    prisma.fileShareLinkFile.findMany({
-      where: {
-        shareLink: { workspaceId, createdById: userId },
-        file: { AND: [readable], trashedAt: null },
-      },
-      include: {
-        file: {
-          include: {
-            uploadedBy: {
-              select: { id: true, displayName: true, avatarUrl: true },
-            },
-          },
-        },
-        shareLink: {
-          select: { createdAt: true },
-        },
-      },
-    }),
+  const userSql = Prisma.sql`${userId}`;
+  const workspaceSql = Prisma.sql`${workspaceId}`;
+  // Same rows as before: member shares and link files the caller can still
+  // read. Disabled, password, expired and legacy links stay in the list.
+  const memberReadable = fileReadable(
+    Prisma.sql`s."fileId"`,
+    userSql,
+    workspaceSql,
+  );
+  const linkReadable = fileReadable(
+    Prisma.sql`lf."fileId"`,
+    userSql,
+    workspaceSql,
+  );
+
+  // A cursor must be one of the listed rows. Any other id gives an empty
+  // page, as shared-with-me does.
+  let cursorAt: Date | undefined;
+  if (cursor) {
+    const found = cursor.startsWith(SHARED_BY_ME_LINK_PREFIX)
+      ? await prisma.$queryRaw<{ createdAt: Date }[]>`
+          SELECT l."createdAt" AS "createdAt"
+          FROM "public"."FileShareLinkFile" lf
+          JOIN "public"."FileShareLink" l ON l.id = lf."shareLinkId"
+          WHERE lf.id = ${cursor.slice(SHARED_BY_ME_LINK_PREFIX.length)}
+            AND l."workspaceId" = ${workspaceId}
+            AND l."createdById" = ${userId}
+            AND ${linkReadable}
+          LIMIT 1`
+      : await prisma.$queryRaw<{ createdAt: Date }[]>`
+          SELECT s."createdAt" AS "createdAt"
+          FROM "public"."FileShare" s
+          WHERE s.id = ${cursor}
+            AND s."workspaceId" = ${workspaceId}
+            AND s."sharedById" = ${userId}
+            AND ${memberReadable}
+          LIMIT 1`;
+    if (found.length === 0) return { data: [], nextCursor: null };
+    cursorAt = found[0].createdAt;
+  }
+
+  // Each side is ordered by the merged key and limited to limit + 1. The
+  // merged top is inside those two slices, so the database applies LIMIT.
+  const [memberKeys, linkKeys] = await Promise.all([
+    prisma.$queryRaw<{ id: string; createdAt: Date }[]>`SELECT s.id AS id, s."createdAt" AS "createdAt"
+      FROM "public"."FileShare" s
+      WHERE s."workspaceId" = ${workspaceId}
+        AND s."sharedById" = ${userId}
+        AND ${memberReadable}
+        ${afterResponseId(Prisma.sql`s."createdAt"`, Prisma.sql`s.id`, cursorAt, cursor)}
+      ORDER BY s."createdAt" DESC, s.id COLLATE "C" DESC
+      LIMIT ${limit + 1}`,
+    prisma.$queryRaw<{ id: string; createdAt: Date }[]>`SELECT ('link-' || lf.id) AS id, l."createdAt" AS "createdAt"
+      FROM "public"."FileShareLinkFile" lf
+      JOIN "public"."FileShareLink" l ON l.id = lf."shareLinkId"
+      WHERE l."workspaceId" = ${workspaceId}
+        AND l."createdById" = ${userId}
+        AND ${linkReadable}
+        ${afterResponseId(
+          Prisma.sql`l."createdAt"`,
+          Prisma.sql`('link-' || lf.id)`,
+          cursorAt,
+          cursor,
+        )}
+      ORDER BY l."createdAt" DESC, ('link-' || lf.id) COLLATE "C" DESC
+      LIMIT ${limit + 1}`,
   ]);
 
-  // Normalize into a common shape
-  type Entry = {
+  const ranked = [...memberKeys, ...linkKeys].sort(bySharedByMeOrder);
+  const hasMore = ranked.length > limit;
+  const page = hasMore ? ranked.slice(0, limit) : ranked;
+  const memberIds = page
+    .filter((row) => !row.id.startsWith(SHARED_BY_ME_LINK_PREFIX))
+    .map((row) => row.id);
+  const linkIds = page
+    .filter((row) => row.id.startsWith(SHARED_BY_ME_LINK_PREFIX))
+    .map((row) => row.id.slice(SHARED_BY_ME_LINK_PREFIX.length));
+  const [memberShares, linkShareFiles] = await Promise.all([
+    memberIds.length === 0
+      ? []
+      : prisma.fileShare.findMany({
+          where: {
+            id: { in: memberIds },
+            workspaceId,
+            sharedById: userId,
+            file: { AND: [readable], trashedAt: null },
+          },
+          include: {
+            file: shareFileInclude,
+            sharedWith: {
+              select: {
+                id: true,
+                displayName: true,
+                avatarUrl: true,
+                email: true,
+              },
+            },
+          },
+        }),
+    linkIds.length === 0
+      ? []
+      : prisma.fileShareLinkFile.findMany({
+          where: {
+            id: { in: linkIds },
+            shareLink: { workspaceId, createdById: userId },
+            file: { AND: [readable], trashedAt: null },
+          },
+          include: {
+            file: shareFileInclude,
+            shareLink: { select: { createdAt: true } },
+          },
+        }),
+  ]);
+  const membersById = new Map(memberShares.map((row) => [row.id, row]));
+  const linksById = new Map(linkShareFiles.map((row) => [row.id, row]));
+  type ListedShare = {
     id: string;
-    file: (typeof memberShares)[0]["file"];
-    sharedWith: (typeof memberShares)[0]["sharedWith"] | null;
+    file: (typeof memberShares)[number]["file"];
+    sharedWith: (typeof memberShares)[number]["sharedWith"] | null;
     shareType: "member" | "link";
     createdAt: Date;
   };
-
-  const entries: Entry[] = [
-    ...memberShares.map((s) => ({
-      id: s.id,
-      file: s.file,
-      sharedWith: s.sharedWith,
-      shareType: "member" as const,
-      createdAt: s.createdAt,
-    })),
-    ...linkShareFiles.map((lf) => ({
-      id: `link-${lf.id}`,
-      file: lf.file,
-      sharedWith: null,
-      shareType: "link" as const,
-      createdAt: lf.shareLink.createdAt,
-    })),
-  ];
-
-  // Sort by date descending
-  entries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const data: ListedShare[] = [];
+  for (const row of page) {
+    if (row.id.startsWith(SHARED_BY_ME_LINK_PREFIX)) {
+      const link = linksById.get(row.id.slice(SHARED_BY_ME_LINK_PREFIX.length));
+      if (!link) continue;
+      data.push({
+        id: row.id,
+        file: link.file,
+        sharedWith: null,
+        shareType: "link",
+        createdAt: link.shareLink.createdAt,
+      });
+      continue;
+    }
+    const share = membersById.get(row.id);
+    if (!share) continue;
+    data.push({
+      id: share.id,
+      file: share.file,
+      sharedWith: share.sharedWith,
+      shareType: "member",
+      createdAt: share.createdAt,
+    });
+  }
 
   return {
-    data: entries,
-    nextCursor: null,
+    data,
+    nextCursor: hasMore ? page[page.length - 1].id : null,
   };
 }
 

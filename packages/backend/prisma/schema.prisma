@@ -903,6 +903,8 @@ model FileShare {
   @@index([sharedById])
   @@index([sharedWithId])
   @@index([fileId])
+  // Shared-by-me pages: this caller's shares, newest first.
+  @@index([sharedById, workspaceId, createdAt(sort: Desc)], map: "FileShare_shared_by_me_idx")
 }
 
 model FileShareLink {
@@ -923,6 +925,8 @@ model FileShareLink {
   @@index([token])
   @@index([workspaceId])
   @@index([createdById])
+  // Shared-by-me link pages: this caller's links, newest first.
+  @@index([createdById, workspaceId, createdAt(sort: Desc)], map: "FileShareLink_shared_by_me_idx")
 }
 
 model FileShareLinkFile {

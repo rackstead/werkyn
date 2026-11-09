@@ -420,6 +420,7 @@ when more follows. A request without paging parameters gets the first page:
 | Endpoint | Default and maximum | More rows |
 | --- | --- | --- |
 | `GET /api/workspaces/:wid/my-tasks` | 100, `limit` up to 200 | pass `nextCursor` as `cursor` until it is `null` |
+| `GET /api/workspaces/:wid/files/shared-by-me` | 50, `limit` up to 100 | pass `nextCursor` as `cursor` until it is `null` |
 | `GET /api/chat/:wid/channels/:channelId/members` | 100, `limit` up to 200 | pass `nextCursor` as `cursor` until it is `null` |
 | `GET /api/chat/:wid/channels` | each channel's first 10 members | `_count.members` is the full count; DMs are complete |
 | `GET /api/workspaces/:wid/time/reports` | 20 entries per group (`entryLimit` 0–500), 5,000 per response | a group with `hasMoreEntries` continues at `GET .../time/reports/entries` with the report's filters, `groupKey` and `cursor` = `nextEntryCursor` (omit it when `null`) |
@@ -429,7 +430,8 @@ Report totals still cover every matching entry, and the CSV export still lists
 them all. `my-tasks` also accepts `dueAfter`, `dueBefore`, `completed` and
 `sort=dueDate`. Cursor
 lists that sort by a value several rows can share (bookmarks, wiki versions,
-shared-with-me, task comments, the drive listing, channel members) break ties by
+shared-with-me, shared-by-me, task comments, the drive listing, channel
+members) break ties by
 ID, so pages neither repeat nor skip rows. See
 [P02b](docs/remediation/p02b.md).
 

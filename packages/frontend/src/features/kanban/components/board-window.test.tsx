@@ -172,8 +172,13 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // The column virtualizer clears isScrolling after 150ms. That timer is not
+  // cancelled on unmount, so let it fire while jsdom is still up.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete (HTMLElement.prototype as { scrollTo?: unknown }).scrollTo;

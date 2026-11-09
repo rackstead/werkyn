@@ -51,7 +51,8 @@ export function ApiKeySettings() {
         <p className="text-sm text-muted-foreground">
           Create a personal key for scripts and integrations. Keys have your
           account's permissions across all your workspaces. Revoking a key stops
-          its access immediately.
+          its access immediately. Last use is stored at most once a minute, so
+          it can be up to a minute behind the latest request.
         </p>
       </div>
 

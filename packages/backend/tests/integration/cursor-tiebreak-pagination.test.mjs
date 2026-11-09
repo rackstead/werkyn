@@ -550,7 +550,7 @@ describe("files shared by me", () => {
         WHERE l."workspaceId" = ${workspace.id} AND l."createdById" = ${owner.id}
           AND f."ownerId" = ${owner.id} AND f."teamFolderId" IS NULL AND f."trashedAt" IS NULL
           AND NOT EXISTS (SELECT 1 FROM "TeamFolder" t WHERE t."folderId" = f.id)
-      ) rows ORDER BY at DESC, id DESC`).map((r) => r.id);
+      ) rows ORDER BY at DESC, id COLLATE "C" DESC`).map((r) => r.id);
   }
 
   test("pages traverse equal timestamps exactly once, with inserts, old cursors and scope", async () => {
@@ -621,6 +621,10 @@ describe("files shared by me", () => {
     const events = await sqlOf((db) => shares.listSharedByMe(db, workspace.id, ctx, first.id, 2));
     assertLimited(events, "FileShare", 2);
     assertLimited(events, "FileShareLinkFile", 2);
+    for (const table of ["FileShare", "FileShareLinkFile"]) {
+      const pages = events.filter((e) => e.query.includes(`"${table}"`) && e.query.includes("ORDER BY"));
+      assert.ok(pages.some((e) => e.query.includes('COLLATE "C"')), `${table} tie-break is byte order`);
+    }
   });
 
   test("an omitted cursor returns the first page and every page size walks the full id set", async () => {
@@ -691,7 +695,7 @@ describe("files shared by me", () => {
           JOIN "File" f ON f.id = lf."fileId"
           WHERE l."workspaceId" = ${workspace.id} AND l."createdById" = ${bulk.id}
             AND f."ownerId" = ${bulk.id} AND f."trashedAt" IS NULL
-        ) rows ORDER BY at DESC, id DESC`).map((r) => r.id);
+        ) rows ORDER BY at DESC, id COLLATE "C" DESC`).map((r) => r.id);
       assert.ok(full.length >= 200, `fixture has ${full.length} shares`);
       assert.ok(keptLinkIds.every((id) => full.includes(id)), "disabled, password, expired and legacy links stay listed");
       assert.ok(!full.includes(hidden.id) && !full.includes(trashed.id));

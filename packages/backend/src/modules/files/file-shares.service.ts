@@ -19,6 +19,7 @@ import {
   fileReadWhere,
   type AccessContext,
 } from "./file-access.js";
+import { fileReadable } from "./file-read-scope.js";
 import {
   deliverNotification,
   enqueueNotification,
@@ -227,24 +228,40 @@ export async function listSharedWithMe(
 // response id is the cursor and the tie-break, shared with member-share ids.
 const SHARED_BY_ME_LINK_PREFIX = "link-";
 
-/**
- * Which link-file ids have a response id strictly before `cursorId` in
- * descending order. Every response id starts with `link-`, a contiguous
- * range, so a cursor outside it is either before all of them or after all.
- */
-function linkResponseIdLt(
-  cursorId: string,
-): Prisma.StringFilter | "all" | "none" {
-  if (cursorId.startsWith(SHARED_BY_ME_LINK_PREFIX)) {
-    return { lt: cursorId.slice(SHARED_BY_ME_LINK_PREFIX.length) };
-  }
-  if (
-    cursorId < SHARED_BY_ME_LINK_PREFIX ||
-    SHARED_BY_ME_LINK_PREFIX.startsWith(cursorId)
-  ) {
-    return "none";
-  }
-  return "all";
+const shareFileInclude = {
+  include: {
+    uploadedBy: {
+      select: { id: true, displayName: true, avatarUrl: true },
+    },
+  },
+} as const;
+
+// COLLATE "C" is UTF-8 byte order, which matches JavaScript string order for
+// well-formed text. The database collation must not decide the tie-break.
+function afterResponseId(
+  createdAt: Prisma.Sql,
+  responseId: Prisma.Sql,
+  cursorAt?: Date,
+  cursorId?: string,
+): Prisma.Sql {
+  if (!cursorAt || cursorId === undefined) return Prisma.empty;
+  return Prisma.sql`AND (
+    ${createdAt} < ${cursorAt}
+    OR (
+      ${createdAt} = ${cursorAt}
+      AND ${responseId} COLLATE "C" < ${cursorId} COLLATE "C"
+    )
+  )`;
+}
+
+function bySharedByMeOrder(
+  a: { id: string; createdAt: Date },
+  b: { id: string; createdAt: Date },
+): number {
+  const byTime = b.createdAt.getTime() - a.createdAt.getTime();
+  if (byTime !== 0) return byTime;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? 1 : -1;
 }
 
 export async function listSharedByMe(
@@ -254,153 +271,151 @@ export async function listSharedByMe(
   cursor?: string,
   limit = 50,
 ) {
-  const readable = await fileReadWhere(prisma, { ...ctx, workspaceId });
+  // Not a member: the same error as the other file lists. The page queries
+  // below would otherwise just return no rows.
+  await fileAccessRole(prisma, { ...ctx, workspaceId });
   const userId = ctx.userId;
+  const userSql = Prisma.sql`${userId}`;
+  const workspaceSql = Prisma.sql`${workspaceId}`;
   // Same rows as before: member shares and link files the caller can still
   // read. Disabled, password, expired and legacy links stay in the list.
-  const memberWhere: Prisma.FileShareWhereInput = {
-    workspaceId,
-    sharedById: userId,
-    file: { AND: [readable], trashedAt: null },
-  };
-  const linkWhere: Prisma.FileShareLinkFileWhereInput = {
-    shareLink: { workspaceId, createdById: userId },
-    file: { AND: [readable], trashedAt: null },
-  };
+  const memberReadable = fileReadable(
+    Prisma.sql`s."fileId"`,
+    userSql,
+    workspaceSql,
+  );
+  const linkReadable = fileReadable(
+    Prisma.sql`lf."fileId"`,
+    userSql,
+    workspaceSql,
+  );
 
   // A cursor must be one of the listed rows. Any other id gives an empty
   // page, as shared-with-me does.
   let cursorAt: Date | undefined;
-  let cursorId: string | undefined;
   if (cursor) {
-    cursorId = cursor;
-    if (cursor.startsWith(SHARED_BY_ME_LINK_PREFIX)) {
-      const row = await prisma.fileShareLinkFile.findFirst({
-        where: {
-          AND: [
-            linkWhere,
-            { id: cursor.slice(SHARED_BY_ME_LINK_PREFIX.length) },
-          ],
-        },
-        select: { id: true, shareLink: { select: { createdAt: true } } },
-      });
-      if (!row) return { data: [], nextCursor: null };
-      cursorAt = row.shareLink.createdAt;
-    } else {
-      const row = await prisma.fileShare.findFirst({
-        where: { AND: [memberWhere, { id: cursor }] },
-        select: { id: true, createdAt: true },
-      });
-      if (!row) return { data: [], nextCursor: null };
-      cursorAt = row.createdAt;
-    }
+    const found = cursor.startsWith(SHARED_BY_ME_LINK_PREFIX)
+      ? await prisma.$queryRaw<{ createdAt: Date }[]>`
+          SELECT l."createdAt" AS "createdAt"
+          FROM "public"."FileShareLinkFile" lf
+          JOIN "public"."FileShareLink" l ON l.id = lf."shareLinkId"
+          WHERE lf.id = ${cursor.slice(SHARED_BY_ME_LINK_PREFIX.length)}
+            AND l."workspaceId" = ${workspaceId}
+            AND l."createdById" = ${userId}
+            AND ${linkReadable}
+          LIMIT 1`
+      : await prisma.$queryRaw<{ createdAt: Date }[]>`
+          SELECT s."createdAt" AS "createdAt"
+          FROM "public"."FileShare" s
+          WHERE s.id = ${cursor}
+            AND s."workspaceId" = ${workspaceId}
+            AND s."sharedById" = ${userId}
+            AND ${memberReadable}
+          LIMIT 1`;
+    if (found.length === 0) return { data: [], nextCursor: null };
+    cursorAt = found[0].createdAt;
   }
 
-  const memberKeyset: Prisma.FileShareWhereInput =
-    cursorAt && cursorId
-      ? {
-          OR: [
-            { createdAt: { lt: cursorAt } },
-            { createdAt: cursorAt, id: { lt: cursorId } },
-          ],
-        }
-      : {};
-  const linkIdLt = cursorId ? linkResponseIdLt(cursorId) : "all";
-  const linkSameTime: Prisma.FileShareLinkFileWhereInput[] =
-    !cursorAt || linkIdLt === "none"
-      ? []
-      : linkIdLt === "all"
-        ? [{ shareLink: { createdAt: cursorAt } }]
-        : [{ shareLink: { createdAt: cursorAt }, id: linkIdLt }];
-  const linkKeyset: Prisma.FileShareLinkFileWhereInput = cursorAt
-    ? {
-        OR: [{ shareLink: { createdAt: { lt: cursorAt } } }, ...linkSameTime],
-      }
-    : {};
-
-  const fileInclude = {
-    include: {
-      uploadedBy: {
-        select: { id: true, displayName: true, avatarUrl: true },
-      },
-    },
-  } as const;
-
-  // Each side is ordered by the merged key. The merged top limit+1 rows are
-  // inside the top limit+1 of each side, so PostgreSQL can apply LIMIT.
-  const [memberShares, linkShareFiles] = await Promise.all([
-    prisma.fileShare.findMany({
-      where: { AND: [memberWhere, memberKeyset] },
-      include: {
-        file: fileInclude,
-        sharedWith: {
-          select: { id: true, displayName: true, avatarUrl: true, email: true },
-        },
-      },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
-    }),
-    prisma.fileShareLinkFile.findMany({
-      where: { AND: [linkWhere, linkKeyset] },
-      include: {
-        file: fileInclude,
-        shareLink: { select: { createdAt: true } },
-      },
-      orderBy: [{ shareLink: { createdAt: "desc" } }, { id: "desc" }],
-      take: limit + 1,
-    }),
+  // Each side is ordered by the merged key and limited to limit + 1. The
+  // merged top is inside those two slices, so the database applies LIMIT.
+  const [memberKeys, linkKeys] = await Promise.all([
+    prisma.$queryRaw<{ id: string; createdAt: Date }[]>`SELECT s.id AS id, s."createdAt" AS "createdAt"
+      FROM "public"."FileShare" s
+      WHERE s."workspaceId" = ${workspaceId}
+        AND s."sharedById" = ${userId}
+        AND ${memberReadable}
+        ${afterResponseId(Prisma.sql`s."createdAt"`, Prisma.sql`s.id`, cursorAt, cursor)}
+      ORDER BY s."createdAt" DESC, s.id COLLATE "C" DESC
+      LIMIT ${limit + 1}`,
+    prisma.$queryRaw<{ id: string; createdAt: Date }[]>`SELECT ('link-' || lf.id) AS id, l."createdAt" AS "createdAt"
+      FROM "public"."FileShareLinkFile" lf
+      JOIN "public"."FileShareLink" l ON l.id = lf."shareLinkId"
+      WHERE l."workspaceId" = ${workspaceId}
+        AND l."createdById" = ${userId}
+        AND ${linkReadable}
+        ${afterResponseId(
+          Prisma.sql`l."createdAt"`,
+          Prisma.sql`('link-' || lf.id)`,
+          cursorAt,
+          cursor,
+        )}
+      ORDER BY l."createdAt" DESC, ('link-' || lf.id) COLLATE "C" DESC
+      LIMIT ${limit + 1}`,
   ]);
 
-  type Entry = {
+  const ranked = [...memberKeys, ...linkKeys].sort(bySharedByMeOrder);
+  const hasMore = ranked.length > limit;
+  const page = hasMore ? ranked.slice(0, limit) : ranked;
+  const memberIds = page
+    .filter((row) => !row.id.startsWith(SHARED_BY_ME_LINK_PREFIX))
+    .map((row) => row.id);
+  const linkIds = page
+    .filter((row) => row.id.startsWith(SHARED_BY_ME_LINK_PREFIX))
+    .map((row) => row.id.slice(SHARED_BY_ME_LINK_PREFIX.length));
+  const [memberShares, linkShareFiles] = await Promise.all([
+    memberIds.length === 0
+      ? []
+      : prisma.fileShare.findMany({
+          where: { id: { in: memberIds } },
+          include: {
+            file: shareFileInclude,
+            sharedWith: {
+              select: {
+                id: true,
+                displayName: true,
+                avatarUrl: true,
+                email: true,
+              },
+            },
+          },
+        }),
+    linkIds.length === 0
+      ? []
+      : prisma.fileShareLinkFile.findMany({
+          where: { id: { in: linkIds } },
+          include: {
+            file: shareFileInclude,
+            shareLink: { select: { createdAt: true } },
+          },
+        }),
+  ]);
+  const membersById = new Map(memberShares.map((row) => [row.id, row]));
+  const linksById = new Map(linkShareFiles.map((row) => [row.id, row]));
+  type ListedShare = {
     id: string;
     file: (typeof memberShares)[number]["file"];
     sharedWith: (typeof memberShares)[number]["sharedWith"] | null;
     shareType: "member" | "link";
     createdAt: Date;
   };
-
-  const ranked: { id: string; createdAt: Date; entry: Entry }[] = [
-    ...memberShares.map((s) => ({
-      id: s.id,
-      createdAt: s.createdAt,
-      entry: {
-        id: s.id,
-        file: s.file,
-        sharedWith: s.sharedWith,
-        shareType: "member" as const,
-        createdAt: s.createdAt,
-      },
-    })),
-    ...linkShareFiles.map((lf) => {
-      const id = `${SHARED_BY_ME_LINK_PREFIX}${lf.id}`;
-      return {
-        id,
-        createdAt: lf.shareLink.createdAt,
-        entry: {
-          id,
-          file: lf.file,
-          sharedWith: null,
-          shareType: "link" as const,
-          createdAt: lf.shareLink.createdAt,
-        },
-      };
-    }),
-  ];
-  ranked.sort((a, b) => {
-    const byTime = b.createdAt.getTime() - a.createdAt.getTime();
-    if (byTime !== 0) return byTime;
-    if (a.id === b.id) return 0;
-    return a.id < b.id ? 1 : -1;
-  });
-
-  const hasMore = ranked.length > limit;
-  const data = (hasMore ? ranked.slice(0, limit) : ranked).map(
-    (row) => row.entry,
-  );
+  const data: ListedShare[] = [];
+  for (const row of page) {
+    if (row.id.startsWith(SHARED_BY_ME_LINK_PREFIX)) {
+      const link = linksById.get(row.id.slice(SHARED_BY_ME_LINK_PREFIX.length));
+      if (!link) continue;
+      data.push({
+        id: row.id,
+        file: link.file,
+        sharedWith: null,
+        shareType: "link",
+        createdAt: link.shareLink.createdAt,
+      });
+      continue;
+    }
+    const share = membersById.get(row.id);
+    if (!share) continue;
+    data.push({
+      id: share.id,
+      file: share.file,
+      sharedWith: share.sharedWith,
+      shareType: "member",
+      createdAt: share.createdAt,
+    });
+  }
 
   return {
     data,
-    nextCursor: hasMore ? data[data.length - 1].id : null,
+    nextCursor: hasMore ? page[page.length - 1].id : null,
   };
 }
 

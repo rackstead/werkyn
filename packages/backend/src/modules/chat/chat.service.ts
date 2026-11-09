@@ -721,34 +721,28 @@ export async function getUnreadCounts(
   workspaceId: string,
   userId: string,
 ) {
-  const memberships = await prisma.chatChannelMember.findMany({
-    where: {
-      userId,
-      channel: { workspaceId },
-    },
-    select: {
-      channelId: true,
-      lastReadAt: true,
-    },
-  });
-
-  if (memberships.length === 0) return [];
-
-  const counts = await Promise.all(
-    memberships.map(async (m) => {
-      const count = await prisma.chatMessage.count({
-        where: {
-          channelId: m.channelId,
-          createdAt: { gt: m.lastReadAt },
-          deletedAt: null,
-          userId: { not: userId },
-        },
-      });
-      return { channelId: m.channelId, count };
-    }),
-  );
-
-  return counts.filter((c) => c.count > 0);
+  // One statement for every channel the caller belongs to in this workspace.
+  // Each membership keeps its own lastReadAt, so the count is lateral and can
+  // use ChatMessage's (channelId, createdAt) index. Deleted messages and the
+  // caller's own messages stay unread-ineligible. Channels with none are
+  // omitted, as the per-channel counts were.
+  const rows = await prisma.$queryRaw<{ channelId: string; count: number }[]>`
+    SELECT m."channelId" AS "channelId", unread."count" AS "count"
+    FROM "ChatChannelMember" m
+    JOIN "ChatChannel" c ON c."id" = m."channelId"
+    JOIN LATERAL (
+      SELECT count(*)::int AS "count"
+      FROM "ChatMessage" msg
+      WHERE msg."channelId" = m."channelId"
+        AND msg."createdAt" > m."lastReadAt"
+        AND msg."deletedAt" IS NULL
+        AND msg."userId" <> ${userId}
+    ) unread ON true
+    WHERE m."userId" = ${userId}
+      AND c."workspaceId" = ${workspaceId}
+      AND unread."count" > 0
+    ORDER BY m."channelId"`;
+  return rows;
 }
 
 // ─── Members ───────────────────────────────────────────

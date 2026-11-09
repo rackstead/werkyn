@@ -58,6 +58,40 @@ export async function createProject(
   });
 }
 
+/**
+ * Adds `_count` with each listed project's members and tasks (every task,
+ * archived included, as the `_count` include counts). Counted here for the
+ * listed projects only: for a list, Prisma's `_count` include joins a count
+ * of every member and task row.
+ */
+async function withProjectListCounts<T extends { id: string }>(
+  prisma: PrismaClient,
+  projects: T[],
+) {
+  if (projects.length === 0) return [];
+  const ids = projects.map((project) => project.id);
+  const rows = await prisma.$queryRaw<{ projectId: string; members: number; tasks: number }[]>`
+    SELECT "projectId",
+      (count(*) FILTER (WHERE kind = 'member'))::int AS "members",
+      (count(*) FILTER (WHERE kind = 'task'))::int AS "tasks"
+    FROM (
+      SELECT "projectId", 'member'::text AS kind FROM "ProjectMember"
+      WHERE "projectId" = ANY(${ids})
+      UNION ALL
+      SELECT "projectId", 'task'::text FROM "Task"
+      WHERE "projectId" = ANY(${ids})
+    ) counted
+    GROUP BY "projectId"`;
+  const byId = new Map(rows.map((row) => [row.projectId, row]));
+  return projects.map((project) => {
+    const row = byId.get(project.id);
+    return {
+      ...project,
+      _count: { members: row?.members ?? 0, tasks: row?.tasks ?? 0 },
+    };
+  });
+}
+
 export async function listProjects(
   prisma: PrismaClient,
   workspaceId: string,
@@ -82,9 +116,6 @@ export async function listProjects(
   const [projects, total] = await Promise.all([
     prisma.project.findMany({
       where,
-      include: {
-        _count: { select: { members: true, tasks: true } },
-      },
       orderBy: { createdAt: "desc" },
       skip: (query.page - 1) * query.limit,
       take: query.limit,
@@ -93,7 +124,7 @@ export async function listProjects(
   ]);
 
   return {
-    data: projects,
+    data: await withProjectListCounts(prisma, projects),
     pagination: {
       page: query.page,
       limit: query.limit,

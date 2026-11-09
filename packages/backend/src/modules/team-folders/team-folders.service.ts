@@ -69,6 +69,29 @@ export async function createTeamFolder(
   });
 }
 
+/**
+ * Adds `_count.members` (every direct member, as the `_count` include counts)
+ * to a team-folder list. Counted here for the listed folders only: for a
+ * list, Prisma's `_count` include joins a count of every member row.
+ */
+async function withTeamFolderMemberCounts<T extends { id: string }>(
+  prisma: PrismaClient,
+  folders: T[],
+) {
+  if (folders.length === 0) return [];
+  const ids = folders.map((folder) => folder.id);
+  const rows = await prisma.$queryRaw<{ teamFolderId: string; members: number }[]>`
+    SELECT "teamFolderId", count(*)::int AS "members"
+    FROM "TeamFolderMember"
+    WHERE "teamFolderId" = ANY(${ids})
+    GROUP BY "teamFolderId"`;
+  const byId = new Map(rows.map((row) => [row.teamFolderId, row.members]));
+  return folders.map((folder) => ({
+    ...folder,
+    _count: { members: byId.get(folder.id) ?? 0 },
+  }));
+}
+
 export async function listTeamFolders(
   prisma: PrismaClient,
   workspaceId: string,
@@ -83,16 +106,16 @@ export async function listTeamFolders(
     ...(role === "ADMIN" ? {} : teamFolderAccessWhere(ctx)),
   };
 
-  return prisma.teamFolder.findMany({
+  const folders = await prisma.teamFolder.findMany({
     where,
     include: {
       folder: {
         select: { id: true, name: true },
       },
-      _count: { select: { members: true } },
     },
     orderBy: { name: "asc" },
   });
+  return withTeamFolderMemberCounts(prisma, folders);
 }
 
 export async function getTeamFolder(

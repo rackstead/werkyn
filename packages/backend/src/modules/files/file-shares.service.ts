@@ -238,6 +238,16 @@ const shareFileInclude = {
 
 // COLLATE "C" is UTF-8 byte order, which matches JavaScript string order for
 // well-formed text. The database collation must not decide the tie-break.
+/**
+ * The column is `timestamp(3)` without time zone. Prisma reads that wall
+ * clock as a UTC `Date` and would bind it back as `timestamptz`, which a
+ * non-UTC session TimeZone then shifts. Compare the same clock as
+ * `timestamp` without time zone.
+ */
+function storedTimestamp(value: Date): Prisma.Sql {
+  return Prisma.sql`(${value.toISOString()}::timestamptz AT TIME ZONE 'UTC')::timestamp(3)`;
+}
+
 function afterResponseId(
   createdAt: Prisma.Sql,
   responseId: Prisma.Sql,
@@ -245,11 +255,12 @@ function afterResponseId(
   cursorId?: string,
 ): Prisma.Sql {
   if (!cursorAt || cursorId === undefined) return Prisma.empty;
+  const at = storedTimestamp(cursorAt);
   // `createdAt <= cursor` is the same set as the tie-break below, and lets the
   // (owner, createdAt) index start at the cursor instead of walking newer rows.
-  return Prisma.sql`AND ${createdAt} <= ${cursorAt}
+  return Prisma.sql`AND ${createdAt} <= ${at}
     AND (
-      ${createdAt} < ${cursorAt}
+      ${createdAt} < ${at}
       OR ${responseId} COLLATE "C" < ${cursorId} COLLATE "C"
     )`;
 }

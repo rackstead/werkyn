@@ -736,4 +736,82 @@ describe("files shared by me", () => {
       await app.prisma.user.delete({ where: { id: bulk.id } });
     }
   });
+
+  test("a non-UTC session TimeZone still walks every active share", async () => {
+    const { PrismaClient } = await import("@prisma/client");
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 10);
+    const user = await app.prisma.user.create({ data: {
+      email: `tiebreak-tz-${suffix}@example.test`, displayName: "tz", emailVerified: true,
+    } });
+    const ctx = { userId: user.id, workspaceId: workspace.id, workspaceRole: "MEMBER" };
+    try {
+      await app.prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: user.id, role: "MEMBER" } });
+      const owned = Array.from({ length: 36 }, (_, i) => ({
+        id: `tzf${suffix}${i.toString(36).padStart(2, "0")}`,
+        workspaceId: workspace.id, name: `tz-${i}`, uploadedById: user.id, ownerId: user.id, size: 1n,
+      }));
+      await app.prisma.file.createMany({ data: owned });
+      await app.prisma.fileShare.createMany({ data: owned.slice(0, 28).map((f, i) => ({
+        id: `tzs${suffix}${i.toString(36).padStart(2, "0")}`,
+        workspaceId: workspace.id, fileId: f.id, sharedById: user.id, sharedWithId: owner.id,
+        createdAt: at(i % 4),
+      })) });
+      const links = Array.from({ length: 4 }, (_, i) => ({
+        id: `tzl${suffix}${i}`,
+        workspaceId: workspace.id, createdById: user.id, createdAt: at(i % 4),
+        token: crypto.randomBytes(32).toString("base64url"),
+      }));
+      await app.prisma.fileShareLink.createMany({ data: links });
+      await app.prisma.fileShareLinkFile.createMany({ data: owned.slice(28).map((f, i) => ({
+        id: `tzlf${suffix}${i}`, shareLinkId: links[i % links.length].id, fileId: f.id,
+      })) });
+      const full = (await app.prisma.$queryRaw`
+        SELECT id FROM (
+          SELECT s.id, s."createdAt" AS at
+          FROM "FileShare" s JOIN "File" f ON f.id = s."fileId"
+          WHERE s."workspaceId" = ${workspace.id} AND s."sharedById" = ${user.id}
+            AND f."ownerId" = ${user.id} AND f."trashedAt" IS NULL
+          UNION ALL
+          SELECT 'link-' || lf.id, l."createdAt" AS at
+          FROM "FileShareLinkFile" lf
+          JOIN "FileShareLink" l ON l.id = lf."shareLinkId"
+          JOIN "File" f ON f.id = lf."fileId"
+          WHERE l."workspaceId" = ${workspace.id} AND l."createdById" = ${user.id}
+            AND f."ownerId" = ${user.id} AND f."trashedAt" IS NULL
+        ) rows ORDER BY at DESC, id COLLATE "C" DESC`).map((r) => r.id);
+      assert.ok(full.length >= 36, `fixture has ${full.length}`);
+
+      async function walk(zone, limit) {
+        const url = new URL(process.env.TEST_DATABASE_URL);
+        url.searchParams.set("connection_limit", "1");
+        const client = new PrismaClient({ datasourceUrl: url.toString() });
+        try {
+          await client.$executeRawUnsafe(`SET TIME ZONE '${zone}'`);
+          const [clock] = await client.$queryRaw`SELECT current_setting('TimeZone') AS zone`;
+          assert.equal(clock.zone, zone);
+          const seen = [];
+          let cursor;
+          let pages = 0;
+          do {
+            const page = await shares.listSharedByMe(client, workspace.id, ctx, cursor, limit);
+            seen.push(...page.data.map((row) => row.id));
+            cursor = page.nextCursor ?? undefined;
+            pages += 1;
+            assert.ok(pages < 500, `${zone}: pagination must terminate`);
+          } while (cursor);
+          console.log(`shared-by-me tz: zone=${zone} limit=${limit} walked=${seen.length} full=${full.length}`);
+          return seen;
+        } finally {
+          await client.$disconnect();
+        }
+      }
+      for (const zone of ["UTC", "America/New_York", "America/Los_Angeles"]) {
+        for (const limit of zone === "America/Los_Angeles" ? [1] : [1, 17]) {
+          assert.deepEqual(await walk(zone, limit), full, `${zone} limit ${limit}`);
+        }
+      }
+    } finally {
+      await app.prisma.user.delete({ where: { id: user.id } });
+    }
+  });
 });

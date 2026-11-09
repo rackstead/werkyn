@@ -47,7 +47,11 @@ receive every matching task.
   view, the column scrolls so a card that stayed on screen does not jump
   to a different task. A card that is not mounted is placed from the
   measured height of each card above it, not from one mounted card's
-  height times how many indexes it moved. The choice uses `stayedEntries`
+  height times how many indexes it moved. The height kept for a card is
+  the tallest one measured while it was on screen. A refetch page that
+  drops a card which was on screen is not followed; the card already
+  chosen stays chosen until the following page brings it back.
+  The choice uses `stayedEntries`
   (`lib/stayed-entries.ts`), over the column's id order, the same helper
   the List and Drive use. While that id list is still loading, only a
   uniform shift (every visible card moved by the same number of places) is

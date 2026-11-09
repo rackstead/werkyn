@@ -277,12 +277,20 @@ describe("board window", () => {
     for (const id of moved) tallIds.add(id);
     const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
     await settle();
-    await act(async () => {
-      openScroller().scrollTop = 120 * CARD;
-      openScroller().dispatchEvent(new Event("scroll"));
-    });
-    await settle();
-    expect(openScroller().querySelector("[data-task-id='open-120']")).toBeTruthy();
+    // Every tall card has to be on screen once, or its height stays the estimate.
+    const seenTall = new Set<string>();
+    for (let top = 100 * CARD; top <= 180 * CARD && seenTall.size < moved.length; top += 150) {
+      await act(async () => {
+        openScroller().scrollTop = top;
+        openScroller().dispatchEvent(new Event("scroll"));
+      });
+      await settle();
+      for (const card of openCards()) {
+        const id = card.dataset.taskId;
+        if (id && tallIds.has(id)) seenTall.add(id);
+      }
+    }
+    expect(seenTall.size).toBe(moved.length);
 
     await act(async () => {
       openScroller().scrollTop = 40 * CARD;
@@ -315,7 +323,7 @@ describe("board window", () => {
 
     const delta = openScroller().scrollTop - before;
     // One mounted card's height per index stops 12 * (240 - 92) px short, more than the viewport.
-    expect(delta).toBeGreaterThan(moved.length * CARD + VIEW);
+    expect(delta).toBeGreaterThan(moved.length * (TALL - 8));
     const anchor = openScroller().querySelector<HTMLElement>("[data-task-id='open-40']");
     expect(anchor).toBeTruthy();
     const top = anchor!.getBoundingClientRect().top - openScroller().getBoundingClientRect().top;

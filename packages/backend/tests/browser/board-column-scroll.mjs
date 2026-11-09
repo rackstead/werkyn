@@ -1,7 +1,7 @@
 // Chromium regression for the board column scrollport
 // (docs/remediation/board-windowing.md). A stubbed offsetHeight does not
 // count: this opens the production build. Run from packages/backend against
-// a migrated loopback database whose name is werkyn_audit_boardfix2_r15:
+// a migrated loopback database whose name is werkyn_audit_boardfix4_r15:
 //
 //   TEST_DATABASE_URL=... PLAYWRIGHT_MODULE=... CHROMIUM_EXECUTABLE=... \
 //     node --import tsx tests/browser/board-column-scroll.mjs
@@ -17,7 +17,7 @@ import { pathToFileURL } from "node:url";
 const OPEN_N = 2000;
 const database = new URL(process.env.TEST_DATABASE_URL ?? "invalid:");
 assert.equal(database.hostname, "127.0.0.1");
-assert.equal(database.pathname, "/werkyn_audit_boardfix2_r15");
+assert.equal(database.pathname, "/werkyn_audit_boardfix4_r15");
 Object.assign(process.env, {
   DATABASE_URL: database.toString(),
   NODE_ENV: "test",
@@ -48,6 +48,9 @@ const log = (...parts) => console.error("[board-scroll]", ...parts);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function titleOf(index) {
+  if (index >= 100 && index <= 111) {
+    return (`Tall ${String(index).padStart(4, "0")} ` + "measured block ".repeat(18)).slice(0, 250);
+  }
   return `Card ${String(index).padStart(4, "0")}`;
 }
 
@@ -170,6 +173,7 @@ async function columnState(page, statusId) {
         index: Number(wrap.dataset.index),
         columnIndex: Number(wrap.dataset.columnIndex),
         top: Math.round((rect.top - view.top) * 10) / 10,
+        height: Math.round(rect.height * 10) / 10,
       };
     });
     return {
@@ -207,7 +211,7 @@ async function main() {
   app = await buildApp();
   await app.listen({ host: "127.0.0.1", port: 0 });
   const identity = await app.prisma.$queryRaw`SELECT current_database() AS name`;
-  assert.equal(identity[0].name, "werkyn_audit_boardfix2_r15");
+  assert.equal(identity[0].name, "werkyn_audit_boardfix4_r15");
   const fixture = await createFixture(app.prisma);
   vite = await preview({
     root: frontend,
@@ -342,6 +346,63 @@ async function main() {
     fit.scrollerTop >= 0 && fit.scrollerBottom <= fit.viewH + 1,
     `column extends past the page (${fit.scrollerTop}..${fit.scrollerBottom} of ${fit.viewH})`,
   );
+  const tallHeights = new Map();
+  for (let top = 80 * 92; top <= 130 * 92 && tallHeights.size < 12; top += 400) {
+    await setScrollTop(page, openId, top);
+    await sleep(250);
+    const state = await columnState(page, openId);
+    for (const card of state?.cards ?? []) {
+      if (card.title.startsWith("Tall ") && card.height > 20) tallHeights.set(card.id, card.height);
+    }
+  }
+  assert.equal(tallHeights.size, 12, `measured ${tallHeights.size} tall cards`);
+  const measuredSum = [...tallHeights.values()].reduce((sum, height) => sum + height, 0);
+  assert.ok(measuredSum > 12 * 92 + 400, `tall cards used the estimate (${measuredSum})`);
+  let parked = null;
+  let anchorCard = null;
+  for (let top = 12 * 92; top < 70 * 92; top += 160) {
+    await setScrollTop(page, openId, top);
+    await sleep(180);
+    parked = await columnState(page, openId);
+    anchorCard = parked.cards.find((card) => card.title === "Card 0040" && card.top >= 40 && card.top < parked.clientHeight - 80) ?? null;
+    if (anchorCard && !parked.cards.some((card) => card.title.startsWith("Tall "))) break;
+  }
+  assert.ok(anchorCard && parked, "Card 0040 was not parked on screen");
+  const tallRows = await app.prisma.task.findMany({
+    where: { id: { in: [...tallHeights.keys()] } },
+    orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+  });
+  for (let index = 0; index < tallRows.length; index++) {
+    await app.prisma.task.update({
+      where: { id: tallRows[index].id },
+      data: { position: 0, createdAt: new Date(Date.UTC(2025, 0, 1) + index * 1000) },
+    });
+  }
+  assert.ok(authorization.startsWith("Bearer "), "board session did not send a token");
+  const doneRow = await app.prisma.task.findFirst({ where: { statusId: fixture.done.id } });
+  const ping = await app.inject({
+    method: "PATCH",
+    url: `/api/tasks/${doneRow.id}`,
+    remoteAddress: "127.0.0.51",
+    headers: { authorization, "content-type": "application/json" },
+    payload: JSON.stringify({ title: "Done 0." }),
+  });
+  assert.equal(ping.statusCode, 200, ping.body.slice(0, 200));
+  let tallSeen = null;
+  const movedView = await waitFor(async () => {
+    const state = await columnState(page, openId);
+    const card = state?.cards.find((item) => item.id === anchorCard.id) ?? null;
+    const delta = state ? state.scrollTop - parked.scrollTop : null;
+    tallSeen = { delta, top: card?.top ?? null, mounted: state?.mounted ?? null, scroll: state?.scrollTop ?? null };
+    if (!state || !card || card.top < -2 || card.top >= state.clientHeight) return null;
+    if (Math.abs(delta - measuredSum) > 48) return null;
+    return { delta, top: card.top, mounted: state.mounted, scroll: state.scrollTop };
+  }, "tall cards keep Card 0040", 20000).catch((error) => {
+    throw new Error(`${error.message} measuredSum=${measuredSum} seen=${JSON.stringify(tallSeen)}`);
+  });
+  report.tall = { measuredSum, ...movedView, scrollBefore: parked.scrollTop };
+  log("tall", JSON.stringify(report.tall));
+
   const firstIds = new Set(painted.cards.map((card) => card.id));
   const firstMax = Math.max(...painted.cards.map((card) => card.columnIndex));
 
@@ -475,7 +536,9 @@ async function main() {
   assert.ok(Math.abs(after.state.mainScrollTop - anchorMain) < 5, "page scroller anchored the card");
   assert.ok(after.state.mounted < 80, `insert mounted ${after.state.mounted} cards`);
   const finalBodies = bodyPages(taskReads);
-  assert.ok(finalBodies.length < 20, `body requests grew to ${finalBodies.length}`);
+  // The tall-card walk and the far window, plus the refetch of those pages, stay
+  // well under one request per page of the 2,000-card column.
+  assert.ok(finalBodies.length < 36, `body requests grew to ${finalBodies.length}`);
   assert.ok(!finalBodies.some((read) => read.status === 429), "a board read returned 429");
   log("ok", JSON.stringify({
     mounted: report.mounted,

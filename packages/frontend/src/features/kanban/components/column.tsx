@@ -62,6 +62,57 @@ function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
   if (Math.abs(moved) >= 1) node.scrollTop += moved;
 }
 
+function rememberSize(sizes: Map<string, number>, id: string | null | undefined, height: number) {
+  if (!id || !(height > 0)) return;
+  const prev = sizes.get(id) ?? 0;
+  // A later pass can read a card while it is collapsing. Keep the height it had on screen.
+  if (height > prev) sizes.set(id, height);
+}
+
+type MeasuredVirtualizer = {
+  itemSizeCache: Map<string | number, number>;
+  measurementsCache: Array<{ start: number; size: number; end: number; key: string | number }>;
+  pendingMeasuredCacheIndexes: number[];
+  getMeasurements: () => Array<{ start: number }>;
+};
+
+/** Index offsets from the tallest height measured for each card. */
+function measurementsFromSizes(
+  virtualizer: { measurementsCache: Array<{ start: number }> },
+  sizes: Map<string, number>,
+) {
+  const raw = virtualizer as unknown as MeasuredVirtualizer;
+  for (const [key, size] of raw.itemSizeCache) {
+    if (typeof key === "string") rememberSize(sizes, key, size);
+  }
+  let changed = false;
+  const cache = new Map(raw.itemSizeCache);
+  for (const [id, size] of sizes) {
+    if (cache.get(id) !== size) {
+      cache.set(id, size);
+      changed = true;
+    }
+  }
+  if (!changed) return raw.getMeasurements();
+  raw.itemSizeCache = cache;
+  // An index rebuild keeps the prefix below the first pending index, which is
+  // still the previous order after cards move. Drop it and measure every index.
+  raw.measurementsCache = [];
+  if (raw.pendingMeasuredCacheIndexes) raw.pendingMeasuredCacheIndexes.length = 0;
+  return raw.getMeasurements();
+}
+
+/** The offset cache already puts this card on the saved row. A transformed rect must not scroll it away. */
+function layoutAlreadyAt(
+  virtualizer: { measurementsCache: Array<{ start: number }> },
+  index: number,
+  scrollTop: number,
+  want: number,
+) {
+  const start = virtualizer.measurementsCache[index]?.start;
+  return start !== undefined && Math.abs(start - scrollTop - want) < 8;
+}
+
 export function Column({
   status,
   column,
@@ -96,6 +147,7 @@ export function Column({
     return [...keep].sort((a, b) => a - b);
   }, [pinKey]);
   const getItemKey = useCallback((index: number) => order[index] || `empty:${index}`, [order]);
+  const sizesRef = useRef(new Map<string, number>());
   const virtualizer = useVirtualizer({
     count,
     enabled: sized,
@@ -105,7 +157,18 @@ export function Column({
     overscan: BOARD_OVERSCAN,
     rangeExtractor,
     getItemKey,
+    measureElement: (element, entry) => {
+      const node = element as HTMLElement;
+      const block = entry?.borderBoxSize?.[0]?.blockSize;
+      const height = Math.max(node.offsetHeight, typeof block === "number" ? Math.round(block) : 0);
+      const id = node.querySelector("[data-task-id]")?.getAttribute("data-task-id");
+      rememberSize(sizesRef.current, id, height);
+      return id ? Math.max(height, sizesRef.current.get(id) ?? 0) : height;
+    },
   });
+  // The list below is positioned from these offsets. Apply them before paint,
+  // or a scroll correction lands on the previous order's spacers.
+  if (sized) measurementsFromSizes(virtualizer, sizesRef.current);
   // A card taller than the estimate already pushes the cards under it.
   // Adjusting the scroll here as well would move them twice.
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
@@ -174,13 +237,21 @@ export function Column({
   const seen = useRef<{ scrollTop: number; rows: SeenRow[]; order: readonly string[]; complete: boolean } | null>(null);
   // The card we just chose to keep, until a later measurement lands it there.
   const hold = useRef<{ key: string; top: number; scrollTop: number } | null>(null);
+  // True while this pass is the one moving scrollTop. The scroll event it
+  // fires must not be read as the reader dragging the column.
+  const correcting = useRef(false);
   const keepInView = useCallback(() => {
     const node = scroller;
     if (!node) return;
     if (pauseAnchor) {
       seen.current = null;
       hold.current = null;
+      correcting.current = false;
       return;
+    }
+    for (const wrap of node.querySelectorAll<HTMLElement>("[data-index]")) {
+      const id = wrap.querySelector("[data-task-id]")?.getAttribute("data-task-id");
+      rememberSize(sizesRef.current, id, Math.max(wrap.offsetHeight, Math.round(wrap.getBoundingClientRect().height)));
     }
     const current = orderRef.current;
     const last = seen.current;
@@ -197,58 +268,71 @@ export function Column({
       };
       const smallScroll = Math.abs(scrolled) < node.clientHeight / 2;
       let kept: { key: string; top: number; index: number } | undefined;
-      if (smallScroll && last.complete && complete && !sameIds(last.order, current)) {
-        kept = keptBoardCards(last.rows, last.order, indexOf)[0];
-      } else if (smallScroll && !sameIds(last.order, current)) {
-        const shifts = last.rows.flatMap((row) => {
-          const now = indexOf(row.key);
-          return now === undefined ? [] : [{ row, now, shift: now - row.index }];
-        });
-        if (shifts.length > 0 && shifts.every((item) => item.shift === shifts[0].shift)) {
-          const first = shifts[0];
-          kept = { key: first.row.key, top: first.row.top, index: first.now };
-        }
+      const heldNow = hold.current;
+      const heldIndex = heldNow ? indexOf(heldNow.key) : undefined;
+      const orderChanged = !sameIds(last.order, current);
+      const shifts = orderChanged ? last.rows.flatMap((row) => {
+        const now = indexOf(row.key);
+        return now === undefined ? [] : [{ row, now, shift: now - row.index }];
+      }) : [];
+      const unanimous = shifts.length > 0 && shifts.every((item) => item.shift === shifts[0].shift);
+      const missing = orderChanged && last.rows.some((row) => indexOf(row.key) === undefined);
+      // A refetch lands in more than one page. A page that drops a card which
+      // was on screen is not the order to follow; the next page brings it back.
+      if (smallScroll && missing && !(heldNow && heldIndex !== undefined)) return;
+      // Keep the card already chosen until that page, instead of whichever
+      // card the partial page still has mounted.
+      if (smallScroll && heldNow && heldIndex !== undefined && orderChanged) {
+        kept = { key: heldNow.key, top: heldNow.top, index: heldIndex };
+      } else if (smallScroll && unanimous) {
+        kept = (last.complete && complete ? keptBoardCards(last.rows, last.order, indexOf)[0] : undefined)
+          ?? { key: shifts[0].row.key, top: shifts[0].row.top, index: shifts[0].now };
+      } else if (smallScroll && orderChanged && shifts.length > 0) {
+        // Visible cards disagree, so this page is only part of the refetch.
+        // Keep the pre-change view until a later page moves them together.
+        return;
       } else if (smallScroll && sameIds(last.order, current)) {
         // Measuring a card removes the estimate gap under it. The order did
         // not change; put the card that was on screen back where it was.
         const still = last.rows.find((row) => indexOf(row.key) === row.index);
         const card = still ? findCard(node, still.key) : undefined;
-        if (still && card) placeCard(node, card, still.top - scrolled);
+        if (still && card && !layoutAlreadyAt(virtualizer, still.index, node.scrollTop, still.top - scrolled)) {
+          placeCard(node, card, still.top - scrolled);
+        }
       }
       if (kept) {
         const want = kept.top - scrolled;
         armed = true;
+        correcting.current = true;
         hold.current = { key: kept.key, top: want, scrollTop: node.scrollTop };
         const card = findCard(node, kept.key);
+        const item = measurementsFromSizes(virtualizer, sizesRef.current)[kept.index];
         if (card) {
           placeCard(node, card, want);
-        } else {
-          // Each card keeps the height it was measured at. A single mounted
-          // card's height would miss an anchor sitting under taller ones.
-          const item = virtualizer.measurementsCache[kept.index];
-          if (item) node.scrollTop = Math.max(0, item.start - want);
+        } else if (item) {
+          // The card is outside the mounted window. Its offset is the sum of
+          // the measured heights above it, including cards that are not mounted.
+          node.scrollTop = Math.max(0, item.start - want);
         }
-        hold.current.scrollTop = node.scrollTop;
+        if (hold.current) hold.current.scrollTop = node.scrollTop;
       }
     }
     if (hold.current && !armed) {
       const held = hold.current;
       const card = findCard(node, held.key);
-      if (card) {
+      const index = current.indexOf(held.key);
+      if (card && !layoutAlreadyAt(virtualizer, index, node.scrollTop, held.top)) {
         const top = card.getBoundingClientRect().top - node.getBoundingClientRect().top;
         const drift = node.scrollTop - held.scrollTop;
         // A scroll that carries the card with it is the reader, not a measurement.
-        if (Math.abs(drift) > 1 && Math.abs(top - (held.top - drift)) < 2) {
+        if (!correcting.current && Math.abs(drift) > 1 && Math.abs(top - (held.top - drift)) < 2) {
           hold.current = null;
         } else {
           placeCard(node, card, held.top);
-          const placed = card.getBoundingClientRect().top - node.getBoundingClientRect().top;
-          if (Math.abs(placed - held.top) < 1) hold.current = null;
-          else hold.current = { ...held, scrollTop: node.scrollTop };
+          hold.current = { ...held, scrollTop: node.scrollTop };
         }
-      } else {
-        const index = current.indexOf(held.key);
-        const item = index >= 0 ? virtualizer.measurementsCache[index] : undefined;
+      } else if (!card && index >= 0) {
+        const item = measurementsFromSizes(virtualizer, sizesRef.current)[index];
         if (item) {
           const next = Math.max(0, item.start - held.top);
           if (Math.abs(node.scrollTop - next) >= 1) {
@@ -279,6 +363,7 @@ export function Column({
       order: current,
       complete,
     };
+    correcting.current = false;
   }, [complete, pauseAnchor, scroller, virtualizer]);
   useLayoutEffect(keepInView);
   useLayoutEffect(() => {

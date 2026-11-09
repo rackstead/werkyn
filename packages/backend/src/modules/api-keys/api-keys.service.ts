@@ -56,24 +56,61 @@ export async function revokeApiKey(
   if (result.count === 0) throw new NotFoundError("API key not found");
 }
 
+// Accepted keys record last use at most once a minute. The stored time can
+// lag the latest use by that long. This is not an authorization cache: the
+// key is read on every call, and a missing, revoked, or expired key is
+// rejected here without refreshing lastUsedAt.
+export const API_KEY_LAST_USED_WRITE_INTERVAL_MS = 60_000;
+
 export async function verifyApiKey(prisma: PrismaClient, token: string) {
   if (!/^wk_[a-f0-9]{64}$/.test(token)) {
     throw new UnauthorizedError("Invalid or expired API key");
   }
   const record = await prisma.apiKey.findUnique({
     where: { tokenHash: hashToken(token) },
-    select: { id: true, userId: true, expiresAt: true, revokedAt: true },
+    select: {
+      id: true,
+      userId: true,
+      expiresAt: true,
+      revokedAt: true,
+      lastUsedAt: true,
+    },
   });
+  // Judge expiry after the lookup returns. A key that expires while the
+  // read is in flight is rejected, and lastUsedAt is not refreshed.
+  const now = new Date();
   if (
     !record ||
     record.revokedAt ||
-    (record.expiresAt && record.expiresAt <= new Date())
+    (record.expiresAt && record.expiresAt <= now)
   ) {
     throw new UnauthorizedError("Invalid or expired API key");
   }
-  await prisma.apiKey.update({
-    where: { id: record.id },
-    data: { lastUsedAt: new Date() },
-  });
-  return record;
+  if (lastUsedWriteIsDue(record.lastUsedAt, now)) {
+    const dueAt = new Date(now.getTime() - API_KEY_LAST_USED_WRITE_INTERVAL_MS);
+    // Re-check in SQL so overlapping requests still change the row at most
+    // once. A lost race, or a key revoked after this read, does not write.
+    // Acceptance still stands from the row just read.
+    await prisma.apiKey.updateMany({
+      where: {
+        id: record.id,
+        revokedAt: null,
+        OR: [{ lastUsedAt: null }, { lastUsedAt: { lte: dueAt } }],
+      },
+      data: { lastUsedAt: now },
+    });
+  }
+  return {
+    id: record.id,
+    userId: record.userId,
+    expiresAt: record.expiresAt,
+    revokedAt: record.revokedAt,
+  };
+}
+
+function lastUsedWriteIsDue(lastUsedAt: Date | null, now: Date): boolean {
+  return (
+    lastUsedAt === null ||
+    now.getTime() - lastUsedAt.getTime() >= API_KEY_LAST_USED_WRITE_INTERVAL_MS
+  );
 }

@@ -345,8 +345,12 @@ curl -H "Authorization: Bearer $WERKYN_API_KEY" \
 Keys have their owner's current permissions across all their workspaces; they
 are not separately scoped identities or service accounts. Existing workspace
 membership, role, and task ownership checks still apply. Expired or revoked keys
-are rejected on the next request. Keys are stored only as SHA-256 hashes and
-cannot be supplied in URL query parameters. Existing JWT login and refresh-cookie
+are rejected on the next request. Each request reads the key again; acceptance
+is not cached. Last use is written at most once a minute, so the stored time
+can be up to a minute behind the latest accepted request. A request that skips
+the write is still authenticated. Missing, revoked, and expired keys do not
+move the stored time. Keys are stored only as SHA-256 hashes and cannot be
+supplied in URL query parameters. Existing JWT login and refresh-cookie
 authentication continues to work. API keys currently support HTTP API access;
 WebSocket authentication continues to require a JWT.
 

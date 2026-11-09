@@ -373,6 +373,233 @@ test("deleting an owner cascades to their keys and invalidates access", async ()
   assert.equal(response.statusCode, 401, response.body);
 });
 
+test("lastUsedAt is written at most once a minute and never on rejection", async () => {
+  const { API_KEY_LAST_USED_WRITE_INTERVAL_MS } = await import(
+    "../src/modules/api-keys/api-keys.service.js"
+  );
+  assert.equal(API_KEY_LAST_USED_WRITE_INTERVAL_MS, 60_000);
+  const windowMs = API_KEY_LAST_USED_WRITE_INTERVAL_MS;
+  try {
+    await removeLastUsedWriteLog();
+    await app.prisma.$executeRawUnsafe(`
+      CREATE TABLE "ApiKeyLastUsedWriteLog" (
+        "id" BIGSERIAL PRIMARY KEY,
+        "keyId" TEXT NOT NULL,
+        "lastUsedAt" TIMESTAMP(3)
+      )
+    `);
+    await app.prisma.$executeRawUnsafe(`
+      CREATE FUNCTION log_api_key_last_used_write() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW."lastUsedAt" IS DISTINCT FROM OLD."lastUsedAt" THEN
+          INSERT INTO "ApiKeyLastUsedWriteLog" ("keyId", "lastUsedAt")
+          VALUES (NEW.id, NEW."lastUsedAt");
+        END IF;
+        RETURN NEW;
+      END
+      $$
+    `);
+    await app.prisma.$executeRawUnsafe(`
+      CREATE TRIGGER log_api_key_last_used_write
+      BEFORE UPDATE ON "ApiKey"
+      FOR EACH ROW
+      EXECUTE FUNCTION log_api_key_last_used_write()
+    `);
+    const created = await createKey({ name: "Throttle" });
+    const first = await useApiKey(created.key);
+    assert.equal(first.statusCode, 200, first.body);
+    assert.equal(first.json().data.id, owner.id);
+    const firstStored = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: created.id },
+    });
+    assert.equal(await lastUsedWriteCount(created.id), 1);
+    const burst = [];
+    for (let i = 0; i < 19; i += 1) burst.push(await useApiKey(created.key));
+    for (const response of burst) {
+      assert.equal(response.statusCode, 200, response.body);
+      assert.equal(response.json().data.id, owner.id);
+    }
+    const afterBurst = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: created.id },
+    });
+    assert.equal(await lastUsedWriteCount(created.id), 1);
+    assert.equal(
+      afterBurst.lastUsedAt?.toISOString(),
+      firstStored.lastUsedAt?.toISOString(),
+    );
+
+    const concurrent = await Promise.all(
+      Array.from({ length: 20 }, () => useApiKey(created.key)),
+    );
+    for (const response of concurrent) {
+      assert.equal(response.statusCode, 200, response.body);
+    }
+    const afterConcurrent = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: created.id },
+    });
+    assert.equal(await lastUsedWriteCount(created.id), 1);
+    assert.equal(
+      afterConcurrent.lastUsedAt?.toISOString(),
+      firstStored.lastUsedAt?.toISOString(),
+    );
+
+    const stale = new Date(Date.now() - windowMs - 1000);
+    await app.prisma.apiKey.update({
+      where: { id: created.id },
+      data: { lastUsedAt: stale },
+    });
+    await app.prisma.$executeRaw`
+      DELETE FROM "ApiKeyLastUsedWriteLog" WHERE "keyId" = ${created.id}
+    `;
+    const afterWindow = await Promise.all(
+      Array.from({ length: 20 }, () => useApiKey(created.key)),
+    );
+    for (const response of afterWindow) {
+      assert.equal(response.statusCode, 200, response.body);
+      assert.equal(response.json().data.id, owner.id);
+    }
+    const moved = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: created.id },
+    });
+    assert.equal(await lastUsedWriteCount(created.id), 1);
+    assert.ok(moved.lastUsedAt);
+    assert.ok(moved.lastUsedAt.getTime() > stale.getTime());
+    const stillInside = [];
+    for (let i = 0; i < 20; i += 1) {
+      stillInside.push(await useApiKey(created.key));
+    }
+    for (const response of stillInside) {
+      assert.equal(response.statusCode, 200, response.body);
+    }
+    const held = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: created.id },
+    });
+    assert.equal(await lastUsedWriteCount(created.id), 1);
+    assert.equal(held.lastUsedAt?.toISOString(), moved.lastUsedAt.toISOString());
+
+    const revoked = await createKey({ name: "Revoked throttle" });
+    const revokedStamp = new Date(Date.now() - 10 * windowMs);
+    await app.prisma.apiKey.update({
+      where: { id: revoked.id },
+      data: { lastUsedAt: revokedStamp },
+    });
+    const revoke = await request({
+      method: "DELETE",
+      url: `/api/api-keys/${revoked.id}`,
+      headers: bearer(ownerSession),
+    });
+    assert.equal(revoke.statusCode, 204, revoke.body);
+    const revokedWrites = await lastUsedWriteCount(revoked.id);
+    const rejected = await useApiKey(revoked.key);
+    assert.equal(rejected.statusCode, 401, rejected.body);
+    const revokedStored = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: revoked.id },
+    });
+    assert.equal(revokedStored.lastUsedAt?.getTime(), revokedStamp.getTime());
+    assert.equal(await lastUsedWriteCount(revoked.id), revokedWrites);
+
+    const expired = await createKey({ name: "Expired throttle" });
+    const expiredStamp = new Date(Date.now() - 10 * windowMs);
+    await app.prisma.apiKey.update({
+      where: { id: expired.id },
+      data: {
+        lastUsedAt: expiredStamp,
+        expiresAt: new Date(Date.now() - 1000),
+      },
+    });
+    const expiredWrites = await lastUsedWriteCount(expired.id);
+    const expiredResponse = await useApiKey(expired.key);
+    assert.equal(expiredResponse.statusCode, 401, expiredResponse.body);
+    const expiredStored = await app.prisma.apiKey.findUniqueOrThrow({
+      where: { id: expired.id },
+    });
+    assert.equal(expiredStored.lastUsedAt?.getTime(), expiredStamp.getTime());
+    assert.equal(await lastUsedWriteCount(expired.id), expiredWrites);
+
+    const writesBeforeUnknown = await lastUsedWriteTotal();
+    const unknown = await useApiKey(`wk_${"0".repeat(64)}`);
+    assert.equal(unknown.statusCode, 401, unknown.body);
+    const malformed = await useApiKey("wk_not-a-key");
+    assert.equal(malformed.statusCode, 401, malformed.body);
+    assert.equal(await lastUsedWriteTotal(), writesBeforeUnknown);
+  } finally {
+    await removeLastUsedWriteLog();
+  }
+});
+
+test("a key that expires while its lookup is in flight is rejected", async () => {
+  const { verifyApiKey } = await import(
+    "../src/modules/api-keys/api-keys.service.js"
+  );
+  const token = `wk_${"ab".repeat(32)}`;
+  const expiresAt = new Date(Date.now() + 100);
+  let writes = 0;
+  const prisma = {
+    apiKey: {
+      async findUnique() {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return {
+          id: "expired-in-flight",
+          userId: owner.id,
+          expiresAt,
+          revokedAt: null,
+          lastUsedAt: null,
+        };
+      },
+      async updateMany() {
+        writes += 1;
+        return { count: 1 };
+      },
+    },
+  };
+  await assert.rejects(
+    () => verifyApiKey(prisma as never, token),
+    (error: unknown) => {
+      assert.equal((error as { statusCode?: number }).statusCode, 401);
+      assert.match(String((error as Error).message), /Invalid or expired API key/);
+      return true;
+    },
+  );
+  assert.equal(writes, 0);
+});
+
+async function removeLastUsedWriteLog() {
+  await app.prisma.$executeRawUnsafe(
+    `DROP TRIGGER IF EXISTS log_api_key_last_used_write ON "ApiKey"`,
+  );
+  await app.prisma.$executeRawUnsafe(
+    `DROP FUNCTION IF EXISTS log_api_key_last_used_write()`,
+  );
+  await app.prisma.$executeRawUnsafe(
+    `DROP TABLE IF EXISTS "ApiKeyLastUsedWriteLog"`,
+  );
+}
+
+async function useApiKey(token: string) {
+  return request({
+    method: "GET",
+    url: "/api/users/me",
+    headers: bearer(token),
+  });
+}
+
+async function lastUsedWriteCount(keyId: string) {
+  const rows = await app.prisma.$queryRaw<Array<{ count: bigint }>>`
+    SELECT COUNT(*)::bigint AS count
+    FROM "ApiKeyLastUsedWriteLog"
+    WHERE "keyId" = ${keyId}
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+async function lastUsedWriteTotal() {
+  const rows = await app.prisma.$queryRaw<Array<{ count: bigint }>>`
+    SELECT COUNT(*)::bigint AS count FROM "ApiKeyLastUsedWriteLog"
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
 test("browser login and refresh cookies continue to work", async () => {
   const login = await request({
     method: "POST",

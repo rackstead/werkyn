@@ -80,6 +80,8 @@ model ApiKey {
   tokenHash  String    @unique
   createdAt  DateTime  @default(now())
   expiresAt  DateTime?
+  // Written at most once a minute. It can lag the latest accepted use by
+  // that long.
   lastUsedAt DateTime?
   revokedAt  DateTime?
 

@@ -64,9 +64,8 @@ function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
 
 function rememberSize(sizes: Map<string, number>, id: string | null | undefined, height: number) {
   if (!id || !(height > 0)) return;
-  const prev = sizes.get(id) ?? 0;
-  // A later pass can read a card while it is collapsing. Keep the height it had on screen.
-  if (height > prev) sizes.set(id, height);
+  // The card on screen is this tall now, including after a title or label is removed.
+  sizes.set(id, height);
 }
 
 type MeasuredVirtualizer = {
@@ -76,15 +75,12 @@ type MeasuredVirtualizer = {
   getMeasurements: () => Array<{ start: number }>;
 };
 
-/** Index offsets from the tallest height measured for each card. */
+/** Index offsets from the height last measured for each card. */
 function measurementsFromSizes(
   virtualizer: { measurementsCache: Array<{ start: number }> },
   sizes: Map<string, number>,
 ) {
   const raw = virtualizer as unknown as MeasuredVirtualizer;
-  for (const [key, size] of raw.itemSizeCache) {
-    if (typeof key === "string") rememberSize(sizes, key, size);
-  }
   let changed = false;
   const cache = new Map(raw.itemSizeCache);
   for (const [id, size] of sizes) {
@@ -163,7 +159,7 @@ export function Column({
       const height = Math.max(node.offsetHeight, typeof block === "number" ? Math.round(block) : 0);
       const id = node.querySelector("[data-task-id]")?.getAttribute("data-task-id");
       rememberSize(sizesRef.current, id, height);
-      return id ? Math.max(height, sizesRef.current.get(id) ?? 0) : height;
+      return height;
     },
   });
   // The list below is positioned from these offsets. Apply them before paint,
@@ -277,19 +273,20 @@ export function Column({
       }) : [];
       const unanimous = shifts.length > 0 && shifts.every((item) => item.shift === shifts[0].shift);
       const missing = orderChanged && last.rows.some((row) => indexOf(row.key) === undefined);
-      // A refetch lands in more than one page. A page that drops a card which
-      // was on screen is not the order to follow; the next page brings it back.
-      if (smallScroll && missing && !(heldNow && heldIndex !== undefined)) return;
-      // Keep the card already chosen until that page, instead of whichever
-      // card the partial page still has mounted.
+      // An id page can omit a card that is still in the column. A finished
+      // order that lacks the id has deleted it or moved it to another column.
+      if (smallScroll && missing && !complete && !(heldNow && heldIndex !== undefined)) return;
+      // Keep the card already chosen until the rest of an incomplete refetch
+      // arrives, instead of whichever card this page still has mounted.
       if (smallScroll && heldNow && heldIndex !== undefined && orderChanged) {
         kept = { key: heldNow.key, top: heldNow.top, index: heldIndex };
       } else if (smallScroll && unanimous) {
         kept = (last.complete && complete ? keptBoardCards(last.rows, last.order, indexOf)[0] : undefined)
           ?? { key: shifts[0].row.key, top: shifts[0].row.top, index: shifts[0].now };
+      } else if (smallScroll && orderChanged && last.complete && complete) {
+        kept = keptBoardCards(last.rows, last.order, indexOf)[0];
       } else if (smallScroll && orderChanged && shifts.length > 0) {
-        // Visible cards disagree, so this page is only part of the refetch.
-        // Keep the pre-change view until a later page moves them together.
+        // Visible cards disagree, and the id list is still loading.
         return;
       } else if (smallScroll && sameIds(last.order, current)) {
         // Measuring a card removes the estimate gap under it. The order did
@@ -332,12 +329,18 @@ export function Column({
           hold.current = { ...held, scrollTop: node.scrollTop };
         }
       } else if (!card && index >= 0) {
-        const item = measurementsFromSizes(virtualizer, sizesRef.current)[index];
-        if (item) {
-          const next = Math.max(0, item.start - held.top);
-          if (Math.abs(node.scrollTop - next) >= 1) {
-            node.scrollTop = next;
-            hold.current = { ...held, scrollTop: node.scrollTop };
+        const drift = node.scrollTop - held.scrollTop;
+        // Page Down or the scrollbar left this card on purpose.
+        if (!correcting.current && Math.abs(drift) >= node.clientHeight / 2) {
+          hold.current = null;
+        } else {
+          const item = measurementsFromSizes(virtualizer, sizesRef.current)[index];
+          if (item) {
+            const next = Math.max(0, item.start - held.top);
+            if (Math.abs(node.scrollTop - next) >= 1) {
+              node.scrollTop = next;
+              hold.current = { ...held, scrollTop: node.scrollTop };
+            }
           }
         }
       }

@@ -48,9 +48,12 @@ receive every matching task.
   to a different task. A card that is not mounted is placed from the
   measured height of each card above it, not from one mounted card's
   height times how many indexes it moved. The height kept for a card is
-  the tallest one measured while it was on screen. A refetch page that
-  drops a card which was on screen is not followed; the card already
-  chosen stays chosen until the following page brings it back.
+  the one last measured while it was on screen, so a shorter title replaces
+  the old offset. An id page that drops a card which is still in the column
+  is not followed. A finished order that no longer has the card, and a
+  finished reorder whose visible cards shifted by different amounts, both
+  correct the view. A scroll of more than half the column is the reader
+  leaving that card.
   The choice uses `stayedEntries`
   (`lib/stayed-entries.ts`), over the column's id order, the same helper
   the List and Drive use. While that id list is still loading, only a

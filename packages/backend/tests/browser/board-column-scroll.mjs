@@ -1,7 +1,7 @@
 // Chromium regression for the board column scrollport
 // (docs/remediation/board-windowing.md). A stubbed offsetHeight does not
 // count: this opens the production build. Run from packages/backend against
-// a migrated loopback database whose name is werkyn_audit_boardfix4_r15:
+// a migrated loopback database whose name is werkyn_audit_boardfix5_r15:
 //
 //   TEST_DATABASE_URL=... PLAYWRIGHT_MODULE=... CHROMIUM_EXECUTABLE=... \
 //     node --import tsx tests/browser/board-column-scroll.mjs
@@ -17,7 +17,7 @@ import { pathToFileURL } from "node:url";
 const OPEN_N = 2000;
 const database = new URL(process.env.TEST_DATABASE_URL ?? "invalid:");
 assert.equal(database.hostname, "127.0.0.1");
-assert.equal(database.pathname, "/werkyn_audit_boardfix4_r15");
+assert.equal(database.pathname, "/werkyn_audit_boardfix5_r15");
 Object.assign(process.env, {
   DATABASE_URL: database.toString(),
   NODE_ENV: "test",
@@ -211,7 +211,7 @@ async function main() {
   app = await buildApp();
   await app.listen({ host: "127.0.0.1", port: 0 });
   const identity = await app.prisma.$queryRaw`SELECT current_database() AS name`;
-  assert.equal(identity[0].name, "werkyn_audit_boardfix4_r15");
+  assert.equal(identity[0].name, "werkyn_audit_boardfix5_r15");
   const fixture = await createFixture(app.prisma);
   vite = await preview({
     root: frontend,

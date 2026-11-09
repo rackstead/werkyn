@@ -331,6 +331,136 @@ describe("board window", () => {
     expect(top).toBeLessThan(VIEW);
   });
 
+  it("uses a card's new height after it gets shorter", async () => {
+    tallIds.add("open-0");
+    render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    expect(openScroller().querySelector("[data-task-id='open-0']")).toBeTruthy();
+    tallIds.delete("open-0");
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 8 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const first = openScroller().querySelector<HTMLElement>("[data-index]")!;
+    const gapEl = first.parentElement?.firstElementChild;
+    const gap = gapEl && gapEl !== first ? parseFloat((gapEl as HTMLElement).style.height) : 0;
+    const index = Number(first.dataset.index);
+    expect(index).toBeGreaterThan(0);
+    expect(gap).toBeLessThan(index * CARD + (TALL - CARD) / 2);
+  });
+
+  it("anchors the column after a visible card is deleted", async () => {
+    const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 30 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const before = openScroller().scrollTop;
+    const current = fixture.columns.get("open")!;
+    const without = current.order.filter((id) => id !== "open-30");
+    const removed = new Map(fixture.columns);
+    const tasks = new Map(current.tasks);
+    tasks.delete("open-30");
+    const columnIndex = new Map<string, number>();
+    without.forEach((id, index) => columnIndex.set(id, index));
+    removed.set("open", { ...current, order: without, tasks, columnIndex, total: without.length, size: without.length, complete: true });
+    fixture.columns = removed;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    const added = ["gone-0", "gone-1", ...without];
+    const inserted = new Map(fixture.columns);
+    const nextTasks = new Map(tasks);
+    const nextIndex = new Map<string, number>();
+    added.forEach((id, index) => {
+      nextIndex.set(id, index);
+      if (!nextTasks.has(id)) nextTasks.set(id, task(id, "open", index));
+    });
+    inserted.set("open", { ...current, order: added, tasks: nextTasks, columnIndex: nextIndex, total: added.length, size: added.length, complete: true });
+    fixture.columns = inserted;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    expect(openScroller().scrollTop).toBeGreaterThanOrEqual(before + CARD);
+  });
+
+  it("keeps a stable card when a finished reorder shifts its neighbours differently", async () => {
+    const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 40 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const before = openScroller().querySelector<HTMLElement>("[data-task-id='open-40']")!;
+    const topBefore = before.getBoundingClientRect().top;
+    const current = fixture.columns.get("open")!;
+    const order = [...current.order];
+    const [moved] = order.splice(43, 1);
+    order.splice(40, 0, moved!);
+    const tasks = new Map(current.tasks);
+    const columnIndex = new Map<string, number>();
+    order.forEach((id, index) => {
+      columnIndex.set(id, index);
+      tasks.set(id, { ...tasks.get(id)!, columnIndex: index, position: index });
+    });
+    const next = new Map(fixture.columns);
+    next.set("open", { ...current, order, tasks, columnIndex, total: order.length, size: order.length, complete: true });
+    fixture.columns = next;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const after = openScroller().querySelector<HTMLElement>("[data-task-id='open-40']");
+    expect(after).toBeTruthy();
+    expect(Math.abs(after!.getBoundingClientRect().top - topBefore)).toBeLessThan(CARD / 2);
+  });
+
+  it("leaves a far scroll where the reader put it", async () => {
+    const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 40 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const current = fixture.columns.get("open")!;
+    const added = ["jump-0", "jump-1", "jump-2", ...current.order];
+    const tasks = new Map(current.tasks);
+    const columnIndex = new Map<string, number>();
+    added.forEach((id, index) => {
+      columnIndex.set(id, index);
+      const existing = tasks.get(id);
+      tasks.set(id, existing ? { ...existing, columnIndex: index, position: index } : task(id, "open", index));
+    });
+    const next = new Map(fixture.columns);
+    next.set("open", { ...current, order: added, tasks, columnIndex, total: added.length, size: added.length, complete: true });
+    fixture.columns = next;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 120 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    expect(openScroller().scrollTop).toBeGreaterThan(100 * CARD);
+  });
+
   it("still opens the quick-add editor", async () => {
     render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
     await settle();

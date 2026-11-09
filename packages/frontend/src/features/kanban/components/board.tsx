@@ -221,7 +221,7 @@ export function Board({
       onDragEnd={handleDragEnd}
       onDragCancel={handleDragCancel}
     >
-      <div className="flex gap-4 overflow-x-auto p-4 h-full">
+      <div className="flex min-h-0 flex-1 gap-4 overflow-x-auto overflow-y-hidden p-4">
         {statuses.map((status) => {
           const column = board.columns.get(status.id);
           const order = localOrders?.get(status.id) ?? column?.order ?? [];

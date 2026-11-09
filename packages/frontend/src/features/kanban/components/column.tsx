@@ -50,6 +50,28 @@ function sameIds(a: readonly string[], b: readonly string[]) {
   return true;
 }
 
+function findCard(node: HTMLElement, key: string) {
+  for (const candidate of node.querySelectorAll<HTMLElement>("[data-task-id]")) {
+    if (candidate.dataset.taskId === key) return candidate;
+  }
+  return undefined;
+}
+
+function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
+  const moved = card.getBoundingClientRect().top - node.getBoundingClientRect().top - want;
+  if (Math.abs(moved) >= 1) node.scrollTop += moved;
+}
+
+/** Distance from one seen card to the next, so an unmounted card can be followed. */
+function rowStride(rows: readonly SeenRow[]) {
+  for (let index = 1; index < rows.length; index++) {
+    const gap = rows[index].index - rows[index - 1].index;
+    const delta = rows[index].top - rows[index - 1].top;
+    if (gap > 0 && delta > 0) return delta / gap;
+  }
+  return BOARD_CARD_ESTIMATE;
+}
+
 export function Column({
   status,
   column,
@@ -192,22 +214,21 @@ export function Column({
           const first = shifts[0];
           kept = { key: first.row.key, top: first.row.top, index: first.now };
         }
+      } else if (smallScroll && sameIds(last.order, current)) {
+        // Measuring a card removes the estimate gap under it. The order did
+        // not change; put the card that was on screen back where it was.
+        const still = last.rows.find((row) => indexOf(row.key) === row.index);
+        const card = still ? findCard(node, still.key) : undefined;
+        if (still && card) placeCard(node, card, still.top - scrolled);
       }
       if (kept) {
-        let card: HTMLElement | undefined;
-        for (const candidate of node.querySelectorAll<HTMLElement>("[data-task-id]")) {
-          if (candidate.dataset.taskId === kept.key) {
-            card = candidate;
-            break;
-          }
-        }
+        const card = findCard(node, kept.key);
         if (card) {
-          const want = kept.top - scrolled;
-          const moved = card.getBoundingClientRect().top - node.getBoundingClientRect().top - want;
-          if (Math.abs(moved) >= 1) node.scrollTop += moved;
+          placeCard(node, card, kept.top - scrolled);
         } else {
-          const item = virtualizer.measurementsCache[kept.index];
-          if (item) node.scrollTop = Math.max(0, item.start - (kept.top - scrolled));
+          const previous = last.rows.find((row) => row.key === kept.key);
+          const shift = previous ? kept.index - previous.index : 0;
+          if (shift !== 0) node.scrollTop += shift * rowStride(last.rows);
         }
       }
     }
@@ -232,7 +253,7 @@ export function Column({
       order: current,
       complete,
     };
-  }, [complete, pauseAnchor, scroller, virtualizer]);
+  }, [complete, pauseAnchor, scroller]);
   useLayoutEffect(keepInView);
   useLayoutEffect(() => {
     if (!scroller || typeof ResizeObserver !== "function") return;
@@ -267,8 +288,9 @@ export function Column({
   });
   const tasks = column?.tasks;
 
+  // Height-capped so the column's own scroller is the one that moves.
   return (
-    <div className="flex w-72 flex-shrink-0 flex-col">
+    <div className="flex h-full max-h-[calc(100dvh-9rem)] min-h-0 w-72 flex-shrink-0 flex-col overflow-hidden">
       <div className="flex items-center gap-2 px-2 pb-3">
         <div
           className="h-3 w-3 rounded-full shrink-0"
@@ -282,7 +304,7 @@ export function Column({
       <div
         ref={setRef}
         data-scroller={status.id}
-        className="flex flex-1 flex-col overflow-y-auto rounded-lg p-1 min-h-[120px]"
+        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg p-1"
       >
         <SortableContext items={ids} strategy={verticalListSortingStrategy}>
           {rendered.map(({ index, gapBefore }) => {

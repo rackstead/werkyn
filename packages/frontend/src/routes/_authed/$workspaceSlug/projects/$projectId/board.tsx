@@ -74,7 +74,7 @@ function BoardRoute() {
   };
 
   return (
-    <>
+    <div className="flex h-full min-h-0 flex-col">
       <FilterBar
         projectId={projectId}
         filters={filters}
@@ -95,6 +95,6 @@ function BoardRoute() {
           onClose={closeTask}
         />
       )}
-    </>
+    </div>
   );
 }

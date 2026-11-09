@@ -23,11 +23,15 @@ receive every matching task.
   background so a column of thousands can be anchored without shipping
   every card. A card body is fetched when its display slot is near the
   view.
-- **Mounted cards.** Each column mounts the cards in view, 4 above and 4
-  below (`BOARD_OVERSCAN`), plus the dragged card and the cards next to it
-  so keyboard drag still has a drop target. Scrolling the column mounts the
-  cards that were not. The column count is the filtered total, not the
-  number mounted.
+- **Mounted cards.** Each column is its own scroll container. Its height
+  is the board region under the filter bar (and never the height of every
+  card), so the page `<main>` does not scroll the cards. The column mounts
+  the cards in that viewport, 4 above and 4 below (`BOARD_OVERSCAN`), plus
+  the dragged card and the cards next to it so keyboard drag still has a
+  drop target. Scrolling the column, not the page, mounts the cards that
+  were not and unmounts the ones that left. The column count is the
+  filtered total, not the number mounted. A task body is requested for the
+  mounted window; id pages may load for the rest of the column.
 - **Move index.** `PATCH /tasks/:id/move` is unchanged: `position` is a
   0-based index into the whole active column, after the dragged task is
   removed. A drop on a card sends that card's `columnIndex` (its place in
@@ -90,3 +94,8 @@ same shape: 40 bodies up front, not 10,789.
   bottom can land a card or two off until those cards are measured.
 - `view=board` without `perColumn` is still the whole project. The List,
   Calendar and dependency picker use that read on purpose.
+
+`packages/backend/tests/browser/board-column-scroll.mjs` loads a column of
+2,000 cards in Chromium. It fails when that column's scroller is as tall as
+its cards, when the first paint asks for every task body, or when a drop
+past the first window does not store the absolute column index.

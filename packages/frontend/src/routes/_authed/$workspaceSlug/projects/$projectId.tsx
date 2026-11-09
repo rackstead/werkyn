@@ -53,8 +53,18 @@ function ProjectLayout() {
     );
   }
 
+  // The board's columns are the scroll containers. The page <main> stays the
+  // scroller for the list and the calendar, which grow with their content.
+  const boardLocked = pathEnd === "board";
+
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div
+      className={
+        boardLocked
+          ? "flex h-[calc(100dvh-3rem)] min-h-0 flex-col overflow-hidden"
+          : "flex flex-1 flex-col overflow-hidden"
+      }
+    >
       <div className="flex items-center justify-between border-b px-6 py-3">
         <div className="flex items-center gap-3">
           <div
@@ -108,7 +118,13 @@ function ProjectLayout() {
           )}
         </div>
       </div>
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div
+        className={
+          boardLocked
+            ? "flex min-h-0 flex-1 flex-col overflow-hidden"
+            : "flex flex-1 flex-col overflow-hidden"
+        }
+      >
         <Outlet />
       </div>
 

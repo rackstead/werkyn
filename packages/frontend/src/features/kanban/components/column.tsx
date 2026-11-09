@@ -62,13 +62,6 @@ function placeCard(node: HTMLElement, card: HTMLElement, want: number) {
   if (Math.abs(moved) >= 1) node.scrollTop += moved;
 }
 
-/** Height of one rendered card, excluding the spacer above an unmeasured range. */
-function measuredStride(node: HTMLElement) {
-  const card = node.querySelector<HTMLElement>("[data-column-index]");
-  const height = card?.getBoundingClientRect().height ?? 0;
-  return height > 0 ? height : BOARD_CARD_ESTIMATE;
-}
-
 export function Column({
   status,
   column,
@@ -230,9 +223,10 @@ export function Column({
         if (card) {
           placeCard(node, card, want);
         } else {
-          const previous = last.rows.find((row) => row.key === kept.key);
-          const shift = previous ? kept.index - previous.index : 0;
-          if (shift !== 0) node.scrollTop += shift * measuredStride(node);
+          // Each card keeps the height it was measured at. A single mounted
+          // card's height would miss an anchor sitting under taller ones.
+          const item = virtualizer.measurementsCache[kept.index];
+          if (item) node.scrollTop = Math.max(0, item.start - want);
         }
         hold.current.scrollTop = node.scrollTop;
       }
@@ -251,6 +245,16 @@ export function Column({
           const placed = card.getBoundingClientRect().top - node.getBoundingClientRect().top;
           if (Math.abs(placed - held.top) < 1) hold.current = null;
           else hold.current = { ...held, scrollTop: node.scrollTop };
+        }
+      } else {
+        const index = current.indexOf(held.key);
+        const item = index >= 0 ? virtualizer.measurementsCache[index] : undefined;
+        if (item) {
+          const next = Math.max(0, item.start - held.top);
+          if (Math.abs(node.scrollTop - next) >= 1) {
+            node.scrollTop = next;
+            hold.current = { ...held, scrollTop: node.scrollTop };
+          }
         }
       }
     }
@@ -275,7 +279,7 @@ export function Column({
       order: current,
       complete,
     };
-  }, [complete, pauseAnchor, scroller]);
+  }, [complete, pauseAnchor, scroller, virtualizer]);
   useLayoutEffect(keepInView);
   useLayoutEffect(() => {
     if (!scroller || typeof ResizeObserver !== "function") return;

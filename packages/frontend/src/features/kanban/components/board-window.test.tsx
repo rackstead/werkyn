@@ -9,7 +9,9 @@ import { Board } from "./board";
 
 const VIEW = 400;
 const CARD = 92;
+const TALL = 240;
 const OPEN = 200;
+const tallIds = new Set<string>();
 
 const fixture = vi.hoisted(() => ({
   move: vi.fn(),
@@ -93,6 +95,17 @@ function columnOf(statusId: string, count: number): AssembledColumn {
   };
 }
 
+function heightFor(id: string | undefined) {
+  return id && tallIds.has(id) ? TALL : CARD;
+}
+
+function startFor(index: number) {
+  const order = fixture.columns.get("open")?.order ?? [];
+  let start = 0;
+  for (let i = 0; i < index && i < order.length; i++) start += heightFor(order[i]);
+  return start;
+}
+
 function box(top: number, height: number) {
   return {
     x: 0, y: top, top, left: 0, right: 288, bottom: top + height, width: 288, height, toJSON() { return {}; },
@@ -113,6 +126,7 @@ beforeEach(() => {
   fixture.ensureRange.mockReset();
   fixture.isLoading = false;
   fixture.dataUpdatedAt = 1;
+  tallIds.clear();
   fixture.columns = new Map([
     ["open", columnOf("open", OPEN)],
     ["done", columnOf("done", 2)],
@@ -124,7 +138,10 @@ beforeEach(() => {
   });
   const height = function (this: HTMLElement) {
     if (this.dataset.scroller) return this.dataset.scroller === "open" ? VIEW : 300;
-    if (this.dataset.index !== undefined) return CARD;
+    if (this.dataset.index !== undefined) {
+      const order = fixture.columns.get("open")?.order;
+      return heightFor(order?.[Number(this.dataset.index)]);
+    }
     return 0;
   };
   vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(height);
@@ -136,8 +153,10 @@ beforeEach(() => {
     if (this.dataset.scroller) return box(0, this.dataset.scroller === "open" ? VIEW : 300);
     if (this.dataset.index !== undefined) {
       const scroller = this.closest<HTMLElement>("[data-scroller]");
-      const top = Number(this.dataset.index) * CARD - (scroller?.scrollTop ?? 0);
-      return box(top, CARD);
+      const index = Number(this.dataset.index);
+      const order = fixture.columns.get("open")?.order;
+      const top = startFor(index) - (scroller?.scrollTop ?? 0);
+      return box(top, heightFor(order?.[index]));
     }
     if (this.dataset.taskId) {
       const indexed = this.closest<HTMLElement>("[data-index]");
@@ -251,6 +270,57 @@ describe("board window", () => {
     })).find((card) => card.top >= 0 && card.top < CARD);
     expect(topAfter?.id).toBe(topBefore?.id);
     expect(topAfter?.id).toBe("open-40");
+  });
+
+  it("keeps an unmounted anchor when taller cards move above it", async () => {
+    const moved = Array.from({ length: 12 }, (_, index) => `open-${120 + index}`);
+    for (const id of moved) tallIds.add(id);
+    const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 120 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    expect(openScroller().querySelector("[data-task-id='open-120']")).toBeTruthy();
+
+    await act(async () => {
+      openScroller().scrollTop = 40 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const before = openScroller().scrollTop;
+    expect(openScroller().querySelector("[data-task-id='open-40']")).toBeTruthy();
+    expect(openScroller().querySelector("[data-task-id='open-120']")).toBeNull();
+
+    const current = fixture.columns.get("open")!;
+    const order = [...moved, ...current.order.filter((id) => !moved.includes(id))];
+    const tasks = new Map(current.tasks);
+    const columnIndex = new Map<string, number>();
+    for (const [index, id] of order.entries()) {
+      columnIndex.set(id, index);
+      const existing = tasks.get(id)!;
+      tasks.set(id, { ...existing, columnIndex: index, position: index });
+    }
+    const next = new Map(fixture.columns);
+    next.set("open", { ...current, order, tasks, columnIndex, total: order.length, size: order.length, complete: true });
+    fixture.columns = next;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    // jsdom does not emit scroll when the column corrects itself. The browser does.
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+
+    const delta = openScroller().scrollTop - before;
+    // One mounted card's height per index stops 12 * (240 - 92) px short, more than the viewport.
+    expect(delta).toBeGreaterThan(moved.length * CARD + VIEW);
+    const anchor = openScroller().querySelector<HTMLElement>("[data-task-id='open-40']");
+    expect(anchor).toBeTruthy();
+    const top = anchor!.getBoundingClientRect().top - openScroller().getBoundingClientRect().top;
+    expect(top).toBeGreaterThanOrEqual(-1);
+    expect(top).toBeLessThan(VIEW);
   });
 
   it("still opens the quick-add editor", async () => {

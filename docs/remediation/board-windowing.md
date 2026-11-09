@@ -45,7 +45,9 @@ receive every matching task.
   the cards the filter shows.
 - **Cards stay put.** When tasks are inserted, deleted or moved above the
   view, the column scrolls so a card that stayed on screen does not jump
-  to a different task. The choice uses `stayedEntries`
+  to a different task. A card that is not mounted is placed from the
+  measured height of each card above it, not from one mounted card's
+  height times how many indexes it moved. The choice uses `stayedEntries`
   (`lib/stayed-entries.ts`), over the column's id order, the same helper
   the List and Drive use. While that id list is still loading, only a
   uniform shift (every visible card moved by the same number of places) is

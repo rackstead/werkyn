@@ -75,12 +75,19 @@ describe("Werkyn logo", () => {
     const [x, y, width, height] = (viewBox?.[1] ?? "").split(/\s+/).map(Number);
     const right = x + width;
     const bottom = y + height;
-    const translateX = 43;
+    const placed = svg.match(
+      /<g transform="translate\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)">\s*<path fill="#212121"/,
+    );
+    expect(placed).not.toBeNull();
+    const translateX = Number(placed?.[1]);
+    const translateY = Number(placed?.[2]);
+    expect(Number.isFinite(translateX)).toBe(true);
+    expect(Number.isFinite(translateY)).toBe(true);
     for (const box of boxes) {
       expect(box.minX + translateX).toBeGreaterThanOrEqual(x);
       expect(box.maxX + translateX).toBeLessThanOrEqual(right);
-      expect(box.minY).toBeGreaterThanOrEqual(y);
-      expect(box.maxY).toBeLessThanOrEqual(bottom + 0.01);
+      expect(box.minY + translateY).toBeGreaterThanOrEqual(y);
+      expect(box.maxY + translateY).toBeLessThanOrEqual(bottom + 0.01);
     }
     const yLetter = boxes[5];
     const n = boxes[6];

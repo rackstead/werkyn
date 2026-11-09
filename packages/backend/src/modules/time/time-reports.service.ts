@@ -1,4 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+
+type ReportDb = PrismaClient | Prisma.TransactionClient;
 import {
   REPORT_ENTRY_TOTAL_LIMIT,
   type TimeReportEntriesQuery,
@@ -227,7 +229,7 @@ const ENTRY_ROW = {
  * end date only bounds which entries are included, never which rate applies.
  */
 async function entryPricing(
-  prisma: PrismaClient,
+  prisma: ReportDb,
   workspaceId: string,
   entries: readonly EntryRow[],
 ) {
@@ -305,7 +307,7 @@ const NAME_BATCH = 10_000;
  * these rows only, instead of joining every entry of the report.
  */
 async function entryNames(
-  prisma: PrismaClient,
+  prisma: ReportDb,
   entries: readonly EntryRow[],
   labels: { userIds?: string[]; projectIds?: string[] } = {},
 ): Promise<EntryNames> {
@@ -365,7 +367,8 @@ async function buildAggregatedReport(
   query: ReportFilters,
   entryLimit: number,
 ) {
-  const totals = await queryReportAggregate(prisma, workspaceId, userId, query);
+  return prisma.$transaction(async (tx) => {
+  const totals = await queryReportAggregate(tx, workspaceId, userId, query);
   const summaryRow = totals.find((row) => row.kind === 1);
   if (!summaryRow) throw new Error("Report summary total was not returned");
   const groupRows = totals.filter((row) => row.kind === 0 && row.groupKey !== null);
@@ -377,8 +380,8 @@ async function buildAggregatedReport(
     budget -= take;
     if (take > 0) limits.push({ key: group.groupKey!, take });
   }
-  const page = await queryReportPage(prisma, workspaceId, userId, query, limits);
-  const skippedEntries = await prisma.timeEntry.count({
+  const page = await queryReportPage(tx, workspaceId, userId, query, limits);
+  const skippedEntries = await tx.timeEntry.count({
     where: { ...reportWhere(workspaceId, userId, query), NOT: { hours: userRatesService.FINITE_FLOAT } },
   });
   const shown = new Map<string, EntryRow[]>();
@@ -398,8 +401,8 @@ async function buildAggregatedReport(
   }
   const listed = [...shown.values()].flat();
   const [price, names] = await Promise.all([
-    entryPricing(prisma, workspaceId, listed),
-    entryNames(prisma, listed, {
+    entryPricing(tx, workspaceId, listed),
+    entryNames(tx, listed, {
       userIds: query.groupBy === "user" ? groupRows.map((group) => group.groupKey!) : [],
       projectIds: query.groupBy === "project" ? groupRows.map((group) => group.groupKey!).filter((key) => key !== NO_PROJECT) : [],
     }),
@@ -436,6 +439,11 @@ async function buildAggregatedReport(
       skippedEntries,
     },
   };
+  }, {
+    isolationLevel: "RepeatableRead",
+    maxWait: 10_000,
+    timeout: 60_000,
+  });
 }
 
 async function buildReport(

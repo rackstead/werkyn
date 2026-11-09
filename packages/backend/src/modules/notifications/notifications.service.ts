@@ -111,11 +111,16 @@ function projectReadable(projectId: Prisma.Sql, userId: string) {
 // when they were sent, so a removed member keeps no copy of later or earlier
 // project, channel, file or workspace content in the list or unread count.
 function visibleNotification(userId: string) {
+  // OFFSET 0 keeps the task lookup correlated. Without that fence PostgreSQL
+  // can hash every task id the caller can read, and it does so for each
+  // notification page once an index can list a project's task ids from the
+  // index alone. The offset does not change which rows match.
   return Prisma.sql`
     (n."data"->>'projectId' IS NULL OR ${projectReadable(Prisma.sql`n."data"->>'projectId'`, userId)})
     AND (n."data"->>'taskId' IS NULL OR EXISTS (
       SELECT 1 FROM "Task" t
       WHERE t."id" = n."data"->>'taskId' AND ${projectReadable(Prisma.sql`t."projectId"`, userId)}
+      OFFSET 0
     ))
     AND (n."data"->>'channelId' IS NULL OR EXISTS (
       SELECT 1 FROM "ChatChannel" c

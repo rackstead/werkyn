@@ -303,8 +303,9 @@ export function Column({
       // is not the reader, and a half-loaded id list is not the order to follow.
       if (orderChanged && missing && !complete && !(heldNow && heldIndex !== undefined)) return;
       // Keep the card already chosen until the rest of an incomplete refetch
-      // arrives, instead of whichever card this page still has mounted.
-      if (orderChanged && heldNow && heldIndex !== undefined) {
+      // arrives. A finished order follows the cards that stayed on screen,
+      // so a later move of that card does not drag the reader with it.
+      if (orderChanged && !complete && heldNow && heldIndex !== undefined) {
         kept = { key: heldNow.key, top: heldNow.top, index: heldIndex };
       } else if (orderChanged && unanimous) {
         kept = (last.complete && complete ? keptBoardCards(last.rows, last.order, indexOf)[0] : undefined)

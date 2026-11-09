@@ -57,9 +57,10 @@ receive every matching task.
   new rows is not.
   The choice uses `stayedEntries`
   (`lib/stayed-entries.ts`), over the column's id order, the same helper
-  the List and Drive use. While that id list is still loading, only a
-  uniform shift (every visible card moved by the same number of places) is
-  corrected. Anchoring is off during a drag, because the drag is supposed
+  the List and Drive use. While that id list is still loading, the card
+  already chosen stays chosen. Once the order is complete, a later move of
+  that card leaves the reader with the cards that were around it.
+  Anchoring is off during a drag, because the drag is supposed
   to move cards.
 
 The task-body page size is 40. The mount window is the viewport plus 8

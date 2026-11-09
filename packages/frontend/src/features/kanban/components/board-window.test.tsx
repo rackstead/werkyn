@@ -461,6 +461,56 @@ describe("board window", () => {
     expect(openScroller().scrollTop).toBeGreaterThan(100 * CARD);
   });
 
+  it("does not follow a held card that is later moved far away", async () => {
+    const { rerender } = render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().scrollTop = 40 * CARD;
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const current = fixture.columns.get("open")!;
+    const inserted = ["hold-0", "hold-1", "hold-2", ...current.order];
+    const tasks = new Map(current.tasks);
+    const columnIndex = new Map<string, number>();
+    inserted.forEach((id, index) => {
+      columnIndex.set(id, index);
+      const existing = tasks.get(id);
+      tasks.set(id, existing ? { ...existing, columnIndex: index, position: index } : task(id, "open", index));
+    });
+    const held = new Map(fixture.columns);
+    held.set("open", { ...current, order: inserted, tasks, columnIndex, total: inserted.length, size: inserted.length, complete: true });
+    fixture.columns = held;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    const neighbor = openScroller().querySelector<HTMLElement>("[data-task-id='open-41']");
+    expect(neighbor).toBeTruthy();
+    const topBefore = neighbor!.getBoundingClientRect().top;
+    const scrollBefore = openScroller().scrollTop;
+    const order = inserted.filter((id) => id !== "open-40");
+    order.splice(150, 0, "open-40");
+    const nextTasks = new Map(tasks);
+    const nextIndex = new Map<string, number>();
+    order.forEach((id, index) => {
+      nextIndex.set(id, index);
+      nextTasks.set(id, { ...nextTasks.get(id)!, columnIndex: index, position: index });
+    });
+    const moved = new Map(fixture.columns);
+    moved.set("open", { ...current, order, tasks: nextTasks, columnIndex: nextIndex, total: order.length, size: order.length, complete: true });
+    fixture.columns = moved;
+    rerender(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
+    await settle();
+    await act(async () => {
+      openScroller().dispatchEvent(new Event("scroll"));
+    });
+    await settle();
+    const after = openScroller().querySelector<HTMLElement>("[data-task-id='open-41']");
+    expect(after).toBeTruthy();
+    expect(Math.abs(after!.getBoundingClientRect().top - topBefore)).toBeLessThan(CARD);
+    expect(openScroller().scrollTop).toBeLessThan(scrollBefore + 20 * CARD);
+    expect(openScroller().querySelector("[data-task-id='open-40']")).toBeNull();
+  });
+
   it("still opens the quick-add editor", async () => {
     render(<Board projectId="p" onTaskClick={fixture.open} canCreate canDrag />);
     await settle();

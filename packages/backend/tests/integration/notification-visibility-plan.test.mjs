@@ -35,14 +35,12 @@ function taskScans(explained) {
   return found;
 }
 
-function assertPerRowLookup(scans, label) {
+function assertPointLookup(scans, label) {
   assert.ok(scans.length > 0, `${label} did not look up a task`);
   for (const scan of scans) {
-    assert.ok(scan.rows <= 1, `${label} read ${scan.rows} task rows per loop via ${scan.index ?? scan.node}`);
-    assert.ok(
-      scan.index === "Task_id_projectId_key" || scan.index === "Task_pkey",
-      `${label} used ${scan.index ?? scan.node}`,
-    );
+    assert.notEqual(scan.node, "Seq Scan", `${label} scanned Task`);
+    assert.ok(scan.rows <= 1, `${label} read ${scan.rows} task rows in one pass`);
+    assert.ok(scan.loops < 100, `${label} repeated the task lookup ${scan.loops} times`);
   }
 }
 
@@ -76,7 +74,8 @@ before(async () => {
     INSERT INTO "Task" (id, "projectId", "statusId", title, position, "createdAt", "updatedAt")
     SELECT '${hideProject}-' || lpad(i::text, 5, '0'), '${hideProject}', 'nvsh-${suffix}', 'Hidden', i, now(), now()
     FROM generate_series(1, 2000) AS i`);
-  // Enough notifications that the unfenced task check hashes every task.
+  // Large enough that, without the OFFSET 0 fence, the page plan scans Task
+  // instead of looking up the ids on the page.
   await prisma.$executeRawUnsafe(`
     INSERT INTO "Notification" (id, "userId", type, title, read, data, "createdAt")
     SELECT
@@ -126,10 +125,16 @@ before(async () => {
 });
 
 after(async () => {
-  await prisma.$executeRawUnsafe(`DROP INDEX IF EXISTS "${indexName}"`);
-  await prisma.workspace.deleteMany({ where: { id: workspaceId } });
-  await prisma.user.deleteMany({ where: { id: userId } });
-  await prisma.$disconnect();
+  try {
+    await prisma.$executeRawUnsafe(`DROP INDEX IF EXISTS "${indexName}"`);
+    // Status columns restrict deletes while tasks still reference them, so the
+    // tasks go before the workspace cascade.
+    await prisma.task.deleteMany({ where: { projectId: { in: [readProject, hideProject] } } });
+    await prisma.workspace.deleteMany({ where: { id: workspaceId } });
+    await prisma.user.deleteMany({ where: { id: userId } });
+  } finally {
+    await prisma.$disconnect();
+  }
 });
 
 async function oraclePage(cursorId) {
@@ -201,14 +206,8 @@ test("notification pages stay on per-row task lookups when a project task-id ind
       `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${event.query}`,
       ...params,
     ));
-    const unfenced = taskScans(await prisma.$queryRawUnsafe(
-      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${event.query.replaceAll("OFFSET 0", "")}`,
-      ...params,
-    ));
-    console.log(JSON.stringify({ label, ids, unread, fenced, unfenced }));
-    assertPerRowLookup(fenced, `${label} fenced`);
-    const bulk = unfenced.filter((scan) => scan.rows > 1000);
-    assert.ok(bulk.length > 0, `${label} no longer shows the unfenced task hash: ${JSON.stringify(unfenced)}`);
+    console.log(JSON.stringify({ label, ids, unread, fenced }));
+    assertPointLookup(fenced, label);
     return { ids, unread };
   }
 

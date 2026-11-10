@@ -151,6 +151,37 @@ function siblings(
   });
 }
 
+/**
+ * `parentId` is the first ancestor of the page about to be inserted. Delete
+ * already returns 409 once a descendant level is past graphLimits.maxDepth.
+ * One recursive read follows parents in this space and stops on a repeated id.
+ */
+async function assertNewPageWithinDepth(
+  tx: Tx,
+  spaceId: string,
+  parentId: string | null | undefined,
+) {
+  if (!parentId) return;
+  const maxDepth = graphLimits.maxDepth;
+  const over = await tx.$queryRaw<Array<{ depth: number }>>`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, "parentId", 1 AS depth, ARRAY[id]::text[] AS path
+      FROM "WikiPage"
+      WHERE id = ${parentId} AND "spaceId" = ${spaceId}
+      UNION ALL
+      SELECT parent.id, parent."parentId", ancestors.depth + 1,
+             ancestors.path || parent.id
+      FROM "WikiPage" AS parent
+      INNER JOIN ancestors ON parent.id = ancestors."parentId"
+      WHERE ancestors.depth <= ${maxDepth}
+        AND parent."spaceId" = ${spaceId}
+        AND NOT (parent.id = ANY(ancestors.path))
+    )
+    SELECT depth FROM ancestors WHERE depth > ${maxDepth} LIMIT 1
+  `;
+  if (over.length > 0) pageTreeTooLarge();
+}
+
 export async function createPage(
   prisma: PrismaClient,
   workspaceId: string,
@@ -174,6 +205,7 @@ export async function createPage(
       if (!parent)
         throw new NotFoundError("Parent page not found in this space");
     }
+    await assertNewPageWithinDepth(tx, spaceId, data.parentId);
 
     // Position: append at end of siblings
     const maxPos = await tx.wikiPage.aggregate({

@@ -65,6 +65,39 @@ async function readHead(
   }
 }
 
+/**
+ * `parentId` is the first ancestor of the row about to be inserted. Delete
+ * already returns 409 once a descendant level is past graphLimits.maxDepth,
+ * which is a new row with more than maxDepth ancestors. One recursive read
+ * follows parents in this workspace and stops on a repeated id, so a legacy
+ * cycle cannot loop and the workspace lock is not held for a query per level.
+ */
+async function assertNewFileWithinDepth(
+  tx: Prisma.TransactionClient,
+  workspaceId: string,
+  parentId: string | null | undefined,
+) {
+  if (!parentId) return;
+  const maxDepth = graphLimits.maxDepth;
+  const over = await tx.$queryRaw<Array<{ depth: number }>>`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, "parentId", 1 AS depth, ARRAY[id]::text[] AS path
+      FROM "File"
+      WHERE id = ${parentId} AND "workspaceId" = ${workspaceId}
+      UNION ALL
+      SELECT parent.id, parent."parentId", ancestors.depth + 1,
+             ancestors.path || parent.id
+      FROM "File" AS parent
+      INNER JOIN ancestors ON parent.id = ancestors."parentId"
+      WHERE ancestors.depth <= ${maxDepth}
+        AND parent."workspaceId" = ${workspaceId}
+        AND NOT (parent.id = ANY(ancestors.path))
+    )
+    SELECT depth FROM ancestors WHERE depth > ${maxDepth} LIMIT 1
+  `;
+  if (over.length > 0) graphTooLarge();
+}
+
 export async function uploadFileStream(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -143,6 +176,7 @@ export async function uploadFileStream(
         { ...ctx, workspaceId },
         parentId,
       );
+      await assertNewFileWithinDepth(tx, workspaceId, current.parentId);
       return tx.file.create({
         data: {
           workspaceId,
@@ -181,6 +215,7 @@ export async function createFolder(
       input.parentId,
       input.teamFolderId,
     );
+    await assertNewFileWithinDepth(tx, workspaceId, destination.parentId);
     return tx.file.create({
       data: {
         workspaceId,
@@ -752,6 +787,7 @@ export async function copyFile(
         input.parentId,
         input.teamFolderId,
       );
+      await assertNewFileWithinDepth(tx, workspaceId, current.parentId);
       const claimed = await tx.$queryRaw<Array<{ storagePath: string }>>`
         DELETE FROM "BlobCleanup"
         WHERE "storagePath" = ${plannedPath} AND "attempts" = 0

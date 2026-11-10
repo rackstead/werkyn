@@ -53,7 +53,7 @@ it("names the bulk selects and keeps every action in a viewport-capped bar", () 
   const bar = status.closest(".max-w-full");
   expect(bar).toBeTruthy();
   expect(bar?.className).toContain("flex-wrap");
-  expect(bar?.className).toContain("w-full");
+  expect(bar?.className).toContain("w-max");
   expect(bar?.className).toContain("max-w-full");
   expect(bar?.className).toContain("min-w-0");
   expect(bar?.className).toContain("overflow-x-auto");

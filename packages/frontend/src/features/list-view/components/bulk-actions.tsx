@@ -62,11 +62,21 @@ export function BulkActions({
           width alone does not, so the row would stay one line and run off a phone. */}
       <div
         className="pointer-events-none fixed inset-x-0 bottom-6 z-30 flex justify-center px-3"
-        style={{ position: "fixed", left: 0, right: 0, bottom: "1.5rem" }}
+        style={{
+          position: "fixed",
+          left: 0,
+          right: 0,
+          bottom: "1.5rem",
+          display: "flex",
+          justifyContent: "center",
+          paddingLeft: "0.75rem",
+          paddingRight: "0.75rem",
+          boxSizing: "border-box",
+        }}
       >
       <div
-        className="pointer-events-auto mx-auto flex w-full min-w-0 max-w-full flex-wrap items-center justify-center gap-3 overflow-x-auto rounded-lg border bg-background px-4 py-3 shadow-lg"
-        style={{ display: "flex", flexWrap: "wrap", width: "100%", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}
+        className="pointer-events-auto mx-auto flex w-max min-w-0 max-w-full flex-wrap items-center justify-center gap-3 overflow-x-auto rounded-lg border bg-background px-4 py-3 shadow-lg"
+        style={{ display: "flex", flexWrap: "wrap", width: "max-content", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}
       >
         <span className="text-sm font-medium">
           {count} task{count !== 1 ? "s" : ""} selected

@@ -28,7 +28,7 @@ import {
   type ImageSize,
 } from "./avatar-crop";
 
-interface AvatarCropDialogProps {
+export interface AvatarCropDialogProps {
   file: File | null;
   saving: boolean;
   onCancel: () => void;

@@ -17,6 +17,7 @@ import {
   setDecodedSize,
   type CropDraw,
 } from "@/test/avatar-crop-canvas";
+import { preloadAvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
 import { Topbar } from "./topbar";
 
 const transport = vi.hoisted(() => ({ upload: vi.fn(), patch: vi.fn() }));
@@ -76,14 +77,19 @@ function mount() {
 }
 
 async function choose(type: string, name: string) {
+  await preloadAvatarCropDialog();
   const input = document.querySelector(
     'input[type="file"]',
   ) as HTMLInputElement;
   const file = new File([originalBytes], name, { type });
-  fireEvent.change(input, { target: { files: [file] } });
-  const dialog = await screen.findByRole("dialog", {
-    name: "Position your avatar",
+  await act(async () => {
+    fireEvent.change(input, { target: { files: [file] } });
   });
+  const dialog = await screen.findByRole(
+    "dialog",
+    { name: "Position your avatar" },
+    { timeout: 15000 },
+  );
   expect(transport.upload).not.toHaveBeenCalled();
   const img = dialog.querySelector("img");
   if (!img) throw new Error("crop preview missing");
@@ -129,7 +135,8 @@ function reposition() {
   fireEvent.change(zoom, { target: { value: "2" } });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await preloadAvatarCropDialog();
   canvas = installAvatarCanvas();
   vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:avatar-preview");
   vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});

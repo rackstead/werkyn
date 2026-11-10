@@ -1,8 +1,8 @@
 import { useAuthStore } from "@/stores/auth-store";
 import { useUIStore } from "@/stores/ui-store";
 import { UserAvatar } from "@/components/shared/user-avatar";
-import { Suspense, useState, useRef, useEffect } from "react";
-import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
+import { useState, useRef, useEffect } from "react";
+import { AvatarCropDialog, preloadAvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
 import {
   AVATAR_ACCEPT,
   avatarFileProblem,
@@ -181,7 +181,14 @@ export function Topbar() {
             </div>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+          <DropdownMenuItem
+            onPointerEnter={preloadAvatarCropDialog}
+            onFocus={preloadAvatarCropDialog}
+            onClick={() => {
+              preloadAvatarCropDialog();
+              fileInputRef.current?.click();
+            }}
+          >
             <Camera className="h-4 w-4" />
             Change avatar
           </DropdownMenuItem>
@@ -231,15 +238,13 @@ export function Topbar() {
       />
 
       {avatarFile && (
-        <Suspense fallback={null}>
-          <AvatarCropDialog
-            file={avatarFile}
-            saving={avatarSaving}
-            onCancel={dismissAvatar}
-            onConfirm={saveAvatar}
-            onError={(message) => toast.error(message)}
-          />
-        </Suspense>
+        <AvatarCropDialog
+          file={avatarFile}
+          saving={avatarSaving}
+          onCancel={dismissAvatar}
+          onConfirm={saveAvatar}
+          onError={(message) => toast.error(message)}
+        />
       )}
 
       {workspaceId && workspaceSlug && (

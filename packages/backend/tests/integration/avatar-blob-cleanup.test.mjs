@@ -129,6 +129,28 @@ async function fileRows(paths) {
   });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function waitForCleanupLock() {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const waiting = await app.prisma.$queryRaw`
+      SELECT pid FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND pid <> pg_backend_pid()
+        AND wait_event_type = 'Lock'`;
+    if (waiting.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("profile update did not wait on the avatar cleanup lock");
+}
+
 before(async () => {
   app = await buildApp();
   await app.ready();
@@ -359,6 +381,94 @@ test("switching back to the previous avatar keeps those bytes", async () => {
   assert.match(kept.lastError ?? "", /live avatar/);
   assert.equal(
     await app.prisma.blobCleanup.count({ where: { storagePath: second.path } }),
+    0,
+  );
+});
+
+test("a profile that adopts a queued avatar before the sweep locks it keeps the bytes", async () => {
+  const { user, token } = await createUser("gia");
+  const first = await uploadAvatar(token);
+  const second = await uploadAvatar(token);
+  assert.equal((await patchProfile(token, { avatarUrl: first.url })).statusCode, 200);
+  assert.equal((await patchProfile(token, { avatarUrl: second.url })).statusCode, 200);
+
+  const entered = deferred();
+  let release = () => {};
+  const sweeping = processBlobCleanup(app.prisma, app.storage, {
+    paths: [first.path],
+    beforeAvatarDecision: async (storagePath) => {
+      assert.equal(storagePath, first.path);
+      entered.resolve();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  try {
+    await entered.promise;
+    const adopted = await patchProfile(token, { avatarUrl: first.url });
+    assert.equal(adopted.statusCode, 200, adopted.body);
+  } finally {
+    release();
+  }
+  const swept = await sweeping;
+  assert.equal(swept.deleted, 0);
+  assert.equal(swept.retained, 1);
+  assert.equal(await app.storage.exists(first.path), true);
+  assert.equal(
+    (await app.prisma.user.findUniqueOrThrow({
+      where: { id: user.id },
+      select: { avatarUrl: true },
+    })).avatarUrl,
+    first.url,
+  );
+  const kept = await app.prisma.blobCleanup.findUniqueOrThrow({
+    where: { storagePath: first.path },
+  });
+  assert.match(kept.lastError ?? "", /live avatar/);
+});
+
+test("a sweep already deleting an avatar rejects a switch back and keeps the saved profile", { timeout: 15_000 }, async () => {
+  const { user, token } = await createUser("fay");
+  const first = await uploadAvatar(token);
+  const second = await uploadAvatar(token);
+  assert.equal((await patchProfile(token, { avatarUrl: first.url })).statusCode, 200);
+  assert.equal((await patchProfile(token, { avatarUrl: second.url })).statusCode, 200);
+
+  const entered = deferred();
+  let release = () => {};
+  const sweeping = processBlobCleanup(app.prisma, {
+    delete: async (storagePath) => {
+      assert.equal(storagePath, first.path);
+      entered.resolve();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      await app.storage.delete(storagePath);
+    },
+  }, { paths: [first.path] });
+  let patching;
+  try {
+    await entered.promise;
+    patching = patchProfile(token, { avatarUrl: first.url });
+    await waitForCleanupLock();
+  } finally {
+    release();
+  }
+  const [swept, patch] = await Promise.all([sweeping, patching]);
+  assert.equal(swept.deleted, 1, JSON.stringify(swept));
+  assert.equal(patch.statusCode, 409, patch.body);
+  assert.equal(await app.storage.exists(first.path), false);
+  assert.equal(await app.storage.exists(second.path), true);
+  assert.equal(
+    (await app.prisma.user.findUniqueOrThrow({
+      where: { id: user.id },
+      select: { avatarUrl: true },
+    })).avatarUrl,
+    second.url,
+  );
+  assert.equal(
+    await app.prisma.blobCleanup.count({ where: { storagePath: first.path } }),
     0,
   );
 });

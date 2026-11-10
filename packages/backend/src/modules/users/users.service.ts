@@ -9,10 +9,12 @@ import {
 import { endSessions } from "../realtime/realtime.service.js";
 import {
   AppError,
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
 } from "../../utils/errors.js";
+import type { StorageProvider } from "../../services/storage.js";
 import { avatarStoragePath } from "../uploads/avatar-storage-path.js";
 
 const profileSelect = {
@@ -38,6 +40,7 @@ export async function getMe(prisma: PrismaClient, userId: string) {
 
 export async function updateProfile(
   prisma: PrismaClient,
+  storage: Pick<StorageProvider, "exists">,
   userId: string,
   requesterId: string,
   data: {
@@ -63,10 +66,13 @@ export async function updateProfile(
 
   // Queue the previous uploaded avatar in the same transaction as the
   // profile write, with the file trigger's insert. The user row is locked so
-  // two replacements cannot each miss the other's path. The request does not
-  // delete the bytes. The same path, a missing previous URL, and anything
-  // that is not an uploaded avatar (including wiki media) are not queued,
-  // and the new URL is never queued.
+  // two replacements cannot each miss the other's path. Adopting a path also
+  // locks its BlobCleanup row, the same row the sweeper holds across its
+  // reference check and delete: whoever gets it first wins, and a path whose
+  // bytes are already gone is not saved. The request does not delete the
+  // bytes. The same path, a missing previous URL, and anything that is not
+  // an uploaded avatar (including wiki media) are not queued, and the new
+  // URL is never queued.
   try {
     return await prisma.$transaction(async (tx) => {
       await limitLockWaits(tx);
@@ -75,6 +81,16 @@ export async function updateProfile(
       `;
       const previousPath = avatarStoragePath(current?.avatarUrl);
       const nextPath = avatarStoragePath(data.avatarUrl);
+      if (nextPath && nextPath !== previousPath) {
+        await tx.$queryRaw`
+          SELECT "storagePath" FROM "BlobCleanup"
+          WHERE "storagePath" = ${nextPath}
+          FOR UPDATE
+        `;
+        if (!(await storage.exists(nextPath))) {
+          throw new ConflictError("This avatar is no longer available");
+        }
+      }
       if (current && previousPath && previousPath !== nextPath) {
         await tx.$executeRaw`
           INSERT INTO "BlobCleanup" ("storagePath")

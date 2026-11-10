@@ -70,6 +70,10 @@ model User {
   dashboardPreferences    DashboardPreference[]
   admissionRequests       WorkspaceAdmissionRequest[]
   backupUploadCooldown    BackupUploadCooldown?
+
+  // Equality lookup for avatar cleanup. Hash, not btree: avatarUrl is
+  // unbounded text, and a btree entry cannot hold an arbitrary value.
+  @@index([avatarUrl], type: Hash, map: "User_avatarUrl_hash_idx")
 }
 
 model ApiKey {

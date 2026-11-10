@@ -29,36 +29,39 @@ function channelsAfter(at: { createdAt: Date; id: string }): Prisma.ChatChannelW
   };
 }
 
-const DM_CURSOR_TTL_MS = 60 * 60 * 1000;
+/** DM list order: newest updatedAt, then id, so equal timestamps do not skip. */
+const DM_LIST_ORDER: Prisma.ChatChannelOrderByWithRelationInput[] = [
+  { updatedAt: "desc" },
+  { id: "desc" },
+];
 
-/** Snapshot id and offset. The remaining ids stay in ChatDmListCursor, not the URL. */
-function encodeDmCursor(snapshotId: string, offset: number): string {
-  return Buffer.from(JSON.stringify([snapshotId, offset]), "utf8").toString("base64url");
+function dmsAfter(at: { updatedAt: Date; id: string }): Prisma.ChatChannelWhereInput {
+  return {
+    OR: [
+      { updatedAt: { lt: at.updatedAt } },
+      { updatedAt: at.updatedAt, id: { lt: at.id } },
+    ],
+  };
 }
 
-function decodeDmCursor(cursor: string): { snapshotId: string; offset: number } | null {
+/** The last row's updatedAt and id. The remaining ids are not stored. */
+function encodeDmCursor(row: { updatedAt: Date; id: string }): string {
+  return Buffer.from(JSON.stringify([row.updatedAt.toISOString(), row.id]), "utf8").toString("base64url");
+}
+
+function decodeDmCursor(cursor: string): { updatedAt: Date; id: string } | null {
   if (!cursorIsStorable(cursor)) return null;
   try {
     const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
     if (!Array.isArray(value) || value.length !== 2) return null;
-    const [snapshotId, offset] = value;
-    if (!cursorIsStorable(snapshotId) || !Number.isInteger(offset) || (offset as number) < 0) return null;
-    return { snapshotId, offset: offset as number };
+    const [iso, id] = value;
+    if (typeof iso !== "string" || typeof id !== "string" || !cursorIsStorable(id)) return null;
+    const updatedAt = new Date(iso);
+    if (Number.isNaN(updatedAt.getTime()) || updatedAt.toISOString() !== iso) return null;
+    return { updatedAt, id };
   } catch {
     return null;
   }
-}
-
-async function dmIdsInOrder(prisma: PrismaClient, workspaceId: string, userId: string) {
-  const ordered = await prisma.$queryRaw<{ id: string }[]>`
-    SELECT c.id
-    FROM "ChatChannelMember" m
-    JOIN "ChatChannel" c ON c.id = m."channelId"
-    WHERE m."userId" = ${userId}
-      AND c."workspaceId" = ${workspaceId}
-      AND c."type" = 'DM'::"ChatChannelType"
-    ORDER BY c."updatedAt" DESC, c.id DESC`;
-  return ordered.map((row) => row.id);
 }
 
 function cursorIsStorable(cursor: string): boolean {
@@ -410,12 +413,11 @@ export async function findOrCreateDm(
 }
 
 /**
- * One page of DMs the caller belongs to. The first page is newest updatedAt
- * first, then id descending, so a newer message puts that DM first. The
- * cursor is a short reference to that order plus an offset. A send during
- * the walk changes updatedAt but cannot skip or repeat a DM. Omit `cursor`
- * for the first page of CHAT_LIST_PAGE_DEFAULT (50) rows. A DM the caller is
- * not in is left out. Each row keeps its members and `_count.members`.
+ * One page of DMs the caller belongs to, newest updatedAt first, then id
+ * descending. The cursor is that last row's updatedAt and id. Omit `cursor`
+ * for the first page of CHAT_LIST_PAGE_DEFAULT (50) rows. A message sent
+ * while the caller is still paging can move a DM. A DM the caller is not in
+ * is left out. Each row keeps its members and `_count.members`.
  */
 export async function listDms(
   prisma: PrismaClient,
@@ -429,66 +431,45 @@ export async function listDms(
     type: "DM",
     members: { some: { userId } },
   };
-  let orderedIds: string[];
-  let offset = 0;
-  let snapshotId: string | null = null;
-  if (cursor === undefined) {
-    orderedIds = await dmIdsInOrder(prisma, workspaceId, userId);
-    if (orderedIds.length > limit) {
-      await prisma.chatDmListCursor.deleteMany({
-        where: { createdAt: { lt: new Date(Date.now() - DM_CURSOR_TTL_MS) } },
-      });
-      const saved = await prisma.chatDmListCursor.create({
-        data: { userId, workspaceId, ids: JSON.stringify(orderedIds) },
-        select: { id: true },
-      });
-      snapshotId = saved.id;
-    }
-  } else {
+  let pageWhere = where;
+  if (cursor !== undefined) {
     const decoded = decodeDmCursor(cursor);
     if (!decoded) return { data: [], nextCursor: null };
-    const saved = await prisma.chatDmListCursor.findFirst({
-      where: { id: decoded.snapshotId, userId, workspaceId },
-      select: { ids: true, createdAt: true },
-    });
-    if (!saved || Date.now() - saved.createdAt.getTime() > DM_CURSOR_TTL_MS) {
-      return { data: [], nextCursor: null };
-    }
-    const parsed: unknown = JSON.parse(saved.ids);
-    if (!Array.isArray(parsed) || parsed.some((id) => typeof id !== "string")) {
-      return { data: [], nextCursor: null };
-    }
-    orderedIds = parsed as string[];
-    offset = decoded.offset;
-    snapshotId = decoded.snapshotId;
+    pageWhere = { AND: [where, dmsAfter(decoded)] };
   }
-  const pageIds = orderedIds.slice(offset, offset + limit);
-  const nextOffset = offset + pageIds.length;
-  const nextCursor = snapshotId !== null && nextOffset < orderedIds.length
-    ? encodeDmCursor(snapshotId, nextOffset)
-    : null;
-  if (pageIds.length === 0) return { data: [], nextCursor: null };
-  // A DM include is every member, so the count is that list's length. A
-  // `_count` include would join a count of every channel before the page.
+  // One page of the order. Members are loaded for those rows only, and the
+  // count is that list's length. A `_count` include would join every channel.
   const fetched = await prisma.chatChannel.findMany({
-    where: { AND: [where, { id: { in: pageIds } }] },
-    include: {
-      members: {
+    where: pageWhere,
+    orderBy: DM_LIST_ORDER,
+    take: limit + 1,
+  });
+  const hasMore = fetched.length > limit;
+  const page = hasMore ? fetched.slice(0, limit) : fetched;
+  const ids = page.map((channel) => channel.id);
+  const memberRows = ids.length === 0
+    ? []
+    : await prisma.chatChannelMember.findMany({
+        where: { channelId: { in: ids } },
         include: {
           user: {
             select: { id: true, displayName: true, avatarUrl: true },
           },
         },
-      },
-    },
-  });
-  const byId = new Map(fetched.map((channel) => [channel.id, channel]));
+      });
+  const byChannel = new Map<string, typeof memberRows>();
+  for (const member of memberRows) {
+    const list = byChannel.get(member.channelId);
+    if (list) list.push(member);
+    else byChannel.set(member.channelId, [member]);
+  }
+  const last = page.at(-1);
   return {
-    data: pageIds.flatMap((id) => {
-      const channel = byId.get(id);
-      return channel ? [{ ...channel, _count: { members: channel.members.length } }] : [];
+    data: page.map((channel) => {
+      const members = byChannel.get(channel.id) ?? [];
+      return { ...channel, members, _count: { members: members.length } };
     }),
-    nextCursor,
+    nextCursor: hasMore && last ? encodeDmCursor(last) : null,
   };
 }
 

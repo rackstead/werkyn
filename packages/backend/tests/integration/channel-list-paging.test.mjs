@@ -1,7 +1,9 @@
 // Channel and DM lists used to return every row. A walk at page size 1 and at
 // the default must return the same ids as the full visible list: channels by
 // createdAt then id, DMs by updatedAt descending then id. A channel or DM the
-// caller cannot see must not appear. Names do not decide the order.
+// caller cannot see must not appear. Names do not decide the order. The first
+// DM page reads that order with a limit. It does not load every membership or
+// store every id. A message during a walk may move a DM.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -305,7 +307,53 @@ function planNodes(plan) {
   return nodes;
 }
 
-test("channel and DM pages use the name order indexes", async () => {
+function memberRowsRead(plan) {
+  let rows = 0;
+  for (const node of planNodes(plan)) {
+    const name = `${node["Relation Name"] ?? ""} ${node["Index Name"] ?? ""}`;
+    if (!name.includes("ChatChannelMember")) continue;
+    rows += (node["Actual Rows"] ?? 0) * (node["Actual Loops"] ?? 1);
+  }
+  return rows;
+}
+
+async function explainAnalyze(event) {
+  const params = JSON.parse(event.params);
+  let sql = event.query;
+  for (let i = params.length; i >= 1; i -= 1) {
+    const value = params[i - 1];
+    const cast = typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value) ? "::timestamp" : "";
+    sql = sql.replace(new RegExp(`\\$${i}(?!\\d)`, "g"), `$${i}${cast}`);
+  }
+  const explained = await app.prisma.$queryRawUnsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`, ...params);
+  return explained[0];
+}
+
+test("the first DM page does not read every membership or store every id", async () => {
+  const dms = await orderedIds(true);
+  assert.ok(dms.length > 1);
+  const memberships = await app.prisma.chatChannelMember.count({
+    where: { userId: users.me.id, channel: { workspaceId: home.id, type: "DM" } },
+  });
+  assert.equal(memberships, dms.length);
+  const listed = await recordQueries(observer, (db) => chat.listDms(db, home.id, users.me.id, undefined, 1));
+  assert.equal(listed.result.data.length, 1);
+  assert.notEqual(listed.result.nextCursor, null);
+  let sawMembers = false;
+  for (const event of listed.events) {
+    assert.equal(/\bINSERT\b/i.test(event.query), false, event.query);
+    const mentioned = dms.filter((id) => event.params.includes(id));
+    assert.ok(mentioned.length <= 1, `${mentioned.length} ids in one statement`);
+    if (!event.query.includes('"ChatChannelMember"')) continue;
+    sawMembers = true;
+    // An unbounded membership read has no LIMIT and names none of the page ids.
+    assert.ok(/\bLIMIT\b/i.test(event.query) || mentioned.length === 1, event.query);
+  }
+  assert.equal(sawMembers, true);
+  assertLimited(listed.events, 1, "updatedAt");
+});
+
+test("channel and DM pages use the order indexes", async () => {
   const bulk = [];
   const memberships = [];
   for (let i = 0; i < 4000; i += 1) {
@@ -372,7 +420,17 @@ test("channel and DM pages use the name order indexes", async () => {
   }
   assert.match(described[0], /ChatChannel_workspaceId_createdAt_id_idx/);
   assert.match(described[1], /ChatChannel_workspaceId_createdAt_id_idx/);
-  assert.match(described[2], /ChatChannelMember/);
+  assert.equal(described[2].includes("Sort"), false, described[2]);
+  assert.match(described[2], /^Limit:/, described[2]);
+  assert.match(described[2], /ChatChannel_workspaceId_type_updatedAt_id_idx/);
+  let memberRows = 0;
+  for (const event of dms.events) {
+    if (!event.query.includes('"ChatChannelMember"')) continue;
+    memberRows += memberRowsRead(await explainAnalyze(event));
+  }
+  const strangerDms = memberships.filter((row) => row.channelId.startsWith("bulk-dm-")).length;
+  assert.ok(strangerDms > 20);
+  assert.ok(memberRows < strangerDms, `${memberRows} member rows of ${strangerDms}`);
 });
 
 test("a row inserted beside an equal createdAt is not skipped or repeated", async () => {
@@ -428,40 +486,6 @@ test("a later name does not jump ahead of an earlier channel, and a newer DM sta
   const newer = dms.indexOf(`sort-dm-new-${suffix}`);
   const older = dms.indexOf(`sort-dm-old-${suffix}`);
   assert.ok(newer >= 0 && older > newer);
-});
-
-test("a DM walk still lists every DM once when messages move updatedAt", async () => {
-  const url = `/api/chat/${home.id}/dms`;
-  const ids = [0, 1, 2, 3].map((i) => `walk-dm-${suffix}-${i}`);
-  const stamp = (seconds) => new Date(Date.UTC(2027, 0, 1, 0, 0, seconds));
-  await app.prisma.chatChannel.createMany({
-    data: ids.map((id, i) => ({
-      id, workspaceId: home.id, type: "DM", name: `walk-${i}`, createdById: users.me.id,
-      createdAt: stamp(0), updatedAt: stamp(i),
-    })),
-  });
-  await app.prisma.chatChannelMember.createMany({
-    data: ids.flatMap((channelId) => [users.me.id, users.peer.id].map((userId) => ({
-      channelId, userId, joinedAt: stamp(0), lastReadAt: stamp(0),
-    }))),
-  });
-  for (let i = 0; i < ids.length; i += 1) {
-    await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "updatedAt" = ${stamp(i)} WHERE id = ${ids[i]}`;
-  }
-  const first = await ok(withPaging(url, 2));
-  assert.deepEqual(first.data.slice(0, 2).map((row) => row.id), [ids[3], ids[2]]);
-  await chat.sendMessage(app.prisma, ids[0], users.me.id, "unseen moved");
-  await chat.sendMessage(app.prisma, ids[2], users.me.id, "cursor moved");
-  const seen = first.data.map((row) => row.id);
-  let cursor = first.nextCursor;
-  for (let pages = 0; cursor && pages < 500; pages += 1) {
-    const body = await ok(withPaging(url, 2, cursor));
-    for (const row of body.data) assert.equal(seen.includes(row.id), false, row.id);
-    seen.push(...body.data.map((row) => row.id));
-    cursor = body.nextCursor;
-  }
-  assert.equal(cursor, null);
-  for (const id of ids) assert.equal(seen.filter((row) => row === id).length, 1, id);
 });
 
 test("a long DM list keeps a short cursor and still returns every DM once", async () => {

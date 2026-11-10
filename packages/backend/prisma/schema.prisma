@@ -1265,17 +1265,6 @@ model ChatChannel {
   @@index([workspaceId, type, updatedAt, id])
 }
 
-/// One DM-list walk. The cursor is this id plus an offset, not the remaining ids.
-model ChatDmListCursor {
-  id          String   @id @default(cuid())
-  userId      String
-  workspaceId String
-  ids         String   @db.Text
-  createdAt   DateTime @default(now())
-
-  @@index([createdAt])
-}
-
 model ChatChannelMember {
   id         String   @id @default(cuid())
   channelId  String

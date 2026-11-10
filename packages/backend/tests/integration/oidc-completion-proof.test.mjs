@@ -407,9 +407,16 @@ async function unchanged(s, run) {
   assert.deepEqual(await familyState(s.token.familyId), before);
   return response;
 }
+function membershipSnapshot(strings) {
+  const text = Array.isArray(strings?.raw)
+    ? strings.raw.join("")
+    : Array.isArray(strings)
+      ? strings.join("")
+      : "";
+  return text.includes("membershipRevision");
+}
 function gateMembership() {
-  const delegate = app.prisma.workspaceMember,
-    original = delegate.findMany;
+  const original = app.prisma.$queryRaw;
   let enter,
     release,
     blocked = false;
@@ -419,13 +426,13 @@ function gateMembership() {
     released = new Promise((resolve) => {
       release = resolve;
     });
-  delegate.findMany = async (...args) => {
-    if (!blocked) {
+  app.prisma.$queryRaw = function (strings, ...values) {
+    if (!blocked && membershipSnapshot(strings)) {
       blocked = true;
       enter();
-      await released;
+      return released.then(() => original.call(this, strings, ...values));
     }
-    return original.apply(delegate, args);
+    return original.call(this, strings, ...values);
   };
   return {
     async entered() {
@@ -447,7 +454,7 @@ function gateMembership() {
     release,
     restore() {
       release();
-      delegate.findMany = original;
+      app.prisma.$queryRaw = original;
     },
   };
 }
@@ -1153,10 +1160,11 @@ for (const sameUser of [true, false])
       b = await session({ identity: sameUser ? identity : undefined });
     const beforeA = await familyState(a.token.familyId),
       beforeB = await familyState(b.token.familyId);
-    const delegate = app.prisma.workspaceMember,
-      original = delegate.findMany;
+    const original = app.prisma.$queryRaw;
     let membershipReads = 0;
-    delegate.findMany = async () => {
+    app.prisma.$queryRaw = function (strings, ...values) {
+      if (!membershipSnapshot(strings))
+        return original.call(this, strings, ...values);
       membershipReads++;
       throw new Error("Foreign memberships must not be read");
     };
@@ -1176,7 +1184,7 @@ for (const sameUser of [true, false])
       assert.equal(r.json.data, undefined);
       assert.equal(membershipReads, 0);
     } finally {
-      delegate.findMany = original;
+      app.prisma.$queryRaw = original;
     }
     assert.deepEqual(await familyState(a.token.familyId), beforeA);
     assert.deepEqual(await familyState(b.token.familyId), beforeB);
@@ -1217,22 +1225,39 @@ for (const kind of ["marker", "token"])
 
 test("real HTTP credential and membership read faults preserve proof and permit cookie-safe retry", async () => {
   const s = await session();
-  for (const [delegate, method] of [
-    [app.prisma.refreshToken, "findFirst"],
-    [app.prisma.workspaceMember, "findMany"],
-  ]) {
-    const original = delegate[method],
-      before = await familyState(s.token.familyId);
-    delegate[method] = async () => {
-      throw new Error("Owned completion read fault");
-    };
+  const faults = [
+    () => {
+      const delegate = app.prisma.refreshToken,
+        original = delegate.findFirst;
+      delegate.findFirst = async () => {
+        throw new Error("Owned completion read fault");
+      };
+      return () => {
+        delegate.findFirst = original;
+      };
+    },
+    () => {
+      const original = app.prisma.$queryRaw;
+      app.prisma.$queryRaw = function (strings, ...values) {
+        if (membershipSnapshot(strings))
+          throw new Error("Owned completion read fault");
+        return original.call(this, strings, ...values);
+      };
+      return () => {
+        app.prisma.$queryRaw = original;
+      };
+    },
+  ];
+  for (const install of faults) {
+    const before = await familyState(s.token.familyId),
+      restore = install();
     try {
       const r = await complete(s);
       assert.equal(r.status, 500);
       noCookie(r);
       assert.equal(r.json.data, undefined);
     } finally {
-      delegate[method] = original;
+      restore();
     }
     assert.deepEqual(await familyState(s.token.familyId), before);
     const retry = await complete(s);

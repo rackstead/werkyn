@@ -93,85 +93,156 @@ function decodeTemplateDescription(value: string): { text: string; pieces: strin
   return { text, pieces };
 }
 
-function findAll(haystack: string, needle: string, from = 0): number[] {
-  const found: number[] = [];
-  if (!needle) return found;
-  let at = haystack.indexOf(needle, from);
-  while (at !== -1) {
-    found.push(at);
-    at = haystack.indexOf(needle, at + 1);
+// Same allow-list as sanitizeDescription. Used only to keep a pasted sample such
+// as <div> when it is new text. Real stored tags are not rewritten here.
+const ALLOWED_TEMPLATE_TAGS = new Set([
+  "b", "i", "em", "strong", "p", "br", "ul", "ol", "li", "a",
+  "h1", "h2", "h3", "blockquote", "code", "pre",
+]);
+
+function tagNameAt(text: string, lt: number): string {
+  let i = lt + 1;
+  if (text[i] === "/") i++;
+  let name = "";
+  while (i < text.length) {
+    const c = text[i];
+    const letter = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9");
+    if (!letter) break;
+    name += c;
+    i++;
   }
-  return found;
+  return name.toLowerCase();
 }
 
-// Longest stored slice at `index` that still occurs in the edited text.
-// A longer slice matches a code sample and not a new tag typed in front of it.
-function matchingPrefix(decoded: string, index: number, edited: string): { length: number; positions: number[] } {
-  const max = Math.min(32, decoded.length - index);
-  let lo = 1;
-  let hi = max;
-  let bestLength = 0;
-  let bestPositions: number[] = [];
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    const positions = findAll(edited, decoded.slice(index, index + mid));
-    if (positions.length > 0) {
-      bestLength = mid;
-      bestPositions = positions;
-      lo = mid + 1;
-    } else hi = mid - 1;
+function unclosedOpenTag(text: string, index: number): number {
+  for (let k = index - 1; k >= 0; k--) {
+    if (text[k] === ">") return -1;
+    if (text[k] === "<") return k;
   }
-  return { length: bestLength, positions: bestPositions };
+  return -1;
+}
+
+function tagNameEndingAt(text: string, gt: number): string {
+  for (let k = gt - 1; k >= 0; k--) {
+    if (text[k] === ">") return "";
+    if (text[k] === "<") return tagNameAt(text, k);
+  }
+  return "";
+}
+
+// Stop a shared prefix or suffix on a bracket whose tag name changed, so an
+// entity bracket is not glued onto a different tag that only shares "<" or "> ".
+function tagAwarePrefix(before: string, after: string): number {
+  let i = 0;
+  const n = Math.min(before.length, after.length);
+  while (i < n && before[i] === after[i]) i++;
+  const lt = unclosedOpenTag(before, i);
+  if (lt >= 0 && tagNameAt(before, lt) !== tagNameAt(after, lt)) return lt;
+  return i;
+}
+
+function tagAwareSuffix(before: string, after: string, prefix: number): number {
+  const max = Math.min(before.length - prefix, after.length - prefix);
+  let suffix = 0;
+  while (suffix < max && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
+  if (suffix === 0) return 0;
+  const beforeGt = before.length - suffix;
+  if (before[beforeGt] === ">" && after[after.length - suffix] === ">") {
+    if (tagNameEndingAt(before, beforeGt) !== tagNameEndingAt(after, after.length - suffix)) return suffix - 1;
+  }
+  return suffix;
+}
+
+function escapeDisallowedTags(text: string): string {
+  return text.replace(/<\/?([A-Za-z][A-Za-z0-9]*)\b[^<>]*>/g, (whole, name: string) => {
+    if (ALLOWED_TEMPLATE_TAGS.has(name.toLowerCase())) return whole;
+    return whole.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  });
+}
+
+function pieceChar(piece: string): string {
+  return piece === "&amp;" ? "&" : piece;
+}
+
+// Order-preserving edit script for the middle. Null when the edit is too large
+// to trace; the caller then escapes only disallowed tags and does not stamp
+// entity brackets onto other tags.
+function equalCharPairs(before: string, after: string): Array<[number, number]> | null {
+  const n = before.length;
+  const m = after.length;
+  if (n === 0 || m === 0) return [];
+  const max = n + m;
+  const off = max;
+  const v = new Int32Array(2 * max + 1);
+  v[off + 1] = 0;
+  const trace: Int32Array[] = [];
+  let found = -1;
+  const cap = 256;
+  for (let d = 0; d <= max && d <= cap; d++) {
+    trace.push(v.slice());
+    let done = false;
+    for (let k = -d; k <= d; k += 2) {
+      const idx = off + k;
+      let x: number;
+      if (k === -d || (k !== d && v[idx - 1] < v[idx + 1])) x = v[idx + 1];
+      else x = v[idx - 1] + 1;
+      let y = x - k;
+      while (x < n && y < m && before[x] === after[y]) { x++; y++; }
+      v[idx] = x;
+      if (x >= n && y >= m) { found = d; done = true; break; }
+    }
+    if (done) break;
+  }
+  if (found < 0) return null;
+  const pairs: Array<[number, number]> = [];
+  let x = n;
+  let y = m;
+  for (let d = found; d > 0; d--) {
+    const snap = trace[d];
+    const k = x - y;
+    const prevK = k === -d || (k !== d && snap[off + k - 1] < snap[off + k + 1]) ? k + 1 : k - 1;
+    const prevX = snap[off + prevK];
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) { x--; y--; pairs.push([x, y]); }
+    x = prevX;
+    y = prevY;
+  }
+  while (x > 0 && y > 0 && before[x - 1] === after[y - 1]) { x--; y--; pairs.push([x, y]); }
+  pairs.reverse();
+  return pairs;
 }
 
 // Runs only when a changed description is submitted, not while the editor renders.
-// Every edited occurrence of an unchanged bracket or quote context keeps the
-// stored spelling, including a second pasted copy and an insertion of any length.
-// A mark whose own context changed is tied to the nearest partner that did match.
+// Equal characters keep the stored spelling of &lt; &gt; and &quot;. A visible &
+// is sent as &. New disallowed tags are escaped so a pasted sample is not deleted.
+// A real allow-listed tag is left as markup.
 function descriptionForEdit(pieces: string[], decoded: string, edited: string): string {
   if (pieces.length !== decoded.length || edited === decoded) return edited;
-  const anchors: number[] = [];
+  let anchors = 0;
   for (let i = 0; i < pieces.length; i++) {
     const piece = pieces[i];
-    if (piece === "&lt;" || piece === "&gt;" || piece === "&quot;") anchors.push(i);
+    if (piece === "&lt;" || piece === "&gt;" || piece === "&quot;") anchors++;
   }
-  if (anchors.length === 0) return edited;
-  const replacements = new Map<number, string>();
-  const placed = new Map<number, number[]>();
-  for (const index of anchors) {
-    const match = matchingPrefix(decoded, index, edited);
-    // A single bare bracket is not distinctive enough to stamp onto every copy.
-    const positions = match.length >= 2 || match.positions.length === 1 ? match.positions : [];
-    placed.set(index, positions);
-    for (const at of positions) replacements.set(at, pieces[index]);
-  }
-  const nearest = (from: number, mark: string, step: -1 | 1): number => {
-    for (let at = from; at >= 0 && at < edited.length; at += step) {
-      if (edited[at] === mark && !replacements.has(at)) return at;
-    }
-    return -1;
-  };
-  for (let a = 0; a < anchors.length; a++) {
-    const index = anchors[a];
-    if ((placed.get(index) ?? []).length > 0) continue;
-    const mark = decoded[index];
-    const partner = mark === "<" ? ">" : mark === ">" ? "<" : "\"";
-    const directions: Array<-1 | 1> = mark === "\"" ? [-1, 1] : mark === ">" ? [-1] : [1];
-    for (const dir of directions) {
-      let partnerIndex = -1;
-      for (let b = a + dir; b >= 0 && b < anchors.length; b += dir) {
-        if (decoded[anchors[b]] === partner) { partnerIndex = anchors[b]; break; }
-      }
-      if (partnerIndex === -1) continue;
-      for (const partnerAt of placed.get(partnerIndex) ?? []) {
-        const at = nearest(partnerAt + dir, mark, dir);
-        if (at !== -1) replacements.set(at, pieces[index]);
-      }
-    }
-  }
-  if (replacements.size === 0) return edited;
+  if (anchors === 0) return edited;
+  const prefix = tagAwarePrefix(decoded, edited);
+  const suffix = tagAwareSuffix(decoded, edited, prefix);
   let out = "";
-  for (let i = 0; i < edited.length; i++) out += replacements.get(i) ?? edited[i];
+  for (let i = 0; i < prefix; i++) out += pieceChar(pieces[i]);
+  const beforeMid = decoded.slice(prefix, decoded.length - suffix);
+  const afterMid = edited.slice(prefix, edited.length - suffix);
+  const pairs = equalCharPairs(beforeMid, afterMid);
+  if (pairs === null) {
+    out += escapeDisallowedTags(afterMid);
+  } else {
+    let cursor = 0;
+    for (const [a, b] of pairs) {
+      if (b > cursor) out += escapeDisallowedTags(afterMid.slice(cursor, b));
+      out += pieceChar(pieces[prefix + a]);
+      cursor = b + 1;
+    }
+    if (cursor < afterMid.length) out += escapeDisallowedTags(afterMid.slice(cursor));
+  }
+  for (let i = decoded.length - suffix; i < decoded.length; i++) out += pieceChar(pieces[i]);
   return out;
 }
 

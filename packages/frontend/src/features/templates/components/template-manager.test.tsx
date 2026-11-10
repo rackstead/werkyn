@@ -1,4 +1,6 @@
 import { writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { afterAll, afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -11,6 +13,26 @@ import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { TemplateManager } from "./template-manager";
 import type { TaskTemplate } from "../api";
+
+// Production options from packages/backend/src/utils/description-html.ts.
+// The allow-list is not widened here. Vitest serves this file over http, so
+// the backend package is taken from the /@fs path rather than a file URL.
+function backendPackageJson(): string {
+  const url = new URL("../../../../../backend/package.json", import.meta.url);
+  if (url.protocol === "file:") return fileURLToPath(url);
+  const marker = "/@fs";
+  const at = url.href.indexOf(marker);
+  return at >= 0 ? decodeURIComponent(url.href.slice(at + marker.length)) : url.pathname;
+}
+const requireBackend = createRequire(backendPackageJson());
+const sanitizeHtml = requireBackend("sanitize-html") as (html: string, options: object) => string;
+const PRODUCTION_SANITIZE = {
+  allowedTags: ["b", "i", "em", "strong", "p", "br", "ul", "ol", "li", "a", "h1", "h2", "h3", "blockquote", "code", "pre"],
+  allowedAttributes: { a: ["href", "target", "rel"] },
+  allowedSchemes: ["http", "https", "mailto"],
+  disallowedTagsMode: "discard",
+};
+const savedBySanitizer = (html: string) => sanitizeHtml(html, PRODUCTION_SANITIZE);
 
 const transport = vi.hoisted(() => {
   vi.stubGlobal("BroadcastChannel", class { addEventListener() {} removeEventListener() {} postMessage() {} close() {} });
@@ -393,6 +415,57 @@ test("text contract: editing inside a code sample keeps its brackets escaped", a
   await mount({ description: "Use &lt;div&gt; end" }); await open();
   change(descriptionInput(), "Use <span> end"); await save();
   expect(writes()[0].data).toEqual({ description: "Use &lt;span&gt; end" });
+});
+test("text contract: a word beside an escaped sample does not escape a real tag", async () => {
+  const stored = "Use &lt;div&gt; please <p>Keep</p> <b>me</b>";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("Use <div> please <p>Keep</p> <b>me</b>");
+  change(descriptionInput(), "Use <div> now <p>Keep</p> <b>me</b>"); await save();
+  const sent = writes()[0].data?.description as string;
+  const saved = savedBySanitizer(sent);
+  expect(saved).toContain("&lt;div&gt;");
+  expect(saved).toContain("<p>Keep</p>");
+  expect(saved).toContain("<b>me</b>");
+  expect(saved).not.toContain("Keepme");
+});
+test("text contract: editing a sample beside a real tag keeps both", async () => {
+  await mount({ description: "Use &lt;div&gt; <b>end</b>" }); await open();
+  change(descriptionInput(), "Use <span> <b>end</b>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;span&gt;");
+  expect(saved).toContain("<b>end</b>");
+  expect(saved).not.toBe("Use end");
+});
+test("text contract: editing a sample beside a paragraph keeps the paragraph", async () => {
+  const stored = "Prefer &lt;div&gt; for layout <p>Keep this whole paragraph.</p>";
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), "Prefer <span> for layout <p>Keep this whole paragraph.</p>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;span&gt;");
+  expect(saved).toContain("<p>Keep this whole paragraph.</p>");
+});
+test("text contract: a second div with a different tail stays a sample", async () => {
+  await mount({ description: "Prefer &lt;div&gt; for layout" }); await open();
+  change(descriptionInput(), "Prefer <div> for layout and <div> in the footer"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("Prefer &lt;div&gt; for layout");
+  expect(saved).toContain("&lt;div&gt; in the footer");
+});
+test("text contract: a shared b prefix does not escape the real tag", async () => {
+  await mount({ description: "Try &lt;b&gt;one <b>two</b>" }); await open();
+  change(descriptionInput(), "Try <b>1 <b>two</b>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;b&gt;1");
+  expect(saved).toContain("<b>two</b>");
+});
+test("text contract: a shared 32 character prefix does not escape the real tag", async () => {
+  const hello = "Hello world this is plenty of matching text";
+  const stored = `&lt;b&gt;${hello} <b>${hello}</b>`;
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), `Note <b>${hello} <b>${hello}</b>`); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain(`&lt;b&gt;${hello}`);
+  expect(saved).toContain(`<b>${hello}</b>`);
 });
 test("text contract: a long insertion before a code sample keeps its spelling", async () => {
   const inserted = "n".repeat(4001);

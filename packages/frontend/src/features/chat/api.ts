@@ -123,10 +123,32 @@ interface MessagesPage {
 export function useChannels(wid: string) {
   return useQuery({
     queryKey: queryKeys.chatChannels(wid),
-    queryFn: () =>
-      api
-        .get(`chat/${wid}/channels`)
-        .json<{ data: ChatChannel[] }>(),
+    queryFn: async ({ signal }) => {
+      // The sidebar, unread widget and backup picker still need every channel
+      // the caller can see. The server returns 50 at a time; follow nextCursor
+      // until it is null. A repeated cursor stops the walk. If a page is still
+      // outstanding after 200 requests, fail rather than treat a short list
+      // as complete. signal aborts the walk when the query is dropped.
+      const data: ChatChannel[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      for (let page = 0; page < 200; page += 1) {
+        if (signal.aborted) throw signal.reason ?? new DOMException("The request was aborted", "AbortError");
+        const searchParams: Record<string, string> = {};
+        if (cursor) searchParams.cursor = cursor;
+        const body = await api
+          .get(`chat/${wid}/channels`, { searchParams, signal })
+          .json<{ data: ChatChannel[]; nextCursor: string | null }>();
+        for (const channel of body.data) {
+          if (seen.has(channel.id)) continue;
+          seen.add(channel.id);
+          data.push(channel);
+        }
+        if (!body.nextCursor || body.data.length === 0 || body.nextCursor === cursor) return { data };
+        cursor = body.nextCursor;
+      }
+      throw new Error("The channel list did not finish");
+    },
     enabled: !!wid,
   });
 }

@@ -1261,6 +1261,8 @@ model ChatChannel {
   messages   ChatMessage[]
 
   @@index([workspaceId, type])
+  @@index([workspaceId, createdAt, id])
+  @@index([workspaceId, type, updatedAt, id])
 }
 
 model ChatChannelMember {

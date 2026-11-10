@@ -12,6 +12,7 @@ import {
   ChatMessageQuerySchema,
   ChatBookmarkQuerySchema,
   ChannelMemberQuerySchema,
+  ChatListQuerySchema,
   ToggleReactionSchema,
   PinMessageSchema,
   ArchiveChannelSchema,
@@ -19,6 +20,7 @@ import {
 } from "@pm/shared";
 import {
   listChannelsHandler,
+  listDmsHandler,
   getChannelHandler,
   createChannelHandler,
   updateChannelHandler,
@@ -57,7 +59,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
   fastify.route({
     method: "GET",
     url: "/:wid/channels",
-    preHandler: [authenticate, authorize("ADMIN", "MEMBER", "VIEWER")],
+    preHandler: [
+      authenticate,
+      authorize("ADMIN", "MEMBER", "VIEWER"),
+      validateQuery(ChatListQuerySchema),
+    ],
     handler: listChannelsHandler,
   });
 
@@ -216,6 +222,17 @@ export default async function chatRoutes(fastify: FastifyInstance) {
   });
 
   // ─── DMs ───────────────────────────────────────────
+
+  fastify.route({
+    method: "GET",
+    url: "/:wid/dms",
+    preHandler: [
+      authenticate,
+      authorize("ADMIN", "MEMBER", "VIEWER"),
+      validateQuery(ChatListQuerySchema),
+    ],
+    handler: listDmsHandler,
+  });
 
   fastify.route({
     method: "POST",

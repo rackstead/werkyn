@@ -49,6 +49,18 @@ export type ChatBookmarkQueryInput = z.infer<typeof ChatBookmarkQuerySchema>;
 export const CHANNEL_LIST_MEMBER_LIMIT = 10;
 /** Default page of a channel's member list. */
 export const CHANNEL_MEMBER_PAGE_DEFAULT = 100;
+/**
+ * Default page of the channel list and the DM list.
+ * A request that omits `limit` gets this many rows, not the whole list.
+ * The maximum is 100.
+ */
+export const CHAT_LIST_PAGE_DEFAULT = 50;
+
+export const ChatListQuerySchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(CHAT_LIST_PAGE_DEFAULT),
+});
+export type ChatListQueryInput = z.infer<typeof ChatListQuerySchema>;
 
 export const ChannelMemberQuerySchema = z.object({
   cursor: z.string().optional(),

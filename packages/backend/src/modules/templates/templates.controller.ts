@@ -114,14 +114,12 @@ export async function createTaskFromTemplateHandler(
       "Could not broadcast committed template task",
     );
   }
-  try {
-    await invalidateVisibleTaskLists(request.server.prisma, params.pid);
-  } catch (error) {
+  void invalidateVisibleTaskLists(request.server.prisma, params.pid).catch((error) => {
     request.log.error(
       { stage: "task_list_invalidation", projectId: params.pid, ...postCommitDiagnostics(error) },
       "Could not invalidate visible task lists",
     );
-  }
+  });
   for (const id of notificationDeliveryIds) {
     void deliverNotification(request.server.prisma, request.server, id, { log: request.server.log })
       .catch((error) => request.log.error(

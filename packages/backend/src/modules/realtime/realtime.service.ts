@@ -1,7 +1,7 @@
 import type { WebSocket } from "ws";
 import type { PrismaClient } from "@prisma/client";
 import { verifyAccessToken } from "../../utils/tokens.js";
-import { assertProjectAccess, filterProjectRecipients } from "../../utils/project-access.js";
+import { assertProjectAccess, visibleProjectAudience } from "../../utils/project-access.js";
 
 interface ConnectionInfo {
   userId: string;
@@ -477,39 +477,54 @@ export function broadcastToUser(
 }
 
 // Dashboard listeners are subscribed to the workspace, not to every project.
-// The signal carries no task id, title, or body. Workspace members who cannot
-// see the project are left out; project-board task events stay on `broadcast`.
+// The signal carries no task id, title, or body. Only sockets already
+// subscribed to that workspace, whose user can see the project, receive it.
+// A revocation during the read bumps accessVersion, so the saved result is
+// not delivered. Sockets that subscribe during the read are not admitted.
+// Project-board task events stay on `broadcast`.
 export async function invalidateVisibleTaskLists(
   prisma: Pick<PrismaClient, "project">,
   projectId: string,
 ): Promise<void> {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { workspaceId: true },
-  });
-  if (!project) return;
-
-  const subscriberIds: string[] = [];
+  const candidates: Array<{
+    ws: WebSocket;
+    version: number;
+    userId: string;
+    workspaceIds: Set<string>;
+  }> = [];
+  const userIds: string[] = [];
   const seen = new Set<string>();
-  for (const conn of connections.values()) {
-    if (!conn.workspaceIds.has(project.workspaceId) || seen.has(conn.userId)) continue;
-    seen.add(conn.userId);
-    subscriberIds.push(conn.userId);
+  for (const [ws, conn] of connections) {
+    if (conn.workspaceIds.size === 0) continue;
+    candidates.push({
+      ws,
+      version: conn.accessVersion,
+      userId: conn.userId,
+      workspaceIds: new Set(conn.workspaceIds),
+    });
+    if (!seen.has(conn.userId)) {
+      seen.add(conn.userId);
+      userIds.push(conn.userId);
+    }
   }
-  if (subscriberIds.length === 0) return;
+  if (userIds.length === 0) return;
 
-  const allowed = new Set(await filterProjectRecipients(prisma, projectId, subscriberIds));
-  if (allowed.size === 0) return;
-
+  const audience = await visibleProjectAudience(prisma, projectId, userIds);
+  if (!audience || audience.recipientIds.length === 0) return;
+  const allowed = new Set(audience.recipientIds);
   const message = JSON.stringify({
     event: "workspace_tasks_invalidated",
     data: {},
-    workspaceId: project.workspaceId,
+    workspaceId: audience.workspaceId,
   });
-  for (const [ws, conn] of connections) {
-    if (conn.workspaceIds.has(project.workspaceId) && allowed.has(conn.userId)) {
-      deliver(ws, conn, message);
-    }
+  for (const candidate of candidates) {
+    const conn = connections.get(candidate.ws);
+    if (!conn || conn.userId !== candidate.userId) continue;
+    if (conn.accessVersion !== candidate.version) continue;
+    if (!candidate.workspaceIds.has(audience.workspaceId)) continue;
+    if (!conn.workspaceIds.has(audience.workspaceId)) continue;
+    if (!allowed.has(conn.userId)) continue;
+    deliver(candidate.ws, conn, message);
   }
 }
 

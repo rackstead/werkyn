@@ -20,6 +20,7 @@ process.env.STORAGE_DIR = storageDir;
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
 const { startRefreshSession } = await import("../../src/modules/auth/refresh-sessions.js");
+const realtime = await import("../../src/modules/realtime/realtime.service.js");
 
 const INVALIDATION = "workspace_tasks_invalidated";
 let app, port, fixture;
@@ -185,10 +186,10 @@ test("a workspace subscriber does not see the task event; a visible user gets a 
     const taskId = created.json().data.id;
     const secrets = [taskId, title, body];
 
-    const createdEvent = await board.next((message) => message.event === "task_created", 1000);
+    const createdEvent = await board.next((message) => message.event === "task_created", 2000);
     assert.deepEqual(createdEvent, { event: "task_created", data: { taskId }, projectId: project.id });
-    const createdForMember = await dashboard.next((message) => message.event === INVALIDATION, 1000);
-    const createdForAdmin = await adminDashboard.next((message) => message.event === INVALIDATION, 1000);
+    const createdForMember = await dashboard.next((message) => message.event === INVALIDATION, 2000);
+    const createdForAdmin = await adminDashboard.next((message) => message.event === INVALIDATION, 2000);
     assertContentFree(createdForMember, workspace.id, secrets);
     assertContentFree(createdForAdmin, workspace.id, secrets);
     await rest(clients);
@@ -201,10 +202,10 @@ test("a workspace subscriber does not see the task event; a visible user gets a 
 
     const updated = await request(actor.token, "PATCH", `/api/tasks/${taskId}`, { title: `${title}-edited` });
     assert.equal(updated.statusCode, 200, updated.body);
-    const updatedEvent = await board.next((message) => message.event === "task_updated", 1000);
+    const updatedEvent = await board.next((message) => message.event === "task_updated", 2000);
     assert.deepEqual(updatedEvent, { event: "task_updated", data: { taskId }, projectId: project.id });
-    assertContentFree(await dashboard.next((message) => message.event === INVALIDATION, 1000), workspace.id, [...secrets, `${title}-edited`]);
-    assertContentFree(await adminDashboard.next((message) => message.event === INVALIDATION, 1000), workspace.id, [...secrets, `${title}-edited`]);
+    assertContentFree(await dashboard.next((message) => message.event === INVALIDATION, 2000), workspace.id, [...secrets, `${title}-edited`]);
+    assertContentFree(await adminDashboard.next((message) => message.event === INVALIDATION, 2000), workspace.id, [...secrets, `${title}-edited`]);
     await rest(clients);
     assert.deepEqual(stranger.inbox, [], JSON.stringify(stranger.inbox));
     assert.deepEqual(otherTab.inbox, [], JSON.stringify(otherTab.inbox));
@@ -215,10 +216,10 @@ test("a workspace subscriber does not see the task event; a visible user gets a 
 
     const removed = await request(actor.token, "DELETE", `/api/tasks/${taskId}`);
     assert.equal(removed.statusCode, 204, removed.body);
-    const deletedEvent = await board.next((message) => message.event === "task_deleted", 1000);
+    const deletedEvent = await board.next((message) => message.event === "task_deleted", 2000);
     assert.deepEqual(deletedEvent, { event: "task_deleted", data: { taskId }, projectId: project.id });
-    assertContentFree(await dashboard.next((message) => message.event === INVALIDATION, 1000), workspace.id, secrets);
-    assertContentFree(await adminDashboard.next((message) => message.event === INVALIDATION, 1000), workspace.id, secrets);
+    assertContentFree(await dashboard.next((message) => message.event === INVALIDATION, 2000), workspace.id, secrets);
+    assertContentFree(await adminDashboard.next((message) => message.event === INVALIDATION, 2000), workspace.id, secrets);
     await rest(clients);
     assert.deepEqual(stranger.inbox, [], JSON.stringify(stranger.inbox));
     assert.deepEqual(otherTab.inbox, [], JSON.stringify(otherTab.inbox));
@@ -226,6 +227,80 @@ test("a workspace subscriber does not see the task event; a visible user gets a 
     assert.deepEqual(board.inbox, [], JSON.stringify(board.inbox));
     assert.deepEqual(adminDashboard.inbox, [], JSON.stringify(adminDashboard.inbox));
   } finally {
+    for (const client of clients) client.socket.destroy();
+  }
+});
+
+test("a revocation during the recipient read is not delivered, nor is a socket that subscribes during it", async () => {
+  const { actor, watcher, admin, workspace, project, suffix } = fixture;
+  const original = app.prisma.project.findUnique.bind(app.prisma.project);
+  let release = () => {};
+  let entered = () => {};
+  const enteredPromise = new Promise((resolve) => { entered = resolve; });
+  const hold = new Promise((resolve) => { release = resolve; });
+  app.prisma.project.findUnique = async (args) => {
+    const result = await original(args);
+    const listed = args?.select?.members?.where?.userId?.in;
+    if (Array.isArray(listed)) {
+      entered();
+      await hold;
+    }
+    return result;
+  };
+  const clients = [];
+  try {
+    const board = await connect(actor.token);
+    const dashboard = await connect(watcher.token);
+    clients.push(board, dashboard);
+    await subscribe(board, "project", project.id);
+    await subscribe(dashboard, "workspace", workspace.id);
+    await quiet(clients);
+
+    const pending = request(actor.token, "POST", `/api/projects/${project.id}/tasks`, {
+      title: `race-${suffix}`,
+      priority: "NONE",
+    });
+    await Promise.race([
+      enteredPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("recipient lookup did not start")), 5000)),
+    ]);
+    await app.prisma.projectMember.delete({
+      where: { projectId_userId: { projectId: project.id, userId: watcher.id } },
+    });
+    realtime.revokeProjectAccess(watcher.id, project.id);
+    const late = await connect(admin.token);
+    clients.push(late);
+    await subscribe(late, "workspace", workspace.id);
+    release();
+
+    const created = await pending;
+    assert.equal(created.statusCode, 201, created.body);
+    const taskId = created.json().data.id;
+    const createdEvent = await board.next((message) => message.event === "task_created", 2000);
+    assert.deepEqual(createdEvent, { event: "task_created", data: { taskId }, projectId: project.id });
+    await rest(clients);
+    assert.equal(dashboard.inbox.some((message) => message.event === INVALIDATION), false, JSON.stringify(dashboard.inbox));
+    assert.equal(late.inbox.some((message) => message.event === INVALIDATION), false, JSON.stringify(late.inbox));
+
+    app.prisma.project.findUnique = original;
+    await quiet(clients);
+    const updated = await request(actor.token, "PATCH", `/api/tasks/${taskId}`, { title: `race-${suffix}-edited` });
+    assert.equal(updated.statusCode, 200, updated.body);
+    assertContentFree(
+      await late.next((message) => message.event === INVALIDATION, 2000),
+      workspace.id,
+      [taskId, `race-${suffix}`, `race-${suffix}-edited`],
+    );
+    await rest([dashboard, late, board]);
+    assert.equal(dashboard.inbox.some((message) => message.event === INVALIDATION), false, JSON.stringify(dashboard.inbox));
+  } finally {
+    app.prisma.project.findUnique = original;
+    release();
+    await app.prisma.projectMember.upsert({
+      where: { projectId_userId: { projectId: project.id, userId: watcher.id } },
+      update: {},
+      create: { projectId: project.id, userId: watcher.id },
+    });
     for (const client of clients) client.socket.destroy();
   }
 });

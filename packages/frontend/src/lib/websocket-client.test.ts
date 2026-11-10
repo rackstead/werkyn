@@ -273,6 +273,84 @@ describe("session close codes", () => {
     }
   });
 
+  it("reconnects immediately when the renewal replaced the token, and catches up only after authenticated", async () => {
+    vi.useFakeTimers();
+    let token = "stale";
+    const caught: string[] = [];
+    const renewal = deferred();
+    const reporting = new WebSocketClient({
+      url: "ws://test/api/ws",
+      getToken: () => token,
+      onReconnect: () => {
+        caught.push(
+          FakeWebSocket.latest()
+            .sent.map((frame) => String(frame.type))
+            .join(","),
+        );
+      },
+      onSessionEnded: () => {
+        token = "fresh";
+        return renewal.promise;
+      },
+    });
+    try {
+      reporting.connect();
+      const opened = FakeWebSocket.latest();
+      opened.accept();
+      expect(caught).toEqual([]);
+      reporting.subscribe("kept");
+      const before = FakeWebSocket.instances.length;
+      opened.closeWith(4004);
+      expect(FakeWebSocket.instances).toHaveLength(before);
+
+      renewal.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(FakeWebSocket.instances).toHaveLength(before + 1);
+      const next = FakeWebSocket.latest();
+      expect(caught).toEqual([]);
+      next.accept();
+      expect(next.sent[0]).toEqual({ type: "auth", token: "fresh" });
+      expect(next.sent).toContainEqual({ type: "subscribe", projectId: "kept" });
+      expect(caught).toEqual(["auth,subscribe"]);
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
+  it("catches up on a visibility reconnect only after holders are sent again", () => {
+    const caught: string[] = [];
+    const reporting = new WebSocketClient({
+      url: "ws://test/api/ws",
+      getToken: () => "token",
+      onReconnect: () => {
+        caught.push(
+          FakeWebSocket.latest()
+            .sent.map((frame) => String(frame.type))
+            .join(","),
+        );
+      },
+    });
+    try {
+      reporting.connect();
+      const opened = FakeWebSocket.latest();
+      opened.accept();
+      reporting.subscribe("kept");
+      opened.drop();
+      const visibility = vi
+        .spyOn(document, "visibilityState", "get")
+        .mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      visibility.mockRestore();
+      const next = FakeWebSocket.latest();
+      expect(next).not.toBe(opened);
+      expect(caught).toEqual([]);
+      next.accept();
+      expect(caught).toEqual(["auth,subscribe"]);
+    } finally {
+      reporting.disconnect();
+    }
+  });
+
   it.each([4004, 4005])(
     "neither reports nor reconnects after close %i of a client that was already disconnected",
     async (code) => {

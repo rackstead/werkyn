@@ -26,6 +26,9 @@ const SESSION_CLOSE_CODES = new Set([4004, 4005]);
 interface WebSocketClientOptions {
   url: string;
   getToken: () => string | null;
+  // Runs only after a later socket has authenticated and its holders have
+  // been sent again. The first connection does not catch up, and neither
+  // does the call to connect() itself.
   onReconnect?: () => void;
   // Called once per socket closed with a session close code. Reconnecting
   // with the same token cannot succeed, so the client waits until the
@@ -61,6 +64,9 @@ export class WebSocketClient {
   };
   private connected = false;
   private destroyed = false;
+  // Set when this client is about to open a socket that replaces one that
+  // already closed. Cleared once that socket has authenticated.
+  private catchUpOnAuthenticated = false;
 
   constructor(options: WebSocketClientOptions) {
     this.url = options.url;
@@ -101,6 +107,12 @@ export class WebSocketClient {
               this.sendScopeFrame(scope, "subscribe", id);
             }
           }
+          // Holders are on the wire before catch-up, so a refetch cannot
+          // finish and then miss a commit that lands before resubscribe.
+          if (this.catchUpOnAuthenticated) {
+            this.catchUpOnAuthenticated = false;
+            this.onReconnect?.();
+          }
           return;
         }
 
@@ -140,6 +152,7 @@ export class WebSocketClient {
       this.ws = null;
     }
     this.connected = false;
+    this.catchUpOnAuthenticated = false;
     this.handlers.clear();
     for (const scope of Object.keys(SCOPES) as Scope[]) {
       this.holders[scope].clear();
@@ -240,23 +253,24 @@ export class WebSocketClient {
       this.maxReconnectDelay,
     );
     this.reconnectAttempts++;
+    this.catchUpOnAuthenticated = true;
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-      this.onReconnect?.();
     }, delay);
   }
 
   // One renewal at a time: neither the backoff timer nor a tab becoming
-  // visible reconnects with the old token while it runs. The owner replaces
-  // or disconnects this client when it gets a new token or signs out;
-  // otherwise the normal backoff resumes afterwards.
+  // visible reconnects with the old token while it runs. A replaced token
+  // reconnects this same client at once. Sign-out destroys it, so that
+  // reconnect does not run. An unchanged token resumes the normal backoff.
   private renewSession(
     onSessionEnded: (code: number) => Promise<unknown> | void,
     code: number,
   ): void {
     this.renewing = true;
+    const tokenAtClose = this.getToken();
     let renewal: Promise<unknown>;
     try {
       renewal = Promise.resolve(onSessionEnded(code));
@@ -267,25 +281,35 @@ export class WebSocketClient {
       .catch(() => {})
       .finally(() => {
         this.renewing = false;
+        if (this.destroyed) return;
+        const tokenNow = this.getToken();
+        if (tokenNow && tokenNow !== tokenAtClose) {
+          this.catchUpOnAuthenticated = true;
+          this.connect();
+          return;
+        }
         this.scheduleReconnect();
       });
   }
 
   private handleVisibility(): void {
     if (
-      document.visibilityState === "visible" &&
-      !this.connected &&
-      !this.renewing &&
-      !this.destroyed
+      document.visibilityState !== "visible" ||
+      this.connected ||
+      this.renewing ||
+      this.destroyed ||
+      // Already opening. A first connection must not catch up just because
+      // the tab was shown before it authenticated.
+      this.ws
     ) {
-      // Clear existing reconnect timer and reconnect immediately
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-      this.reconnectAttempts = 0;
-      this.connect();
-      this.onReconnect?.();
+      return;
     }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
+    this.catchUpOnAuthenticated = true;
+    this.connect();
   }
 }

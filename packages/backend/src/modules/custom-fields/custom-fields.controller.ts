@@ -7,6 +7,7 @@ import type {
   SetCustomFieldValueInput,
 } from "@pm/shared";
 import { logActivity } from "../../utils/activity-log.js";
+import { invalidateVisibleTaskLists } from "../realtime/realtime.service.js";
 
 export async function listCustomFieldsHandler(
   request: FastifyRequest,
@@ -53,6 +54,11 @@ export async function updateCustomFieldHandler(
   if (migratedValues + clearedValues > 0) {
     // Renamed or removed options rewrote task values.
     request.server.broadcast(params.pid, "task_updated", { bulk: true });
+    try {
+      await invalidateVisibleTaskLists(request.server.prisma, params.pid);
+    } catch (error) {
+      request.log.error({ err: error, projectId: params.pid }, "Could not invalidate visible task lists");
+    }
   }
   return reply.send({ data: field, meta: { migratedValues, clearedValues } });
 }
@@ -112,5 +118,10 @@ export async function setFieldValueHandler(
   });
 
   request.server.broadcast(params.pid, "task_updated", { taskId: params.tid });
+  try {
+    await invalidateVisibleTaskLists(request.server.prisma, params.pid);
+  } catch (error) {
+    request.log.error({ err: error, projectId: params.pid }, "Could not invalidate visible task lists");
+  }
   return reply.send({ data: result });
 }

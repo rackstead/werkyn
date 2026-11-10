@@ -1,7 +1,7 @@
 import type { WebSocket } from "ws";
 import type { PrismaClient } from "@prisma/client";
 import { verifyAccessToken } from "../../utils/tokens.js";
-import { assertProjectAccess } from "../../utils/project-access.js";
+import { assertProjectAccess, filterProjectRecipients } from "../../utils/project-access.js";
 
 interface ConnectionInfo {
   userId: string;
@@ -471,6 +471,43 @@ export function broadcastToUser(
 
   for (const [ws, conn] of connections) {
     if (conn.userId === userId) {
+      deliver(ws, conn, message);
+    }
+  }
+}
+
+// Dashboard listeners are subscribed to the workspace, not to every project.
+// The signal carries no task id, title, or body. Workspace members who cannot
+// see the project are left out; project-board task events stay on `broadcast`.
+export async function invalidateVisibleTaskLists(
+  prisma: Pick<PrismaClient, "project">,
+  projectId: string,
+): Promise<void> {
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { workspaceId: true },
+  });
+  if (!project) return;
+
+  const subscriberIds: string[] = [];
+  const seen = new Set<string>();
+  for (const conn of connections.values()) {
+    if (!conn.workspaceIds.has(project.workspaceId) || seen.has(conn.userId)) continue;
+    seen.add(conn.userId);
+    subscriberIds.push(conn.userId);
+  }
+  if (subscriberIds.length === 0) return;
+
+  const allowed = new Set(await filterProjectRecipients(prisma, projectId, subscriberIds));
+  if (allowed.size === 0) return;
+
+  const message = JSON.stringify({
+    event: "workspace_tasks_invalidated",
+    data: {},
+    workspaceId: project.workspaceId,
+  });
+  for (const [ws, conn] of connections) {
+    if (conn.workspaceIds.has(project.workspaceId) && allowed.has(conn.userId)) {
       deliver(ws, conn, message);
     }
   }

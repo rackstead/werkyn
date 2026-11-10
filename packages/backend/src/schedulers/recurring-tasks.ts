@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
 import { createTaskFromTemplate } from "../modules/templates/templates.service.js";
+import { invalidateVisibleTaskLists } from "../modules/realtime/realtime.service.js";
 import {
   advanceNextRunDate,
   calculateNextRunDate,
@@ -289,6 +290,11 @@ export async function processRecurringTasks(
             fastify.broadcast(outcome.projectId, "task_created", { taskId: outcome.taskId });
           } catch (err) {
             fastify.log.error(err, `Could not announce recurring task ${outcome.taskId}`);
+          }
+          try {
+            await invalidateVisibleTaskLists(prisma, outcome.projectId);
+          } catch (err) {
+            fastify.log.error(err, "Could not invalidate visible task lists");
           }
         } else if (outcome.kind === "existing") {
           summary.alreadyGenerated++;

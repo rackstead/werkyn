@@ -1,5 +1,8 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
-import type { StorageProvider } from "../../services/storage.js";
+import {
+  MissingBlobError,
+  type StorageProvider,
+} from "../../services/storage.js";
 import type {
   CreateFolderInput,
   UpdateFileInput,
@@ -859,6 +862,50 @@ interface ArchiveEntry {
   storagePath: string;
 }
 
+/**
+ * Blob checks overlapped before a zip. High enough to hide stat latency,
+ * low enough that the directory walks do not hold a large set of descriptors.
+ */
+const ARCHIVE_BLOB_CHECKS = 8;
+
+/**
+ * Same answers as a single-file download, before any zip byte exists.
+ * The earliest missing blob is 410; the earliest refusal is 403. Later
+ * checks stop once an earlier entry has already failed.
+ */
+async function assertArchiveBlobsPresent(
+  storage: StorageProvider,
+  entries: ArchiveEntry[],
+): Promise<void> {
+  let next = 0;
+  let failureIndex = entries.length;
+  let failure: unknown;
+  const workers = Array.from(
+    { length: Math.min(ARCHIVE_BLOB_CHECKS, entries.length) },
+    async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= failureIndex) return;
+        try {
+          if (!(await storage.exists(entries[index].storagePath))) {
+            if (index < failureIndex) {
+              failureIndex = index;
+              failure = new MissingBlobError();
+            }
+          }
+        } catch (error) {
+          if (index < failureIndex) {
+            failureIndex = index;
+            failure = error;
+          }
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  if (failure !== undefined) throw failure;
+}
+
 async function collectFolderEntries(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -951,6 +998,11 @@ export async function archiveFiles(
       ? `${files[0].name}.zip`
       : "files.zip";
 
+  // Dropping a missing entry and returning 200 would hide it. A blob that
+  // disappears after this check still aborts the stream below; the status
+  // can no longer change once bytes start.
+  await assertArchiveBlobsPresent(storage, entries);
+
   const passthrough = new PassThrough();
   const archive = new ZipArchive({ zlib: { level: 6 } });
 
@@ -960,8 +1012,8 @@ export async function archiveFiles(
   for (const entry of entries) {
     const fileStream = storage.readStream(entry.storagePath);
     // The archiver pipes each entry without forwarding its errors. A blob that
-    // cannot be read (missing, or refused below the storage root) ends the
-    // archive and its response instead of becoming an uncaught error.
+    // cannot be read after the check above ends the archive instead of
+    // becoming an uncaught error.
     fileStream.once("error", (err) => {
       archive.abort();
       passthrough.destroy(err);

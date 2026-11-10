@@ -7,6 +7,8 @@ const state = vi.hoisted(() => ({
   entries: [] as unknown[],
   ranges: [] as unknown[][],
   create: vi.fn(),
+  isError: false,
+  refetch: vi.fn(),
 }));
 
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
@@ -17,7 +19,13 @@ vi.mock("@/hooks/use-permissions", () => ({ usePermissions: () => ({ canEdit: tr
 vi.mock("../api", () => ({
   useTimeEntries: (...args: unknown[]) => {
     state.ranges.push(args);
-    return { data: state.entries, isLoading: false };
+    return {
+      data: state.isError ? undefined : state.entries,
+      isLoading: false,
+      isError: state.isError,
+      isFetching: false,
+      refetch: state.refetch,
+    };
   },
   useCreateTimeEntry: () => ({ mutate: state.create }),
   useUpdateTimeEntry: () => ({ mutate: vi.fn() }),
@@ -40,6 +48,8 @@ const entry = (id: string, date: string, hours: number) => ({
 beforeEach(() => {
   state.entries = [];
   state.ranges = [];
+  state.isError = false;
+  state.refetch = vi.fn();
 });
 afterEach(() => {
   cleanup();
@@ -50,6 +60,16 @@ const renderWeek = (week?: string) =>
   render(
     <TimesheetPage workspaceId="w" workspaceSlug="acme" membership={{ role: "MEMBER" }} week={week} />,
   );
+
+it("does not show an empty grid when a page fails", () => {
+  state.isError = true;
+  state.entries = [entry("mon", "2026-10-26", 2)];
+  renderWeek("2026-10-26");
+  expect(screen.queryByText("Standup")).toBeNull();
+  expect(screen.getByRole("alert").textContent).toMatch(/Could not load time entries/);
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  expect(state.refetch).toHaveBeenCalled();
+});
 
 describe.each(TIME_ZONES)("timesheet in %s", (zone) => {
   useTimeZone(zone);

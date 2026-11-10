@@ -542,8 +542,7 @@ model Task {
   @@index([projectId, startDate])
   // Board order of a project's tasks (utils/task-order.ts): serves the task
   // list's default sort without sorting every task of the project. "id" is
-  // left out on purpose: as an index-only source of a project's task IDs it
-  // made the planner hash every readable task for the notification list.
+  // not a key column; ties of position and createdAt sort incrementally.
   @@index([projectId, archived, position, createdAt])
   // Trigram indexes for title and description search (ILIKE '%term%'; pg_trgm,
   // migration 20261105180000_search_trigram_indexes).
@@ -904,6 +903,8 @@ model FileShare {
   @@index([sharedById])
   @@index([sharedWithId])
   @@index([fileId])
+  // Shared-by-me pages: this caller's shares, newest first.
+  @@index([sharedById, workspaceId, createdAt(sort: Desc)], map: "FileShare_shared_by_me_idx")
 }
 
 model FileShareLink {
@@ -924,6 +925,8 @@ model FileShareLink {
   @@index([token])
   @@index([workspaceId])
   @@index([createdById])
+  // Shared-by-me link pages: this caller's links, newest first.
+  @@index([createdById, workspaceId, createdAt(sort: Desc)], map: "FileShareLink_shared_by_me_idx")
 }
 
 model FileShareLinkFile {

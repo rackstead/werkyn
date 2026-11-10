@@ -420,6 +420,7 @@ when more follows. A request without paging parameters gets the first page:
 | Endpoint | Default and maximum | More rows |
 | --- | --- | --- |
 | `GET /api/workspaces/:wid/my-tasks` | 100, `limit` up to 200 | pass `nextCursor` as `cursor` until it is `null` |
+| `GET /api/workspaces/:wid/files/shared-by-me` | 50, `limit` up to 100 | pass `nextCursor` as `cursor` until it is `null` |
 | `GET /api/chat/:wid/channels/:channelId/members` | 100, `limit` up to 200 | pass `nextCursor` as `cursor` until it is `null` |
 | `GET /api/chat/:wid/channels` | 50 channels, `limit` up to 100. Each channel still carries its first 10 members | pass `nextCursor` as `cursor` until it is `null`. `_count.members` is the full count; a DM's members are complete |
 | `GET /api/chat/:wid/dms` | 50 DMs, `limit` up to 100 | pass `nextCursor` as `cursor` until it is `null` |
@@ -430,10 +431,11 @@ Report totals still cover every matching entry, and the CSV export still lists
 them all. `my-tasks` also accepts `dueAfter`, `dueBefore`, `completed` and
 `sort=dueDate`. Cursor
 lists that sort by a value several rows can share (bookmarks, wiki versions,
-shared-with-me, task comments, the drive listing, channel members, the channel
-list and the DM list) break ties by ID, so pages neither repeat nor skip rows.
-The channel list orders by createdAt then id. The DM list orders by
-updatedAt descending then id. See [P02b](docs/remediation/p02b.md) and
+shared-with-me, shared-by-me, task comments, the drive listing, channel
+members, the channel list and the DM list) break ties by ID, so pages neither
+repeat nor skip rows. The channel list orders by createdAt then id. The DM
+list orders by updatedAt descending then id. See
+[P02b](docs/remediation/p02b.md) and
 [channel and DM list paging](docs/remediation/chat-list-paging.md).
 
 ### Testing API keys

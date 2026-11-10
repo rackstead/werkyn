@@ -5,10 +5,14 @@ import { queryKeys } from "@/lib/query-keys";
 import { toast } from "sonner";
 import {
   isDateOnly,
+  TIME_ENTRY_PAGE_MAX,
   type CreateTimeEntryInput,
   type UpdateTimeEntryInput,
   type SetUserRateInput,
 } from "@pm/shared";
+
+/** Stops a repeated cursor. A normal range finishes in a handful of pages. */
+const TIME_ENTRY_PAGE_WALK_CAP = 1_000;
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -116,6 +120,13 @@ export interface TimeReport {
 
 // ─── Queries ────────────────────────────────────────────
 
+/**
+ * Every entry in the date range. The server returns one page at a time
+ * (100 when `limit` is omitted, at most TIME_ENTRY_PAGE_MAX). This follows
+ * `nextCursor` so the timesheet and the week widget still list the whole range.
+ * A failed page rejects the query. Callers must show that failure, not an
+ * empty week.
+ */
 export function useTimeEntries(
   workspaceId: string,
   startDate: string,
@@ -124,14 +135,31 @@ export function useTimeEntries(
 ) {
   return useQuery({
     queryKey: queryKeys.timeEntries(workspaceId, startDate, endDate, userId),
-    queryFn: () => {
-      const searchParams: Record<string, string> = { startDate, endDate };
-      if (userId) searchParams.userId = userId;
-      return api
-        .get(`workspaces/${workspaceId}/time/entries`, { searchParams })
-        .json<{ data: TimeEntry[] }>();
+    queryFn: async ({ signal }) => {
+      const entries: TimeEntry[] = [];
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      for (let page = 0; page < TIME_ENTRY_PAGE_WALK_CAP; page += 1) {
+        const searchParams: Record<string, string> = {
+          startDate,
+          endDate,
+          limit: String(TIME_ENTRY_PAGE_MAX),
+        };
+        if (userId) searchParams.userId = userId;
+        if (cursor) searchParams.cursor = cursor;
+        const res = await api
+          .get(`workspaces/${workspaceId}/time/entries`, { searchParams, signal })
+          .json<{ data: TimeEntry[]; nextCursor: string | null }>();
+        entries.push(...res.data);
+        if (!res.nextCursor) return entries;
+        if (seenCursors.has(res.nextCursor)) {
+          throw new Error("Time entry pages repeated a cursor");
+        }
+        seenCursors.add(res.nextCursor);
+        cursor = res.nextCursor;
+      }
+      throw new Error("Time entry pages did not end");
     },
-    select: (res) => res.data,
     // A date input reports partial years (0002-03-15) while the user types.
     enabled: !!workspaceId && isDateOnly(startDate) && isDateOnly(endDate),
   });

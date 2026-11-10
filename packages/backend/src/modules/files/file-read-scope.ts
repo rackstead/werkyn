@@ -5,7 +5,7 @@ import { Prisma } from "@prisma/client";
  * assertFileAccess's read policy without materializing every shared descendant.
  * Values/outer-column expressions are composed with Prisma.sql, never raw text.
  */
-function fileReadable(
+export function fileReadable(
   fileId: Prisma.Sql,
   userId: Prisma.Sql,
   workspaceId: Prisma.Sql,

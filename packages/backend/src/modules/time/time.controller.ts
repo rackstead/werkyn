@@ -37,7 +37,7 @@ export async function listEntriesHandler(
   const { wid } = request.params as { wid: string };
   const query = request.query as TimeEntryQuery;
 
-  const entries = await timeEntriesService.listEntries(
+  const page = await timeEntriesService.listEntries(
     request.server.prisma,
     wid,
     request.user!.id,
@@ -45,7 +45,7 @@ export async function listEntriesHandler(
     query,
   );
 
-  return reply.send({ data: entries });
+  return reply.send(page);
 }
 
 export async function updateEntryHandler(

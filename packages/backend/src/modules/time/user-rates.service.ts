@@ -82,7 +82,7 @@ export const FINITE_FLOAT: Prisma.FloatFilter = { gte: -1e308, lte: 1e308 };
  * earlier rate.
  */
 export async function listRateHistory(
-  prisma: PrismaClient,
+  prisma: PrismaClient | Prisma.TransactionClient,
   workspaceId: string,
   userIds: string[],
   throughDate: string,

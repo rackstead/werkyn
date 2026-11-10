@@ -1,7 +1,16 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type { FastifyBaseLogger } from "fastify";
+import {
+  avatarHolderUrls,
+  avatarStoragePath,
+  canonicalAvatarUrl,
+} from "../modules/uploads/avatar-storage-path.js";
 import type { StorageProvider } from "./storage.js";
 import { logger } from "../utils/logger.js";
+import {
+  isLockTimeoutError,
+  isRetryableDatabaseError,
+} from "../utils/retryable-database-errors.js";
 
 /**
  * Durable blob cleanup.
@@ -20,7 +29,11 @@ import { logger } from "../utils/logger.js";
  *   stored paths are unique per row and immutable). Its row is kept with
  *   backoff rather than removed, so a concurrent File delete, whose trigger
  *   finds the row already queued, cannot strand the blob; that trigger makes
- *   the row due again.
+ *   the row due again;
+ * - an uploaded avatar path still named by User.avatarUrl is kept the same
+ *   way. The sweep holds that path's BlobCleanup row across the reference
+ *   check and the delete. A profile save that adopts the path locks the same
+ *   row first, so it either keeps the bytes or learns they are already gone.
  */
 
 const BATCH_SIZE = 100;
@@ -50,6 +63,96 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+type AvatarCleanupOutcome = "retained" | "deleted" | "failed" | "skipped";
+
+// The profile save locks this same row before it points avatarUrl at the path.
+// Hold it from the reference check through the delete so one of the two commits
+// first: a saved avatar is still here to see, or the bytes are already gone.
+async function cleanupQueuedAvatar(
+  prisma: PrismaClient,
+  storage: StorageProvider,
+  claim: { storagePath: string; attempts: number; availableAt: Date },
+): Promise<AvatarCleanupOutcome> {
+  const { storagePath, attempts, availableAt } = claim;
+  const leaseTimestamp = availableAt.toISOString();
+  const delay = Math.min(
+    BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
+    MAX_BACKOFF_SECONDS,
+  );
+  // New saves store the lowercase prefix. A profile that already has another
+  // casing of that prefix still names this exact path, and the media route
+  // serves it. The rest of the path is not folded.
+  const urls = canonicalAvatarUrl(`/storage/${storagePath}`)
+    ? avatarHolderUrls(storagePath)
+    : [];
+  if (urls.length === 0) return "skipped";
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;
+      const locked = await tx.$queryRaw<Array<{ storagePath: string }>>`
+        SELECT "storagePath" FROM "BlobCleanup"
+        WHERE "storagePath" = ${storagePath}
+          AND "attempts" = ${attempts}
+          AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        FOR UPDATE
+      `;
+      if (locked.length !== 1) return "skipped";
+      // One equality per prefix casing. Each lookup is the hash index, not a
+      // scan of every user. The path after the prefix matches exactly.
+      const [holder] = await tx.$queryRaw<Array<{ present: number }>>`
+        SELECT 1 AS present
+        FROM unnest(${urls}::text[]) AS candidate(url)
+        WHERE EXISTS (
+          SELECT 1 FROM "User" WHERE "avatarUrl" = candidate.url
+        )
+        LIMIT 1
+      `;
+      const reason = holder
+        ? "Still referenced by a live avatar"
+        : null;
+      if (reason) {
+        await tx.$executeRaw`
+          UPDATE "BlobCleanup"
+          SET "lastError" = ${reason},
+            "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
+          WHERE "storagePath" = ${storagePath}
+            AND "attempts" = ${attempts}
+            AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        `;
+        return "retained";
+      }
+      try {
+        await storage.delete(storagePath);
+      } catch (error) {
+        const message = errorMessage(error).slice(0, 1000);
+        await tx.$executeRaw`
+          UPDATE "BlobCleanup"
+          SET "lastError" = ${message},
+            "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
+          WHERE "storagePath" = ${storagePath}
+            AND "attempts" = ${attempts}
+            AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        `;
+        return "failed";
+      }
+      await tx.$executeRaw`
+        DELETE FROM "BlobCleanup"
+        WHERE "storagePath" = ${storagePath}
+          AND "attempts" = ${attempts}
+          AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+      `;
+      return "deleted";
+    }, {
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      maxWait: 5_000,
+      timeout: 20_000,
+    });
+  } catch (error) {
+    if (isLockTimeoutError(error) || isRetryableDatabaseError(error)) return "failed";
+    throw error;
+  }
+}
+
 /**
  * Processes one batch of due cleanup rows (optionally only the given paths).
  * Never deletes a row whose blob deletion failed.
@@ -57,7 +160,13 @@ function errorMessage(error: unknown) {
 export async function processBlobCleanup(
   prisma: PrismaClient,
   storage: StorageProvider,
-  options: { paths?: string[]; limit?: number; log?: Logger } = {},
+  options: {
+    paths?: string[];
+    limit?: number;
+    log?: Logger;
+    // Test seam: runs after the claim and before this path's cleanup row is locked.
+    beforeAvatarDecision?: (storagePath: string) => Promise<void>;
+  } = {},
 ): Promise<BlobCleanupResult> {
   const log = options.log ?? logger;
   const result = { claimed: 0, deleted: 0, retained: 0, failed: 0 };
@@ -100,6 +209,11 @@ export async function processBlobCleanup(
       }),
     ),
   );
+  const avatarPaths = new Set(
+    paths.filter(
+      (storagePath) => avatarStoragePath(`/storage/${storagePath}`) === storagePath,
+    ),
+  );
 
   const retry = async (storagePath: string, attempts: number, availableAt: Date, reason: string) => {
     const delay = Math.min(
@@ -128,6 +242,26 @@ export async function processBlobCleanup(
           { storagePath, attempts },
           "Queued stored blob is still referenced by a live File; kept",
         );
+        continue;
+      }
+      if (avatarPaths.has(storagePath)) {
+        if (options.beforeAvatarDecision) await options.beforeAvatarDecision(storagePath);
+        const outcome = await cleanupQueuedAvatar(prisma, storage, claim);
+        if (outcome === "retained") {
+          result.retained++;
+          log.warn(
+            { storagePath, attempts },
+            "Queued stored blob is still referenced by a live avatar; kept",
+          );
+        } else if (outcome === "deleted") {
+          result.deleted++;
+        } else if (outcome === "failed") {
+          result.failed++;
+          log.warn(
+            { storagePath, attempts },
+            "Stored blob cleanup failed; it will be retried",
+          );
+        }
         continue;
       }
       try {

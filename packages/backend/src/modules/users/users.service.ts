@@ -9,24 +9,32 @@ import {
 import { endSessions } from "../realtime/realtime.service.js";
 import {
   AppError,
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
 } from "../../utils/errors.js";
+import type { StorageProvider } from "../../services/storage.js";
+import {
+  avatarStoragePath,
+  canonicalAvatarUrl,
+} from "../uploads/avatar-storage-path.js";
+
+const profileSelect = {
+  id: true,
+  email: true,
+  displayName: true,
+  avatarUrl: true,
+  jobTitle: true,
+  phone: true,
+  timezone: true,
+  emailVerified: true,
+} as const;
 
 export async function getMe(prisma: PrismaClient, userId: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
+    select: profileSelect,
   });
 
   if (!user) throw new NotFoundError("User not found");
@@ -35,6 +43,7 @@ export async function getMe(prisma: PrismaClient, userId: string) {
 
 export async function updateProfile(
   prisma: PrismaClient,
+  storage: Pick<StorageProvider, "exists">,
   userId: string,
   requesterId: string,
   data: {
@@ -49,22 +58,74 @@ export async function updateProfile(
     throw new ForbiddenError("You can only update your own profile");
   }
 
-  const user = await prisma.user.update({
-    where: { id: userId },
-    data,
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      avatarUrl: true,
-      jobTitle: true,
-      phone: true,
-      timezone: true,
-      emailVerified: true,
-    },
-  });
+  // A display-name (or other) save does not read or queue the avatar.
+  if (data.avatarUrl === undefined) {
+    return prisma.user.update({
+      where: { id: userId },
+      data,
+      select: profileSelect,
+    });
+  }
 
-  return user;
+  // Queue the previous uploaded avatar in the same transaction as the
+  // profile write, with the file trigger's insert. The user row is locked so
+  // two replacements cannot each miss the other's path. Adopting a path also
+  // locks its BlobCleanup row, the same row the sweeper holds across its
+  // reference check and delete: whoever gets it first wins, and a path whose
+  // bytes are already gone is not saved. The request does not delete the
+  // bytes. The same path, a missing previous URL, and anything that is not
+  // an uploaded avatar (including wiki media) are not queued, and the new
+  // URL is never queued.
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await limitLockWaits(tx);
+      const [current] = await tx.$queryRaw<Array<{ avatarUrl: string | null }>>`
+        SELECT "avatarUrl" FROM "User" WHERE id = ${userId} FOR NO KEY UPDATE
+      `;
+      const previousPath = avatarStoragePath(current?.avatarUrl);
+      // Same prefix the upload handler writes. The media route also serves
+      // other casings of `/storage`; the sweep keeps those too.
+      const storedAvatarUrl =
+        canonicalAvatarUrl(data.avatarUrl) ?? data.avatarUrl;
+      const nextPath = avatarStoragePath(storedAvatarUrl);
+      const profileData =
+        storedAvatarUrl === data.avatarUrl
+          ? data
+          : { ...data, avatarUrl: storedAvatarUrl };
+      if (nextPath && nextPath !== previousPath) {
+        await tx.$queryRaw`
+          SELECT "storagePath" FROM "BlobCleanup"
+          WHERE "storagePath" = ${nextPath}
+          FOR UPDATE
+        `;
+        if (!(await storage.exists(nextPath))) {
+          throw new ConflictError("This avatar is no longer available");
+        }
+      }
+      if (current && previousPath && previousPath !== nextPath) {
+        await tx.$executeRaw`
+          INSERT INTO "BlobCleanup" ("storagePath")
+          VALUES (${previousPath})
+          ON CONFLICT ("storagePath") DO UPDATE
+          SET "availableAt" = LEAST("BlobCleanup"."availableAt", CURRENT_TIMESTAMP)
+        `;
+      }
+      return tx.user.update({
+        where: { id: userId },
+        data: profileData,
+        select: profileSelect,
+      });
+    }, refreshTransactionOptions);
+  } catch (error: unknown) {
+    if (isBusy(error)) {
+      throw new AppError(
+        503,
+        "Service Unavailable",
+        "This account is busy. Try again in a moment.",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function changePassword(

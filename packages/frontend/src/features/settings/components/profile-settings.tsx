@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { Suspense, useState, useEffect, useRef, useMemo } from "react";
 import type { UpdateUserInput } from "@pm/shared";
 import { toast } from "sonner";
 import { Loader2, Upload, X } from "lucide-react";
@@ -18,7 +18,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { identityGeneration } from "@/lib/identity";
 import { useProfile, useUpdateProfile, useChangePassword } from "../api";
 import { useUploadFile } from "@/features/uploads/api";
-import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog";
+import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
 import { AVATAR_ACCEPT, avatarFileProblem } from "@/components/shared/avatar-crop";
 
 const TIMEZONE_NONE = "__none__";
@@ -315,13 +315,17 @@ export function ProfileSettings() {
             className="hidden"
             onChange={handleAvatarUpload}
           />
-          <AvatarCropDialog
-            file={avatarFile}
-            saving={avatarSaving}
-            onCancel={dismissAvatar}
-            onConfirm={saveAvatar}
-            onError={(message) => toast.error(message)}
-          />
+          {avatarFile && (
+            <Suspense fallback={null}>
+              <AvatarCropDialog
+                file={avatarFile}
+                saving={avatarSaving}
+                onCancel={dismissAvatar}
+                onConfirm={saveAvatar}
+                onError={(message) => toast.error(message)}
+              />
+            </Suspense>
+          )}
         </div>
       </section>
 

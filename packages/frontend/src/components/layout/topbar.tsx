@@ -1,8 +1,8 @@
 import { useAuthStore } from "@/stores/auth-store";
 import { useUIStore } from "@/stores/ui-store";
 import { UserAvatar } from "@/components/shared/user-avatar";
-import { useState, useRef, useEffect } from "react";
-import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog";
+import { Suspense, useState, useRef, useEffect } from "react";
+import { AvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
 import {
   AVATAR_ACCEPT,
   avatarFileProblem,
@@ -230,13 +230,17 @@ export function Topbar() {
         onChange={chooseAvatar}
       />
 
-      <AvatarCropDialog
-        file={avatarFile}
-        saving={avatarSaving}
-        onCancel={dismissAvatar}
-        onConfirm={saveAvatar}
-        onError={(message) => toast.error(message)}
-      />
+      {avatarFile && (
+        <Suspense fallback={null}>
+          <AvatarCropDialog
+            file={avatarFile}
+            saving={avatarSaving}
+            onCancel={dismissAvatar}
+            onConfirm={saveAvatar}
+            onError={(message) => toast.error(message)}
+          />
+        </Suspense>
+      )}
 
       {workspaceId && workspaceSlug && (
         <SearchCommand

@@ -289,6 +289,11 @@ process). Running the backend from `packages/backend` writes to
 `packages/backend/storage/`; new files there are excluded from Git and Docker
 build context. The files that were already tracked are no longer tracked. Git
 history still contains them. This change does not review the image contents.
+An existing checkout that pulls this change loses those 21 working-tree copies
+when they still match the index. Copy `packages/backend/storage/` aside before
+pulling, then put it back. The restored files stay untracked because that
+directory is ignored. Other ignored files already in the directory are not
+removed by this pull.
 
 5. Start development servers:
 ```bash

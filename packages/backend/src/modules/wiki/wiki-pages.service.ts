@@ -89,10 +89,12 @@ async function findPage(tx: Tx, workspaceId: string, pageId: string) {
 }
 
 /**
- * Collects the ids of every descendant of `rootId` level by level. A cycle,
- * a child in another space or an exhausted budget rejects the operation, so a
- * move never leaves part of a tree behind and a delete never lets the parent
- * cascade reach pages outside the space.
+ * Collects the ids of every descendant of `rootId` level by level. Each level
+ * reads only the descendants still allowed by graphLimits.maxNodes, plus one
+ * sentinel, and appends those rows. A cycle, a child in another space or an
+ * exhausted budget rejects the operation, so a move never leaves part of a
+ * tree behind and a delete never lets the parent cascade reach pages outside
+ * the space.
  */
 async function collectSubtree(tx: Tx, rootId: string, spaceId: string) {
   const seen = new Set([rootId]);
@@ -100,13 +102,21 @@ async function collectSubtree(tx: Tx, rootId: string, spaceId: string) {
   let parents = [rootId];
   for (let depth = 1; parents.length; depth++) {
     const children: Array<{ id: string; spaceId: string }> = [];
-    for (const batch of batches(parents))
-      children.push(
-        ...(await tx.wikiPage.findMany({
-          where: { parentId: { in: batch } },
-          select: { id: true, spaceId: true },
-        })),
-      );
+    // Later batches in this level count rows already fetched, so the whole
+    // level stays within the remaining cap plus one sentinel.
+    const room = graphLimits.maxNodes - descendants.length;
+    if (room < 0) pageTreeTooLarge();
+    for (const batch of batches(parents)) {
+      const take = room - children.length + 1;
+      if (take <= 0) break;
+      const rows = await tx.wikiPage.findMany({
+        where: { parentId: { in: batch } },
+        select: { id: true, spaceId: true },
+        take,
+      });
+      for (const row of rows) children.push(row);
+      if (children.length > room) break;
+    }
     if (children.length === 0) break;
     if (depth > graphLimits.maxDepth) pageTreeTooLarge();
     parents = [];

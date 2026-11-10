@@ -815,11 +815,12 @@ export async function copyFile(
 }
 
 /**
- * Collects every descendant row with bounded, level-by-level queries. Any
- * cycle, cross-workspace child or child of a non-folder rejects the whole
- * operation, so callers never act on (or let a cascade delete) rows they did
- * not validate. Pass the locked transaction client when the result drives a
- * write.
+ * Collects every descendant row with bounded, level-by-level queries. Each
+ * level reads only the descendants still allowed by graphLimits.maxNodes, plus
+ * one sentinel, and appends those rows. Any cycle, cross-workspace child or
+ * child of a non-folder rejects the whole operation, so callers never act on
+ * (or let a cascade delete) rows they did not validate. Pass the locked
+ * transaction client when the result drives a write.
  */
 export async function collectDescendantFiles(
   prisma: Prisma.TransactionClient,
@@ -843,24 +844,42 @@ export async function collectDescendantFiles(
   const writableScopes = new Set<string>();
   let parents = [parentId];
   for (let depth = 1; parents.length; depth++) {
-    const children = [];
-    for (const batch of batches(parents))
-      children.push(
-        ...(await prisma.file.findMany({
-          where: { parentId: { in: batch } },
-          select: {
-            id: true,
-            parentId: true,
-            workspaceId: true,
-            storagePath: true,
-            thumbnailPath: true,
-            isFolder: true,
-            ownerId: true,
-            teamFolderId: true,
-            asTeamFolder: { select: { id: true } },
-          },
-        })),
-      );
+    const children: Array<{
+      id: string;
+      parentId: string | null;
+      workspaceId: string;
+      storagePath: string | null;
+      thumbnailPath: string | null;
+      isFolder: boolean;
+      ownerId: string | null;
+      teamFolderId: string | null;
+      asTeamFolder: { id: string } | null;
+    }> = [];
+    // Later batches in this level count rows already fetched, so the whole
+    // level stays within the remaining cap plus one sentinel.
+    const room = graphLimits.maxNodes - result.length;
+    if (room < 0) graphTooLarge();
+    for (const batch of batches(parents)) {
+      const take = room - children.length + 1;
+      if (take <= 0) break;
+      const rows = await prisma.file.findMany({
+        where: { parentId: { in: batch } },
+        select: {
+          id: true,
+          parentId: true,
+          workspaceId: true,
+          storagePath: true,
+          thumbnailPath: true,
+          isFolder: true,
+          ownerId: true,
+          teamFolderId: true,
+          asTeamFolder: { select: { id: true } },
+        },
+        take,
+      });
+      for (const row of rows) children.push(row);
+      if (children.length > room) break;
+    }
     if (children.length === 0) break;
     if (depth > graphLimits.maxDepth) graphTooLarge();
     parents = [];
@@ -955,9 +974,14 @@ async function collectFolderEntries(
   if (visited.has(parentId))
     throw new ForbiddenError("Invalid folder ancestry");
   visited.add(parentId);
+  // Remaining visited descendants, plus one sentinel. A non-positive take
+  // means this walk is already over the cap, so it must not read the level.
+  const take = graphLimits.maxNodes - budget.nodes + 1;
+  if (take <= 0) graphTooLarge();
   const children = await prisma.file.findMany({
     where: { parentId, trashedAt: null },
     select: { id: true, name: true, isFolder: true, storagePath: true },
+    take,
   });
   if (children.length > 0 && depth >= graphLimits.maxDepth) graphTooLarge();
 
@@ -976,7 +1000,7 @@ async function collectFolderEntries(
         visited,
         depth + 1,
       );
-      entries.push(...nested);
+      for (const entry of nested) entries.push(entry);
     } else if (child.storagePath) {
       entries.push({
         name: `${prefix}${child.name}`,
@@ -1022,7 +1046,7 @@ export async function archiveFiles(
         { ...ctx, workspaceId },
         budget,
       );
-      entries.push(...nested);
+      for (const entry of nested) entries.push(entry);
     } else if (file.storagePath) {
       entries.push({ name: file.name, storagePath: file.storagePath });
     }

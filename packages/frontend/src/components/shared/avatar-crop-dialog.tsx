@@ -19,7 +19,9 @@ import {
   croppedAvatarFile,
   displayedSize,
   initialCrop,
+  keyboardPanStep,
   panCrop,
+  scaleCrop,
   zoomAroundCenter,
   type CropState,
   type ImageSize,
@@ -59,8 +61,8 @@ export function AvatarCropDialog({
         <DialogHeader>
           <DialogTitle>Position your avatar</DialogTitle>
           <DialogDescription>
-            Drag the picture to position it. The square is saved, and the circle
-            shows the round avatar.
+            Drag the picture, or focus it and use the arrow keys. The square is
+            saved, and the circle shows the round avatar.
           </DialogDescription>
         </DialogHeader>
         {file && (
@@ -92,7 +94,9 @@ function AvatarCropEditor({
   onError: (message: string) => void;
 }) {
   const url = useObjectUrl(file);
-  const imgRef = useRef<HTMLImageElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const holderRef = useRef<HTMLDivElement>(null);
+  const frozenRef = useRef<HTMLCanvasElement | null>(null);
   const drag = useRef<{
     id: number;
     x: number;
@@ -101,44 +105,91 @@ function AvatarCropEditor({
   } | null>(null);
   const preparingRef = useRef(false);
   const mounted = useRef(true);
+  const cropViewport = useRef(0);
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
     };
   }, []);
+  const [viewport, setViewport] = useState(AVATAR_VIEWPORT);
   const [size, setSize] = useState<ImageSize | null>(null);
   const [crop, setCrop] = useState<CropState | null>(null);
+  const [frozenVersion, setFrozenVersion] = useState(0);
   const [preparing, setPreparing] = useState(false);
   const locked = saving || preparing;
-  const shown =
-    size && crop ? displayedSize(size, AVATAR_VIEWPORT, crop.zoom) : null;
+  const shown = size && crop ? displayedSize(size, viewport, crop.zoom) : null;
+
+  useLayoutEffect(() => {
+    const node = frameRef.current;
+    if (!node) return;
+    const measure = () => {
+      const width = node.clientWidth;
+      const next = width >= 1 ? Math.round(width) : AVATAR_VIEWPORT;
+      setViewport((current) => (current === next ? current : next));
+    };
+    measure();
+    const observer =
+      typeof ResizeObserver === "function" ? new ResizeObserver(measure) : null;
+    observer?.observe(node);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!size) return;
+    setCrop((current) => {
+      if (!current || cropViewport.current === 0) {
+        cropViewport.current = viewport;
+        return initialCrop(size, viewport);
+      }
+      if (cropViewport.current === viewport) return current;
+      const next = scaleCrop(current, cropViewport.current, viewport);
+      cropViewport.current = viewport;
+      return next;
+    });
+  }, [size, viewport]);
+
+  useLayoutEffect(() => {
+    const canvas = frozenRef.current;
+    const parent = holderRef.current;
+    if (!canvas || !parent || !shown || !crop) return;
+    canvas.className = "absolute max-w-none select-none";
+    canvas.style.width = `${shown.width}px`;
+    canvas.style.height = `${shown.height}px`;
+    canvas.style.left = `${crop.offsetX}px`;
+    canvas.style.top = `${crop.offsetY}px`;
+    if (canvas.parentElement !== parent) parent.replaceChildren(canvas);
+  }, [shown, crop, frozenVersion]);
 
   function reject(message: string) {
     onError(message);
     onCancel();
   }
 
-  function applySize(img: HTMLImageElement) {
-    if (size) return;
-    const next = { width: img.naturalWidth, height: img.naturalHeight };
-    if (!(next.width > 0) || !(next.height > 0)) return;
-    setSize(next);
-    setCrop(initialCrop(next));
+  function freeze(img: HTMLImageElement) {
+    if (!(img.naturalWidth > 0) || !(img.naturalHeight > 0)) {
+      reject("This image could not be read");
+      return;
+    }
+    // The preview and the saved file share this still, so an animation cannot
+    // move on after the frame that will be stored.
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      reject("Could not prepare the avatar image");
+      return;
+    }
+    context.drawImage(img, 0, 0);
+    frozenRef.current = canvas;
+    setSize({ width: canvas.width, height: canvas.height });
+    setFrozenVersion((version) => version + 1);
   }
-
-  useLayoutEffect(() => {
-    const img = imgRef.current;
-    // A finished decode can beat the load handler. No size yet means the picture is still loading.
-    if (
-      img &&
-      !size &&
-      img.complete &&
-      img.naturalWidth > 0 &&
-      img.naturalHeight > 0
-    )
-      applySize(img);
-  }, [url, size]);
 
   function onPointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (locked || !size || !crop || event.button !== 0) return;
@@ -163,6 +214,7 @@ function AvatarCropEditor({
         start.crop,
         event.clientX - start.x,
         event.clientY - start.y,
+        viewport,
       ),
     );
   }
@@ -171,9 +223,27 @@ function AvatarCropEditor({
     if (drag.current?.id === event.pointerId) drag.current = null;
   }
 
+  function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (locked || !size || !crop) return;
+    const step = keyboardPanStep(viewport, event.shiftKey);
+    const delta =
+      event.key === "ArrowRight"
+        ? [step, 0]
+        : event.key === "ArrowLeft"
+          ? [-step, 0]
+          : event.key === "ArrowDown"
+            ? [0, step]
+            : event.key === "ArrowUp"
+              ? [0, -step]
+              : null;
+    if (!delta) return;
+    event.preventDefault();
+    setCrop(panCrop(size, crop, delta[0], delta[1], viewport));
+  }
+
   async function confirm() {
-    const img = imgRef.current;
-    if (preparingRef.current || saving || !img || !size || !crop) return;
+    const frozen = frozenRef.current;
+    if (preparingRef.current || saving || !frozen || !size || !crop) return;
     const source = avatarMime(file);
     if (!source) {
       reject("Avatar must be a JPEG, PNG, GIF, or WebP image");
@@ -183,10 +253,11 @@ function AvatarCropEditor({
     setPreparing(true);
     try {
       const cropped = await croppedAvatarFile(
-        img,
-        { width: img.naturalWidth, height: img.naturalHeight },
+        frozen,
+        { width: frozen.width, height: frozen.height },
         crop,
         source,
+        viewport,
       );
       if (!mounted.current) return;
       await onConfirm(cropped);
@@ -206,50 +277,35 @@ function AvatarCropEditor({
   return (
     <div>
       <div
+        ref={frameRef}
         data-avatar-crop="square"
         role="group"
-        aria-label="Drag to position the picture"
-        className="relative mx-auto touch-none overflow-hidden bg-muted select-none"
+        tabIndex={0}
+        aria-label="Drag or use arrow keys to position the picture"
+        className="relative mx-auto w-full touch-none overflow-hidden bg-muted select-none outline-none focus-visible:ring-2 focus-visible:ring-ring"
         style={{
-          width: AVATAR_VIEWPORT,
-          height: AVATAR_VIEWPORT,
+          maxWidth: AVATAR_VIEWPORT,
+          aspectRatio: "1 / 1",
           touchAction: "none",
         }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        onKeyDown={onKeyDown}
       >
-        {url && (
+        {url && !size && (
           <img
-            ref={imgRef}
             src={url}
             alt=""
             draggable={false}
-            className={cn(
-              "absolute max-w-none select-none",
-              !shown && "invisible",
-            )}
-            style={
-              shown && crop
-                ? {
-                    width: shown.width,
-                    height: shown.height,
-                    left: crop.offsetX,
-                    top: crop.offsetY,
-                  }
-                : undefined
-            }
-            onLoad={(event) => {
-              const img = event.currentTarget;
-              if (img.naturalWidth > 0 && img.naturalHeight > 0) applySize(img);
-              else reject("This image could not be read");
-            }}
+            className={cn("absolute h-px w-px opacity-0")}
+            onLoad={(event) => freeze(event.currentTarget)}
             onError={() => reject("This image could not be read")}
           />
         )}
+        <div ref={holderRef} className="absolute inset-0" />
         <div className="pointer-events-none absolute inset-0 border-2 border-white" />
-        {/* The square border is the saved crop. The circle only darkens what the round avatar hides. */}
         <div
           data-avatar-preview="circle"
           className="pointer-events-none absolute inset-0"
@@ -274,7 +330,14 @@ function AvatarCropEditor({
           disabled={locked}
           onChange={(event) => {
             if (!size || !crop) return;
-            setCrop(zoomAroundCenter(size, crop, Number(event.target.value)));
+            setCrop(
+              zoomAroundCenter(
+                size,
+                crop,
+                Number(event.target.value),
+                viewport,
+              ),
+            );
           }}
           className="w-full"
         />

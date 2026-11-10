@@ -20,10 +20,11 @@ import {
 import { Topbar } from "./topbar";
 
 const transport = vi.hoisted(() => ({ upload: vi.fn(), patch: vi.fn() }));
+const route = vi.hoisted(() => ({ slug: "acme" }));
 
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
-  useParams: () => ({ workspaceSlug: "acme" }),
+  useParams: () => ({ workspaceSlug: route.slug }),
 }));
 vi.mock("@/components/shared/theme-toggle", () => ({
   ThemeToggle: () => null,
@@ -102,7 +103,7 @@ async function choose(type: string, name: string) {
 
 function reposition() {
   const frame = screen.getByRole("group", {
-    name: "Drag to position the picture",
+    name: "Drag or use arrow keys to position the picture",
   });
   const zoom = screen.getByRole("slider", { name: "Zoom" });
   zoom.focus();
@@ -145,6 +146,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   canvas.restore();
+  route.slug = "acme";
   vi.restoreAllMocks();
   useAuthStore.setState(useAuthStore.getInitialState(), true);
 });
@@ -185,6 +187,7 @@ it.each([
       sh: 100,
       dw: AVATAR_OUTPUT_SIZE,
       dh: AVATAR_OUTPUT_SIZE,
+      source: "CANVAS",
       mime: output,
     });
     expect(transport.patch).toHaveBeenCalledWith("users/me", {
@@ -196,6 +199,93 @@ it.each([
     expect(toast.success).toHaveBeenCalledWith("Avatar updated");
   },
 );
+
+it("arrow keys move the picture that is uploaded", async () => {
+  mount();
+  await choose("image/png", "photo.png");
+  const frame = screen.getByRole("group", {
+    name: "Drag or use arrow keys to position the picture",
+  });
+  frame.focus();
+  fireEvent.keyDown(frame, { key: "ArrowRight" });
+  fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+  await waitFor(() => expect(transport.upload).toHaveBeenCalledTimes(1));
+  const uploaded = transport.upload.mock.calls[0][0] as { file: File };
+  const bytes = await blobBytes(uploaded.file);
+  // One arrow step is 14px on the 280px frame, so the center square shifts from x=100 to x=90.
+  expect(bytes).toEqual(
+    Array.from(
+      encodeCropDraw({ sx: 90, sy: 0, sw: 200, sh: 200 }, "image/png"),
+    ),
+  );
+});
+
+it("uses the measured frame when the dialog is narrower than 280px", async () => {
+  mount();
+  const input = document.querySelector(
+    'input[type="file"]',
+  ) as HTMLInputElement;
+  fireEvent.change(input, {
+    target: {
+      files: [new File([originalBytes], "photo.png", { type: "image/png" })],
+    },
+  });
+  const frame = await screen.findByRole("group", {
+    name: "Drag or use arrow keys to position the picture",
+  });
+  Object.defineProperty(frame, "clientWidth", {
+    configurable: true,
+    value: 240,
+  });
+  act(() => window.dispatchEvent(new Event("resize")));
+  const img = frame.querySelector("img");
+  if (!img) throw new Error("crop preview missing");
+  setDecodedSize(img, 400, 200);
+  fireEvent.load(img);
+  await waitFor(() => {
+    expect(
+      (screen.getByRole("button", { name: "Save avatar" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+  fireEvent.pointerDown(frame, {
+    pointerId: 1,
+    button: 0,
+    clientX: 0,
+    clientY: 0,
+  });
+  fireEvent.pointerMove(frame, {
+    pointerId: 1,
+    button: 0,
+    clientX: 60,
+    clientY: 0,
+  });
+  fireEvent.pointerUp(frame, {
+    pointerId: 1,
+    button: 0,
+    clientX: 60,
+    clientY: 0,
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+  await waitFor(() => expect(transport.upload).toHaveBeenCalledTimes(1));
+  const uploaded = transport.upload.mock.calls[0][0] as { file: File };
+  const bytes = await blobBytes(uploaded.file);
+  expect(bytes).toEqual(
+    Array.from(
+      encodeCropDraw({ sx: 50, sy: 0, sw: 200, sh: 200 }, "image/png"),
+    ),
+  );
+});
+
+it("drops an open crop when the workspace changes and uploads nothing", async () => {
+  mount();
+  await choose("image/png", "photo.png");
+  route.slug = "other";
+  act(() => useAuthStore.setState({ workspaces: [] }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(transport.upload).not.toHaveBeenCalled();
+  expect(useAuthStore.getState().user?.avatarUrl).toBe("/uploads/old.png");
+});
 
 it("does not upload when the crop is cancelled", async () => {
   mount();

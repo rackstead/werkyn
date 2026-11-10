@@ -25,12 +25,13 @@ const transport = vi.hoisted(() => ({
   patch: vi.fn(),
   upload: vi.fn(),
 }));
+const route = vi.hoisted(() => ({ slug: "acme" }));
 
 vi.mock("@/lib/api-client", () => ({
   api: { get: transport.get, patch: transport.patch },
 }));
 vi.mock("@tanstack/react-router", () => ({
-  useParams: () => ({ workspaceSlug: "acme" }),
+  useParams: () => ({ workspaceSlug: route.slug }),
 }));
 vi.mock("@/features/uploads/api", () => ({
   useUploadFile: () => ({ mutate: transport.upload, isPending: false }),
@@ -122,6 +123,7 @@ afterEach(() => {
   cleanup();
   canvas.restore();
   vi.restoreAllMocks();
+  route.slug = "acme";
   queryClient.clear();
   useAuthStore.setState(useAuthStore.getInitialState(), true);
 });
@@ -130,7 +132,7 @@ it("uploads the cropped picture from profile settings only after confirm", async
   mount();
   const dialog = await choose();
   const frame = screen.getByRole("group", {
-    name: "Drag to position the picture",
+    name: "Drag or use arrow keys to position the picture",
   });
   fireEvent.pointerDown(frame, {
     pointerId: 1,
@@ -168,6 +170,15 @@ it("uploads the cropped picture from profile settings only after confirm", async
   );
   expect(bytes).not.toEqual(Array.from(originalBytes));
   expect(dialog.querySelector("[data-avatar-preview='circle']")).toBeTruthy();
+});
+
+it("drops an open profile crop when the workspace changes", async () => {
+  mount();
+  await choose();
+  route.slug = "other";
+  act(() => useAuthStore.setState({ workspaces: [] }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(transport.upload).not.toHaveBeenCalled();
 });
 
 it("uploads nothing when the profile crop is cancelled", async () => {

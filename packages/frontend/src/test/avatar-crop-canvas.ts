@@ -59,6 +59,7 @@ export interface CropDraw {
   dw: number;
   dh: number;
   mime: string;
+  source: string;
 }
 
 export function setDecodedSize(
@@ -140,18 +141,12 @@ export function installAvatarCanvas(): {
       imageSmoothingEnabled: true,
       imageSmoothingQuality: "high",
       fillRect() {},
-      drawImage(
-        _image: CanvasImageSource,
-        sx: number,
-        sy: number,
-        sw: number,
-        sh: number,
-        _dx: number,
-        _dy: number,
-        dw: number,
-        dh: number,
-      ) {
-        draws.push({ sx, sy, sw, sh, dw, dh, mime: "" });
+      drawImage(image: CanvasImageSource, ...rest: number[]) {
+        // A full-image snapshot uses fewer arguments. Only the saved crop is recorded.
+        if (rest.length !== 8) return;
+        const [sx, sy, sw, sh, , , dw, dh] = rest;
+        const source = image instanceof Element ? image.tagName : "";
+        draws.push({ sx, sy, sw, sh, dw, dh, mime: "", source });
       },
     } as unknown as CanvasRenderingContext2D;
   } as unknown as typeof HTMLCanvasElement.prototype.getContext;

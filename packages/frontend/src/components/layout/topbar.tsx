@@ -43,6 +43,7 @@ export function Topbar() {
 
   const [searchOpen, setSearchOpen] = useState(false);
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarWorkspaceId, setAvatarWorkspaceId] = useState<string | null>(null);
   const [avatarSaving, setAvatarSaving] = useState(false);
   const avatarSavingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -60,6 +61,14 @@ export function Topbar() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  useEffect(() => {
+    if (!avatarFile || avatarSavingRef.current) return;
+    if (avatarWorkspaceId !== workspaceId) {
+      setAvatarFile(null);
+      setAvatarWorkspaceId(null);
+    }
+  }, [workspaceId, avatarFile, avatarWorkspaceId]);
+
   const handleLogout = () => {
     // Local state is cleared at once; server revocation finishes on its own.
     void logout();
@@ -76,22 +85,25 @@ export function Topbar() {
       return;
     }
     setAvatarFile(file);
+    setAvatarWorkspaceId(workspaceId);
   };
 
   const dismissAvatar = () => {
     if (avatarSavingRef.current) return;
     setAvatarFile(null);
+    setAvatarWorkspaceId(null);
   };
 
   const saveAvatar = async (cropped: File) => {
-    if (avatarSavingRef.current || !workspaceId) return;
+    const targetWorkspaceId = avatarWorkspaceId;
+    if (avatarSavingRef.current || !targetWorkspaceId) return;
     avatarSavingRef.current = true;
     setAvatarSaving(true);
     try {
       const result = await uploadFile.mutateAsync({
         file: cropped,
         purpose: "avatar",
-        workspaceId,
+        workspaceId: targetWorkspaceId,
       });
       const res = await api
         .patch("users/me", {
@@ -108,6 +120,7 @@ export function Topbar() {
       }
       toast.success("Avatar updated");
       setAvatarFile(null);
+      setAvatarWorkspaceId(null);
     } catch {
       // Only the account that chose the picture hears that it failed.
       if (useAuthStore.getState().user?.id === user?.id)

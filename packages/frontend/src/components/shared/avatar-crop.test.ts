@@ -6,6 +6,7 @@ import {
   avatarOutputMime,
   initialCrop,
   panCrop,
+  scaleCrop,
   sourceRect,
   zoomAroundCenter,
 } from "./avatar-crop";
@@ -107,5 +108,13 @@ describe("avatar crop geometry", () => {
     });
     expect(zoomAroundCenter(wide, initialCrop(wide), 0.1).zoom).toBe(1);
     expect(zoomAroundCenter(wide, initialCrop(wide), 9).zoom).toBe(3);
+  });
+
+  it("keeps the same bitmap region when the frame gets narrower", () => {
+    const crop = initialCrop(wide, 280);
+    const narrower = scaleCrop(crop, 280, 240);
+    expect(sourceRect(wide, narrower, 240)).toEqual(
+      sourceRect(wide, crop, 280),
+    );
   });
 });

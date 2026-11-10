@@ -172,17 +172,37 @@ export function sourceRect(
   };
 }
 
+export function keyboardPanStep(viewport: number, fast: boolean): number {
+  return Math.max(1, Math.round(viewport / (fast ? 5 : 20)));
+}
+
+/** Keeps the same bitmap region when the on-screen frame changes size. */
+export function scaleCrop(
+  crop: CropState,
+  fromViewport: number,
+  toViewport: number,
+): CropState {
+  if (!(fromViewport > 0) || fromViewport === toViewport) return crop;
+  const ratio = toViewport / fromViewport;
+  return {
+    zoom: crop.zoom,
+    offsetX: crop.offsetX * ratio,
+    offsetY: crop.offsetY * ratio,
+  };
+}
+
 export async function croppedAvatarFile(
   image: CanvasImageSource,
   bitmap: ImageSize,
   crop: CropState,
   source: AvatarMime,
+  viewport = AVATAR_VIEWPORT,
 ): Promise<File> {
   if (!(bitmap.width > 0) || !(bitmap.height > 0)) {
     throw new Error("This image could not be read");
   }
   const mime = avatarOutputMime(source);
-  const rect = sourceRect(bitmap, crop);
+  const rect = sourceRect(bitmap, crop, viewport);
   const canvas = document.createElement("canvas");
   canvas.width = AVATAR_OUTPUT_SIZE;
   canvas.height = AVATAR_OUTPUT_SIZE;

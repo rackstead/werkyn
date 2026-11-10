@@ -55,6 +55,7 @@ export function ProfileSettings() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarWorkspaceId, setAvatarWorkspaceId] = useState<string | null>(null);
   const [avatarSaving, setAvatarSaving] = useState(false);
   const avatarSavingRef = useRef(false);
 
@@ -88,6 +89,14 @@ export function ProfileSettings() {
       values: initial,
     });
   }, [profile, profileUserId, profileGeneration]);
+
+  useEffect(() => {
+    if (!avatarFile || avatarSavingRef.current) return;
+    if (avatarWorkspaceId !== workspaceId) {
+      setAvatarFile(null);
+      setAvatarWorkspaceId(null);
+    }
+  }, [workspaceId, avatarFile, avatarWorkspaceId]);
 
   if (isLoading) {
     return (
@@ -129,6 +138,7 @@ export function ProfileSettings() {
       return;
     }
     setAvatarFile(file);
+    setAvatarWorkspaceId(workspaceId);
   }
 
   function stopAvatarSaving() {
@@ -139,14 +149,16 @@ export function ProfileSettings() {
   function dismissAvatar() {
     if (avatarSavingRef.current) return;
     setAvatarFile(null);
+    setAvatarWorkspaceId(null);
   }
 
   function saveAvatar(cropped: File) {
-    if (!workspaceId || avatarSavingRef.current) return;
+    const targetWorkspaceId = avatarWorkspaceId;
+    if (!targetWorkspaceId || avatarSavingRef.current) return;
     avatarSavingRef.current = true;
     setAvatarSaving(true);
     uploadFile.mutate(
-      { file: cropped, purpose: "avatar", workspaceId },
+      { file: cropped, purpose: "avatar", workspaceId: targetWorkspaceId },
       {
         onSuccess: (res: { data: { url: string } }) => {
           updateProfile.mutate(
@@ -155,6 +167,7 @@ export function ProfileSettings() {
               onSuccess: () => {
                 toast.success("Avatar updated");
                 setAvatarFile(null);
+                setAvatarWorkspaceId(null);
                 stopAvatarSaving();
               },
               onError: () => stopAvatarSaving(),

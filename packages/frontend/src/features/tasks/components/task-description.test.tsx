@@ -500,8 +500,8 @@ it("an ordinary rich-text paste is stored as before", async () => {
       expectedDescriptionRevision: 0,
       description:
         "<h2>Heading</h2>" +
-        '<p><strong>Bold</strong>, <em>italic</em>, <s>struck</s> and <a target="_blank" rel="noopener noreferrer nofollow" href="https://example.com/a?b=1&amp;c=2">a link</a></p>' +
-        '<ul><li><p>One</p></li><li><p>Two</p></li></ul><ol start="4"><li><p>Four</p></li></ol>' +
+        '<p><strong>Bold</strong>, <em>italic</em>, struck and <a target="_blank" rel="noopener noreferrer nofollow" href="https://example.com/a?b=1&amp;c=2">a link</a></p>' +
+        '<ul><li><p>One</p></li><li><p>Two</p></li></ul><ol><li><p>Four</p></li></ol>' +
         "<blockquote><p>Quoted</p></blockquote><pre><code>x &lt; y</code></pre>" +
         "<p><strong>Inline styled</strong></p><p>Cell</p>",
     },
@@ -514,6 +514,79 @@ function sentDescriptions() {
     ([, options]) => (options as { json: { description: string } }).json.description,
   );
 }
+
+const DISALLOWED_DESCRIPTION_TAG = /<\/?(?:s|u|hr|h4|h5|h6)\b|start\s*=/i;
+
+it("does not send strike, underline, a rule, h4-h6, or an ordered-list start", async () => {
+  const id = `task-allowlist-${++suffix}`;
+  render(<TaskDescription descriptionRevision={0} taskId={id} description="<p></p>" canEdit />, {
+    wrapper,
+  });
+  await tick();
+  act(() => {
+    currentEditor().commands.setContent(
+      "<h1>Heading 1</h1><h2>Heading 2</h2><h3>Heading 3</h3>" +
+        "<h4>Heading 4</h4><h5>Heading 5</h5><h6>Heading 6</h6>" +
+        "<p><strong>bold</strong> <em>italic</em> <s>strike</s> <u>underline</u> <code>code</code></p>" +
+        '<ol start="3"><li><p>Third</p></li></ol><hr>' +
+        "<blockquote><p>Quote</p></blockquote>",
+    );
+  });
+  await tick(801);
+  const description = sentDescriptions().at(-1);
+  expect(description).toBeTruthy();
+  expect(description).not.toMatch(DISALLOWED_DESCRIPTION_TAG);
+  expect(description).toContain("<h1>Heading 1</h1>");
+  expect(description).toContain("<h2>Heading 2</h2>");
+  expect(description).toContain("<h3>Heading 3</h3>");
+  expect(description).toContain("<strong>bold</strong>");
+  expect(description).toContain("<em>italic</em>");
+  expect(description).toContain("<code>code</code>");
+  expect(description).toContain("strike");
+  expect(description).toContain("underline");
+  expect(description).toContain("Heading 4");
+  expect(description).toContain("<ol>");
+  expect(description).toContain("Third");
+  expect(description).toContain("<blockquote><p>Quote</p></blockquote>");
+});
+
+it("loads a stored description that already uses only the server allow-list", async () => {
+  const stored =
+    "<h1>Heading 1</h1><h2>Heading 2</h2><h3>Heading 3</h3>" +
+    "<p><strong>bold</strong> <em>italic</em> <b>b</b> <i>i</i> <code>code</code></p>" +
+    "<ul><li><p>One</p></li></ul><ol><li><p>Two</p></li></ol>" +
+    "<blockquote><p>Quote<br>next</p></blockquote>" +
+    "<pre><code>x &lt; y</code></pre>" +
+    '<p><a href="https://example.com/a?b=1&amp;c=2" rel="noopener noreferrer nofollow">link</a></p>';
+  render(
+    <TaskDescription
+      descriptionRevision={0}
+      taskId={`task-stored-${++suffix}`}
+      description={stored}
+      canEdit
+    />,
+    { wrapper },
+  );
+  await tick();
+  const html = currentEditor().getHTML();
+  expect(html).toContain("<h1>Heading 1</h1>");
+  expect(html).toContain("<h2>Heading 2</h2>");
+  expect(html).toContain("<h3>Heading 3</h3>");
+  expect(html).toContain("<strong>bold</strong>");
+  expect(html).toContain("<em>italic</em>");
+  expect(html).toContain("<strong>b</strong>");
+  expect(html).toContain("<em>i</em>");
+  expect(html).toContain("<code>code</code>");
+  expect(html).toContain("<ul><li><p>One</p></li></ul>");
+  expect(html).toContain("<ol><li><p>Two</p></li></ol>");
+  expect(html).toContain("Quote");
+  expect(html).toContain("next");
+  expect(html).toContain("<pre><code>x &lt; y</code></pre>");
+  expect(html).toContain('href="https://example.com/a?b=1&amp;c=2"');
+  expect(html).toContain(">link</a>");
+  expect(html).not.toMatch(DISALLOWED_DESCRIPTION_TAG);
+  expect(http.patch).not.toHaveBeenCalled();
+});
 function serverAccepts(description: string) {
   return UpdateTaskSchema.safeParse({ description, expectedDescriptionRevision: 0 }).success;
 }

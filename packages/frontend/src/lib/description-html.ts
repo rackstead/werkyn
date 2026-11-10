@@ -4,16 +4,15 @@ import DOMPurify, { type Config } from "dompurify";
 // allow-list. It mirrors the server's sanitize-html policy
 // (packages/backend/src/utils/description-html.ts), so markup the server
 // would never store is not rendered either, including rows stored before
-// every write path sanitized descriptions. Two differences, both inert:
-// - It also keeps the formatting the task editor itself writes (s, u, hr,
-//   h4-h6 and ol[start]), so an unsaved local draft reloads as it was typed.
-// - It does not keep a[target], which the read-only view never rendered.
+// every write path sanitized descriptions. The task editor does not emit s,
+// u, hr, h4-h6, or ol[start], and this list does not keep them. One
+// difference, inert for stored rows: it does not keep a[target], which the
+// read-only view never rendered.
 // Nothing here can match or style app elements (no id, class, style), act on
 // them (no command/commandfor, popover*, dialog, form, button, label[for]) or
 // load anything (no img, svg, style, link).
 export const DESCRIPTION_SANITIZE_CONFIG: Config = {
   ALLOWED_TAGS: [
-    // The server's allow-list.
     "b",
     "i",
     "em",
@@ -30,15 +29,8 @@ export const DESCRIPTION_SANITIZE_CONFIG: Config = {
     "blockquote",
     "code",
     "pre",
-    // Inert formatting from the task editor.
-    "s",
-    "u",
-    "hr",
-    "h4",
-    "h5",
-    "h6",
   ],
-  ALLOWED_ATTR: ["href", "rel", "start"],
+  ALLOWED_ATTR: ["href", "rel"],
   ALLOW_DATA_ATTR: false,
   ALLOW_ARIA_ATTR: false,
   // http, https, mailto, or no scheme (relative, fragment, protocol-relative),

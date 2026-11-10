@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef } from "react";
 import { stripDisallowedControlCharacters } from "@pm/shared";
 import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
+import { taskDescriptionKit } from "./task-description-kit";
 import { SafeHtml } from "@/components/safe-html";
 import { sanitizeDescriptionHtml } from "@/lib/description-html";
 import { stripPastedStyleSheets } from "@/lib/pasted-html";
@@ -106,7 +106,7 @@ function TaskDescriptionEditor({
 
   const editor = useEditor({
     extensions: [
-      StarterKit,
+      taskDescriptionKit,
       Placeholder.configure({ placeholder: "Add a description..." }),
     ],
     content: sanitizeDescriptionHtml(

@@ -1,8 +1,9 @@
 import { cleanup, render } from "@testing-library/react";
-import { Editor, type JSONContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
+import { Editor } from "@tiptap/react";
 import DOMPurify from "dompurify";
 import { afterEach, expect, it } from "vitest";
+import { taskDescriptionKit } from "@/features/tasks/components/task-description-kit";
+import { sanitizeDescriptionHtml } from "@/lib/description-html";
 import { SafeHtml } from "./safe-html";
 
 afterEach(cleanup);
@@ -103,98 +104,19 @@ it("keeps only http, https, mailto and scheme-less link targets, as the server d
   });
 });
 
-// Every node and mark the task editor (StarterKit) can produce.
-const EDITOR_DOCUMENT: JSONContent = {
-  type: "doc",
-  content: [
-    ...[1, 2, 3, 4, 5, 6].map((level) => ({
-      type: "heading",
-      attrs: { level },
-      content: [{ type: "text", text: `Heading ${level}` }],
-    })),
-    {
-      type: "paragraph",
-      content: [
-        { type: "text", marks: [{ type: "bold" }], text: "bold" },
-        { type: "text", text: " " },
-        { type: "text", marks: [{ type: "italic" }], text: "italic" },
-        { type: "text", text: " " },
-        { type: "text", marks: [{ type: "strike" }], text: "strike" },
-        { type: "text", text: " " },
-        { type: "text", marks: [{ type: "underline" }], text: "underline" },
-        { type: "text", text: " " },
-        { type: "text", marks: [{ type: "code" }], text: "a < b && c" },
-        { type: "hardBreak" },
-        {
-          type: "text",
-          marks: [
-            { type: "link", attrs: { href: "https://example.com/x?y=1&z=2" } },
-          ],
-          text: "link",
-        },
-        { type: "text", text: " " },
-        {
-          type: "text",
-          marks: [{ type: "link", attrs: { href: "mailto:a@example.com" } }],
-          text: "mail",
-        },
-        { type: "text", text: ' &  <escaped> "text"' },
-      ],
-    },
-    { type: "paragraph" },
-    {
-      type: "bulletList",
-      content: [
-        {
-          type: "listItem",
-          content: [
-            { type: "paragraph", content: [{ type: "text", text: "One" }] },
-            {
-              type: "bulletList",
-              content: [
-                {
-                  type: "listItem",
-                  content: [
-                    {
-                      type: "paragraph",
-                      content: [{ type: "text", text: "Nested" }],
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    },
-    {
-      type: "orderedList",
-      attrs: { start: 3 },
-      content: [
-        {
-          type: "listItem",
-          content: [
-            { type: "paragraph", content: [{ type: "text", text: "Third" }] },
-          ],
-        },
-      ],
-    },
-    {
-      type: "blockquote",
-      content: [
-        { type: "paragraph", content: [{ type: "text", text: "Quote" }] },
-      ],
-    },
-    {
-      type: "codeBlock",
-      content: [{ type: "text", text: "const x = 1 < 2;\n  return <p/>;" }],
-    },
-    { type: "horizontalRule" },
-  ],
-};
+// Marks the task editor still emits, which are the server allow-list.
+const ALLOWED_EDITOR_HTML =
+  "<h1>Heading 1</h1><h2>Heading 2</h2><h3>Heading 3</h3>" +
+  "<p><strong>bold</strong> <em>italic</em> <code>a &lt; b &amp;&amp; c</code><br>" +
+  '<a href="https://example.com/x?y=1&amp;z=2">link</a> ' +
+  '<a href="mailto:a@example.com">mail</a> &amp; &nbsp;&lt;escaped&gt; "text"</p>' +
+  "<ul><li><p>One</p><ul><li><p>Nested</p></li></ul></li></ul>" +
+  "<ol><li><p>Third</p></li></ol>" +
+  "<blockquote><p>Quote</p></blockquote>" +
+  "<pre><code>const x = 1 &lt; 2;\n  return &lt;p/&gt;;</code></pre>";
 
-function editorHtml(content: JSONContent) {
-  const editor = new Editor({ extensions: [StarterKit], content });
+function editorHtml(content: string) {
+  const editor = new Editor({ extensions: [taskDescriptionKit], content });
   const html = editor.getHTML();
   editor.destroy();
   return html;
@@ -216,11 +138,32 @@ const SERVER_SHAPED = [
   "",
 ];
 
-it("renders everything the task editor writes exactly as before", () => {
-  const html = editorHtml(EDITOR_DOCUMENT);
-  expect(html).toContain('<ol start="3">');
-  expect(html).toContain("<s>strike</s>");
+it("renders the marks the task editor still writes", () => {
+  const html = editorHtml(ALLOWED_EDITOR_HTML);
+  expect(html).toContain("<h1>Heading 1</h1>");
+  expect(html).toContain("<h3>Heading 3</h3>");
+  expect(html).toContain("<strong>bold</strong>");
+  expect(html).toContain("<em>italic</em>");
+  expect(html).toContain("<ol><li><p>Third</p></li></ol>");
+  expect(html).not.toMatch(/<\/?(?:s|u|hr|h4|h5|h6)\b|start\s*=/i);
   expect(rendered(html).innerHTML).toBe(DOMPurify.sanitize(html));
+});
+
+it("drops strike, underline, rules, h4-h6, and ol start from a local draft", () => {
+  const view = rendered(
+    "<h4>Heading 4</h4><h5>Heading 5</h5><h6>Heading 6</h6>" +
+      "<p><s>strike</s> <u>underline</u></p><hr>" +
+      '<ol start="3"><li><p>Third</p></li></ol>',
+  );
+  expect(view.innerHTML).not.toMatch(/<\/?(?:s|u|hr|h4|h5|h6)\b|start\s*=/i);
+  expect(view.textContent).toContain("Heading 4");
+  expect(view.textContent).toContain("Heading 5");
+  expect(view.textContent).toContain("Heading 6");
+  expect(view.textContent).toContain("strike");
+  expect(view.textContent).toContain("underline");
+  expect(view.querySelector("ol")?.getAttribute("start")).toBeNull();
+  expect(view.textContent).toContain("Third");
+  expect(sanitizeDescriptionHtml(view.innerHTML)).toBe(view.innerHTML);
 });
 
 it("renders server-sanitized descriptions exactly as before", () => {

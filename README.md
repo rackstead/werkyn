@@ -287,8 +287,8 @@ workspaces. `SEED_FORCE=true` replaces only previously seeded data.
 Local runtime files use `STORAGE_DIR` (default `./storage`, relative to the backend
 process). Running the backend from `packages/backend` writes to
 `packages/backend/storage/`; new files there are excluded from Git and Docker
-build context. Existing files already tracked in Git stay tracked and are
-preserved for separate provenance review.
+build context. The files that were already tracked are no longer tracked. Git
+history still contains them. This change does not review the image contents.
 
 5. Start development servers:
 ```bash

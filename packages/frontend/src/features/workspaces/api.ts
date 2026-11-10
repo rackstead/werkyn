@@ -193,6 +193,7 @@ type AdmissionResponse = {
   data: Exclude<WorkspaceAdmissionCheck, { status: "denied" | "unavailable" }> & {
     userId: string;
     workspaces?: WorkspaceMembership[];
+    membershipRevision?: number;
   };
 };
 
@@ -268,7 +269,11 @@ function useAdmissionMutation(
         !result.workspaces ||
         !useAuthStore
           .getState()
-          .setWorkspacesForUser(result.userId, result.workspaces)
+          .setWorkspacesForUser(
+            result.userId,
+            result.workspaces,
+            result.membershipRevision,
+          )
       )
         return;
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });

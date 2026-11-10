@@ -144,7 +144,8 @@ beforeEach(() => {
   );
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (request: Request) => {
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
       const url = new URL(request.url);
       const text = await request.text();
       state.requests.push({
@@ -572,6 +573,156 @@ it("ignores a reply to a request sent before the same account signed out and in 
   expect(state.navigate).not.toHaveBeenCalled();
   expect(state.broadcasts.some((m) => (m as { type: string }).type === "workspaces")).toBe(false);
   expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
+});
+
+it("does not let a refresh that read memberships before a join erase that join", async () => {
+  const existing = [membership("old")];
+  signIn("applicant", existing);
+  let releaseRefresh!: (response: Response) => void;
+  respond("POST", "/api/auth/refresh", () =>
+    new Promise((resolve) => {
+      releaseRefresh = resolve;
+    }),
+  );
+  const refreshPromise = useAuthStore.getState().refresh();
+  await waitFor(() => expect(releaseRefresh).toBeTypeOf("function"));
+
+  const joined = [existing[0]!, membership("acme")];
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: {
+        status: "joined",
+        workspace,
+        role: "MEMBER",
+        alreadyMember: false,
+        userId: "applicant",
+        workspaces: joined,
+        membershipRevision: 2,
+      },
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await waitFor(() => expect(state.navigate).toHaveBeenCalled());
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+  const joinBroadcast = state.broadcasts.find(
+    (message) => (message as { type?: string }).type === "workspaces",
+  ) as {
+    type: string;
+    epoch: { at: number; tab: string };
+    data: { userId: string; workspaces: WorkspaceMembership[]; membershipRevision: number };
+  };
+  expect(joinBroadcast).toMatchObject({
+    type: "workspaces",
+    data: { userId: "applicant", workspaces: joined, membershipRevision: 2 },
+  });
+
+  await act(async () => {
+    releaseRefresh(
+      json(200, {
+        data: {
+          user: user("applicant"),
+          accessToken: "refreshed-token",
+          workspaces: existing,
+          membershipRevision: 1,
+        },
+      }),
+    );
+    await refreshPromise;
+  });
+  // The rotated token is kept. The older membership list is not.
+  expect(useAuthStore.getState().accessToken).toBe("refreshed-token");
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+
+  const deliver = (message: unknown) => {
+    act(() => {
+      for (const listener of state.listeners) listener({ data: message });
+    });
+  };
+  deliver({
+    type: "workspaces",
+    epoch: joinBroadcast.epoch,
+    data: { userId: "applicant", workspaces: existing, membershipRevision: 1 },
+  });
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+
+  const realNow = Date.now;
+  let shift = 10_000;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + shift);
+  try {
+    const promoted = [{ ...membership("acme"), role: "ADMIN" as const }];
+    let releaseNewer!: (response: Response) => void;
+    respond("POST", "/api/auth/refresh", () =>
+      new Promise((resolve) => {
+        releaseNewer = resolve;
+      }),
+    );
+    const newer = useAuthStore.getState().refresh();
+    await waitFor(() => expect(releaseNewer).toBeTypeOf("function"));
+    await act(async () => {
+      releaseNewer(
+        json(200, {
+          data: {
+            user: user("applicant"),
+            accessToken: "role-token",
+            workspaces: promoted,
+            membershipRevision: 3,
+          },
+        }),
+      );
+      await newer;
+    });
+    expect(useAuthStore.getState().accessToken).toBe("role-token");
+    expect(useAuthStore.getState().workspaces).toEqual(promoted);
+
+    deliver({
+      type: "workspaces",
+      epoch: joinBroadcast.epoch,
+      data: { userId: "applicant", workspaces: [], membershipRevision: 4 },
+    });
+    expect(useAuthStore.getState().workspaces).toEqual([]);
+    // The removal is newer; the join's revision cannot put the workspace back.
+    deliver({
+      type: "workspaces",
+      epoch: joinBroadcast.epoch,
+      data: { userId: "applicant", workspaces: joined, membershipRevision: 2 },
+    });
+    expect(useAuthStore.getState().workspaces).toEqual([]);
+
+    respond("POST", "/api/auth/logout", () => json(204, null));
+    shift += 10_000;
+    await act(async () => {
+      await useAuthStore.getState().logout();
+    });
+  } finally {
+    clock.mockRestore();
+  }
+  expect(useAuthStore.getState().user).toBeNull();
+  const logoutBroadcast = [...state.broadcasts].reverse().find(
+    (message) => (message as { type?: string }).type === "logout",
+  ) as { epoch: { at: number; tab: string } };
+  expect(
+    logoutBroadcast.epoch.at > joinBroadcast.epoch.at ||
+      (logoutBroadcast.epoch.at === joinBroadcast.epoch.at &&
+        logoutBroadcast.epoch.tab !== joinBroadcast.epoch.tab),
+  ).toBe(true);
+  deliver({
+    type: "workspaces",
+    epoch: joinBroadcast.epoch,
+    data: { userId: "applicant", workspaces: joined, membershipRevision: 5 },
+  });
+  expect(useAuthStore.getState().user).toBeNull();
+  expect(useAuthStore.getState().workspaces).toEqual([]);
+
+  const other = [membership("other")];
+  act(() => signIn("someone-else", other));
+  deliver({
+    type: "workspaces",
+    epoch: logoutBroadcast.epoch,
+    data: { userId: "applicant", workspaces: joined, membershipRevision: 9 },
+  });
+  expect(useAuthStore.getState().user?.id).toBe("someone-else");
+  expect(useAuthStore.getState().workspaces).toBe(other);
 });
 
 it("keeps a result stored after the same account signed in again when an earlier check is refused late", async () => {

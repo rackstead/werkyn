@@ -700,6 +700,7 @@ test("completion returns exactly the ordinary refresh DTO and unchanged access l
   );
   assert.deepEqual(Object.keys(result.json.data).sort(), [
     "accessToken",
+    "membershipRevision",
     "user",
     "workspaces",
   ]);

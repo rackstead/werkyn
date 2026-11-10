@@ -37,6 +37,7 @@ interface Session {
   user: User;
   accessToken: string;
   workspaces: WorkspaceMembership[];
+  membershipRevision?: number;
 }
 
 interface AuthState {
@@ -50,11 +51,13 @@ interface AuthState {
     user: User,
     accessToken: string,
     workspaces: WorkspaceMembership[],
+    membershipRevision?: number,
   ) => void;
   setWorkspaces: (workspaces: WorkspaceMembership[]) => void;
   setWorkspacesForUser: (
     userId: string,
     workspaces: WorkspaceMembership[],
+    membershipRevision?: number,
   ) => boolean;
   /**
    * Signs out at once, here and in this browser's other tabs, then revokes the
@@ -124,13 +127,46 @@ function acceptEpoch(value: unknown): boolean {
   return true;
 }
 
+// Workspace lists are ordered by the revision captured with that list, not by
+// the sign-in epoch. An equal or older revision is left in place, so a refresh
+// that read memberships before a join cannot erase the join. The epoch does
+// not move: a membership update cannot outrank a sign-out.
+let appliedMembershipUserId: string | null = null;
+let appliedMembershipRevision: number | null = null;
+
+function membershipRevisionOf(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+/** True when this list may replace the one already applied for `userId`. */
+function isNewerMembershipRevision(userId: string, revision: number | null) {
+  const applied =
+    appliedMembershipUserId === userId ? appliedMembershipRevision : null;
+  // A list with no revision is the previous protocol. It can fill an
+  // unversioned tab, and cannot replace a list that already has a revision.
+  if (revision === null) return applied === null;
+  if (applied === null) return true;
+  return revision > applied;
+}
+
+function rememberMembershipRevision(userId: string, revision: number | null) {
+  appliedMembershipUserId = userId;
+  appliedMembershipRevision = revision;
+}
+
 type AuthMessage =
   | { type: "logout"; epoch: Epoch }
   | { type: "refresh"; epoch: Epoch; data: Session }
   | {
       type: "workspaces";
       epoch: Epoch;
-      data: { userId: string; workspaces: WorkspaceMembership[] };
+      data: {
+        userId: string;
+        workspaces: WorkspaceMembership[];
+        membershipRevision?: number;
+      };
     };
 
 // BroadcastChannel for cross-tab sync
@@ -571,8 +607,12 @@ async function recoverSession(
 // ─── Store ────────────────────────────────────────────────
 
 export const useAuthStore = create<AuthState>((set, get) => {
-  /** Applies a session; an account change resets everything held for the previous one. */
-  function applySession(session: Session, epoch: Epoch) {
+  /**
+   * Applies a session. A sign-in replaces the workspace list. A same-account
+   * refresh replaces it only when its membership revision is newer, and still
+   * keeps the new access token when the list is older.
+   */
+  function applySession(session: Session, epoch: Epoch, authoritative = false) {
     // A late sign-in can leave one family in memory while another family's
     // cookie is in the browser. Check the returned family, not only the one
     // this tab held before refreshing, and never publish a signed-out one.
@@ -580,13 +620,35 @@ export const useAuthStore = create<AuthState>((set, get) => {
       endSession(epoch);
       return false;
     }
+    const revision = membershipRevisionOf(session.membershipRevision);
+    const sameUser = get().user?.id === session.user.id;
+    const replaceWorkspaces =
+      authoritative ||
+      !sameUser ||
+      isNewerMembershipRevision(session.user.id, revision);
+    const workspaces = replaceWorkspaces ? session.workspaces : get().workspaces;
+    if (replaceWorkspaces) rememberMembershipRevision(session.user.id, revision);
+    const announcedRevision = replaceWorkspaces
+      ? revision
+      : appliedMembershipRevision;
     supersededSince = null;
     set({
       user: session.user,
       accessToken: session.accessToken,
-      workspaces: session.workspaces,
+      workspaces,
     });
-    announce({ type: "refresh", epoch, data: session });
+    announce({
+      type: "refresh",
+      epoch,
+      data: {
+        user: session.user,
+        accessToken: session.accessToken,
+        workspaces,
+        ...(announcedRevision !== null
+          ? { membershipRevision: announcedRevision }
+          : {}),
+      },
+    });
     return true;
   }
 
@@ -596,6 +658,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
     abortRefreshes();
     lastRefreshTime = 0;
     supersededSince = null;
+    appliedMembershipUserId = null;
+    appliedMembershipRevision = null;
     set({ user: null, accessToken: null, workspaces: [] });
     announce({ type: "logout", epoch });
   }
@@ -611,6 +675,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
       abortRefreshes();
       lastRefreshTime = 0;
       supersededSince = null;
+      appliedMembershipUserId = null;
+      appliedMembershipRevision = null;
       set({ user: null, accessToken: null, workspaces: [], isHydrated: true });
       wakeRefreshWaiters();
     } else if (message.type === "refresh" && message.data) {
@@ -624,14 +690,32 @@ export const useAuthStore = create<AuthState>((set, get) => {
         wakeRefreshWaiters();
         return;
       }
+      const revision = membershipRevisionOf(message.data.membershipRevision);
+      const sameUser = get().user?.id === user.id;
+      const replaceWorkspaces =
+        !sameUser || isNewerMembershipRevision(user.id, revision);
+      if (replaceWorkspaces) rememberMembershipRevision(user.id, revision);
       lastRefreshTime = Date.now();
       supersededSince = null;
-      set({ user, accessToken, workspaces });
+      set({
+        user,
+        accessToken,
+        workspaces: replaceWorkspaces ? workspaces : get().workspaces,
+      });
       wakeRefreshWaiters();
     } else if (message.type === "workspaces" && message.data) {
       const { userId, workspaces } = message.data;
-      // Memberships of one account; ignored by tabs signed in as another.
-      set((state) => (state.user?.id === userId ? { workspaces } : state));
+      const revision = membershipRevisionOf(message.data.membershipRevision);
+      // Memberships of one account; ignored by tabs signed in as another,
+      // and ignored when this revision is not newer than the applied one.
+      let applied = false;
+      set((state) => {
+        if (state.user?.id !== userId) return state;
+        if (!isNewerMembershipRevision(userId, revision)) return state;
+        applied = true;
+        return { workspaces };
+      });
+      if (applied) rememberMembershipRevision(userId, revision);
     }
   });
 
@@ -642,7 +726,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
     isHydrated: false,
     _refreshPromise: null,
 
-    setAuth: (user, accessToken, workspaces) => {
+    setAuth: (user, accessToken, workspaces, membershipRevision) => {
       // The sign-in's response replaced the cookie: sign-outs recorded before
       // its request was sent can no longer be completed from this browser,
       // and their sessions can no longer be restored here.
@@ -652,7 +736,11 @@ export const useAuthStore = create<AuthState>((set, get) => {
       }
       recordedBeforeSignIn = [];
       // A sign-in is newer than anything announced before it.
-      applySession({ user, accessToken, workspaces }, advanceEpoch(Date.now()));
+      applySession(
+        { user, accessToken, workspaces, membershipRevision },
+        advanceEpoch(Date.now()),
+        true,
+      );
     },
 
     setWorkspaces: (workspaces) => {
@@ -660,21 +748,29 @@ export const useAuthStore = create<AuthState>((set, get) => {
     },
 
     // Applies committed memberships returned for one account, only while that
-    // account is signed in here, and shares them with its other open tabs.
-    setWorkspacesForUser: (userId, workspaces) => {
+    // account is signed in here and the revision is newer than the list
+    // already applied, and shares them with its other open tabs.
+    setWorkspacesForUser: (userId, workspaces, membershipRevision) => {
+      const revision = membershipRevisionOf(membershipRevision);
       let applied = false;
       set((state) => {
         if (state.user?.id !== userId) return state;
+        if (!isNewerMembershipRevision(userId, revision)) return state;
         applied = true;
         return { workspaces };
       });
-      if (applied)
-        announce({
-          type: "workspaces",
-          epoch: knownEpoch,
-          data: { userId, workspaces },
-        });
-      return applied;
+      if (!applied) return false;
+      rememberMembershipRevision(userId, revision);
+      announce({
+        type: "workspaces",
+        epoch: knownEpoch,
+        data: {
+          userId,
+          workspaces,
+          ...(revision !== null ? { membershipRevision: revision } : {}),
+        },
+      });
+      return true;
     },
 
     logout: () => {
@@ -821,6 +917,12 @@ useAuthStore.subscribe((state, previous) => {
   const previousUserId = previous.user?.id ?? null;
   if (userId === previousUserId) return;
   supersededSince = null;
+  // A revision stamped for this account, just before the set, is kept.
+  // Every other identity change drops the previous account's revision.
+  if (appliedMembershipUserId !== userId) {
+    appliedMembershipUserId = userId;
+    appliedMembershipRevision = null;
+  }
   changeIdentity(previousUserId, userId);
   wakeRefreshWaiters();
 });
@@ -866,7 +968,12 @@ export async function completeOidcSignIn(): Promise<boolean> {
     // Proof of a new completed sign-in replaces only its pre-redirect records.
     // A sign-out made while that request was in flight remains authoritative.
     recordedBeforeSignIn = attempt.sessionIds;
-    useAuthStore.getState().setAuth(session.user, session.accessToken, session.workspaces);
+    useAuthStore.getState().setAuth(
+      session.user,
+      session.accessToken,
+      session.workspaces,
+      session.membershipRevision,
+    );
     clearOidcSignIn(attempt.attemptId);
     return useAuthStore.getState().accessToken === session.accessToken;
   } catch {

@@ -78,6 +78,7 @@ export async function registerHandler(
       user: result.user,
       accessToken: result.accessToken,
       workspaces: result.workspaces,
+      membershipRevision: result.membershipRevision,
       ...(result.admission ? { admission: result.admission } : {}),
     },
   });
@@ -112,6 +113,7 @@ export async function loginHandler(
       user: result.user,
       accessToken: result.accessToken,
       workspaces: result.workspaces,
+      membershipRevision: result.membershipRevision,
     },
   });
 }
@@ -138,6 +140,7 @@ export async function refreshHandler(
       user: result.user,
       accessToken: result.accessToken,
       workspaces: result.workspaces,
+      membershipRevision: result.membershipRevision,
     },
   });
 }

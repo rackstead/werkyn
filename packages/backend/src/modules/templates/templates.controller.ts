@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import * as templatesService from "./templates.service.js";
 import { deliverNotification } from "../notifications/notification-delivery.js";
+import { invalidateVisibleTaskLists } from "../realtime/realtime.service.js";
 import type { CreateTemplateInput, UpdateTemplateInput, InstantiateTemplateInput } from "@pm/shared";
 
 const NETWORK_ERROR_CODES = new Set([
@@ -113,6 +114,12 @@ export async function createTaskFromTemplateHandler(
       "Could not broadcast committed template task",
     );
   }
+  void invalidateVisibleTaskLists(request.server.prisma, params.pid).catch((error) => {
+    request.log.error(
+      { stage: "task_list_invalidation", projectId: params.pid, ...postCommitDiagnostics(error) },
+      "Could not invalidate visible task lists",
+    );
+  });
   for (const id of notificationDeliveryIds) {
     void deliverNotification(request.server.prisma, request.server, id, { log: request.server.log })
       .catch((error) => request.log.error(

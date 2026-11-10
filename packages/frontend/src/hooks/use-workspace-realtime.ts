@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useRealtimeClient } from "@/components/providers/realtime-provider";
 import { queryClient } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
+import type { RealtimeEnvelope } from "@/lib/realtime-events";
 
 /**
  * Keeps the connection subscribed to a workspace's events (wiki, presence,
@@ -19,8 +20,8 @@ export function useWorkspaceSubscription(workspaceId: string | undefined) {
 }
 
 /**
- * Refreshes the workspace's task summaries when a task event arrives. It only
- * listens: the subscription itself belongs to the workspace layout.
+ * Refreshes dashboard and My Tasks when a content-free invalidation arrives
+ * for this workspace. The subscription itself belongs to the workspace layout.
  */
 export function useWorkspaceRealtime(workspaceId: string | undefined) {
   const client = useRealtimeClient();
@@ -28,28 +29,20 @@ export function useWorkspaceRealtime(workspaceId: string | undefined) {
   useEffect(() => {
     if (!client || !workspaceId) return;
 
-    const handler = () => {
+    const handler = (message: RealtimeEnvelope) => {
+      if (message.workspaceId !== workspaceId) return;
       queryClient.invalidateQueries({
         queryKey: queryKeys.dashboard(workspaceId),
       });
       queryClient.invalidateQueries({
         queryKey: queryKeys.myTasks(workspaceId),
       });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.projects(workspaceId),
-      });
     };
 
-    client.on("task_created", handler);
-    client.on("task_updated", handler);
-    client.on("task_deleted", handler);
-    client.on("task_moved", handler);
+    client.on("workspace_tasks_invalidated", handler);
 
     return () => {
-      client.off("task_created", handler);
-      client.off("task_updated", handler);
-      client.off("task_deleted", handler);
-      client.off("task_moved", handler);
+      client.off("workspace_tasks_invalidated", handler);
     };
   }, [client, workspaceId]);
 }

@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import * as tasksService from "./tasks.service.js";
 import { deliverNotification } from "../notifications/notification-delivery.js";
+import { invalidateVisibleTaskLists } from "../realtime/realtime.service.js";
 import type {
   CreateTaskInput,
   UpdateTaskInput,
@@ -35,7 +36,18 @@ function postCommitDiagnostics(error: unknown) {
   }
 }
 
-function afterTaskCommit(
+async function invalidateTaskLists(request: FastifyRequest, projectId: string) {
+  try {
+    await invalidateVisibleTaskLists(request.server.prisma, projectId);
+  } catch (error) {
+    request.log.error(
+      { stage: "task_list_invalidation", projectId, ...postCommitDiagnostics(error) },
+      "Could not invalidate visible task lists",
+    );
+  }
+}
+
+async function afterTaskCommit(
   request: FastifyRequest,
   mutation: {
     operation: "update" | "move" | "assign" | "duplicate";
@@ -54,6 +66,7 @@ function afterTaskCommit(
       "Could not broadcast committed task change",
     );
   }
+  void invalidateTaskLists(request, projectId);
   for (const id of notificationDeliveryIds) {
     void deliverNotification(request.server.prisma, request.server, id, { log: request.server.log })
       .catch((error) => request.log.error(
@@ -91,6 +104,7 @@ export async function createTaskHandler(
     body,
   );
   request.server.broadcast(params.pid, "task_created", { taskId: task.id });
+  void invalidateTaskLists(request, params.pid);
   return reply.status(201).send({ data: task });
 }
 
@@ -116,7 +130,7 @@ export async function updateTaskHandler(
     request.server.prisma, params.tid, request.user!.id,
     request.workspaceMember!.role, body, request.user!.displayName,
   );
-  afterTaskCommit(request, { operation: "update", projectId, taskId: task.id, event: "task_updated", notificationDeliveryIds });
+  await afterTaskCommit(request, { operation: "update", projectId, taskId: task.id, event: "task_updated", notificationDeliveryIds });
   return reply.send({ data: task });
 }
 
@@ -133,6 +147,7 @@ export async function deleteTaskHandler(
   await tasksService.deleteTask(request.server.prisma, params.tid, request.user!.id);
   if (taskToDelete) {
     request.server.broadcast(taskToDelete.projectId, "task_deleted", { taskId: params.tid });
+    void invalidateTaskLists(request, taskToDelete.projectId);
   }
   return reply.status(204).send();
 }
@@ -146,7 +161,7 @@ export async function moveTaskHandler(
   const { result, projectId, notificationDeliveryIds } = await tasksService.moveTaskWithNotifications(
     request.server.prisma, params.tid, request.user!.id, body, request.user!.displayName,
   );
-  afterTaskCommit(request, { operation: "move", projectId, taskId: params.tid, event: "task_moved", notificationDeliveryIds });
+  await afterTaskCommit(request, { operation: "move", projectId, taskId: params.tid, event: "task_moved", notificationDeliveryIds });
   return reply.send({ data: result });
 }
 
@@ -163,6 +178,7 @@ export async function archiveTaskHandler(
     request.user!.id,
   );
   request.server.broadcast(task.projectId, "task_updated", { taskId: params.tid });
+  void invalidateTaskLists(request, task.projectId);
   return reply.send({ data: task });
 }
 
@@ -176,7 +192,7 @@ export async function addAssigneeHandler(
     request.server.prisma, params.tid, request.user!.id,
     request.workspaceMember!.role, body, request.user!.displayName,
   );
-  afterTaskCommit(request, { operation: "assign", projectId, taskId: params.tid, event: "task_updated", notificationDeliveryIds });
+  await afterTaskCommit(request, { operation: "assign", projectId, taskId: params.tid, event: "task_updated", notificationDeliveryIds });
   return reply.status(201).send({ data: assignee });
 }
 
@@ -195,6 +211,7 @@ export async function removeAssigneeHandler(
   const taskForUnassign = await request.server.prisma.task.findUnique({ where: { id: params.tid }, select: { projectId: true } });
   if (taskForUnassign) {
     request.server.broadcast(taskForUnassign.projectId, "task_updated", { taskId: params.tid });
+    void invalidateTaskLists(request, taskForUnassign.projectId);
   }
   return reply.status(204).send();
 }
@@ -214,6 +231,7 @@ export async function addLabelHandler(
   const taskForLabel = await request.server.prisma.task.findUnique({ where: { id: params.tid }, select: { projectId: true } });
   if (taskForLabel) {
     request.server.broadcast(taskForLabel.projectId, "task_updated", { taskId: params.tid });
+    void invalidateTaskLists(request, taskForLabel.projectId);
   }
   return reply.status(201).send({ data: taskLabel });
 }
@@ -233,6 +251,7 @@ export async function removeLabelHandler(
   const taskForLabelRemove = await request.server.prisma.task.findUnique({ where: { id: params.tid }, select: { projectId: true } });
   if (taskForLabelRemove) {
     request.server.broadcast(taskForLabelRemove.projectId, "task_updated", { taskId: params.tid });
+    void invalidateTaskLists(request, taskForLabelRemove.projectId);
   }
   return reply.status(204).send();
 }
@@ -250,6 +269,7 @@ export async function bulkUpdateHandler(
     body,
   );
   request.server.broadcast(params.pid, "task_updated", { bulk: true });
+  void invalidateTaskLists(request, params.pid);
   return reply.send({ data: result });
 }
 
@@ -266,6 +286,7 @@ export async function bulkDeleteHandler(
     request.user!.id,
   );
   request.server.broadcast(params.pid, "task_deleted", { bulk: true });
+  void invalidateTaskLists(request, params.pid);
   return reply.send({ data: result });
 }
 
@@ -291,7 +312,7 @@ export async function duplicateTaskHandler(
   const { result: task, projectId, notificationDeliveryIds } = await tasksService.duplicateTaskWithNotifications(
     request.server.prisma, params.tid, request.user!.id, request.user!.displayName,
   );
-  afterTaskCommit(request, { operation: "duplicate", projectId, taskId: task.id, event: "task_created", notificationDeliveryIds });
+  await afterTaskCommit(request, { operation: "duplicate", projectId, taskId: task.id, event: "task_created", notificationDeliveryIds });
   return reply.status(201).send({ data: task });
 }
 

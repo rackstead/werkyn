@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
 import { createTaskFromTemplate } from "../modules/templates/templates.service.js";
+import { invalidateVisibleTaskLists } from "../modules/realtime/realtime.service.js";
 import {
   advanceNextRunDate,
   calculateNextRunDate,
@@ -257,6 +258,7 @@ export async function processRecurringTasks(
   // Pages by id, so each due schedule is visited once per run even when it
   // stays due (a failure, or a backlog longer than one run's share).
   let cursor: string | undefined;
+  const changedProjects = new Set<string>();
   pages: while (!signal?.aborted) {
     const due = await prisma.recurringTaskConfig.findMany({
       where: {
@@ -290,6 +292,7 @@ export async function processRecurringTasks(
           } catch (err) {
             fastify.log.error(err, `Could not announce recurring task ${outcome.taskId}`);
           }
+          changedProjects.add(outcome.projectId);
         } else if (outcome.kind === "existing") {
           summary.alreadyGenerated++;
         } else if (outcome.kind === "skipped") {
@@ -300,6 +303,12 @@ export async function processRecurringTasks(
         if (!("more" in outcome) || !outcome.more) break;
       }
     }
+  }
+
+  for (const projectId of changedProjects) {
+    void invalidateVisibleTaskLists(prisma, projectId).catch((err) => {
+      fastify.log.error(err, "Could not invalidate visible task lists");
+    });
   }
 
   fastify.log.info(

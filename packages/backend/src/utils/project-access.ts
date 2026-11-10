@@ -64,24 +64,38 @@ export async function assertTaskEdit(
   return { ...task, ...access };
 }
 
-export async function filterProjectRecipients(
+/** Workspace id plus the subset of userIds who may see the project. One read. */
+export async function visibleProjectAudience(
   prisma: Pick<AccessDatabase, "project">,
   projectId: string,
   userIds: string[],
-) {
-  if (userIds.length === 0) return [];
+): Promise<{ workspaceId: string; recipientIds: string[] } | null> {
+  if (userIds.length === 0) return null;
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     select: {
+      workspaceId: true,
       members: { where: { userId: { in: userIds } }, select: { userId: true } },
       workspace: {
         select: { members: { where: { userId: { in: userIds } }, select: { userId: true, role: true } } },
       },
     },
   });
-  if (!project) return [];
+  if (!project) return null;
   const projectMembers = new Set(project.members.map((m) => m.userId));
-  return project.workspace.members
-    .filter((m) => m.role === "ADMIN" || projectMembers.has(m.userId))
-    .map((m) => m.userId);
+  return {
+    workspaceId: project.workspaceId,
+    recipientIds: project.workspace.members
+      .filter((m) => m.role === "ADMIN" || projectMembers.has(m.userId))
+      .map((m) => m.userId),
+  };
+}
+
+export async function filterProjectRecipients(
+  prisma: Pick<AccessDatabase, "project">,
+  projectId: string,
+  userIds: string[],
+) {
+  const audience = await visibleProjectAudience(prisma, projectId, userIds);
+  return audience?.recipientIds ?? [];
 }

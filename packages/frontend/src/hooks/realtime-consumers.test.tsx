@@ -8,6 +8,7 @@ import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { FakeWebSocket } from "@/test/fake-websocket";
 import { useRealtime } from "./use-realtime";
+import { useWorkspaceRealtime } from "./use-workspace-realtime";
 
 // Real provider and WebSocket client; the test delivers server envelopes and
 // checks which cached queries each one marks for refetch.
@@ -318,5 +319,43 @@ describe("project events", () => {
     expect(stale(queryKeys.task("[object Object]"))).toBe(false);
     // The project's lists still refresh.
     expect(stale(queryKeys.tasks("project"))).toBe(true);
+  });
+});
+
+describe("dashboard task invalidation", () => {
+  const myTasksPage = [...queryKeys.myTasks("ws"), { completed: false }] as const;
+
+  it("invalidates this workspace's dashboard and my tasks only", async () => {
+    const send = await connect(() => useWorkspaceRealtime("ws"));
+    seed(
+      queryKeys.dashboard("ws"),
+      queryKeys.myTasks("ws"),
+      myTasksPage,
+      queryKeys.projects("ws"),
+      queryKeys.dashboard("other"),
+      queryKeys.myTasks("other"),
+    );
+    send({ event: "workspace_tasks_invalidated", workspaceId: "ws", data: {} });
+    expect(stale(queryKeys.dashboard("ws"))).toBe(true);
+    expect(stale(queryKeys.myTasks("ws"))).toBe(true);
+    expect(stale(myTasksPage)).toBe(true);
+    expect(stale(queryKeys.projects("ws"))).toBe(false);
+    expect(stale(queryKeys.dashboard("other"))).toBe(false);
+    expect(stale(queryKeys.myTasks("other"))).toBe(false);
+  });
+
+  it("ignores a signal for another workspace and a project task event", async () => {
+    const send = await connect(() => useWorkspaceRealtime("ws"));
+    seed(queryKeys.dashboard("ws"), queryKeys.myTasks("ws"), queryKeys.dashboard("other"));
+    send({ event: "workspace_tasks_invalidated", workspaceId: "other", data: {} });
+    send({ event: "workspace_tasks_invalidated", data: {} });
+    send({
+      event: "task_updated",
+      projectId: "project",
+      data: { taskId: "task", title: "secret title" },
+    });
+    expect(stale(queryKeys.dashboard("ws"))).toBe(false);
+    expect(stale(queryKeys.myTasks("ws"))).toBe(false);
+    expect(stale(queryKeys.dashboard("other"))).toBe(false);
   });
 });

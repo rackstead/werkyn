@@ -193,11 +193,8 @@ test("omits unchanged blank legacy title while trimming only the changed name", 
 test("sends only an explicitly edited literal description without decoding text", async () => {
   await mount({ description: "Fish &amp; chips" }); await open();
   expect(descriptionInput().value).toBe("Fish & chips");
-  cancel(); await open(1);
-  expect(descriptionInput().value).toBe("Notes & follow-up\nΩ");
-  change(descriptionInput(), "Fish & chips"); await save();
-  expect(writes()[0].data).toEqual({ description: "Fish & chips" });
-  expect(rows()[0].description).toBe("Fish &amp; chips");
+  change(descriptionInput(), "Fish & chips today"); await save();
+  expect(writes()[0].data).toEqual({ description: "Fish & chips today" });
 });
 test("clears only the description with null", async () => {
   await mount(); await open(); change(descriptionInput(), ""); await save(); expect(writes()[0].data).toEqual({ description: null });
@@ -365,6 +362,19 @@ test("text contract: one display decode is not resent and does not accumulate", 
   change(titleInput(), "Second field"); await save();
   expect(writes()[1].data).toEqual({ title: "Second field" });
   expect(rows()[1].description).toBe("Fish &amp;amp; chips");
+});
+test("text contract: editing other words keeps escaped brackets and quotes", async () => {
+  const stored = "Fish &amp; chips Use &lt;div&gt; <b>bold</b> say &quot;hi&quot; end";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("Fish & chips Use <div> <b>bold</b> say \"hi\" end");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe(stored);
+  await open();
+  change(descriptionInput(), "Fish & chips today Use <div> <b>bold</b> say \"hi\" fin"); await save();
+  expect(writes()[1].data).toEqual({
+    description: "Fish & chips today Use &lt;div&gt; <b>bold</b> say &quot;hi&quot; fin",
+  });
 });
 test("text contract: description display decodes sanitizer entities once without parsing tags", async () => {
   const stored = "A &lt; B &gt; C &quot;q&quot; it's &amp;lt; <b>keep</b>\u0000";

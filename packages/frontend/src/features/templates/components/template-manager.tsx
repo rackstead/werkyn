@@ -60,42 +60,118 @@ interface TemplateEdit {
   generation: number;
   initial: TemplateFormData;
   values: TemplateFormData;
+  descriptionPieces: string[];
 }
 
 function sameOrderedIds(left: string[], right: string[]) {
   return left.length === right.length && left.every((id, i) => id === right[i]);
 }
 
-// One pass over the entities sanitize-html writes (&amp; &lt; &gt;, and &quot; in
-// attributes). Apostrophes are stored as characters, so there is no apostrophe
-// entity to decode. Not an HTML parse: tags and NULs stay. A chained replace
-// would decode &amp;amp; twice.
-function decodeTemplateDescription(value: string): string {
-  return value.replace(/&(?:amp|lt|gt|quot);/g, (entity) => {
-    switch (entity) {
-      case "&amp;":
-        return "&";
-      case "&lt;":
-        return "<";
-      case "&gt;":
-        return ">";
-      case "&quot;":
-        return "\"";
-      default:
-        return entity;
+// One pass over the entities sanitize-html writes. Apostrophes are stored as
+// characters. pieces[i] is the stored spelling of text[i]. Not an HTML parse:
+// tags and NULs stay. A second pass would decode &amp;amp; again.
+function decodeTemplateDescription(value: string): { text: string; pieces: string[] } {
+  const pieces: string[] = [];
+  let text = "";
+  const entities = /&(?:amp|lt|gt|quot);/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = entities.exec(value)) !== null) {
+    for (let i = last; i < match.index; i++) {
+      pieces.push(value[i]);
+      text += value[i];
     }
-  });
+    const entity = match[0];
+    pieces.push(entity);
+    text += entity === "&amp;" ? "&" : entity === "&lt;" ? "<" : entity === "&gt;" ? ">" : "\"";
+    last = match.index + entity.length;
+  }
+  for (let i = last; i < value.length; i++) {
+    pieces.push(value[i]);
+    text += value[i];
+  }
+  return { text, pieces };
+}
+
+// sanitize-html round-trips a visible &. A visible <div> or a decoded quote in
+// an attribute does not: the tag is discarded and the attribute is truncated.
+function spellingForUnchanged(piece: string): string {
+  return piece === "&amp;" ? "&" : piece;
+}
+
+function alignDescription(before: string, after: string): Array<[number, number]> {
+  const n = before.length;
+  const m = after.length;
+  let prefix = 0;
+  while (prefix < n && prefix < m && before[prefix] === after[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < n - prefix && suffix < m - prefix &&
+    before[n - 1 - suffix] === after[m - 1 - suffix]
+  ) suffix++;
+  const matches: Array<[number, number]> = [];
+  for (let i = 0; i < prefix; i++) matches.push([i, i]);
+  const middle = alignDescriptionMiddle(before.slice(prefix, n - suffix), after.slice(prefix, m - suffix));
+  for (const [left, right] of middle) matches.push([left + prefix, right + prefix]);
+  for (let i = 0; i < suffix; i++) matches.push([n - suffix + i, m - suffix + i]);
+  return matches;
+}
+
+function alignDescriptionMiddle(before: string, after: string): Array<[number, number]> {
+  const n = before.length;
+  const m = after.length;
+  if (n === 0 || m === 0 || n * m > 1_000_000) return [];
+  const cols = m + 1;
+  const scores = new Uint32Array((n + 1) * cols);
+  const at = (i: number, j: number) => i * cols + j;
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      scores[at(i, j)] = before[i] === after[j]
+        ? scores[at(i + 1, j + 1)] + 1
+        : Math.max(scores[at(i + 1, j)], scores[at(i, j + 1)]);
+    }
+  }
+  const matches: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      matches.push([i, j]);
+      i++;
+      j++;
+    } else if (scores[at(i + 1, j)] >= scores[at(i, j + 1)]) i++;
+    else j++;
+  }
+  return matches;
+}
+
+function descriptionForEdit(pieces: string[], decoded: string, edited: string): string {
+  if (pieces.length !== decoded.length) return edited;
+  let out = "";
+  let cursor = 0;
+  for (const [decodedIndex, editedIndex] of alignDescription(decoded, edited)) {
+    out += edited.slice(cursor, editedIndex);
+    out += spellingForUnchanged(pieces[decodedIndex]);
+    cursor = editedIndex + 1;
+  }
+  return out + edited.slice(cursor);
 }
 
 /** Compare the raw edit snapshot before applying the existing encodings. */
-function templateChanges(form: TemplateFormData, initial: TemplateFormData): UpdateTemplateInput {
+function templateChanges(
+  form: TemplateFormData,
+  initial: TemplateFormData,
+  descriptionPieces: string[],
+): UpdateTemplateInput {
   const changes: UpdateTemplateInput = {};
   if (form.name !== initial.name) changes.name = form.name.trim();
   if (form.title !== initial.title) changes.title = form.title.trim();
-  // Both sides are the one-pass display decode, so an unedited legacy entity
+  // Equality is the one-pass display decode, so an unedited legacy entity
   // string is omitted. Do not decode again here.
   if (form.description !== initial.description)
-    changes.description = stripDisallowedControlCharacters(form.description) || null;
+    changes.description = stripDisallowedControlCharacters(
+      descriptionForEdit(descriptionPieces, initial.description, form.description),
+    ) || null;
   if (form.priority !== initial.priority) changes.priority = form.priority;
   if (form.statusId !== initial.statusId) changes.statusId = form.statusId || null;
   if (form.dueOffset !== initial.dueOffset)
@@ -358,17 +434,21 @@ function TemplateForm({
   );
 }
 
-function templateToForm(t: TaskTemplate): TemplateFormData {
+function templateToForm(t: TaskTemplate): { form: TemplateFormData; descriptionPieces: string[] } {
+  const description = decodeTemplateDescription(t.description ?? "");
   return {
-    name: t.name,
-    title: t.title,
-    description: decodeTemplateDescription(t.description ?? ""),
-    priority: t.priority,
-    statusId: t.statusId ?? "",
-    dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",
-    assigneeIds: t.assigneeIds,
-    labelIds: t.labelIds,
-    subtasks: t.subtasks,
+    descriptionPieces: description.pieces,
+    form: {
+      name: t.name,
+      title: t.title,
+      description: description.text,
+      priority: t.priority,
+      statusId: t.statusId ?? "",
+      dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",
+      assigneeIds: t.assigneeIds,
+      labelIds: t.labelIds,
+      subtasks: t.subtasks,
+    },
   };
 }
 
@@ -394,7 +474,7 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
   const currentEdit = useRef(edit);
   currentEdit.current = edit;
   const generation = identityGeneration();
-  const editChanges = edit ? templateChanges(edit.values, edit.initial) : {};
+  const editChanges = edit ? templateChanges(edit.values, edit.initial, edit.descriptionPieces) : {};
   const invalidChangedTitle = editChanges.title !== undefined && !editChanges.title;
   const invalidChangedName = editChanges.name !== undefined && !editChanges.name;
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -515,8 +595,15 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                       projectId !== currentProject.current || t.projectId !== projectId ||
                       generation !== identityGeneration()
                     ) return;
-                    const initial = templateToForm(t);
-                    setEdit({ id: t.id, projectId, generation, initial, values: initial });
+                    const loaded = templateToForm(t);
+                    setEdit({
+                      id: t.id,
+                      projectId,
+                      generation,
+                      initial: loaded.form,
+                      values: loaded.form,
+                      descriptionPieces: loaded.descriptionPieces,
+                    });
                   }}
                   className="text-muted-foreground hover:text-foreground shrink-0"
                 >

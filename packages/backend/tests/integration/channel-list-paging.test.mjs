@@ -1,6 +1,7 @@
 // Channel and DM lists used to return every row. A walk at page size 1 and at
-// the default must return the same ids as the full visible list, in name then
-// id order, and must leave out a channel or DM the caller cannot see.
+// the default must return the same ids as the full visible list: channels by
+// createdAt then id, DMs by updatedAt descending then id. A channel or DM the
+// caller cannot see must not appear. Names do not decide the order.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -25,7 +26,7 @@ process.env.STORAGE_DIR = storageDir;
 
 const { buildApp } = await import("../../src/app.js");
 const { signAccessToken } = await import("../../src/utils/tokens.js");
-const { PrismaClient } = await import("@prisma/client");
+const { Prisma, PrismaClient } = await import("@prisma/client");
 const chat = await import("../../src/modules/chat/chat.service.js");
 
 const observerUrl = new URL(process.env.TEST_DATABASE_URL);
@@ -93,8 +94,8 @@ async function walk(url, limit) {
   assert.fail("pagination did not end");
 }
 
-function assertLimited(events, limit) {
-  const pages = events.filter((event) => /ORDER BY[\s\S]*"name"[\s\S]*NULLS LAST/i.test(event.query));
+function assertLimited(events, limit, column) {
+  const pages = events.filter((event) => new RegExp(`ORDER BY[\\s\\S]*"${column}"`, "i").test(event.query));
   assert.ok(pages.length > 0, events.map((event) => event.query).join("\n---\n"));
   for (const page of pages) {
     const match = /LIMIT \$(\d+)/.exec(page.query);
@@ -112,7 +113,9 @@ async function orderedIds(dmsOnly) {
            ) AS member
     FROM "ChatChannel" c
     WHERE c."workspaceId" = ${home.id}
-    ORDER BY c."name" ASC NULLS LAST, c."id" ASC`;
+    ORDER BY ${dmsOnly
+      ? Prisma.sql`c."updatedAt" DESC, c."id" DESC`
+      : Prisma.sql`c."createdAt" ASC, c."id" ASC`}`;
   return rows
     .filter((row) => (dmsOnly
       ? row.type === "DM" && row.member
@@ -275,8 +278,8 @@ test("walking either list at page size 1 and at the default returns today's visi
 
   const listed = await recordQueries(observer, (db) => chat.listChannels(db, home.id, users.me.id, undefined, 1));
   const listedDms = await recordQueries(observer, (db) => chat.listDms(db, home.id, users.me.id, undefined, 1));
-  assertLimited(listed.events, 1);
-  assertLimited(listedDms.events, 1);
+  assertLimited(listed.events, 1, "createdAt");
+  assertLimited(listedDms.events, 1, "updatedAt");
   assert.equal(listed.events.some((event) => event.query.includes('msg."userId"')), false);
 
   const unread = await recordQueries(observer, (db) => chat.getUnreadCounts(db, home.id, users.me.id));
@@ -347,12 +350,17 @@ test("channel and DM pages use the name order indexes", async () => {
   const dms = await recordQueries(observer, (db) => chat.listDms(db, other.id, users.stranger.id, undefined, 20));
   const plans = [];
   for (const recorded of [first, later, dms]) {
-    const page = recorded.events.find((event) => /ORDER BY[\s\S]*"name"[\s\S]*NULLS LAST/i.test(event.query));
+    const column = recorded === dms ? "updatedAt" : "createdAt";
+    const page = recorded.events.find((event) => new RegExp(`ORDER BY[\\s\\S]*"${column}"`, "i").test(event.query));
     assert.ok(page, recorded.events.map((event) => event.query).join("\n---\n"));
-    const explained = await app.prisma.$queryRawUnsafe(
-      `EXPLAIN (FORMAT JSON) ${page.query}`,
-      ...JSON.parse(page.params),
-    );
+    const params = JSON.parse(page.params);
+    let sql = page.query;
+    for (let i = params.length; i >= 1; i -= 1) {
+      const value = params[i - 1];
+      const cast = typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value) ? "::timestamp" : "";
+      sql = sql.replace(new RegExp(`\\$${i}(?!\\d)`, "g"), `$${i}${cast}`);
+    }
+    const explained = await app.prisma.$queryRawUnsafe(`EXPLAIN (FORMAT JSON) ${sql}`, ...params);
     plans.push(explained[0]);
   }
   const described = plans.map((plan) => planNodes(plan).map((node) => `${node["Node Type"]}:${node["Index Name"] ?? ""}`).join(" > "));
@@ -360,12 +368,12 @@ test("channel and DM pages use the name order indexes", async () => {
     assert.equal(description.includes("Sort"), false, description);
     assert.match(description, /^Limit:/, description);
   }
-  assert.match(described[0], /ChatChannel_workspaceId_name_id_idx/);
-  assert.match(described[1], /ChatChannel_workspaceId_name_id_idx/);
-  assert.match(described[2], /ChatChannel_workspaceId_type_name_id_idx/);
+  assert.match(described[0], /ChatChannel_workspaceId_createdAt_id_idx/);
+  assert.match(described[1], /ChatChannel_workspaceId_createdAt_id_idx/);
+  assert.match(described[2], /ChatChannel_workspaceId_type_updatedAt_id_idx/);
 });
 
-test("a row inserted beside an equal name is not skipped or repeated", async () => {
+test("a row inserted beside an equal createdAt is not skipped or repeated", async () => {
   const url = `/api/chat/${home.id}/channels`;
   const first = await ok(withPaging(url, 1));
   assert.equal(first.data[0].id, `aaa-${suffix}-00`);
@@ -383,4 +391,39 @@ test("a row inserted beside an equal name is not skipped or repeated", async () 
   assert.equal(again.filter((id) => id === first.data[0].id).length, 1);
   assert.ok(again.includes(before));
   assert.ok(again.includes(between));
+});
+
+test("a later name does not jump ahead of an earlier channel, and a newer DM stays first", async () => {
+  const early = new Date("2026-01-01T00:00:00.000Z");
+  const late = new Date("2026-06-01T00:00:00.000Z");
+  await app.prisma.chatChannel.createMany({
+    data: [
+      { id: `sort-z-${suffix}`, workspaceId: home.id, name: "zzzz-sort", type: "PUBLIC", createdById: users.me.id, createdAt: early, updatedAt: early },
+      { id: `sort-a-${suffix}`, workspaceId: home.id, name: "aaaa-sort", type: "PUBLIC", createdById: users.me.id, createdAt: late, updatedAt: late },
+      { id: `sort-dm-new-${suffix}`, workspaceId: home.id, name: "zzzz-dm", type: "DM", createdById: users.me.id, createdAt: early, updatedAt: late },
+      { id: `sort-dm-old-${suffix}`, workspaceId: home.id, name: "aaaa-dm", type: "DM", createdById: users.me.id, createdAt: late, updatedAt: early },
+    ],
+  });
+  await app.prisma.chatChannelMember.createMany({
+    data: [`sort-dm-new-${suffix}`, `sort-dm-old-${suffix}`].map((channelId) => ({
+      channelId, userId: users.me.id, joinedAt: early, lastReadAt: early,
+    })),
+  });
+  // @updatedAt may stamp create time. Set the order columns directly.
+  await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "createdAt" = ${early}, "updatedAt" = ${early} WHERE id = ${`sort-z-${suffix}`}`;
+  await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "createdAt" = ${late}, "updatedAt" = ${late} WHERE id = ${`sort-a-${suffix}`}`;
+  await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "createdAt" = ${early}, "updatedAt" = ${late} WHERE id = ${`sort-dm-new-${suffix}`}`;
+  await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "createdAt" = ${late}, "updatedAt" = ${early} WHERE id = ${`sort-dm-old-${suffix}`}`;
+
+  const channels = await walk(`/api/chat/${home.id}/channels`, 1);
+  assert.deepEqual(channels, await orderedIds(false));
+  const earlier = channels.indexOf(`sort-z-${suffix}`);
+  const laterName = channels.indexOf(`sort-a-${suffix}`);
+  assert.ok(earlier >= 0 && laterName > earlier);
+
+  const dms = await walk(`/api/chat/${home.id}/dms`, 1);
+  assert.deepEqual(dms, await orderedIds(true));
+  const newer = dms.indexOf(`sort-dm-new-${suffix}`);
+  const older = dms.indexOf(`sort-dm-old-${suffix}`);
+  assert.ok(newer >= 0 && older > newer);
 });

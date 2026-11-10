@@ -432,8 +432,8 @@ them all. `my-tasks` also accepts `dueAfter`, `dueBefore`, `completed` and
 lists that sort by a value several rows can share (bookmarks, wiki versions,
 shared-with-me, task comments, the drive listing, channel members, the channel
 list and the DM list) break ties by ID, so pages neither repeat nor skip rows.
-The channel and DM lists order by name ascending, with a missing name last,
-then id. See [P02b](docs/remediation/p02b.md) and
+The channel list orders by createdAt then id. The DM list orders by
+updatedAt descending then id. See [P02b](docs/remediation/p02b.md) and
 [channel and DM list paging](docs/remediation/chat-list-paging.md).
 
 ### Testing API keys

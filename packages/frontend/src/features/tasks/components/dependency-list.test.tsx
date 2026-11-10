@@ -24,7 +24,7 @@ const task = {
     },
   ],
   blocking: [],
-} as TaskDetail;
+} as unknown as TaskDetail;
 
 afterEach(() => {
   cleanup();

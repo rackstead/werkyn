@@ -25,6 +25,7 @@ const task: Task = {
   customFieldValues: [],
   _count: { subtasks: 0, blockedBy: 0 },
   columnIndex: 0,
+  status: { id: "open", name: "Open", color: "#888", isCompletion: false },
 };
 
 const column: AssembledColumn = {

@@ -376,6 +376,24 @@ test("text contract: editing other words keeps escaped brackets and quotes", asy
     description: "Fish & chips today Use &lt;div&gt; <b>bold</b> say &quot;hi&quot; fin",
   });
 });
+test("text contract: long edits on both ends keep an escaped code sample", async () => {
+  const gap = "x".repeat(1001);
+  const stored = "A&lt;div&gt;" + gap + "Z";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("A<div>" + gap + "Z");
+  change(descriptionInput(), "B<div>" + gap + "Y"); await save();
+  expect(writes()[0].data).toEqual({ description: "B&lt;div&gt;" + gap + "Y" });
+});
+test("text contract: a new tag does not steal a code sample's stored spelling", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <b><div> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use <b>&lt;div&gt; end" });
+});
+test("text contract: editing inside a code sample keeps its brackets escaped", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <span> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use &lt;span&gt; end" });
+});
 test("text contract: description display decodes sanitizer entities once without parsing tags", async () => {
   const stored = "A &lt; B &gt; C &quot;q&quot; it's &amp;lt; <b>keep</b>\u0000";
   await mount({ description: stored }); await open();

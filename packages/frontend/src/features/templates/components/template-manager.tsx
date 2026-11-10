@@ -99,48 +99,60 @@ function spellingForUnchanged(piece: string): string {
   return piece === "&amp;" ? "&" : piece;
 }
 
+// Longest forward snake, not a full matrix. A matrix cutoff dropped matches and
+// turned an unchanged &lt;div&gt; into a tag the sanitizer removes. A shared
+// prefix is not taken blindly: the bracket of a new tag typed in front of a
+// code sample must not take the stored spelling.
 function alignDescription(before: string, after: string): Array<[number, number]> {
+  const matches: Array<[number, number]> = [];
   const n = before.length;
   const m = after.length;
-  let prefix = 0;
-  while (prefix < n && prefix < m && before[prefix] === after[prefix]) prefix++;
-  let suffix = 0;
-  while (
-    suffix < n - prefix && suffix < m - prefix &&
-    before[n - 1 - suffix] === after[m - 1 - suffix]
-  ) suffix++;
-  const matches: Array<[number, number]> = [];
-  for (let i = 0; i < prefix; i++) matches.push([i, i]);
-  const middle = alignDescriptionMiddle(before.slice(prefix, n - suffix), after.slice(prefix, m - suffix));
-  for (const [left, right] of middle) matches.push([left + prefix, right + prefix]);
-  for (let i = 0; i < suffix; i++) matches.push([n - suffix + i, m - suffix + i]);
-  return matches;
-}
-
-function alignDescriptionMiddle(before: string, after: string): Array<[number, number]> {
-  const n = before.length;
-  const m = after.length;
-  if (n === 0 || m === 0 || n * m > 1_000_000) return [];
-  const cols = m + 1;
-  const scores = new Uint32Array((n + 1) * cols);
-  const at = (i: number, j: number) => i * cols + j;
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      scores[at(i, j)] = before[i] === after[j]
-        ? scores[at(i + 1, j + 1)] + 1
-        : Math.max(scores[at(i + 1, j)], scores[at(i, j + 1)]);
-    }
-  }
-  const matches: Array<[number, number]> = [];
   let i = 0;
   let j = 0;
+  const window = 4000;
   while (i < n && j < m) {
-    if (before[i] === after[j]) {
+    const mark = before[i] === "<" || before[i] === ">" || before[i] === "\"";
+    if (!mark && before[i] === after[j]) {
       matches.push([i, j]);
       i++;
       j++;
-    } else if (scores[at(i + 1, j)] >= scores[at(i, j + 1)]) i++;
-    else j++;
+      continue;
+    }
+    let bestJ = -1;
+    let bestSnake = 0;
+    let bestCount = 0;
+    // A plain character must not jump past a bracket or quote. Those stay
+    // available for the stored spelling, instead of being swallowed by a later letter.
+    let limit = Math.min(m, j + window);
+    if (!mark) {
+      for (let k = j; k < limit; k++) {
+        if (after[k] === "<" || after[k] === ">" || after[k] === "\"") {
+          limit = k;
+          break;
+        }
+      }
+    }
+    for (let j2 = j; j2 < limit; j2++) {
+      if (after[j2] !== before[i]) continue;
+      let snake = 1;
+      while (i + snake < n && j2 + snake < m && before[i + snake] === after[j2 + snake]) snake++;
+      if (snake > bestSnake) {
+        bestSnake = snake;
+        bestJ = j2;
+        bestCount = 1;
+      } else if (snake === bestSnake) bestCount++;
+      // A snake that consumes the rest of the stored text cannot be beaten
+      // unless it is a single ambiguous character, which still has to be counted.
+      if (snake > 1 && i + snake === n) break;
+    }
+    const ambiguous = bestSnake === 1 && bestCount > 1;
+    if (bestSnake === 0 || ambiguous) {
+      i++;
+      continue;
+    }
+    for (let t = 0; t < bestSnake; t++) matches.push([i + t, bestJ + t]);
+    i += bestSnake;
+    j = bestJ + bestSnake;
   }
   return matches;
 }

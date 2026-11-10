@@ -93,97 +93,102 @@ function decodeTemplateDescription(value: string): { text: string; pieces: strin
   return { text, pieces };
 }
 
-// sanitize-html round-trips a visible &. A visible <div> or a decoded quote in
-// an attribute does not: the tag is discarded and the attribute is truncated.
-function spellingForUnchanged(piece: string): string {
-  return piece === "&amp;" ? "&" : piece;
+function findAll(haystack: string, needle: string, from = 0): number[] {
+  const found: number[] = [];
+  if (!needle) return found;
+  let at = haystack.indexOf(needle, from);
+  while (at !== -1) {
+    found.push(at);
+    at = haystack.indexOf(needle, at + 1);
+  }
+  return found;
 }
 
-// Longest forward snake, not a full matrix. A matrix cutoff dropped matches and
-// turned an unchanged &lt;div&gt; into a tag the sanitizer removes. A shared
-// prefix is not taken blindly: the bracket of a new tag typed in front of a
-// code sample must not take the stored spelling.
-function alignDescription(before: string, after: string): Array<[number, number]> {
-  const matches: Array<[number, number]> = [];
-  const n = before.length;
-  const m = after.length;
-  let i = 0;
-  let j = 0;
-  const window = 4000;
-  while (i < n && j < m) {
-    const mark = before[i] === "<" || before[i] === ">" || before[i] === "\"";
-    if (!mark && before[i] === after[j]) {
-      matches.push([i, j]);
-      i++;
-      j++;
-      continue;
+// Longest stored slice at `index` that still occurs in the edited text.
+// A longer slice matches a code sample and not a new tag typed in front of it.
+function matchingPrefix(decoded: string, index: number, edited: string): { length: number; positions: number[] } {
+  const max = Math.min(32, decoded.length - index);
+  let lo = 1;
+  let hi = max;
+  let bestLength = 0;
+  let bestPositions: number[] = [];
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const positions = findAll(edited, decoded.slice(index, index + mid));
+    if (positions.length > 0) {
+      bestLength = mid;
+      bestPositions = positions;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return { length: bestLength, positions: bestPositions };
+}
+
+// Runs only when a changed description is submitted, not while the editor renders.
+// Every edited occurrence of an unchanged bracket or quote context keeps the
+// stored spelling, including a second pasted copy and an insertion of any length.
+// A mark whose own context changed is tied to the nearest partner that did match.
+function descriptionForEdit(pieces: string[], decoded: string, edited: string): string {
+  if (pieces.length !== decoded.length || edited === decoded) return edited;
+  const anchors: number[] = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i];
+    if (piece === "&lt;" || piece === "&gt;" || piece === "&quot;") anchors.push(i);
+  }
+  if (anchors.length === 0) return edited;
+  const replacements = new Map<number, string>();
+  const placed = new Map<number, number[]>();
+  // A note that is mostly entities is escaped wholesale. Searching each mark
+  // across it would be quadratic, and there is no rich-text tag left to keep.
+  if (anchors.length > 500) {
+    return edited.replace(/[<>"]/g, (mark) => (mark === "<" ? "&lt;" : mark === ">" ? "&gt;" : "&quot;"));
+  }
+  for (const index of anchors) {
+    const match = matchingPrefix(decoded, index, edited);
+    // A single bare bracket is not distinctive enough to stamp onto every copy.
+    const positions = match.length >= 2 || match.positions.length === 1 ? match.positions : [];
+    placed.set(index, positions);
+    for (const at of positions) replacements.set(at, pieces[index]);
+  }
+  const nearest = (from: number, mark: string, step: -1 | 1): number => {
+    for (let at = from; at >= 0 && at < edited.length; at += step) {
+      if (edited[at] === mark && !replacements.has(at)) return at;
     }
-    let bestJ = -1;
-    let bestSnake = 0;
-    let bestCount = 0;
-    // A plain character must not jump past a bracket or quote. Those stay
-    // available for the stored spelling, instead of being swallowed by a later letter.
-    let limit = Math.min(m, j + window);
-    if (!mark) {
-      for (let k = j; k < limit; k++) {
-        if (after[k] === "<" || after[k] === ">" || after[k] === "\"") {
-          limit = k;
-          break;
-        }
+    return -1;
+  };
+  for (let a = 0; a < anchors.length; a++) {
+    const index = anchors[a];
+    if ((placed.get(index) ?? []).length > 0) continue;
+    const mark = decoded[index];
+    const partner = mark === "<" ? ">" : mark === ">" ? "<" : "\"";
+    const directions: Array<-1 | 1> = mark === "\"" ? [-1, 1] : mark === ">" ? [-1] : [1];
+    for (const dir of directions) {
+      let partnerIndex = -1;
+      for (let b = a + dir; b >= 0 && b < anchors.length; b += dir) {
+        if (decoded[anchors[b]] === partner) { partnerIndex = anchors[b]; break; }
+      }
+      if (partnerIndex === -1) continue;
+      for (const partnerAt of placed.get(partnerIndex) ?? []) {
+        const at = nearest(partnerAt + dir, mark, dir);
+        if (at !== -1) replacements.set(at, pieces[index]);
       }
     }
-    for (let j2 = j; j2 < limit; j2++) {
-      if (after[j2] !== before[i]) continue;
-      let snake = 1;
-      while (i + snake < n && j2 + snake < m && before[i + snake] === after[j2 + snake]) snake++;
-      if (snake > bestSnake) {
-        bestSnake = snake;
-        bestJ = j2;
-        bestCount = 1;
-      } else if (snake === bestSnake) bestCount++;
-      // A snake that consumes the rest of the stored text cannot be beaten
-      // unless it is a single ambiguous character, which still has to be counted.
-      if (snake > 1 && i + snake === n) break;
-    }
-    const ambiguous = bestSnake === 1 && bestCount > 1;
-    if (bestSnake === 0 || ambiguous) {
-      i++;
-      continue;
-    }
-    for (let t = 0; t < bestSnake; t++) matches.push([i + t, bestJ + t]);
-    i += bestSnake;
-    j = bestJ + bestSnake;
   }
-  return matches;
-}
-
-function descriptionForEdit(pieces: string[], decoded: string, edited: string): string {
-  if (pieces.length !== decoded.length) return edited;
+  if (replacements.size === 0) return edited;
   let out = "";
-  let cursor = 0;
-  for (const [decodedIndex, editedIndex] of alignDescription(decoded, edited)) {
-    out += edited.slice(cursor, editedIndex);
-    out += spellingForUnchanged(pieces[decodedIndex]);
-    cursor = editedIndex + 1;
-  }
-  return out + edited.slice(cursor);
+  for (let i = 0; i < edited.length; i++) out += replacements.get(i) ?? edited[i];
+  return out;
 }
 
 /** Compare the raw edit snapshot before applying the existing encodings. */
-function templateChanges(
-  form: TemplateFormData,
-  initial: TemplateFormData,
-  descriptionPieces: string[],
-): UpdateTemplateInput {
+function templateChanges(form: TemplateFormData, initial: TemplateFormData): UpdateTemplateInput {
   const changes: UpdateTemplateInput = {};
   if (form.name !== initial.name) changes.name = form.name.trim();
   if (form.title !== initial.title) changes.title = form.title.trim();
   // Equality is the one-pass display decode, so an unedited legacy entity
-  // string is omitted. Do not decode again here.
+  // string is omitted. The stored spelling is applied at submit, not here.
   if (form.description !== initial.description)
-    changes.description = stripDisallowedControlCharacters(
-      descriptionForEdit(descriptionPieces, initial.description, form.description),
-    ) || null;
+    changes.description = stripDisallowedControlCharacters(form.description) || null;
   if (form.priority !== initial.priority) changes.priority = form.priority;
   if (form.statusId !== initial.statusId) changes.statusId = form.statusId || null;
   if (form.dueOffset !== initial.dueOffset)
@@ -486,7 +491,7 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
   const currentEdit = useRef(edit);
   currentEdit.current = edit;
   const generation = identityGeneration();
-  const editChanges = edit ? templateChanges(edit.values, edit.initial, edit.descriptionPieces) : {};
+  const editChanges = edit ? templateChanges(edit.values, edit.initial) : {};
   const invalidChangedTitle = editChanges.title !== undefined && !editChanges.title;
   const invalidChangedName = editChanges.name !== undefined && !editChanges.name;
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -531,8 +536,14 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
       edit.projectId !== currentProject.current || edit.generation !== identityGeneration() ||
       Object.keys(editChanges).length === 0 || invalidChangedName || invalidChangedTitle
     ) return;
+    const changes = { ...editChanges };
+    if (changes.description !== undefined) {
+      changes.description = stripDisallowedControlCharacters(
+        descriptionForEdit(edit.descriptionPieces, edit.initial.description, edit.values.description),
+      ) || null;
+    }
     updateTemplate.mutate(
-      { id: edit.id, ...editChanges },
+      { id: edit.id, ...changes },
       {
         onSuccess: () => {
           // Keep the existing close-on-success policy, including pending edits.

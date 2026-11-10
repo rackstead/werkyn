@@ -394,6 +394,23 @@ test("text contract: editing inside a code sample keeps its brackets escaped", a
   change(descriptionInput(), "Use <span> end"); await save();
   expect(writes()[0].data).toEqual({ description: "Use &lt;span&gt; end" });
 });
+test("text contract: a long insertion before a code sample keeps its spelling", async () => {
+  const inserted = "n".repeat(4001);
+  await mount({ description: "Keep &lt;div&gt; tail" }); await open();
+  change(descriptionInput(), inserted + "Keep <div> tail"); await save();
+  expect(writes()[0].data).toEqual({ description: inserted + "Keep &lt;div&gt; tail" });
+});
+test("text contract: a duplicated code sample keeps both copies escaped", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <div> endUse <div> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use &lt;div&gt; endUse &lt;div&gt; end" });
+});
+test("text contract: replacing a long description without entities sends the new text", async () => {
+  await mount({ description: "a".repeat(5000) }); await open();
+  const next = "b".repeat(5000);
+  change(descriptionInput(), next); await save();
+  expect(writes()[0].data).toEqual({ description: next });
+});
 test("text contract: description display decodes sanitizer entities once without parsing tags", async () => {
   const stored = "A &lt; B &gt; C &quot;q&quot; it's &amp;lt; <b>keep</b>\u0000";
   await mount({ description: stored }); await open();

@@ -8,7 +8,7 @@ import {
 } from "../api";
 
 interface DependencyListProps {
-  task: TaskDetail;
+  task: Pick<TaskDetail, "id" | "projectId" | "blockedBy" | "blocking">;
   canEdit: boolean;
 }
 

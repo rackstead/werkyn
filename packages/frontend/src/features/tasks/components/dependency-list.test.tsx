@@ -24,7 +24,7 @@ const task = {
     },
   ],
   blocking: [],
-} as unknown as TaskDetail;
+} satisfies Pick<TaskDetail, "id" | "projectId" | "blockedBy" | "blocking">;
 
 afterEach(() => {
   cleanup();

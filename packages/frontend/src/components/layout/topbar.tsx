@@ -2,6 +2,11 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useUIStore } from "@/stores/ui-store";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { useState, useRef, useEffect } from "react";
+import { AvatarCropDialog, preloadAvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
+import {
+  AVATAR_ACCEPT,
+  avatarFileProblem,
+} from "@/components/shared/avatar-crop";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { PanelLeft, LogOut, Search, Camera, Settings, Shield } from "lucide-react";
 import { SearchCommand } from "@/features/search/components/search-command";
@@ -37,6 +42,10 @@ export function Topbar() {
   const workspaceId = membership?.workspace.id;
 
   const [searchOpen, setSearchOpen] = useState(false);
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarWorkspaceId, setAvatarWorkspaceId] = useState<string | null>(null);
+  const [avatarSaving, setAvatarSaving] = useState(false);
+  const avatarSavingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadFile = useUploadFile();
 
@@ -52,18 +61,50 @@ export function Topbar() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  useEffect(() => {
+    if (!avatarFile || avatarSavingRef.current) return;
+    if (avatarWorkspaceId !== workspaceId) {
+      setAvatarFile(null);
+      setAvatarWorkspaceId(null);
+    }
+  }, [workspaceId, avatarFile, avatarWorkspaceId, avatarSaving]);
+
   const handleLogout = () => {
     // Local state is cleared at once; server revocation finishes on its own.
     void logout();
     navigate({ to: "/login" });
   };
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const chooseAvatar = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    e.target.value = "";
+    if (!file || !workspaceId) return;
+    const problem = avatarFileProblem(file);
+    if (problem) {
+      toast.error(problem);
+      return;
+    }
+    setAvatarFile(file);
+    setAvatarWorkspaceId(workspaceId);
+  };
+
+  const dismissAvatar = () => {
+    if (avatarSavingRef.current) return;
+    setAvatarFile(null);
+    setAvatarWorkspaceId(null);
+  };
+
+  const saveAvatar = async (cropped: File) => {
+    const targetWorkspaceId = avatarWorkspaceId;
+    if (avatarSavingRef.current || !targetWorkspaceId) return;
+    avatarSavingRef.current = true;
+    setAvatarSaving(true);
     try {
-      if (!workspaceId) return;
-      const result = await uploadFile.mutateAsync({ file, purpose: "avatar", workspaceId });
+      const result = await uploadFile.mutateAsync({
+        file: cropped,
+        purpose: "avatar",
+        workspaceId: targetWorkspaceId,
+      });
       const res = await api
         .patch("users/me", {
           json: { avatarUrl: result.data.url },
@@ -73,15 +114,21 @@ export function Topbar() {
         .json<{ data: { id: string; avatarUrl: string } }>();
       const currentUser = useAuthStore.getState().user;
       if (currentUser?.id === res.data.id) {
-        useAuthStore.setState({ user: { ...currentUser, avatarUrl: res.data.avatarUrl } });
+        useAuthStore.setState({
+          user: { ...currentUser, avatarUrl: res.data.avatarUrl },
+        });
       }
       toast.success("Avatar updated");
+      setAvatarFile(null);
+      setAvatarWorkspaceId(null);
     } catch {
       // Only the account that chose the picture hears that it failed.
       if (useAuthStore.getState().user?.id === user?.id)
         toast.error("Failed to upload avatar");
+    } finally {
+      avatarSavingRef.current = false;
+      setAvatarSaving(false);
     }
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   return (
@@ -134,7 +181,14 @@ export function Topbar() {
             </div>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+          <DropdownMenuItem
+            onPointerEnter={preloadAvatarCropDialog}
+            onFocus={preloadAvatarCropDialog}
+            onClick={() => {
+              preloadAvatarCropDialog();
+              fileInputRef.current?.click();
+            }}
+          >
             <Camera className="h-4 w-4" />
             Change avatar
           </DropdownMenuItem>
@@ -178,10 +232,20 @@ export function Topbar() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/jpeg,image/png,image/gif,image/webp"
+        accept={AVATAR_ACCEPT}
         className="hidden"
-        onChange={handleAvatarUpload}
+        onChange={chooseAvatar}
       />
+
+      {avatarFile && (
+        <AvatarCropDialog
+          file={avatarFile}
+          saving={avatarSaving}
+          onCancel={dismissAvatar}
+          onConfirm={saveAvatar}
+          onError={(message) => toast.error(message)}
+        />
+      )}
 
       {workspaceId && workspaceSlug && (
         <SearchCommand

@@ -18,6 +18,8 @@ import { useAuthStore } from "@/stores/auth-store";
 import { identityGeneration } from "@/lib/identity";
 import { useProfile, useUpdateProfile, useChangePassword } from "../api";
 import { useUploadFile } from "@/features/uploads/api";
+import { AvatarCropDialog, preloadAvatarCropDialog } from "@/components/shared/avatar-crop-dialog.lazy";
+import { AVATAR_ACCEPT, avatarFileProblem } from "@/components/shared/avatar-crop";
 
 const TIMEZONE_NONE = "__none__";
 
@@ -52,6 +54,10 @@ export function ProfileSettings() {
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarWorkspaceId, setAvatarWorkspaceId] = useState<string | null>(null);
+  const [avatarSaving, setAvatarSaving] = useState(false);
+  const avatarSavingRef = useRef(false);
 
   const timezones = useMemo(() => {
     try {
@@ -83,6 +89,14 @@ export function ProfileSettings() {
       values: initial,
     });
   }, [profile, profileUserId, profileGeneration]);
+
+  useEffect(() => {
+    if (!avatarFile || avatarSavingRef.current) return;
+    if (avatarWorkspaceId !== workspaceId) {
+      setAvatarFile(null);
+      setAvatarWorkspaceId(null);
+    }
+  }, [workspaceId, avatarFile, avatarWorkspaceId, avatarSaving]);
 
   if (isLoading) {
     return (
@@ -116,23 +130,56 @@ export function ProfileSettings() {
 
   function handleAvatarUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file) return;
+    e.target.value = "";
+    if (!file || !workspaceId) return;
+    const problem = avatarFileProblem(file);
+    if (problem) {
+      toast.error(problem);
+      return;
+    }
+    setAvatarFile(file);
+    setAvatarWorkspaceId(workspaceId);
+  }
 
-    if (!workspaceId) return;
+  function stopAvatarSaving() {
+    avatarSavingRef.current = false;
+    setAvatarSaving(false);
+  }
+
+  function dismissAvatar() {
+    if (avatarSavingRef.current) return;
+    setAvatarFile(null);
+    setAvatarWorkspaceId(null);
+  }
+
+  function saveAvatar(cropped: File) {
+    const targetWorkspaceId = avatarWorkspaceId;
+    if (!targetWorkspaceId || avatarSavingRef.current) return;
+    avatarSavingRef.current = true;
+    setAvatarSaving(true);
     uploadFile.mutate(
-      { file, purpose: "avatar", workspaceId },
+      { file: cropped, purpose: "avatar", workspaceId: targetWorkspaceId },
       {
         onSuccess: (res: { data: { url: string } }) => {
           updateProfile.mutate(
             { avatarUrl: res.data.url },
-            { onSuccess: () => toast.success("Avatar updated") },
+            {
+              onSuccess: () => {
+                toast.success("Avatar updated");
+                setAvatarFile(null);
+                setAvatarWorkspaceId(null);
+                stopAvatarSaving();
+              },
+              onError: () => stopAvatarSaving(),
+            },
           );
         },
-        onError: (err: Error) => toast.error(err.message),
+        onError: (err: Error) => {
+          toast.error(err.message);
+          stopAvatarSaving();
+        },
       },
     );
-
-    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   function handleRemoveAvatar() {
@@ -217,7 +264,7 @@ export function ProfileSettings() {
     );
   }
 
-  const isUploading = uploadFile.isPending;
+  const isUploading = uploadFile.isPending || avatarSaving;
 
   return (
     <div className="space-y-8">
@@ -235,7 +282,12 @@ export function ProfileSettings() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => fileInputRef.current?.click()}
+                onPointerEnter={preloadAvatarCropDialog}
+                onFocus={preloadAvatarCropDialog}
+                onClick={() => {
+                  preloadAvatarCropDialog();
+                  fileInputRef.current?.click();
+                }}
                 disabled={isUploading}
               >
                 {isUploading ? (
@@ -264,10 +316,19 @@ export function ProfileSettings() {
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept={AVATAR_ACCEPT}
             className="hidden"
             onChange={handleAvatarUpload}
           />
+          {avatarFile && (
+            <AvatarCropDialog
+              file={avatarFile}
+              saving={avatarSaving}
+              onCancel={dismissAvatar}
+              onConfirm={saveAvatar}
+              onError={(message) => toast.error(message)}
+            />
+          )}
         </div>
       </section>
 

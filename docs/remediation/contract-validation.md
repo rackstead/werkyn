@@ -139,7 +139,9 @@ including changes made while its request was pending; failures retain the draft.
 An older completion cannot close a newly opened editor, and a stale project or
 identity generation cannot submit its draft. The existing identity boundary and
 request/cache guards remain. This adds no revision/CAS, unseen-update protection,
-raw-entity decoding, stored-row repair or sanitizer/editor policy expansion.
+stored-row repair or sanitizer/editor policy expansion; the description textarea
+decodes one level of stored sanitizer entities for display and omits that field
+when the decoded draft is unchanged.
 
 Template description submissions use the existing multiline control-character
 helper: vertical tab and form feed become newlines, and other forbidden controls

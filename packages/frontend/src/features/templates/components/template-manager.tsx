@@ -66,11 +66,34 @@ function sameOrderedIds(left: string[], right: string[]) {
   return left.length === right.length && left.every((id, i) => id === right[i]);
 }
 
+// One pass over the entities sanitize-html writes (&amp; &lt; &gt;, and &quot; in
+// attributes). Apostrophes are stored as characters, so there is no apostrophe
+// entity to decode. Not an HTML parse: tags and NULs stay. A chained replace
+// would decode &amp;amp; twice.
+function decodeTemplateDescription(value: string): string {
+  return value.replace(/&(?:amp|lt|gt|quot);/g, (entity) => {
+    switch (entity) {
+      case "&amp;":
+        return "&";
+      case "&lt;":
+        return "<";
+      case "&gt;":
+        return ">";
+      case "&quot;":
+        return "\"";
+      default:
+        return entity;
+    }
+  });
+}
+
 /** Compare the raw edit snapshot before applying the existing encodings. */
 function templateChanges(form: TemplateFormData, initial: TemplateFormData): UpdateTemplateInput {
   const changes: UpdateTemplateInput = {};
   if (form.name !== initial.name) changes.name = form.name.trim();
   if (form.title !== initial.title) changes.title = form.title.trim();
+  // Both sides are the one-pass display decode, so an unedited legacy entity
+  // string is omitted. Do not decode again here.
   if (form.description !== initial.description)
     changes.description = stripDisallowedControlCharacters(form.description) || null;
   if (form.priority !== initial.priority) changes.priority = form.priority;
@@ -339,7 +362,7 @@ function templateToForm(t: TaskTemplate): TemplateFormData {
   return {
     name: t.name,
     title: t.title,
-    description: t.description ?? "",
+    description: decodeTemplateDescription(t.description ?? ""),
     priority: t.priority,
     statusId: t.statusId ?? "",
     dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",

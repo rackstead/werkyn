@@ -191,8 +191,13 @@ test("omits unchanged blank legacy title while trimming only the changed name", 
   expect(writes()).toHaveLength(1); expect(writes()[0].data).toEqual({ name: "Revised name" }); expect(rows()[0].title).toBe("");
 });
 test("sends only an explicitly edited literal description without decoding text", async () => {
-  await mount(); await open(); change(descriptionInput(), "Revised &amp; notes\nΩ"); await save();
-  expect(writes()[0].data).toEqual({ description: "Revised &amp; notes\nΩ" });
+  await mount({ description: "Fish &amp; chips" }); await open();
+  expect(descriptionInput().value).toBe("Fish & chips");
+  cancel(); await open(1);
+  expect(descriptionInput().value).toBe("Notes & follow-up\nΩ");
+  change(descriptionInput(), "Fish & chips"); await save();
+  expect(writes()[0].data).toEqual({ description: "Fish & chips" });
+  expect(rows()[0].description).toBe("Fish &amp; chips");
 });
 test("clears only the description with null", async () => {
   await mount(); await open(); change(descriptionInput(), ""); await save(); expect(writes()[0].data).toEqual({ description: null });
@@ -340,8 +345,34 @@ test("text contract: changed controls-only description sends explicit null", asy
   await mount(); await open(); change(descriptionInput(), "\u0000\u0001"); await save(); expect(writes()[0].data).toEqual({ description: null }); expect(writes()[0].status).toBe(200);
 });
 test("text contract: unrelated edit omits unchanged legacy-invalid description", async () => {
-  const legacy = "Legacy\u0000 &amp; <b>text</b>"; await mount({ description: legacy }); await open(); change(titleInput(), "Other field"); await save();
+  const legacy = "Legacy\u0000 &amp; <b>text</b>"; await mount({ description: legacy }); await open();
+  expect(descriptionInput().value).toBe("Legacy\u0000 & <b>text</b>");
+  change(titleInput(), "Other field"); await save();
   expect(writes()[0].data).toEqual({ title: "Other field" }); expect(writes()[0].status).toBe(200); expect(rows()[0].description).toBe(legacy);
+});
+test("text contract: one display decode is not resent and does not accumulate", async () => {
+  rows("a")[0].description = "Notes &amp; follow-up";
+  rows("a")[1].description = "Fish &amp;amp; chips";
+  await mount(); await open(0);
+  expect(descriptionInput().value).toBe("Notes & follow-up");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe("Notes &amp; follow-up");
+  await open(0);
+  expect(descriptionInput().value).toBe("Notes & follow-up");
+  cancel(); await open(1);
+  expect(descriptionInput().value).toBe("Fish &amp; chips");
+  change(titleInput(), "Second field"); await save();
+  expect(writes()[1].data).toEqual({ title: "Second field" });
+  expect(rows()[1].description).toBe("Fish &amp;amp; chips");
+});
+test("text contract: description display decodes sanitizer entities once without parsing tags", async () => {
+  const stored = "A &lt; B &gt; C &quot;q&quot; it's &amp;lt; <b>keep</b>\u0000";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("A < B > C \"q\" it's &lt; <b>keep</b>\u0000");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe(stored);
 });
 test("text contract: allowed markup entities tabs Unicode and newlines stay verbatim", async () => {
   const allowed = "<p>Résumé &amp; &lt;copy&gt;\tΩ\nnext line</p>"; await mount(); createFields(allowed); await createSave();

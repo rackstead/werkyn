@@ -83,8 +83,8 @@ export async function updateProfile(
         SELECT "avatarUrl" FROM "User" WHERE id = ${userId} FOR NO KEY UPDATE
       `;
       const previousPath = avatarStoragePath(current?.avatarUrl);
-      // Same prefix the upload handler writes. The media route serves other
-      // casings of `/storage`, and the sweep looks up only this spelling.
+      // Same prefix the upload handler writes. The media route also serves
+      // other casings of `/storage`; the sweep keeps those too.
       const storedAvatarUrl =
         canonicalAvatarUrl(data.avatarUrl) ?? data.avatarUrl;
       const nextPath = avatarStoragePath(storedAvatarUrl);

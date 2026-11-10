@@ -17,9 +17,27 @@ export function avatarStoragePath(url: unknown): string | null {
   return `${match[1]}/uploads/${match[2]}/${match[3]}/${match[4]}`;
 }
 
-// The spelling uploads write and the sweep looks up. A `/Storage/` prefix
-// names this same blob on the media route; it is not a different file.
+// The spelling uploads write. A different case of this prefix names the same
+// blob on the media route; the path after the prefix does not.
 export function canonicalAvatarUrl(url: unknown): string | null {
   const storagePath = avatarStoragePath(url);
   return storagePath === null ? null : `/storage/${storagePath}`;
+}
+
+const STORAGE_PREFIX = "storage";
+
+// Every casing of the `/storage` prefix plus this exact remaining path.
+// The sweep looks these up by equality so the hash index can serve them.
+export function avatarHolderUrls(storagePath: string): string[] {
+  const urls: string[] = [];
+  const total = 1 << STORAGE_PREFIX.length;
+  for (let mask = 0; mask < total; mask++) {
+    let prefix = "/";
+    for (let i = 0; i < STORAGE_PREFIX.length; i++) {
+      const letter = STORAGE_PREFIX[i];
+      prefix += mask & (1 << i) ? letter.toUpperCase() : letter;
+    }
+    urls.push(`${prefix}/${storagePath}`);
+  }
+  return urls;
 }

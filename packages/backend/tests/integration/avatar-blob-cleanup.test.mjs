@@ -512,3 +512,32 @@ test("a /Storage/ prefix is saved as the upload spelling and the sweep keeps tho
     assert.equal(media.statusCode, 200, media.body);
   }
 });
+
+test("a pre-existing /Storage/ avatar survives a sweep of the canonical path", async () => {
+  const { user, token } = await createUser("jet");
+  const avatar = await uploadAvatar(token);
+  const mixed = `/Storage/${avatar.url.slice("/storage/".length)}`;
+  await app.prisma.user.update({
+    where: { id: user.id },
+    data: { avatarUrl: mixed },
+  });
+  await app.prisma.blobCleanup.create({ data: { storagePath: avatar.path } });
+
+  const swept = await processBlobCleanup(app.prisma, app.storage, {
+    paths: [avatar.path],
+  });
+  assert.equal(swept.deleted, 0, JSON.stringify(swept));
+  assert.equal(swept.retained, 1, JSON.stringify(swept));
+  assert.equal(await app.storage.exists(avatar.path), true);
+  assert.equal(
+    (await app.prisma.user.findUniqueOrThrow({
+      where: { id: user.id },
+      select: { avatarUrl: true },
+    })).avatarUrl,
+    mixed,
+  );
+  const kept = await app.prisma.blobCleanup.findUniqueOrThrow({
+    where: { storagePath: avatar.path },
+  });
+  assert.match(kept.lastError ?? "", /live avatar/);
+});

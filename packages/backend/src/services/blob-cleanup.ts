@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type { FastifyBaseLogger } from "fastify";
 import {
+  avatarHolderUrls,
   avatarStoragePath,
   canonicalAvatarUrl,
 } from "../modules/uploads/avatar-storage-path.js";
@@ -78,10 +79,13 @@ async function cleanupQueuedAvatar(
     BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
     MAX_BACKOFF_SECONDS,
   );
-  // Profile saves store this spelling, including when the request sent
-  // another case of the `/storage` prefix. The media route serves both.
-  const url = canonicalAvatarUrl(`/storage/${storagePath}`);
-  if (!url) return "skipped";
+  // New saves store the lowercase prefix. A profile that already has another
+  // casing of that prefix still names this exact path, and the media route
+  // serves it. The rest of the path is not folded.
+  const urls = canonicalAvatarUrl(`/storage/${storagePath}`)
+    ? avatarHolderUrls(storagePath)
+    : [];
+  if (urls.length === 0) return "skipped";
   try {
     return await prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;
@@ -93,10 +97,14 @@ async function cleanupQueuedAvatar(
         FOR UPDATE
       `;
       if (locked.length !== 1) return "skipped";
-      // Existence only. The hash index serves this equality; one row is enough.
+      // One equality per prefix casing. Each lookup is the hash index, not a
+      // scan of every user. The path after the prefix matches exactly.
       const [holder] = await tx.$queryRaw<Array<{ present: number }>>`
-        SELECT 1 AS present FROM "User"
-        WHERE "avatarUrl" = ${url}
+        SELECT 1 AS present
+        FROM unnest(${urls}::text[]) AS candidate(url)
+        WHERE EXISTS (
+          SELECT 1 FROM "User" WHERE "avatarUrl" = candidate.url
+        )
         LIMIT 1
       `;
       const reason = holder

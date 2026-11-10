@@ -1,9 +1,11 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { identityGeneration } from "@/lib/identity";
+import { queryClient } from "@/lib/query-client";
+import type { WebSocketClient } from "@/lib/websocket-client";
 import { useAuthStore } from "@/stores/auth-store";
 import { FakeWebSocket } from "@/test/fake-websocket";
-import { RealtimeProvider } from "./realtime-provider";
+import { RealtimeProvider, useRealtimeClient } from "./realtime-provider";
 
 // Real provider, WebSocket client and identity transitions. The store's
 // refresh, logout and expireSession are replaced per test; the test plays the
@@ -210,5 +212,144 @@ describe("session close codes", () => {
     expect(renew).not.toHaveBeenCalled();
     expect(signOut).not.toHaveBeenCalled();
     expect(expire).not.toHaveBeenCalled();
+  });
+});
+
+function ClientSlot({ slot }: { slot: { current: WebSocketClient | null } }) {
+  slot.current = useRealtimeClient();
+  return null;
+}
+
+function mountHeld(token: string) {
+  const slot: { current: WebSocketClient | null } = { current: null };
+  useAuthStore.setState({ user: alice, accessToken: token });
+  render(
+    <RealtimeProvider>
+      <ClientSlot slot={slot} />
+    </RealtimeProvider>,
+  );
+  return slot;
+}
+
+describe("access token rotation", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps the same client and its holders when only the access token changes", async () => {
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    try {
+      const slot = mountHeld("token-a");
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const socket = FakeWebSocket.latest();
+      act(() => socket.accept());
+      const client = slot.current;
+      expect(client).not.toBeNull();
+      act(() => {
+        client!.subscribe("project-1");
+        client!.subscribeWorkspace("workspace-1");
+      });
+
+      act(() => useAuthStore.setState({ accessToken: "token-b" }));
+
+      expect(slot.current).toBe(client);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      expect(socket.closed).toBe(false);
+      expect(socket.sent.filter((frame) => frame.type === "unsubscribe")).toEqual([]);
+      expect(socket.sent.filter((frame) => frame.type === "unsubscribe_workspace")).toEqual([]);
+      expect(invalidate).not.toHaveBeenCalled();
+
+      vi.useFakeTimers();
+      act(() => socket.drop());
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      const next = FakeWebSocket.latest();
+      expect(next).not.toBe(socket);
+      expect(invalidate).not.toHaveBeenCalled();
+      act(() => next.accept());
+      expect(next.sent.filter((frame) => frame.type !== "auth")).toEqual([
+        { type: "subscribe", projectId: "project-1" },
+        { type: "subscribe_workspace", workspaceId: "workspace-1" },
+      ]);
+      expect(next.sent[0]).toEqual({ type: "auth", token: "token-b" });
+      expect(invalidate).toHaveBeenCalledTimes(1);
+    } finally {
+      invalidate.mockRestore();
+    }
+  });
+
+  it("after 4004, reconnects that same client and catches up only once authenticated", async () => {
+    const caught: string[] = [];
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockImplementation(() => {
+      caught.push(
+        FakeWebSocket.latest()
+          .sent.map((frame) => String(frame.type))
+          .join(","),
+      );
+      return Promise.resolve();
+    });
+    let finish!: () => void;
+    stubStore(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = () => {
+            useAuthStore.setState({ accessToken: "fresh-token" });
+            resolve(true);
+          };
+        }),
+    );
+    try {
+      const slot = mountHeld("stale-token");
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const socket = FakeWebSocket.latest();
+      act(() => socket.accept());
+      const client = slot.current!;
+      act(() => {
+        client.subscribe("project-1");
+        client.subscribeWorkspace("workspace-1");
+      });
+
+      act(() => socket.closeWith(4004, "Session expired"));
+      await Promise.resolve();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      expect(invalidate).not.toHaveBeenCalled();
+
+      await act(async () => finish());
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+      const next = FakeWebSocket.latest();
+      expect(slot.current).toBe(client);
+      expect(invalidate).not.toHaveBeenCalled();
+      act(() => next.accept());
+
+      expect(next.sent[0]).toEqual({ type: "auth", token: "fresh-token" });
+      expect(next.sent.filter((frame) => frame.type !== "auth")).toEqual([
+        { type: "subscribe", projectId: "project-1" },
+        { type: "subscribe_workspace", workspaceId: "workspace-1" },
+      ]);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(caught).toEqual(["auth,subscribe,subscribe_workspace"]);
+    } finally {
+      invalidate.mockRestore();
+    }
+  });
+
+  it("destroys the client when the signed-in user changes", async () => {
+    const slot = mountHeld("alice-token");
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.latest();
+    act(() => socket.accept());
+    const client = slot.current!;
+    act(() => client.subscribe("project-1"));
+
+    act(() =>
+      useAuthStore.setState({ user: { ...alice, id: "bob" }, accessToken: "bob-token" }),
+    );
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+
+    expect(socket.closed).toBe(true);
+    expect(slot.current).not.toBe(client);
+    expect(slot.current).not.toBeNull();
+    const next = FakeWebSocket.latest();
+    act(() => next.accept());
+    expect(next.sent).toEqual([{ type: "auth", token: "bob-token" }]);
   });
 });

@@ -463,3 +463,30 @@ test("a DM walk still lists every DM once when messages move updatedAt", async (
   assert.equal(cursor, null);
   for (const id of ids) assert.equal(seen.filter((row) => row === id).length, 1, id);
 });
+
+test("a long DM list keeps a short cursor and still returns every DM once", async () => {
+  const url = `/api/chat/${home.id}/dms`;
+  const many = Array.from({ length: 500 }, (_, i) => `long-dm-${suffix}-${String(i).padStart(4, "0")}`);
+  const stamp = new Date("2026-02-01T00:00:00.000Z");
+  for (let offset = 0; offset < many.length; offset += 100) {
+    const slice = many.slice(offset, offset + 100);
+    await app.prisma.chatChannel.createMany({
+      data: slice.map((id) => ({
+        id, workspaceId: home.id, type: "DM", createdById: users.me.id, createdAt: stamp, updatedAt: stamp,
+      })),
+    });
+    await app.prisma.chatChannelMember.createMany({
+      data: slice.map((channelId) => ({ channelId, userId: users.me.id, joinedAt: stamp, lastReadAt: stamp })),
+    });
+  }
+  const seen = [];
+  let cursor;
+  for (let pages = 0; pages < 40; pages += 1) {
+    const body = await ok(withPaging(url, 50, cursor));
+    if (body.nextCursor) assert.ok(body.nextCursor.length < 500, body.nextCursor.length);
+    seen.push(...body.data.map((row) => row.id));
+    if (!body.nextCursor) break;
+    cursor = body.nextCursor;
+  }
+  for (const id of many) assert.equal(seen.filter((row) => row === id).length, 1, id);
+});

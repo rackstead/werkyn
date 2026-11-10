@@ -154,8 +154,32 @@ function tagAwareSuffix(before: string, after: string, prefix: number): number {
 }
 
 function escapeDisallowedTags(text: string): string {
+  return escapeTags(text, new Set());
+}
+
+// Tag names whose every stored bracket is an entity. A large edit that cannot
+// be aligned must still escape those, or an allow-listed sample such as &lt;b&gt;
+// becomes a live tag. A name that also occurs as real markup is left alone.
+function entityOnlyTagNames(pieces: string[], decoded: string): Set<string> {
+  const entity = new Set<string>();
+  const raw = new Set<string>();
+  for (let i = 0; i < decoded.length; i++) {
+    if (decoded[i] !== "<") continue;
+    const name = tagNameAt(decoded, i);
+    if (!name || !ALLOWED_TEMPLATE_TAGS.has(name)) continue;
+    const gt = decoded.indexOf(">", i);
+    if (gt < 0) continue;
+    if (pieces[i] === "&lt;" && pieces[gt] === "&gt;") entity.add(name);
+    else raw.add(name);
+  }
+  for (const name of raw) entity.delete(name);
+  return entity;
+}
+
+function escapeTags(text: string, entityOnly: Set<string>): string {
   return text.replace(/<\/?([A-Za-z][A-Za-z0-9]*)\b[^<>]*>/g, (whole, name: string) => {
-    if (ALLOWED_TEMPLATE_TAGS.has(name.toLowerCase())) return whole;
+    const lower = name.toLowerCase();
+    if (ALLOWED_TEMPLATE_TAGS.has(lower) && !entityOnly.has(lower)) return whole;
     return whole.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   });
 }
@@ -232,7 +256,7 @@ function descriptionForEdit(pieces: string[], decoded: string, edited: string): 
   const afterMid = edited.slice(prefix, edited.length - suffix);
   const pairs = equalCharPairs(beforeMid, afterMid);
   if (pairs === null) {
-    out += escapeDisallowedTags(afterMid);
+    out += escapeTags(afterMid, entityOnlyTagNames(pieces, decoded));
   } else {
     let cursor = 0;
     for (const [a, b] of pairs) {

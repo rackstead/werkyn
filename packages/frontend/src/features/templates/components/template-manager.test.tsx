@@ -458,6 +458,17 @@ test("text contract: a shared b prefix does not escape the real tag", async () =
   expect(saved).toContain("&lt;b&gt;1");
   expect(saved).toContain("<b>two</b>");
 });
+test("text contract: a large edit keeps an escaped bold sample literal", async () => {
+  const stored = "A &lt;b&gt;" + "a".repeat(300) + "&lt;/b&gt; Z";
+  await mount({ description: stored }); await open();
+  const edited = "B <b>" + "b".repeat(300) + "</b> Y";
+  change(descriptionInput(), edited); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;b&gt;");
+  expect(saved).toContain("&lt;/b&gt;");
+  expect(saved).toContain("b".repeat(300));
+  expect(saved).not.toContain("<b>");
+});
 test("text contract: a shared 32 character prefix does not escape the real tag", async () => {
   const hello = "Hello world this is plenty of matching text";
   const stored = `&lt;b&gt;${hello} <b>${hello}</b>`;

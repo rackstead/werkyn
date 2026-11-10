@@ -26,6 +26,7 @@ Object.assign(process.env, {
 const { PrismaClient } = await import("@prisma/client");
 const { LocalStorageProvider } = await import("../../src/services/storage.ts");
 const { uploadFileStream } = await import("../../src/modules/files/files.service.ts");
+const { processBlobCleanup } = await import("../../src/services/blob-cleanup.ts");
 
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWMwTjuDFTEMLQkAuYZZQQ0kCIcAAAAASUVORK5CYII=",
@@ -279,6 +280,96 @@ test("a thumbnail queued before it is written is kept with the file and cleared 
   assert.equal(failed.paths.length, 2);
   assert.ok(failed.data.thumbnailPath);
   assertRolledBack(failed, png);
+});
+
+test("a late write keeps its cleanup row when a worker already owns the claim", { timeout: 30_000 }, async () => {
+  const bytes = Buffer.from("late upload write\n");
+  const originalSave = storage.saveStream.bind(storage);
+  const originalDeleteMany = prisma.blobCleanup.deleteMany.bind(prisma.blobCleanup);
+  let releaseDelete = () => {};
+  const gate = new Promise((resolve) => {
+    releaseDelete = resolve;
+  });
+  let noteDelete = () => {};
+  const deleteReached = new Promise((resolve) => {
+    noteDelete = resolve;
+  });
+  let held = false;
+  let planned;
+  let worker;
+  prisma.blobCleanup.deleteMany = async (args) => {
+    if (!held) {
+      held = true;
+      noteDelete();
+      await gate;
+    }
+    return originalDeleteMany(args);
+  };
+  storage.saveStream = async (...args) => {
+    planned = path.join(args[0], args[1], `${args[2]}${args[3]}`);
+    await prisma.$executeRaw`
+      UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP - interval '1 second'
+      WHERE "storagePath" = ${planned}`;
+    worker = processBlobCleanup(prisma, storage, { paths: [planned], limit: 1 });
+    worker.catch(() => {});
+    let waitTimer;
+    try {
+      await Promise.race([
+        deleteReached,
+        new Promise((_, reject) => {
+          waitTimer = setTimeout(() => reject(new Error("worker did not reach row delete")), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(waitTimer);
+    }
+    return originalSave(...args);
+  };
+  try {
+    const pending = uploadFileStream(
+      prisma,
+      storage,
+      workspace.id,
+      user.id,
+      undefined,
+      "late.txt",
+      "text/plain",
+      Readable.from([bytes]),
+      { workspaceId: workspace.id, userId: user.id, workspaceRole: "ADMIN" },
+    ).then(
+      (file) => ({ ok: true, file }),
+      (error) => ({ ok: false, error }),
+    );
+    let settleTimer;
+    const settled = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        settleTimer = setTimeout(() => resolve({ ok: false, error: new Error("late write did not settle") }), 15_000);
+      }),
+    ]);
+    clearTimeout(settleTimer);
+    const claimed = await observer.blobCleanup.findUnique({ where: { storagePath: planned } });
+    assert.equal(settled.ok, false);
+    assert.equal(settled.error.statusCode, 503);
+    assert.equal(await prisma.file.count({ where: { storagePath: planned } }), 0);
+    assert.equal(await storage.exists(planned), true);
+    assert.equal(Buffer.from(await storage.read(planned)).equals(bytes), true);
+    assert.equal(claimed?.attempts, 1);
+    const renewedAt = claimed.availableAt;
+    releaseDelete();
+    const sweep = await worker;
+    const afterWorker = await observer.blobCleanup.findUnique({ where: { storagePath: planned } });
+    assert.equal(sweep.claimed, 1);
+    assert.equal(sweep.deleted, 1);
+    assert.equal(afterWorker?.attempts, 1);
+    assert.equal(afterWorker.availableAt.getTime(), renewedAt.getTime());
+    assert.equal(await storage.exists(planned), true);
+  } finally {
+    releaseDelete();
+    if (worker) await worker.catch(() => {});
+    prisma.blobCleanup.deleteMany = originalDeleteMany;
+    storage.saveStream = originalSave;
+  }
 });
 });
 

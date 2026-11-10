@@ -129,9 +129,10 @@ async function claimStagedUploads(tx: Prisma.TransactionClient, paths: string[])
 }
 
 /**
- * A caught failure still has to remove the bytes. discardStagedBlobs only
- * takes rows that are already due, so unclaimed grace rows are made due
- * first. A sweeper that has already claimed one keeps that lease.
+ * A caught failure still has to remove the bytes. Unclaimed grace rows are
+ * made due so discardStagedBlobs can take them. A sweeper that already
+ * claimed one keeps its attempts; the lease moves by at least one stored
+ * millisecond so that sweeper cannot retire this later write's row.
  */
 async function releaseStagedUploads(
   prisma: PrismaClient,
@@ -141,14 +142,20 @@ async function releaseStagedUploads(
   const staged = [...new Set(paths.filter((p): p is string => !!p))];
   if (staged.length === 0) return;
   try {
-    await prisma.$executeRaw`
-      UPDATE "BlobCleanup"
-      SET "availableAt" = date_trunc('milliseconds', CURRENT_TIMESTAMP)
-      WHERE "storagePath" = ANY(${staged}::text[]) AND "attempts" = 0`;
+    for (const storagePath of staged) {
+      await prisma.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "availableAt") VALUES (
+          ${storagePath}, date_trunc('milliseconds', CURRENT_TIMESTAMP))
+        ON CONFLICT ("storagePath") DO UPDATE SET "availableAt" =
+          CASE WHEN "BlobCleanup"."attempts" = 0
+            THEN date_trunc('milliseconds', CURRENT_TIMESTAMP)
+          ELSE GREATEST("BlobCleanup"."availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+          END`;
+    }
   } catch (error) {
     logger.error(
       { err: error, paths: staged },
-      "Could not make a failed upload's staged blobs due; left until grace expiry",
+      "Could not renew a failed upload's staged blobs; left until grace expiry",
     );
     return;
   }

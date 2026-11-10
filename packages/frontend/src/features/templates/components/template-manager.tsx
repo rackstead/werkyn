@@ -146,6 +146,23 @@ function tagAwareSuffix(before: string, after: string, prefix: number): number {
   let suffix = 0;
   while (suffix < max && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
   if (suffix === 0) return 0;
+  const beforeAt = before.length - suffix;
+  const afterAt = after.length - suffix;
+  // A shared "</b>" at the end is not the same tag when the text before it differs.
+  // An opening tag such as "<div>" stays in the suffix: a new tag typed in front
+  // of a sample must not take the sample's stored spelling.
+  if (before[beforeAt] === "<" && before[beforeAt + 1] === "/" && after[afterAt] === "<" && after[afterAt + 1] === "/") {
+    const prevBefore = beforeAt > 0 ? before[beforeAt - 1] : "";
+    const prevAfter = afterAt > 0 ? after[afterAt - 1] : "";
+    if (prevBefore !== prevAfter) {
+      const gt = before.indexOf(">", beforeAt);
+      if (gt >= 0) {
+        const drop = gt - beforeAt + 1;
+        if (drop <= suffix) suffix -= drop;
+      }
+    }
+  }
+  if (suffix === 0) return 0;
   const beforeGt = before.length - suffix;
   if (before[beforeGt] === ">" && after[after.length - suffix] === ">") {
     if (tagNameEndingAt(before, beforeGt) !== tagNameEndingAt(after, after.length - suffix)) return suffix - 1;
@@ -154,38 +171,39 @@ function tagAwareSuffix(before: string, after: string, prefix: number): number {
 }
 
 function escapeDisallowedTags(text: string): string {
-  return escapeTags(text, new Set());
-}
-
-// Tag names whose every stored bracket is an entity. A large edit that cannot
-// be aligned must still escape those, or an allow-listed sample such as &lt;b&gt;
-// becomes a live tag. A name that also occurs as real markup is left alone.
-function entityOnlyTagNames(pieces: string[], decoded: string): Set<string> {
-  const entity = new Set<string>();
-  const raw = new Set<string>();
-  for (let i = 0; i < decoded.length; i++) {
-    if (decoded[i] !== "<") continue;
-    const name = tagNameAt(decoded, i);
-    if (!name || !ALLOWED_TEMPLATE_TAGS.has(name)) continue;
-    const gt = decoded.indexOf(">", i);
-    if (gt < 0) continue;
-    if (pieces[i] === "&lt;" && pieces[gt] === "&gt;") entity.add(name);
-    else raw.add(name);
-  }
-  for (const name of raw) entity.delete(name);
-  return entity;
-}
-
-function escapeTags(text: string, entityOnly: Set<string>): string {
   return text.replace(/<\/?([A-Za-z][A-Za-z0-9]*)\b[^<>]*>/g, (whole, name: string) => {
-    const lower = name.toLowerCase();
-    if (ALLOWED_TEMPLATE_TAGS.has(lower) && !entityOnly.has(lower)) return whole;
+    if (ALLOWED_TEMPLATE_TAGS.has(name.toLowerCase())) return whole;
     return whole.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   });
 }
 
+// An entity bracket matched hundreds of characters away is a different tag, not
+// the stored sample. A new <b> after a long replacement must stay markup.
+const MAX_ENTITY_DRIFT = 256;
+
+function entityPiece(piece: string): boolean {
+  return piece === "&lt;" || piece === "&gt;" || piece === "&quot;";
+}
+
 function pieceChar(piece: string): string {
   return piece === "&amp;" ? "&" : piece;
+}
+
+function preserveNearbyEntities(beforeMid: string, afterMid: string, pieces: string[], prefix: number): string {
+  const rep = new Map<number, string>();
+  for (let i = 0; i < beforeMid.length; i++) {
+    const piece = pieces[prefix + i];
+    if (!entityPiece(piece)) continue;
+    const start = Math.max(0, i - MAX_ENTITY_DRIFT);
+    const end = Math.min(afterMid.length, i + MAX_ENTITY_DRIFT + 1);
+    let at = afterMid.indexOf(beforeMid[i], start);
+    while (at !== -1 && at < end && rep.has(at)) at = afterMid.indexOf(beforeMid[i], at + 1);
+    if (at < 0 || at >= end) continue;
+    rep.set(at, piece);
+  }
+  let text = "";
+  for (let i = 0; i < afterMid.length; i++) text += rep.get(i) ?? afterMid[i];
+  return escapeDisallowedTags(text);
 }
 
 // Order-preserving edit script for the middle. Null when the edit is too large
@@ -201,7 +219,7 @@ function equalCharPairs(before: string, after: string): Array<[number, number]> 
   v[off + 1] = 0;
   const trace: Int32Array[] = [];
   let found = -1;
-  const cap = 256;
+  const cap = 8192;
   for (let d = 0; d <= max && d <= cap; d++) {
     trace.push(v.slice());
     let done = false;
@@ -256,12 +274,14 @@ function descriptionForEdit(pieces: string[], decoded: string, edited: string): 
   const afterMid = edited.slice(prefix, edited.length - suffix);
   const pairs = equalCharPairs(beforeMid, afterMid);
   if (pairs === null) {
-    out += escapeTags(afterMid, entityOnlyTagNames(pieces, decoded));
+    out += preserveNearbyEntities(beforeMid, afterMid, pieces, prefix);
   } else {
     let cursor = 0;
     for (const [a, b] of pairs) {
+      const piece = pieces[prefix + a];
+      if (entityPiece(piece) && Math.abs(a - b) > MAX_ENTITY_DRIFT) continue;
       if (b > cursor) out += escapeDisallowedTags(afterMid.slice(cursor, b));
-      out += pieceChar(pieces[prefix + a]);
+      out += pieceChar(piece);
       cursor = b + 1;
     }
     if (cursor < afterMid.length) out += escapeDisallowedTags(afterMid.slice(cursor));

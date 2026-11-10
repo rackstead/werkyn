@@ -262,10 +262,10 @@ test("Drive reads refuse a link at the blob, in a folder above it, or into anoth
       assertRefused(response, `${label}: ${route}`);
       assert.equal(leaks(response, marker), false, `${label}: ${route}`);
     }
-    // The archive streams entries after its headers: the refusal ends the
-    // response early, and nothing of the outside file is sent.
+    // A link is refused before any zip byte, the same 403 as the other reads.
     const archive = await archiveOf([file.id]);
-    assert.equal(archive.aborted, true, `${label}: archive`);
+    assert.equal(archive.aborted, false, `${label}: archive`);
+    assertRefused(archive.response, `${label}: archive`);
     assert.equal(leaks(archive, marker), false, `${label}: archive`);
   };
 
@@ -296,11 +296,16 @@ test("Drive reads refuse a link at the blob, in a folder above it, or into anoth
   assertRefused(await request("GET", `/api/workspaces/${workspace.id}/files/${photo.id}/thumbnail`), "thumbnail");
   await undo();
 
-  // An archive entry that cannot be read at all (here: missing) ends the
-  // archive instead of becoming an uncaught stream error.
+  // A missing blob is a 410 with no zip body, the same error as a single-file
+  // download, instead of a 200 that resets after a local header.
   const missing = await uploadDrive("missing.txt", "text/plain", Buffer.from("soon gone"));
   await rm(onDisk(missing.storagePath));
-  assert.equal((await archiveOf([missing.id])).aborted, true);
+  const missingArchive = await archiveOf([missing.id]);
+  assert.equal(missingArchive.aborted, false);
+  assert.equal(missingArchive.response.statusCode, 410);
+  assert.match(missingArchive.response.headers["content-type"], /^application\/json/);
+  assert.equal(missingArchive.response.json().message, "File content is no longer available");
+  assert.equal(missingArchive.rawPayload.subarray(0, 4).equals(Buffer.from("PK\x03\x04")), false);
   assert.equal((await request("GET", "/api/live")).statusCode, 200, "the server is still serving");
 
   // With every link removed, the same routes serve the member's bytes again.

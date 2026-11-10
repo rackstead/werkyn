@@ -1,5 +1,8 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
-import type { StorageProvider } from "../../services/storage.js";
+import {
+  MissingBlobError,
+  type StorageProvider,
+} from "../../services/storage.js";
 import type {
   CreateFolderInput,
   UpdateFileInput,
@@ -951,6 +954,16 @@ export async function archiveFiles(
       ? `${files[0].name}.zip`
       : "files.zip";
 
+  // Same answers as a single-file download, before any zip byte exists: a
+  // missing blob is 410 and a refusal is 403. Dropping the missing entry and
+  // returning 200 would hide it. A blob that disappears after this check still
+  // aborts the stream below; the status can no longer change once bytes start.
+  for (const entry of entries) {
+    if (!(await storage.exists(entry.storagePath))) {
+      throw new MissingBlobError();
+    }
+  }
+
   const passthrough = new PassThrough();
   const archive = new ZipArchive({ zlib: { level: 6 } });
 
@@ -960,8 +973,8 @@ export async function archiveFiles(
   for (const entry of entries) {
     const fileStream = storage.readStream(entry.storagePath);
     // The archiver pipes each entry without forwarding its errors. A blob that
-    // cannot be read (missing, or refused below the storage root) ends the
-    // archive and its response instead of becoming an uncaught error.
+    // cannot be read after the check above ends the archive instead of
+    // becoming an uncaught error.
     fileStream.once("error", (err) => {
       archive.abort();
       passthrough.destroy(err);

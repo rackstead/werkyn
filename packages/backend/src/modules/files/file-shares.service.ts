@@ -13,6 +13,7 @@ import {
   ForbiddenError,
   ConflictError,
 } from "../../utils/errors.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import {
   assertFileAccess,
   fileAccessRole,
@@ -143,10 +144,14 @@ export async function removeFileShare(
   userId: string,
   ctx: AccessContext,
 ) {
-  await assertFileAccess(prisma, fileId, { ...ctx, workspaceId }, true);
+  // File updates re-check shares after they take the workspace lock.
+  // The delete has to take that same lock so it cannot commit underneath one.
+  return withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    await assertFileAccess(tx, fileId, { ...ctx, workspaceId }, true);
 
-  return prisma.fileShare.deleteMany({
-    where: { workspaceId, fileId, sharedWithId: userId },
+    return tx.fileShare.deleteMany({
+      where: { workspaceId, fileId, sharedWithId: userId },
+    });
   });
 }
 

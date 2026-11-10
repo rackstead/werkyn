@@ -265,17 +265,21 @@ export async function removeMember(
   teamFolderId: string,
   userId: string,
 ) {
-  const teamFolder = await prisma.teamFolder.findFirst({
-    where: { id: teamFolderId, workspaceId },
-  });
-  if (!teamFolder) throw new NotFoundError("Team folder not found");
+  // File updates re-check this grant after they take the workspace lock.
+  // The delete has to take that same lock so it cannot commit underneath one.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const teamFolder = await tx.teamFolder.findFirst({
+      where: { id: teamFolderId, workspaceId },
+    });
+    if (!teamFolder) throw new NotFoundError("Team folder not found");
 
-  const member = await prisma.teamFolderMember.findUnique({
-    where: { teamFolderId_userId: { teamFolderId, userId } },
-  });
-  if (!member) throw new NotFoundError("Member not found");
+    const member = await tx.teamFolderMember.findUnique({
+      where: { teamFolderId_userId: { teamFolderId, userId } },
+    });
+    if (!member) throw new NotFoundError("Member not found");
 
-  await prisma.teamFolderMember.delete({ where: { id: member.id } });
+    await tx.teamFolderMember.delete({ where: { id: member.id } });
+  });
 }
 
 export async function addGroupToTeamFolder(
@@ -310,15 +314,19 @@ export async function removeGroupFromTeamFolder(
   teamFolderId: string,
   groupId: string,
 ) {
-  const teamFolder = await prisma.teamFolder.findFirst({
-    where: { id: teamFolderId, workspaceId },
-  });
-  if (!teamFolder) throw new NotFoundError("Team folder not found");
+  // File updates re-check this grant after they take the workspace lock.
+  // The delete has to take that same lock so it cannot commit underneath one.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const teamFolder = await tx.teamFolder.findFirst({
+      where: { id: teamFolderId, workspaceId },
+    });
+    if (!teamFolder) throw new NotFoundError("Team folder not found");
 
-  const tfGroup = await prisma.teamFolderGroup.findUnique({
-    where: { teamFolderId_groupId: { teamFolderId, groupId } },
-  });
-  if (!tfGroup) throw new NotFoundError("Group assignment not found");
+    const tfGroup = await tx.teamFolderGroup.findUnique({
+      where: { teamFolderId_groupId: { teamFolderId, groupId } },
+    });
+    if (!tfGroup) throw new NotFoundError("Group assignment not found");
 
-  await prisma.teamFolderGroup.delete({ where: { id: tfGroup.id } });
+    await tx.teamFolderGroup.delete({ where: { id: tfGroup.id } });
+  });
 }

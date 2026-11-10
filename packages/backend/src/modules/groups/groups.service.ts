@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import type { CreateGroupInput, UpdateGroupInput } from "@pm/shared";
 import { ConflictError, NotFoundError } from "../../utils/errors.js";
+import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 
 export async function createGroup(
   prisma: PrismaClient,
@@ -118,12 +119,16 @@ export async function deleteGroup(
   workspaceId: string,
   groupId: string,
 ) {
-  const group = await prisma.group.findFirst({
-    where: { id: groupId, workspaceId },
-  });
-  if (!group) throw new NotFoundError("Group not found");
+  // File updates re-check group grants after they take the workspace lock.
+  // Deleting the group has to take that same lock so it cannot commit underneath one.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const group = await tx.group.findFirst({
+      where: { id: groupId, workspaceId },
+    });
+    if (!group) throw new NotFoundError("Group not found");
 
-  await prisma.group.delete({ where: { id: groupId } });
+    await tx.group.delete({ where: { id: groupId } });
+  });
 }
 
 export async function addMember(
@@ -159,15 +164,19 @@ export async function removeMember(
   groupId: string,
   userId: string,
 ) {
-  const group = await prisma.group.findFirst({
-    where: { id: groupId, workspaceId },
-  });
-  if (!group) throw new NotFoundError("Group not found");
+  // File updates re-check this grant after they take the workspace lock.
+  // The delete has to take that same lock so it cannot commit underneath one.
+  await withWorkspaceLock(prisma, workspaceId, async (tx) => {
+    const group = await tx.group.findFirst({
+      where: { id: groupId, workspaceId },
+    });
+    if (!group) throw new NotFoundError("Group not found");
 
-  const member = await prisma.groupMember.findUnique({
-    where: { groupId_userId: { groupId, userId } },
-  });
-  if (!member) throw new NotFoundError("Member not found");
+    const member = await tx.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+    if (!member) throw new NotFoundError("Member not found");
 
-  await prisma.groupMember.delete({ where: { id: member.id } });
+    await tx.groupMember.delete({ where: { id: member.id } });
+  });
 }

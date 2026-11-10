@@ -58,7 +58,16 @@ export function BulkActions({
 
   return (
     <>
-      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 rounded-lg border bg-background px-4 py-3 shadow-lg">
+      {/* left and right pin the fixed bar to the viewport. A percentage
+          width alone does not, so the row would stay one line and run off a phone. */}
+      <div
+        className="pointer-events-none fixed inset-x-0 bottom-6 z-30 flex justify-center px-3"
+        style={{ position: "fixed", left: 0, right: 0, bottom: "1.5rem" }}
+      >
+      <div
+        className="pointer-events-auto mx-auto flex w-full min-w-0 max-w-full flex-wrap items-center justify-center gap-3 overflow-x-auto rounded-lg border bg-background px-4 py-3 shadow-lg"
+        style={{ display: "flex", flexWrap: "wrap", width: "100%", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}
+      >
         <span className="text-sm font-medium">
           {count} task{count !== 1 ? "s" : ""} selected
           {count > 50 && (
@@ -68,6 +77,7 @@ export function BulkActions({
 
         {/* Change Status */}
         <select
+          aria-label="Change status"
           defaultValue=""
           onChange={(e) => {
             if (e.target.value) handleUpdate({ statusId: e.target.value });
@@ -88,6 +98,7 @@ export function BulkActions({
 
         {/* Change Priority */}
         <select
+          aria-label="Change priority"
           defaultValue=""
           onChange={(e) => {
             if (e.target.value)
@@ -109,6 +120,7 @@ export function BulkActions({
 
         {/* Assign */}
         <select
+          aria-label="Assign to"
           defaultValue=""
           onChange={(e) => {
             if (e.target.value) handleUpdate({ assigneeIds: [e.target.value] });
@@ -129,6 +141,7 @@ export function BulkActions({
 
         {/* Set Label */}
         <select
+          aria-label="Set label"
           defaultValue=""
           onChange={(e) => {
             const val = e.target.value;
@@ -210,6 +223,7 @@ export function BulkActions({
         >
           <X className="h-4 w-4" />
         </button>
+      </div>
       </div>
 
       <ConfirmDialog

@@ -96,13 +96,12 @@ test("populated previous-schema upgrade preserves account links and hashes each 
       async () => {
         for (let owner = 0; owner < 2; owner++) {
           const userId = `account-link-upgrade-user-${owner}`;
-          await prisma.user.create({
-            data: {
-              id: userId,
-              email: `upgrade-${owner}@example.test`,
-              displayName: "Upgrade fixture",
-            },
-          });
+          // This database is the pre-hash schema. The current client would
+          // also write membershipRevision, which that schema does not have.
+          await prisma.$executeRaw`
+            INSERT INTO "User" (id, email, "displayName", "updatedAt")
+            VALUES (${userId}, ${`upgrade-${owner}@example.test`}, ${"Upgrade fixture"}, ${createdAt})
+          `;
           const raw = crypto.randomBytes(32).toString("hex");
           // One raw bearer equals another's digest; conversion must not guess
           // from shape or fail on a transient in-place unique-index conflict.

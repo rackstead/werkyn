@@ -15,7 +15,10 @@ import {
   ValidationError,
 } from "../../utils/errors.js";
 import type { StorageProvider } from "../../services/storage.js";
-import { avatarStoragePath } from "../uploads/avatar-storage-path.js";
+import {
+  avatarStoragePath,
+  canonicalAvatarUrl,
+} from "../uploads/avatar-storage-path.js";
 
 const profileSelect = {
   id: true,
@@ -80,7 +83,15 @@ export async function updateProfile(
         SELECT "avatarUrl" FROM "User" WHERE id = ${userId} FOR NO KEY UPDATE
       `;
       const previousPath = avatarStoragePath(current?.avatarUrl);
-      const nextPath = avatarStoragePath(data.avatarUrl);
+      // Same prefix the upload handler writes. The media route serves other
+      // casings of `/storage`, and the sweep looks up only this spelling.
+      const storedAvatarUrl =
+        canonicalAvatarUrl(data.avatarUrl) ?? data.avatarUrl;
+      const nextPath = avatarStoragePath(storedAvatarUrl);
+      const profileData =
+        storedAvatarUrl === data.avatarUrl
+          ? data
+          : { ...data, avatarUrl: storedAvatarUrl };
       if (nextPath && nextPath !== previousPath) {
         await tx.$queryRaw`
           SELECT "storagePath" FROM "BlobCleanup"
@@ -101,7 +112,7 @@ export async function updateProfile(
       }
       return tx.user.update({
         where: { id: userId },
-        data,
+        data: profileData,
         select: profileSelect,
       });
     }, refreshTransactionOptions);

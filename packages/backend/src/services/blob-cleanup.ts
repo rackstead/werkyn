@@ -1,6 +1,9 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type { FastifyBaseLogger } from "fastify";
-import { avatarStoragePath } from "../modules/uploads/avatar-storage-path.js";
+import {
+  avatarStoragePath,
+  canonicalAvatarUrl,
+} from "../modules/uploads/avatar-storage-path.js";
 import type { StorageProvider } from "./storage.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -75,7 +78,10 @@ async function cleanupQueuedAvatar(
     BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
     MAX_BACKOFF_SECONDS,
   );
-  const url = `/storage/${storagePath}`;
+  // Profile saves store this spelling, including when the request sent
+  // another case of the `/storage` prefix. The media route serves both.
+  const url = canonicalAvatarUrl(`/storage/${storagePath}`);
+  if (!url) return "skipped";
   try {
     return await prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;

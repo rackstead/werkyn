@@ -472,3 +472,43 @@ test("a sweep already deleting an avatar rejects a switch back and keeps the sav
     0,
   );
 });
+
+test("a /Storage/ prefix is saved as the upload spelling and the sweep keeps those bytes", async () => {
+  const { user, token } = await createUser("ivy");
+  const first = await uploadAvatar(token);
+  const second = await uploadAvatar(token);
+  assert.equal(first.url.startsWith("/storage/"), true);
+  assert.equal((await patchProfile(token, { avatarUrl: first.url })).statusCode, 200);
+  assert.equal((await patchProfile(token, { avatarUrl: second.url })).statusCode, 200);
+
+  const mixed = `/Storage/${first.url.slice("/storage/".length)}`;
+  const saved = await patchProfile(token, { avatarUrl: mixed });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json().data.avatarUrl, first.url);
+  const stored = await app.prisma.user.findUniqueOrThrow({
+    where: { id: user.id },
+    select: { avatarUrl: true },
+  });
+  assert.equal(stored.avatarUrl, first.url);
+
+  const swept = await processBlobCleanup(app.prisma, app.storage, {
+    paths: [first.path, second.path],
+  });
+  assert.equal(swept.retained, 1, JSON.stringify(swept));
+  assert.equal(await app.storage.exists(first.path), true);
+  assert.equal(
+    (await app.prisma.user.findUniqueOrThrow({
+      where: { id: user.id },
+      select: { avatarUrl: true },
+    })).avatarUrl,
+    first.url,
+  );
+  for (const url of [first.url, mixed]) {
+    const media = await app.inject({
+      method: "GET",
+      url: `/api/uploads/media?url=${encodeURIComponent(url)}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(media.statusCode, 200, media.body);
+  }
+});

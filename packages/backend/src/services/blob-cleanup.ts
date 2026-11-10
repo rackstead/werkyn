@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
 import type { FastifyBaseLogger } from "fastify";
+import { avatarStoragePath } from "../modules/uploads/avatar-storage-path.js";
 import type { StorageProvider } from "./storage.js";
 import { logger } from "../utils/logger.js";
 
@@ -20,7 +21,10 @@ import { logger } from "../utils/logger.js";
  *   stored paths are unique per row and immutable). Its row is kept with
  *   backoff rather than removed, so a concurrent File delete, whose trigger
  *   finds the row already queued, cannot strand the blob; that trigger makes
- *   the row due again.
+ *   the row due again;
+ * - an uploaded avatar path still named by User.avatarUrl is kept the same
+ *   way. Profile replacement queues that path; this check stops the sweep
+ *   from deleting an upload another profile, or a switch back, still shows.
  */
 
 const BATCH_SIZE = 100;
@@ -100,6 +104,22 @@ export async function processBlobCleanup(
       }),
     ),
   );
+  const avatarPaths = paths.filter(
+    (storagePath) => avatarStoragePath(`/storage/${storagePath}`) === storagePath,
+  );
+  const referencedAvatars = new Set<string>();
+  if (avatarPaths.length > 0) {
+    const holders = await prisma.user.findMany({
+      where: {
+        avatarUrl: { in: avatarPaths.map((storagePath) => `/storage/${storagePath}`) },
+      },
+      select: { avatarUrl: true },
+    });
+    for (const holder of holders) {
+      const storagePath = avatarStoragePath(holder.avatarUrl);
+      if (storagePath) referencedAvatars.add(storagePath);
+    }
+  }
 
   const retry = async (storagePath: string, attempts: number, availableAt: Date, reason: string) => {
     const delay = Math.min(
@@ -127,6 +147,15 @@ export async function processBlobCleanup(
         log.warn(
           { storagePath, attempts },
           "Queued stored blob is still referenced by a live File; kept",
+        );
+        continue;
+      }
+      if (referencedAvatars.has(storagePath)) {
+        result.retained++;
+        await retry(storagePath, attempts, availableAt, "Still referenced by a live avatar");
+        log.warn(
+          { storagePath, attempts },
+          "Queued stored blob is still referenced by a live avatar; kept",
         );
         continue;
       }

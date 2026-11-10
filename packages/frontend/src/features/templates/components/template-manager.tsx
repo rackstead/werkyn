@@ -138,11 +138,6 @@ function descriptionForEdit(pieces: string[], decoded: string, edited: string): 
   if (anchors.length === 0) return edited;
   const replacements = new Map<number, string>();
   const placed = new Map<number, number[]>();
-  // A note that is mostly entities is escaped wholesale. Searching each mark
-  // across it would be quadratic, and there is no rich-text tag left to keep.
-  if (anchors.length > 500) {
-    return edited.replace(/[<>"]/g, (mark) => (mark === "<" ? "&lt;" : mark === ">" ? "&gt;" : "&quot;"));
-  }
   for (const index of anchors) {
     const match = matchingPrefix(decoded, index, edited);
     // A single bare bracket is not distinctive enough to stamp onto every copy.

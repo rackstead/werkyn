@@ -405,6 +405,19 @@ test("text contract: a duplicated code sample keeps both copies escaped", async 
   change(descriptionInput(), "Use <div> endUse <div> end"); await save();
   expect(writes()[0].data).toEqual({ description: "Use &lt;div&gt; endUse &lt;div&gt; end" });
 });
+test("text contract: many escaped samples do not escape real formatting tags", async () => {
+  const items = Array.from({ length: 251 }, () => "&lt;item&gt;").join(" ");
+  const stored = "<p>Intro " + items + " end</p>";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value.startsWith("<p>Intro ")).toBe(true);
+  expect(descriptionInput().value.endsWith(" end</p>")).toBe(true);
+  change(descriptionInput(), descriptionInput().value.replace("Intro", "Opening")); await save();
+  const sent = writes()[0].data?.description as string;
+  expect(sent.startsWith("<p>Opening ")).toBe(true);
+  expect(sent.endsWith(" end</p>")).toBe(true);
+  expect(sent).toContain("&lt;item&gt;");
+  expect(sent).not.toContain("<item>");
+});
 test("text contract: replacing a long description without entities sends the new text", async () => {
   await mount({ description: "a".repeat(5000) }); await open();
   const next = "b".repeat(5000);

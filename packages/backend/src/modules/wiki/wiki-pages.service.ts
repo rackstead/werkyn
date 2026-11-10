@@ -154,29 +154,32 @@ function siblings(
 /**
  * `parentId` is the first ancestor of the page about to be inserted. Delete
  * already returns 409 once a descendant level is past graphLimits.maxDepth.
- * The walk stays in this space and stops if an ancestor repeats.
+ * One recursive read follows parents in this space and stops on a repeated id.
  */
 async function assertNewPageWithinDepth(
   tx: Tx,
   spaceId: string,
   parentId: string | null | undefined,
 ) {
-  const seen = new Set<string>();
-  let current = parentId || null;
-  for (let depth = 1; current; depth++) {
-    // A repeated ancestor is a legacy cycle. Stop so the walk cannot loop.
-    // Only an unseen ancestor past maxDepth is the delete walk's 409.
-    if (seen.has(current)) return;
-    if (depth > graphLimits.maxDepth) pageTreeTooLarge();
-    seen.add(current);
-    const row: { parentId: string | null } | null =
-      await tx.wikiPage.findFirst({
-        where: { id: current, spaceId },
-        select: { parentId: true },
-      });
-    if (!row) return;
-    current = row.parentId;
-  }
+  if (!parentId) return;
+  const maxDepth = graphLimits.maxDepth;
+  const over = await tx.$queryRaw<Array<{ depth: number }>>`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, "parentId", 1 AS depth, ARRAY[id]::text[] AS path
+      FROM "WikiPage"
+      WHERE id = ${parentId} AND "spaceId" = ${spaceId}
+      UNION ALL
+      SELECT parent.id, parent."parentId", ancestors.depth + 1,
+             ancestors.path || parent.id
+      FROM "WikiPage" AS parent
+      INNER JOIN ancestors ON parent.id = ancestors."parentId"
+      WHERE ancestors.depth <= ${maxDepth}
+        AND parent."spaceId" = ${spaceId}
+        AND NOT (parent.id = ANY(ancestors.path))
+    )
+    SELECT depth FROM ancestors WHERE depth > ${maxDepth} LIMIT 1
+  `;
+  if (over.length > 0) pageTreeTooLarge();
 }
 
 export async function createPage(

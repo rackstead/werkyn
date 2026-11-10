@@ -65,29 +65,34 @@ async function readHead(
 /**
  * `parentId` is the first ancestor of the row about to be inserted. Delete
  * already returns 409 once a descendant level is past graphLimits.maxDepth,
- * which is a new row with more than maxDepth ancestors. The walk stays in
- * this workspace and stops if an ancestor repeats; it does not repair a cycle.
+ * which is a new row with more than maxDepth ancestors. One recursive read
+ * follows parents in this workspace and stops on a repeated id, so a legacy
+ * cycle cannot loop and the workspace lock is not held for a query per level.
  */
 async function assertNewFileWithinDepth(
   tx: Prisma.TransactionClient,
   workspaceId: string,
   parentId: string | null | undefined,
 ) {
-  const seen = new Set<string>();
-  let current = parentId || null;
-  for (let depth = 1; current; depth++) {
-    // A repeated ancestor is a legacy cycle. Stop so the walk cannot loop.
-    // Only an unseen ancestor past maxDepth is the delete walk's 409.
-    if (seen.has(current)) return;
-    if (depth > graphLimits.maxDepth) graphTooLarge();
-    seen.add(current);
-    const row: { parentId: string | null } | null = await tx.file.findFirst({
-      where: { id: current, workspaceId },
-      select: { parentId: true },
-    });
-    if (!row) return;
-    current = row.parentId;
-  }
+  if (!parentId) return;
+  const maxDepth = graphLimits.maxDepth;
+  const over = await tx.$queryRaw<Array<{ depth: number }>>`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, "parentId", 1 AS depth, ARRAY[id]::text[] AS path
+      FROM "File"
+      WHERE id = ${parentId} AND "workspaceId" = ${workspaceId}
+      UNION ALL
+      SELECT parent.id, parent."parentId", ancestors.depth + 1,
+             ancestors.path || parent.id
+      FROM "File" AS parent
+      INNER JOIN ancestors ON parent.id = ancestors."parentId"
+      WHERE ancestors.depth <= ${maxDepth}
+        AND parent."workspaceId" = ${workspaceId}
+        AND NOT (parent.id = ANY(ancestors.path))
+    )
+    SELECT depth FROM ancestors WHERE depth > ${maxDepth} LIMIT 1
+  `;
+  if (over.length > 0) graphTooLarge();
 }
 
 export async function uploadFileStream(

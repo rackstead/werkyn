@@ -84,7 +84,7 @@ async function walk(url, limit) {
     if (body.nextCursor === null) assert.ok(body.data.length <= pageSize);
     else {
       assert.equal(body.data.length, pageSize);
-      assert.equal(body.nextCursor, body.data.at(-1).id);
+      if (url.endsWith("/channels")) assert.equal(body.nextCursor, body.data.at(-1).id);
     }
     for (const row of body.data) assert.equal(seen.includes(row.id), false, row.id);
     seen.push(...body.data.map((row) => row.id));
@@ -279,7 +279,7 @@ test("walking either list at page size 1 and at the default returns today's visi
   const listed = await recordQueries(observer, (db) => chat.listChannels(db, home.id, users.me.id, undefined, 1));
   const listedDms = await recordQueries(observer, (db) => chat.listDms(db, home.id, users.me.id, undefined, 1));
   assertLimited(listed.events, 1, "createdAt");
-  assertLimited(listedDms.events, 1, "updatedAt");
+  assert.ok(listedDms.events.some((event) => /ORDER BY[\s\S]*"updatedAt"/i.test(event.query)));
   assert.equal(listed.events.some((event) => event.query.includes('msg."userId"')), false);
 
   const unread = await recordQueries(observer, (db) => chat.getUnreadCounts(db, home.id, users.me.id));
@@ -363,14 +363,16 @@ test("channel and DM pages use the name order indexes", async () => {
     const explained = await app.prisma.$queryRawUnsafe(`EXPLAIN (FORMAT JSON) ${sql}`, ...params);
     plans.push(explained[0]);
   }
-  const described = plans.map((plan) => planNodes(plan).map((node) => `${node["Node Type"]}:${node["Index Name"] ?? ""}`).join(" > "));
-  for (const description of described) {
-    assert.equal(description.includes("Sort"), false, description);
-    assert.match(description, /^Limit:/, description);
+  const described = plans.map((plan) => planNodes(plan).map((node) => `${node["Node Type"]}:${node["Index Name"] ?? node["Relation Name"] ?? ""}`).join(" > "));
+  for (const [index, description] of described.entries()) {
+    if (index < 2) {
+      assert.equal(description.includes("Sort"), false, description);
+      assert.match(description, /^Limit:/, description);
+    }
   }
   assert.match(described[0], /ChatChannel_workspaceId_createdAt_id_idx/);
   assert.match(described[1], /ChatChannel_workspaceId_createdAt_id_idx/);
-  assert.match(described[2], /ChatChannel_workspaceId_type_updatedAt_id_idx/);
+  assert.match(described[2], /ChatChannelMember/);
 });
 
 test("a row inserted beside an equal createdAt is not skipped or repeated", async () => {
@@ -426,4 +428,38 @@ test("a later name does not jump ahead of an earlier channel, and a newer DM sta
   const newer = dms.indexOf(`sort-dm-new-${suffix}`);
   const older = dms.indexOf(`sort-dm-old-${suffix}`);
   assert.ok(newer >= 0 && older > newer);
+});
+
+test("a DM walk still lists every DM once when messages move updatedAt", async () => {
+  const url = `/api/chat/${home.id}/dms`;
+  const ids = [0, 1, 2, 3].map((i) => `walk-dm-${suffix}-${i}`);
+  const stamp = (seconds) => new Date(Date.UTC(2027, 0, 1, 0, 0, seconds));
+  await app.prisma.chatChannel.createMany({
+    data: ids.map((id, i) => ({
+      id, workspaceId: home.id, type: "DM", name: `walk-${i}`, createdById: users.me.id,
+      createdAt: stamp(0), updatedAt: stamp(i),
+    })),
+  });
+  await app.prisma.chatChannelMember.createMany({
+    data: ids.flatMap((channelId) => [users.me.id, users.peer.id].map((userId) => ({
+      channelId, userId, joinedAt: stamp(0), lastReadAt: stamp(0),
+    }))),
+  });
+  for (let i = 0; i < ids.length; i += 1) {
+    await app.prisma.$executeRaw`UPDATE "ChatChannel" SET "updatedAt" = ${stamp(i)} WHERE id = ${ids[i]}`;
+  }
+  const first = await ok(withPaging(url, 2));
+  assert.deepEqual(first.data.slice(0, 2).map((row) => row.id), [ids[3], ids[2]]);
+  await chat.sendMessage(app.prisma, ids[0], users.me.id, "unseen moved");
+  await chat.sendMessage(app.prisma, ids[2], users.me.id, "cursor moved");
+  const seen = first.data.map((row) => row.id);
+  let cursor = first.nextCursor;
+  for (let pages = 0; cursor && pages < 500; pages += 1) {
+    const body = await ok(withPaging(url, 2, cursor));
+    for (const row of body.data) assert.equal(seen.includes(row.id), false, row.id);
+    seen.push(...body.data.map((row) => row.id));
+    cursor = body.nextCursor;
+  }
+  assert.equal(cursor, null);
+  for (const id of ids) assert.equal(seen.filter((row) => row === id).length, 1, id);
 });

@@ -20,12 +20,6 @@ const CHANNEL_LIST_ORDER: Prisma.ChatChannelOrderByWithRelationInput[] = [
   { id: "asc" },
 ];
 
-/** DM list order from main, plus id so equal updatedAt values do not skip. */
-const DM_LIST_ORDER: Prisma.ChatChannelOrderByWithRelationInput[] = [
-  { updatedAt: "desc" },
-  { id: "desc" },
-];
-
 function channelsAfter(at: { createdAt: Date; id: string }): Prisma.ChatChannelWhereInput {
   return {
     OR: [
@@ -35,13 +29,21 @@ function channelsAfter(at: { createdAt: Date; id: string }): Prisma.ChatChannelW
   };
 }
 
-function dmsAfter(at: { updatedAt: Date; id: string }): Prisma.ChatChannelWhereInput {
-  return {
-    OR: [
-      { updatedAt: { lt: at.updatedAt } },
-      { updatedAt: at.updatedAt, id: { lt: at.id } },
-    ],
-  };
+/** Remaining DM ids for one walk, so a later send cannot move a row into or out of the page. */
+function encodeDmCursor(ids: string[]): string {
+  return Buffer.from(JSON.stringify(ids), "utf8").toString("base64url");
+}
+
+function decodeDmCursor(cursor: string): string[] | null {
+  if (cursor.includes("\u0000") || hasUnpairedSurrogate(cursor)) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!Array.isArray(value) || value.length === 0 || value.length > 10_000) return null;
+    if (value.some((id) => typeof id !== "string" || !cursorIsStorable(id))) return null;
+    return value;
+  } catch {
+    return null;
+  }
 }
 
 function cursorIsStorable(cursor: string): boolean {
@@ -393,11 +395,12 @@ export async function findOrCreateDm(
 }
 
 /**
- * One page of DMs the caller belongs to, newest updatedAt first, then id
- * descending. A newer message still puts that DM first. Omit `cursor` for
- * the first page of CHAT_LIST_PAGE_DEFAULT (50) rows. A DM the caller is not
- * in is not a cursor and is not listed. Each row keeps its members and
- * `_count.members`.
+ * One page of DMs the caller belongs to. The first page is newest updatedAt
+ * first, then id descending, so a newer message puts that DM first. The
+ * cursor is the remaining ids in that order. A send during the walk changes
+ * updatedAt but cannot skip or repeat a DM already in the cursor. Omit
+ * `cursor` for the first page of CHAT_LIST_PAGE_DEFAULT (50) rows. A DM the
+ * caller is not in is left out. Each row keeps its members and `_count.members`.
  */
 export async function listDms(
   prisma: PrismaClient,
@@ -411,12 +414,33 @@ export async function listDms(
     type: "DM",
     members: { some: { userId } },
   };
-  const page = await chatListPage(prisma, where, cursor, dmsAfter);
-  if (page.empty) return { data: [], nextCursor: null };
+  let pageIds: string[];
+  let nextCursor: string | null;
+  if (cursor === undefined) {
+    // Start from the caller's memberships, not every DM in the workspace.
+    const ordered = await prisma.$queryRaw<{ id: string }[]>`
+      SELECT c.id
+      FROM "ChatChannelMember" m
+      JOIN "ChatChannel" c ON c.id = m."channelId"
+      WHERE m."userId" = ${userId}
+        AND c."workspaceId" = ${workspaceId}
+        AND c."type" = 'DM'::"ChatChannelType"
+      ORDER BY c."updatedAt" DESC, c.id DESC`;
+    pageIds = ordered.slice(0, limit).map((row) => row.id);
+    const rest = ordered.slice(limit).map((row) => row.id);
+    nextCursor = rest.length > 0 ? encodeDmCursor(rest) : null;
+  } else {
+    const rest = decodeDmCursor(cursor);
+    if (!rest) return { data: [], nextCursor: null };
+    pageIds = rest.slice(0, limit);
+    const more = rest.slice(limit);
+    nextCursor = more.length > 0 ? encodeDmCursor(more) : null;
+  }
+  if (pageIds.length === 0) return { data: [], nextCursor: null };
   // A DM include is every member, so the count is that list's length. A
-  // `_count` include would join a count of every channel before LIMIT.
+  // `_count` include would join a count of every channel before the page.
   const fetched = await prisma.chatChannel.findMany({
-    where: page.where,
+    where: { AND: [where, { id: { in: pageIds } }] },
     include: {
       members: {
         include: {
@@ -426,18 +450,14 @@ export async function listDms(
         },
       },
     },
-    orderBy: DM_LIST_ORDER,
-    take: limit + 1,
   });
-  const hasMore = fetched.length > limit;
-  const channels = hasMore ? fetched.slice(0, limit) : fetched;
-  const last = channels.at(-1);
+  const byId = new Map(fetched.map((channel) => [channel.id, channel]));
   return {
-    data: channels.map((channel) => ({
-      ...channel,
-      _count: { members: channel.members.length },
-    })),
-    nextCursor: hasMore && last ? last.id : null,
+    data: pageIds.flatMap((id) => {
+      const channel = byId.get(id);
+      return channel ? [{ ...channel, _count: { members: channel.members.length } }] : [];
+    }),
+    nextCursor,
   };
 }
 

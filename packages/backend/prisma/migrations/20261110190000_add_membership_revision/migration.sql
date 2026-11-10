@@ -9,9 +9,10 @@
 
 ALTER TABLE "User" ADD COLUMN "membershipRevision" INTEGER NOT NULL DEFAULT 0;
 
--- One bump per affected account per statement. User rows are locked in id
--- order before the counter moves, so overlapping membership statements wait
--- instead of deadlocking.
+-- One bump per affected account per statement. User rows are locked FOR NO
+-- KEY UPDATE in id order before the counter moves. That waits on another
+-- revision update without conflicting with the KEY SHARE lock a foreign-key
+-- insert already holds, including the membership insert that fires this.
 CREATE FUNCTION bump_listed_membership_revisions() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -19,7 +20,7 @@ BEGIN
   FROM "User" u
   WHERE u.id IN (SELECT "userId" FROM changed)
   ORDER BY u.id
-  FOR UPDATE;
+  FOR NO KEY UPDATE;
   UPDATE "User" u
   SET "membershipRevision" = u."membershipRevision" + 1
   WHERE u.id IN (SELECT "userId" FROM changed);
@@ -38,7 +39,7 @@ BEGIN
     SELECT "userId" FROM previous_rows
   )
   ORDER BY u.id
-  FOR UPDATE;
+  FOR NO KEY UPDATE;
   UPDATE "User" u
   SET "membershipRevision" = u."membershipRevision" + 1
   WHERE u.id IN (
@@ -74,7 +75,7 @@ BEGIN
     SELECT wm."userId" FROM "WorkspaceMember" wm WHERE wm."workspaceId" = NEW.id
   )
   ORDER BY u.id
-  FOR UPDATE;
+  FOR NO KEY UPDATE;
   UPDATE "User" u
   SET "membershipRevision" = u."membershipRevision" + 1
   WHERE u.id IN (

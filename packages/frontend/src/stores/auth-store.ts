@@ -608,11 +608,12 @@ async function recoverSession(
 
 export const useAuthStore = create<AuthState>((set, get) => {
   /**
-   * Applies a session. A sign-in replaces the workspace list. A same-account
-   * refresh replaces it only when its membership revision is newer, and still
-   * keeps the new access token when the list is older.
+   * Applies a session. The access token is always stored. A same-account
+   * workspace list is stored only when its membership revision is newer, so a
+   * sign-in snapshot cannot erase a join that was applied while it was in
+   * flight. An account change replaces the list.
    */
-  function applySession(session: Session, epoch: Epoch, authoritative = false) {
+  function applySession(session: Session, epoch: Epoch) {
     // A late sign-in can leave one family in memory while another family's
     // cookie is in the browser. Check the returned family, not only the one
     // this tab held before refreshing, and never publish a signed-out one.
@@ -622,10 +623,10 @@ export const useAuthStore = create<AuthState>((set, get) => {
     }
     const revision = membershipRevisionOf(session.membershipRevision);
     const sameUser = get().user?.id === session.user.id;
+    // A same-account sign-in still loses to a newer list already applied.
+    // Only an account change replaces the list without comparing revisions.
     const replaceWorkspaces =
-      authoritative ||
-      !sameUser ||
-      isNewerMembershipRevision(session.user.id, revision);
+      !sameUser || isNewerMembershipRevision(session.user.id, revision);
     const workspaces = replaceWorkspaces ? session.workspaces : get().workspaces;
     if (replaceWorkspaces) rememberMembershipRevision(session.user.id, revision);
     const announcedRevision = replaceWorkspaces
@@ -739,7 +740,6 @@ export const useAuthStore = create<AuthState>((set, get) => {
       applySession(
         { user, accessToken, workspaces, membershipRevision },
         advanceEpoch(Date.now()),
-        true,
       );
     },
 

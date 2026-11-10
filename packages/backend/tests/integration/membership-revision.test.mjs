@@ -161,6 +161,37 @@ test("a membership revision is captured with its list and orders a role change a
   assert.deepEqual(removed.workspaces, []);
 });
 
+test("concurrent membership inserts for one account do not deadlock", async () => {
+  const user = await makeUser("concurrent");
+  const first = await app.prisma.workspace.create({
+    data: { name: `Concurrent A ${suffix}`, slug: `conc-a-${suffix}` },
+  });
+  const second = await app.prisma.workspace.create({
+    data: { name: `Concurrent B ${suffix}`, slug: `conc-b-${suffix}` },
+  });
+  let entered = 0;
+  let open;
+  const bothEntered = new Promise((resolve) => {
+    open = resolve;
+  });
+  const insert = (workspaceId) =>
+    app.prisma.$transaction(async (tx) => {
+      entered += 1;
+      if (entered === 2) open();
+      await bothEntered;
+      await tx.workspaceMember.create({
+        data: { userId: user.id, workspaceId, role: "MEMBER" },
+      });
+    });
+  await Promise.all([insert(first.id), insert(second.id)]);
+  const snapshot = await getUserWorkspaces(app.prisma, user.id);
+  assert.deepEqual(
+    snapshot.workspaces.map((membership) => membership.workspaceId).sort(),
+    [first.id, second.id].sort(),
+  );
+  assert.ok(snapshot.membershipRevision >= 2);
+});
+
 test("refresh, invite accept and admission check return the revision of the list they describe", async () => {
   const owner = await makeUser("host");
   const joiner = await makeUser("joiner");

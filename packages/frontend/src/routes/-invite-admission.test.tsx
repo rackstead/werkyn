@@ -575,6 +575,70 @@ it("ignores a reply to a request sent before the same account signed out and in 
   expect(queryClient.getQueryData(["invite-admission", "first", "invite-token"])).toBeUndefined();
 });
 
+it("navigates when a joined admission matches the revision already applied", async () => {
+  const joined = [membership("acme")];
+  useAuthStore.getState().setAuth(user("member"), "member-token", joined, 4);
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: {
+        status: "joined",
+        workspace,
+        role: "MEMBER",
+        alreadyMember: true,
+        userId: "member",
+        workspaces: joined,
+        membershipRevision: 4,
+      },
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await waitFor(() =>
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: "/$workspaceSlug",
+      params: { workspaceSlug: "acme" },
+    }),
+  );
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+});
+
+it("does not open a workspace a newer list has already removed", async () => {
+  const current = [membership("other")];
+  useAuthStore.getState().setAuth(user("member"), "member-token", current, 5);
+  respond("POST", "/api/invites/invite-token/accept", () =>
+    json(200, {
+      data: {
+        status: "joined",
+        workspace,
+        role: "MEMBER",
+        alreadyMember: false,
+        userId: "member",
+        workspaces: [membership("acme")],
+        membershipRevision: 4,
+      },
+    }),
+  );
+  renderRoute(InviteRoute);
+  fireEvent.click(await screen.findByRole("button", { name: "Accept invite" }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Accept invite" })).toHaveProperty("disabled", false),
+  );
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(useAuthStore.getState().workspaces).toBe(current);
+});
+
+it("a same-account sign-in does not replace a newer workspace list", () => {
+  const joined = [membership("acme")];
+  useAuthStore.getState().setAuth(user("applicant"), "first-token", [membership("old")], 1);
+  expect(useAuthStore.getState().setWorkspacesForUser("applicant", joined, 2)).toBe(true);
+  useAuthStore.getState().setAuth(user("applicant"), "second-token", [membership("old")], 1);
+  expect(useAuthStore.getState().accessToken).toBe("second-token");
+  expect(useAuthStore.getState().workspaces).toEqual(joined);
+  const other = [membership("other")];
+  useAuthStore.getState().setAuth(user("someone-else"), "other-token", other, 1);
+  expect(useAuthStore.getState().workspaces).toEqual(other);
+});
+
 it("does not let a refresh that read memberships before a join erase that join", async () => {
   const existing = [membership("old")];
   signIn("applicant", existing);

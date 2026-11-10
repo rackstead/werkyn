@@ -4,6 +4,7 @@ import {
   avatarFileProblem,
   avatarMime,
   avatarOutputMime,
+  frozenBitmapSize,
   initialCrop,
   panCrop,
   scaleCrop,
@@ -108,6 +109,11 @@ describe("avatar crop geometry", () => {
     });
     expect(zoomAroundCenter(wide, initialCrop(wide), 0.1).zoom).toBe(1);
     expect(zoomAroundCenter(wide, initialCrop(wide), 9).zoom).toBe(3);
+  });
+
+  it("shrinks only a picture larger than the positioning bitmap", () => {
+    expect(frozenBitmapSize(400, 200)).toEqual({ width: 400, height: 200 });
+    expect(frozenBitmapSize(8000, 4000)).toEqual({ width: 2048, height: 1024 });
   });
 
   it("keeps the same bitmap region when the frame gets narrower", () => {

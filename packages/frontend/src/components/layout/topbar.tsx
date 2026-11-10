@@ -67,7 +67,7 @@ export function Topbar() {
       setAvatarFile(null);
       setAvatarWorkspaceId(null);
     }
-  }, [workspaceId, avatarFile, avatarWorkspaceId]);
+  }, [workspaceId, avatarFile, avatarWorkspaceId, avatarSaving]);
 
   const handleLogout = () => {
     // Local state is cleared at once; server revocation finishes on its own.

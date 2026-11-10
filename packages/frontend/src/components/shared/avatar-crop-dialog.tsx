@@ -18,6 +18,7 @@ import {
   avatarMime,
   croppedAvatarFile,
   displayedSize,
+  frozenBitmapSize,
   initialCrop,
   keyboardPanStep,
   panCrop,
@@ -175,20 +176,25 @@ function AvatarCropEditor({
       reject("This image could not be read");
       return;
     }
-    // The preview and the saved file share this still, so an animation cannot
-    // move on after the frame that will be stored.
-    const canvas = document.createElement("canvas");
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      reject("Could not prepare the avatar image");
-      return;
+    // The preview and the saved file share this still. A huge photo is scaled
+    // down here so the dialog does not keep a full-resolution bitmap.
+    const bitmap = frozenBitmapSize(img.naturalWidth, img.naturalHeight);
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d");
+      if (!context || canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        reject("Could not prepare the avatar image");
+        return;
+      }
+      context.drawImage(img, 0, 0, canvas.width, canvas.height);
+      frozenRef.current = canvas;
+      setSize({ width: canvas.width, height: canvas.height });
+      setFrozenVersion((version) => version + 1);
+    } catch (error) {
+      reject(error instanceof Error ? error.message : "Could not prepare the avatar image");
     }
-    context.drawImage(img, 0, 0);
-    frozenRef.current = canvas;
-    setSize({ width: canvas.width, height: canvas.height });
-    setFrozenVersion((version) => version + 1);
   }
 
   function onPointerDown(event: React.PointerEvent<HTMLDivElement>) {

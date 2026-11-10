@@ -287,6 +287,52 @@ it("drops an open crop when the workspace changes and uploads nothing", async ()
   expect(useAuthStore.getState().user?.avatarUrl).toBe("/uploads/old.png");
 });
 
+it("downsamples a huge picture before cropping it", async () => {
+  mount();
+  const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(input, {
+    target: { files: [new File([originalBytes], "huge.jpg", { type: "image/jpeg" })] },
+  });
+  const dialog = await screen.findByRole("dialog", { name: "Position your avatar" });
+  const img = dialog.querySelector("img");
+  if (!img) throw new Error("crop preview missing");
+  setDecodedSize(img, 8000, 4000);
+  fireEvent.load(img);
+  await waitFor(() => {
+    expect((screen.getByRole("button", { name: "Save avatar" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+  await waitFor(() => expect(transport.upload).toHaveBeenCalledTimes(1));
+  const uploaded = transport.upload.mock.calls[0][0] as { file: File };
+  expect(uploaded.file.type).toBe("image/jpeg");
+  expect(await blobBytes(uploaded.file)).toEqual(
+    Array.from(encodeCropDraw({ sx: 512, sy: 0, sw: 1024, sh: 1024 }, "image/jpeg")),
+  );
+});
+
+it("closes a crop when the workspace changes and the save then fails", async () => {
+  let rejectUpload: (error: Error) => void = () => {};
+  transport.upload.mockImplementation(
+    () => new Promise((_resolve, reject) => {
+      rejectUpload = reject;
+    }),
+  );
+  mount();
+  await choose("image/png", "photo.png");
+  fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+  await waitFor(() => expect(transport.upload).toHaveBeenCalledTimes(1));
+  expect(transport.upload.mock.calls[0][0].workspaceId).toBe("ws-1");
+  route.slug = "other";
+  act(() => useAuthStore.setState({ workspaces: [] }));
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  await act(async () => {
+    rejectUpload(new Error("disk full"));
+  });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(transport.upload).toHaveBeenCalledTimes(1);
+  expect(transport.patch).not.toHaveBeenCalled();
+});
+
 it("does not upload when the crop is cancelled", async () => {
   mount();
   await choose("image/png", "photo.png");

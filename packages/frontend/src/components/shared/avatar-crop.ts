@@ -3,6 +3,8 @@
 export const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 export const AVATAR_VIEWPORT = 280;
 export const AVATAR_OUTPUT_SIZE = 512;
+/** Longest side kept in memory for positioning. The saved file is still 512px. */
+export const MAX_AVATAR_SOURCE_SIDE = 2048;
 export const MIN_ZOOM = 1;
 export const MAX_ZOOM = 3;
 export const AVATAR_ACCEPT = "image/jpeg,image/png,image/gif,image/webp";
@@ -169,6 +171,17 @@ export function sourceRect(
     sy: Math.min(maxY, Math.max(0, -crop.offsetY / scale)),
     sw: side,
     sh: side,
+  };
+}
+
+export function frozenBitmapSize(width: number, height: number): ImageSize {
+  const longest = Math.max(width, height);
+  if (!(longest > 0)) return { width: 0, height: 0 };
+  if (longest <= MAX_AVATAR_SOURCE_SIDE) return { width, height };
+  const scale = MAX_AVATAR_SOURCE_SIDE / longest;
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
   };
 }
 

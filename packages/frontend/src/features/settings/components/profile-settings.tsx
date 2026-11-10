@@ -96,7 +96,7 @@ export function ProfileSettings() {
       setAvatarFile(null);
       setAvatarWorkspaceId(null);
     }
-  }, [workspaceId, avatarFile, avatarWorkspaceId]);
+  }, [workspaceId, avatarFile, avatarWorkspaceId, avatarSaving]);
 
   if (isLoading) {
     return (

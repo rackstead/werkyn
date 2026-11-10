@@ -181,6 +181,23 @@ it("drops an open profile crop when the workspace changes", async () => {
   expect(transport.upload).not.toHaveBeenCalled();
 });
 
+it("closes a profile crop when the workspace changes and the save then fails", async () => {
+  let fail: () => void = () => {};
+  transport.upload.mockImplementation((_vars: unknown, options: { onError: (error: Error) => void }) => {
+    fail = () => options.onError(new Error("disk full"));
+  });
+  mount();
+  await choose();
+  fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+  await waitFor(() => expect(transport.upload).toHaveBeenCalledTimes(1));
+  route.slug = "other";
+  act(() => useAuthStore.setState({ workspaces: [] }));
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  act(() => fail());
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(transport.upload).toHaveBeenCalledTimes(1);
+});
+
 it("uploads nothing when the profile crop is cancelled", async () => {
   mount();
   await choose();

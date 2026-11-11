@@ -157,8 +157,9 @@ async function cleanupQueuedAvatar(
   }
 }
 
-// A page or version save locks this same row (the trigger's queue write)
-// across its reference change. Hold it from the check through the delete.
+// A page save locks this same row before it publishes the reference, and
+// refuses the save when the bytes are already gone. Hold the row from the
+// reference check through the delete so one of the two commits first.
 async function cleanupQueuedWiki(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -242,6 +243,7 @@ export async function processBlobCleanup(
     log?: Logger;
     // Test seam: runs after the claim and before this path's cleanup row is locked.
     beforeAvatarDecision?: (storagePath: string) => Promise<void>;
+    beforeWikiDecision?: (storagePath: string) => Promise<void>;
   } = {},
 ): Promise<BlobCleanupResult> {
   const log = options.log ?? logger;
@@ -346,6 +348,7 @@ export async function processBlobCleanup(
         continue;
       }
       if (wikiPaths.has(storagePath)) {
+        if (options.beforeWikiDecision) await options.beforeWikiDecision(storagePath);
         const outcome = await cleanupQueuedWiki(prisma, storage, claim);
         if (outcome === "retained") {
           result.retained++;

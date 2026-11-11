@@ -139,6 +139,61 @@ async function cleanupRow(storagePath) {
   return app.prisma.blobCleanup.findUnique({ where: { storagePath } });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function waitForCleanupLock() {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const waiting = await app.prisma.$queryRaw`
+      SELECT pid FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND pid <> pg_backend_pid()
+        AND wait_event_type = 'Lock'`;
+    if (waiting.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("page save did not wait on the wiki cleanup lock");
+}
+
+/** Upload, save it onto a page, then remove it with no version left naming it. */
+async function uploadThenDrop() {
+  const page = await createPage("Race", textDoc("empty"));
+  const uploaded = await uploadWiki();
+  const withImage = await updatePage(
+    page.id,
+    imageDoc(uploaded.url),
+    page.revision,
+  );
+  const dropped = await updatePage(
+    withImage.id,
+    textDoc("gone"),
+    withImage.revision,
+  );
+  const queued = await cleanupRow(uploaded.storagePath);
+  assert.ok(queued, "dropping the last reference queues the blob");
+  assert.equal(queued.attempts, 0);
+  assert.equal(await app.storage.exists(uploaded.storagePath), true);
+  assert.equal(
+    await app.prisma.wikiPageMedia.count({
+      where: { storagePath: uploaded.storagePath },
+    }),
+    0,
+  );
+  assert.equal(
+    await app.prisma.wikiVersionMedia.count({
+      where: { storagePath: uploaded.storagePath },
+    }),
+    0,
+  );
+  return { page: dropped, uploaded };
+}
+
 function assertGrace(row) {
   assert.ok(row, "expected a grace row");
   assert.equal(row.attempts, 0);
@@ -398,4 +453,93 @@ test("deleting the last page queues the blob and keeps one another page still na
   assert.equal(await app.storage.exists(only.storagePath), false);
   assert.equal(await cleanupRow(shared.storagePath), null);
   assert.equal(await cleanupRow(only.storagePath), null);
+});
+
+test("a page that puts a queued wiki image back before the sweep locks it keeps the bytes", async () => {
+  const { page, uploaded } = await uploadThenDrop();
+  const entered = deferred();
+  let release = () => {};
+  const sweeping = processBlobCleanup(app.prisma, app.storage, {
+    paths: [uploaded.storagePath],
+    beforeWikiDecision: async (storagePath) => {
+      assert.equal(storagePath, uploaded.storagePath);
+      entered.resolve();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  await entered.promise;
+  let saved;
+  try {
+    saved = await api("PATCH", `/api/wiki/pages/${page.id}`, {
+      content: imageDoc(uploaded.url),
+      expectedRevision: page.revision,
+    });
+  } finally {
+    release();
+  }
+  assert.equal(saved.statusCode, 200, saved.body);
+  const swept = await sweeping;
+  assert.equal(swept.deleted, 0, JSON.stringify(swept));
+  assert.equal(await app.storage.exists(uploaded.storagePath), true);
+  assert.equal(
+    JSON.stringify(saved.json().data.content).includes(uploaded.storagePath),
+    true,
+  );
+  assert.equal(
+    await app.prisma.wikiPageMedia.count({
+      where: { storagePath: uploaded.storagePath, pageId: page.id },
+    }),
+    1,
+  );
+  assert.equal(await cleanupRow(uploaded.storagePath), null);
+});
+
+test("a sweep already deleting a wiki image rejects putting it back", { timeout: 15_000 }, async () => {
+  const { page, uploaded } = await uploadThenDrop();
+  const entered = deferred();
+  let release = () => {};
+  const sweeping = processBlobCleanup(
+    app.prisma,
+    {
+      delete: async (storagePath) => {
+        assert.equal(storagePath, uploaded.storagePath);
+        entered.resolve();
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        await app.storage.delete(storagePath);
+      },
+    },
+    { paths: [uploaded.storagePath] },
+  );
+  let saving;
+  try {
+    await entered.promise;
+    saving = api("PATCH", `/api/wiki/pages/${page.id}`, {
+      content: imageDoc(uploaded.url),
+      expectedRevision: page.revision,
+    });
+    await waitForCleanupLock();
+  } finally {
+    release();
+  }
+  const [swept, saved] = await Promise.all([sweeping, saving]);
+  assert.equal(swept.deleted, 1, JSON.stringify(swept));
+  assert.equal(saved.statusCode, 409, saved.body);
+  assert.equal(await app.storage.exists(uploaded.storagePath), false);
+  const stored = await app.prisma.wikiPage.findUniqueOrThrow({
+    where: { id: page.id },
+    select: { content: true, revision: true },
+  });
+  assert.equal(stored.revision, page.revision);
+  assert.equal(JSON.stringify(stored.content).includes(uploaded.storagePath), false);
+  assert.equal(
+    await app.prisma.wikiPageMedia.count({
+      where: { storagePath: uploaded.storagePath },
+    }),
+    0,
+  );
+  assert.equal(await cleanupRow(uploaded.storagePath), null);
 });

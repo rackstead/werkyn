@@ -190,20 +190,84 @@ function pieceChar(piece: string): string {
   return piece === "&amp;" ? "&" : piece;
 }
 
+type MidTag = { start: number; gt: number; name: string; closing: boolean };
+
+function tagsOf(text: string): MidTag[] {
+  const tags: MidTag[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "<") continue;
+    const gt = text.indexOf(">", i + 1);
+    if (gt < 0) break;
+    const nested = text.indexOf("<", i + 1);
+    if (nested !== -1 && nested < gt) continue;
+    const name = tagNameAt(text, i);
+    if (!name) continue;
+    tags.push({ start: i, gt, name, closing: text[i + 1] === "/" });
+    i = gt;
+  }
+  return tags;
+}
+
+function tagIsEntity(pieces: string[], prefix: number, tag: MidTag): boolean {
+  return entityPiece(pieces[prefix + tag.start]) && entityPiece(pieces[prefix + tag.gt]);
+}
+
+// Past the distance cap, an intact sample keeps its own brackets wherever it
+// moved. A deleted sample must not mark a different tag, and a real tag that
+// stayed put keeps the spelling it was stored with.
 function preserveNearbyEntities(beforeMid: string, afterMid: string, pieces: string[], prefix: number): string {
-  const rep = new Map<number, string>();
-  for (let i = 0; i < beforeMid.length; i++) {
+  const marks = new Map<number, string>();
+  const taken: Array<[number, number]> = [];
+  const blocked = (at: number, len: number) => taken.some(([start, end]) => at < end && start < at + len);
+  const beforeTags = tagsOf(beforeMid);
+  for (const tag of beforeTags) {
+    const text = beforeMid.slice(tag.start, tag.gt + 1);
+    if (!afterMid.startsWith(text, tag.start)) continue;
+    if (!tagIsEntity(pieces, prefix, tag)) {
+      taken.push([tag.start, tag.gt + 1]);
+      continue;
+    }
+    marks.set(tag.start, pieces[prefix + tag.start]);
+    marks.set(tag.gt, pieces[prefix + tag.gt]);
+  }
+  const used = new Set<number>();
+  for (let t = 0; t < beforeTags.length; t++) {
+    if (used.has(t)) continue;
+    const tag = beforeTags[t];
+    if (tag.closing || !tagIsEntity(pieces, prefix, tag)) continue;
+    let close = -1;
+    for (let j = t + 1; j < beforeTags.length; j++) {
+      if (beforeTags[j].name !== tag.name || !beforeTags[j].closing) continue;
+      if (tagIsEntity(pieces, prefix, beforeTags[j])) close = j;
+      break;
+    }
+    const end = close >= 0 ? beforeTags[close].gt : tag.gt;
+    if (close >= 0) used.add(close);
+    else if (ALLOWED_TEMPLATE_TAGS.has(tag.name)) continue;
+    const sample = beforeMid.slice(tag.start, end + 1);
+    let from = 0;
+    while (from < afterMid.length) {
+      const at = afterMid.indexOf(sample, from);
+      if (at < 0) break;
+      from = at + 1;
+      if (blocked(at, sample.length)) continue;
+      for (let k = tag.start; k <= end; k++) {
+        if ((beforeMid[k] === "<" || beforeMid[k] === ">") && entityPiece(pieces[prefix + k])) {
+          marks.set(at + (k - tag.start), pieces[prefix + k]);
+        }
+      }
+      taken.push([at, at + sample.length]);
+      break;
+    }
+  }
+  const limit = Math.min(beforeMid.length, afterMid.length);
+  for (let i = 0; i < limit; i++) {
+    if (beforeMid[i] !== "\"" || afterMid[i] !== "\"") continue;
     const piece = pieces[prefix + i];
-    if (!entityPiece(piece)) continue;
-    const start = Math.max(0, i - MAX_ENTITY_DRIFT);
-    const end = Math.min(afterMid.length, i + MAX_ENTITY_DRIFT + 1);
-    let at = afterMid.indexOf(beforeMid[i], start);
-    while (at !== -1 && at < end && rep.has(at)) at = afterMid.indexOf(beforeMid[i], at + 1);
-    if (at < 0 || at >= end) continue;
-    rep.set(at, piece);
+    if (piece === "&quot;") marks.set(i, piece);
   }
   let text = "";
-  for (let i = 0; i < afterMid.length; i++) text += rep.get(i) ?? afterMid[i];
+  for (let i = 0; i < afterMid.length; i++) text += marks.get(i) ?? afterMid[i];
   return escapeDisallowedTags(text);
 }
 

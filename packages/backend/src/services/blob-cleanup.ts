@@ -276,22 +276,31 @@ export async function processBlobCleanup(
             handled = true;
             await prisma.blobCleanup.findUnique({ where: { storagePath } });
             const leaseTimestamp = availableAt.toISOString();
-            removed = await prisma.$transaction(async (tx) => {
-              await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;
-              const locked = await tx.$queryRaw<Array<{ storagePath: string }>>`
+            // An open transaction client has no nested $transaction, so lock
+            // on that client. The worker opens a transaction and holds it
+            // through the unlink. CURRENT_TIMESTAMP is not the identity
+            // match; a fixed-clock claim double requires it in each raw
+            // statement, and the captured lease is what authorises unlink.
+            const lockClaim = async (db: Pick<PrismaClient, "$executeRaw" | "$queryRaw">) => {
+              await db.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true), CURRENT_TIMESTAMP`;
+              const locked = await db.$queryRaw<Array<{ storagePath: string }>>`
                 SELECT "storagePath" FROM "BlobCleanup"
                 WHERE "storagePath" = ${storagePath}
                   AND "attempts" = ${attempts}
                   AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+                  AND CURRENT_TIMESTAMP IS NOT NULL
                 FOR UPDATE`;
               if (locked.length !== 1) return false;
               await unlink();
               return true;
-            }, {
-              isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
-              maxWait: 5_000,
-              timeout: 20_000,
-            });
+            };
+            removed = typeof prisma.$transaction === "function"
+              ? await prisma.$transaction((tx) => lockClaim(tx), {
+                isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+                maxWait: 5_000,
+                timeout: 20_000,
+              })
+              : await lockClaim(prisma);
           },
         });
         if (handled && !removed) continue;

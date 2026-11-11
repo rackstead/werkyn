@@ -74,8 +74,11 @@ export async function acceptInviteHandler(
   if (result.status === "joined") {
     // The requester's committed memberships, so the client can enter the
     // workspace without depending on a separate session refresh.
-    const workspaces = await getUserWorkspaces(request.server.prisma, userId);
-    return reply.send({ data: { ...result, userId, workspaces } });
+    const { workspaces, membershipRevision } = await getUserWorkspaces(
+      request.server.prisma,
+      userId,
+    );
+    return reply.send({ data: { ...result, userId, workspaces, membershipRevision } });
   }
   // Not a member yet: verification or administrator approval is pending.
   return reply.status(202).send({ data: { ...result, userId } });
@@ -95,8 +98,11 @@ export async function checkAdmissionHandler(
     throw admissionDenialError(result.reason);
   }
   if (result.status === "joined") {
-    const workspaces = await getUserWorkspaces(request.server.prisma, userId);
-    return reply.send({ data: { ...result, userId, workspaces } });
+    const { workspaces, membershipRevision } = await getUserWorkspaces(
+      request.server.prisma,
+      userId,
+    );
+    return reply.send({ data: { ...result, userId, workspaces, membershipRevision } });
   }
   return reply.send({ data: { ...result, userId } });
 }

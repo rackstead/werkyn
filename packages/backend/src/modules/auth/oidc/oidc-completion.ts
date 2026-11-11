@@ -218,7 +218,7 @@ export async function completeOidcSessionHandler(
     current.userId !== current.user.id
   )
     throw unavailable();
-  const workspaces = await getUserWorkspaces(
+  const { workspaces, membershipRevision } = await getUserWorkspaces(
     request.server.prisma,
     current.userId,
   );
@@ -232,5 +232,7 @@ export async function completeOidcSessionHandler(
     email: current.user.email,
     sid: current.familyId,
   });
-  return reply.send({ data: { user: current.user, accessToken, workspaces } });
+  return reply.send({
+    data: { user: current.user, accessToken, workspaces, membershipRevision },
+  });
 }

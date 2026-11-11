@@ -193,6 +193,7 @@ type AdmissionResponse = {
   data: Exclude<WorkspaceAdmissionCheck, { status: "denied" | "unavailable" }> & {
     userId: string;
     workspaces?: WorkspaceMembership[];
+    membershipRevision?: number;
   };
 };
 
@@ -263,14 +264,24 @@ function useAdmissionMutation(
       )
         return;
       rememberInviteAdmission(result.userId, token, result);
-      if (result.status !== "joined") return;
-      if (
-        !result.workspaces ||
-        !useAuthStore
-          .getState()
-          .setWorkspacesForUser(result.userId, result.workspaces)
-      )
-        return;
+      if (result.status !== "joined" || !result.workspaces) return;
+      const replaced = useAuthStore
+        .getState()
+        .setWorkspacesForUser(
+          result.userId,
+          result.workspaces,
+          result.membershipRevision,
+        );
+      // An equal revision does not replace the list. Navigation still proceeds
+      // when this account's current list contains the joined workspace. A
+      // newer list that no longer contains it does not.
+      const listed = useAuthStore.getState().workspaces.some(
+        (membership) =>
+          membership.workspaceId === result.workspace.id ||
+          membership.workspace.id === result.workspace.id ||
+          membership.workspace.slug === result.workspace.slug,
+      );
+      if (!replaced && !listed) return;
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });
       toast.success(
         result.alreadyMember

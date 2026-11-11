@@ -6,6 +6,7 @@ import { env } from "../../../config/env.js";
 import { UnauthorizedError } from "../../../utils/errors.js";
 import { signAccessToken } from "../../../utils/tokens.js";
 import { startRefreshSession } from "../refresh-sessions.js";
+import { getUserWorkspaces } from "../auth.service.js";
 import {
   assertSsoEnabled,
   readOidcIdentity,
@@ -199,17 +200,7 @@ export async function handleOidcCallback(
     sid: familyId,
   });
 
-  const workspaces = await prisma.workspaceMember.findMany({
-    where: { userId: user.id },
-    select: {
-      id: true,
-      workspaceId: true,
-      role: true,
-      workspace: {
-        select: { id: true, name: true, slug: true, logoUrl: true },
-      },
-    },
-  });
+  const { workspaces } = await getUserWorkspaces(prisma, user.id);
 
   return {
     user,

@@ -4,6 +4,7 @@ import {
   DragOverlay,
   PointerSensor,
   KeyboardSensor,
+  KeyboardCode,
   useSensor,
   useSensors,
   pointerWithin,
@@ -129,7 +130,15 @@ export function Board({
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    // Enter opens the focused card. Space picks it up and drops it.
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+      keyboardCodes: {
+        start: [KeyboardCode.Space],
+        cancel: [KeyboardCode.Esc],
+        end: [KeyboardCode.Space, KeyboardCode.Tab],
+      },
+    }),
   );
 
   const handleDragStart = useCallback((event: DragStartEvent) => {

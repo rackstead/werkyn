@@ -27,6 +27,7 @@ export async function updateProfileHandler(
 
   const user = await usersService.updateProfile(
     request.server.prisma,
+    request.server.storage,
     params.id,
     request.user!.id,
     body,
@@ -49,6 +50,7 @@ export async function updateMeHandler(
 
   const user = await usersService.updateProfile(
     request.server.prisma,
+    request.server.storage,
     request.user!.id,
     request.user!.id,
     body,

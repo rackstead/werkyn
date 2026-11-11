@@ -36,6 +36,7 @@ interface AuthResponse {
     user: User;
     accessToken: string;
     workspaces: WorkspaceMembership[];
+    membershipRevision?: number;
     admission?: WorkspaceAdmissionResult;
   };
 }
@@ -49,8 +50,8 @@ export function useLogin(inviteToken?: string) {
       return api.post("auth/login", { json: data }).json<AuthResponse>();
     },
     onSuccess: async (res) => {
-      const { user, accessToken, workspaces } = res.data;
-      useAuthStore.getState().setAuth(user, accessToken, workspaces);
+      const { user, accessToken, workspaces, membershipRevision } = res.data;
+      useAuthStore.getState().setAuth(user, accessToken, workspaces, membershipRevision);
       await router.invalidate();
       if (inviteToken) {
         navigate({ to: "/invite/$token", params: { token: inviteToken } });
@@ -80,8 +81,8 @@ export function useRegister(inviteToken?: string) {
       // Privacy-preserving registration answers without a session. The same
       // message is used whether or not the address already has an account.
       if (!("data" in res)) return;
-      const { user, accessToken, workspaces, admission } = res.data;
-      useAuthStore.getState().setAuth(user, accessToken, workspaces);
+      const { user, accessToken, workspaces, membershipRevision, admission } = res.data;
+      useAuthStore.getState().setAuth(user, accessToken, workspaces, membershipRevision);
       await router.invalidate();
       if (inviteToken && admission) {
         rememberInviteAdmission(user.id, inviteToken, admission);

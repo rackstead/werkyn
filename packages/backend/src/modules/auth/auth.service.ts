@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import type { WorkspaceAdmissionResult } from "@pm/shared";
 import { createAccount, waitForAccountRetry } from "./account-creation.js";
 import { admitWithInvite } from "../invites/admission.service.js";
@@ -45,23 +45,76 @@ export {
   startRefreshSession,
 } from "./refresh-sessions.js";
 
-export async function getUserWorkspaces(prisma: PrismaClient, userId: string) {
-  return prisma.workspaceMember.findMany({
-    where: { userId },
-    select: {
-      id: true,
-      workspaceId: true,
-      role: true,
+export interface UserWorkspaceSnapshot {
+  membershipRevision: number;
+  workspaces: Array<{
+    id: string;
+    workspaceId: string;
+    role: "ADMIN" | "MEMBER" | "VIEWER";
+    workspace: {
+      id: string;
+      name: string;
+      slug: string;
+      logoUrl: string | null;
+    };
+  }>;
+}
+
+// One statement, so the revision and the rows are one snapshot. Callers that
+// already hold a transaction pass it in; a pool query is its own transaction.
+export async function getUserWorkspaces(
+  prisma: PrismaClient | Prisma.TransactionClient,
+  userId: string,
+): Promise<UserWorkspaceSnapshot> {
+  const rows = await prisma.$queryRaw<
+    Array<{
+      membershipRevision: number | null;
+      id: string | null;
+      workspaceId: string | null;
+      role: string | null;
+      name: string | null;
+      slug: string | null;
+      logoUrl: string | null;
+    }>
+  >`
+    SELECT u."membershipRevision"::int AS "membershipRevision",
+           wm.id AS "id",
+           wm."workspaceId" AS "workspaceId",
+           wm.role::text AS "role",
+           w.name AS "name",
+           w.slug AS "slug",
+           w."logoUrl" AS "logoUrl"
+    FROM "User" u
+    LEFT JOIN "WorkspaceMember" wm ON wm."userId" = u.id
+    LEFT JOIN "Workspace" w ON w.id = wm."workspaceId"
+    WHERE u.id = ${userId}
+    ORDER BY wm."joinedAt" ASC, wm.id ASC
+  `;
+  const membershipRevision = rows[0]?.membershipRevision ?? 0;
+  const workspaces: UserWorkspaceSnapshot["workspaces"] = [];
+  for (const row of rows) {
+    if (
+      !row.id ||
+      !row.workspaceId ||
+      !row.name ||
+      !row.slug ||
+      (row.role !== "ADMIN" && row.role !== "MEMBER" && row.role !== "VIEWER")
+    ) {
+      continue;
+    }
+    workspaces.push({
+      id: row.id,
+      workspaceId: row.workspaceId,
+      role: row.role,
       workspace: {
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          logoUrl: true,
-        },
+        id: row.workspaceId,
+        name: row.name,
+        slug: row.slug,
+        logoUrl: row.logoUrl,
       },
-    },
-  });
+    });
+  }
+  return { membershipRevision, workspaces };
 }
 
 async function createTokenPair(
@@ -157,9 +210,9 @@ export async function register(
     user.email,
   );
 
-  const workspaces = await getUserWorkspaces(prisma, user.id);
+  const { workspaces, membershipRevision } = await getUserWorkspaces(prisma, user.id);
 
-  return { user, accessToken, refreshToken, workspaces, admission };
+  return { user, accessToken, refreshToken, workspaces, membershipRevision, admission };
 }
 
 async function createPasswordAccount(
@@ -622,7 +675,7 @@ export async function login(
     email: user.email,
     sid: familyId,
   });
-  const workspaces = await getUserWorkspaces(prisma, user.id);
+  const { workspaces, membershipRevision } = await getUserWorkspaces(prisma, user.id);
 
   const { passwordHash: _, ...userWithoutPassword } = user;
 
@@ -631,6 +684,7 @@ export async function login(
     accessToken,
     refreshToken,
     workspaces,
+    membershipRevision,
     // Bound to the hash this sign-in was checked and committed against (a
     // successful check means the account has one).
     deviceCookie: deviceCookieAfterSignIn(deviceCookie, email, user.passwordHash!),
@@ -690,9 +744,15 @@ export async function refresh(prisma: PrismaClient, rawToken: string) {
     email: user.email,
     sid: rotation.familyId,
   });
-  const workspaces = await getUserWorkspaces(prisma, user.id);
+  const { workspaces, membershipRevision } = await getUserWorkspaces(prisma, user.id);
 
-  return { user, accessToken, refreshToken: rotation.refreshToken, workspaces };
+  return {
+    user,
+    accessToken,
+    refreshToken: rotation.refreshToken,
+    workspaces,
+    membershipRevision,
+  };
 }
 
 // Ends the cookie's whole session (family), whether the presented token is the

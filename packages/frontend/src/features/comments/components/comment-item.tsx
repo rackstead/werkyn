@@ -87,8 +87,10 @@ export function CommentItem({
             )}
 
             {canModify && !editing && (
-              <div className="ml-auto flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="ml-auto flex gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                 <button
+                  type="button"
+                  aria-label="Edit comment"
                   onClick={() => {
                     setEditBody(comment.body);
                     setEditing(true);
@@ -98,6 +100,8 @@ export function CommentItem({
                   <Pencil className="h-3 w-3" />
                 </button>
                 <button
+                  type="button"
+                  aria-label="Delete comment"
                   onClick={() => setShowDelete(true)}
                   className="rounded p-0.5 hover:bg-accent text-muted-foreground hover:text-destructive"
                 >

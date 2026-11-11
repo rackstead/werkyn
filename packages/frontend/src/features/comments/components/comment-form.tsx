@@ -137,6 +137,9 @@ export function CommentForm({ taskId }: CommentFormProps) {
       }
       if (e.key === "Escape") {
         e.preventDefault();
+        // The mention list is not a dialog layer. Stopping the key keeps the
+        // task panel open; the next Escape still reaches it.
+        e.stopPropagation();
         setMentionQuery(null);
         return;
       }

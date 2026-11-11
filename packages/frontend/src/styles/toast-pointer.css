@@ -1,0 +1,9 @@
+/* A modal sets pointer-events: none on the body. The toaster covers a corner,
+   so the empty area must not take clicks, while each toast still can. */
+[data-sonner-toaster] {
+  pointer-events: none;
+}
+
+[data-sonner-toast] {
+  pointer-events: auto;
+}

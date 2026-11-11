@@ -117,6 +117,18 @@ async function queueStagedUpload(prisma: PrismaClient, storagePath: string) {
   if (inserted !== 1) throw unavailableUpload();
 }
 
+/**
+ * A sweeper may already hold this path's claim. Move that claim's lease
+ * before any new bytes exist, so its unlink and its row retirement no
+ * longer match. An unclaimed grace row is left on its original hour.
+ */
+async function supersedeOwnedClaim(prisma: PrismaClient, storagePath: string) {
+  await prisma.$executeRaw`
+    UPDATE "BlobCleanup"
+    SET "availableAt" = GREATEST("availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+    WHERE "storagePath" = ${storagePath} AND "attempts" > 0`;
+}
+
 /** Drops the grace rows only when every one is still unclaimed. */
 async function claimStagedUploads(tx: Prisma.TransactionClient, paths: string[]) {
   const staged = [...new Set(paths)];
@@ -194,6 +206,7 @@ export async function uploadFileStream(
   try {
     await queueStagedUpload(prisma, plannedPath);
     staged.push(plannedPath);
+    await supersedeOwnedClaim(prisma, plannedPath);
 
     const saved = await storage.saveStream(
       category,
@@ -230,6 +243,7 @@ export async function uploadFileStream(
         try {
           await queueStagedUpload(prisma, plannedThumb);
           staged.push(plannedThumb);
+          await supersedeOwnedClaim(prisma, plannedThumb);
           const savedThumb = await storage.save(
             category,
             scopeId,

@@ -79,9 +79,9 @@ async function exercise({ fileName, mimeType, bytes, fail }) {
   const atCreate = new Promise((resolve) => {
     notifyCreate = resolve;
   });
-  storage.delete = async (storagePath) => {
+  storage.delete = async (storagePath, options) => {
     deletes.push(storagePath);
-    return originalDelete(storagePath);
+    return originalDelete(storagePath, options);
   };
   prisma.$transaction = (fn, options) => {
     if (typeof fn !== "function") return originalTransaction(fn, options);
@@ -368,6 +368,112 @@ test("a late write keeps its cleanup row when a worker already owns the claim", 
     releaseDelete();
     if (worker) await worker.catch(() => {});
     prisma.blobCleanup.deleteMany = originalDeleteMany;
+    storage.saveStream = originalSave;
+  }
+});
+
+test("a sweeper that owns the claim cannot unlink or retire bytes written after that claim", { timeout: 30_000 }, async () => {
+  const bytes = Buffer.from("owned-claim upload must stay queued\n");
+  const originalExecute = prisma.$executeRaw.bind(prisma);
+  const originalDelete = storage.delete.bind(storage);
+  const originalSave = storage.saveStream.bind(storage);
+  let releaseDelete = () => {};
+  const deleteGate = new Promise((resolve) => {
+    releaseDelete = resolve;
+  });
+  let noteDelete = () => {};
+  const deleteEntered = new Promise((resolve) => {
+    noteDelete = resolve;
+  });
+  let armed = false;
+  let planned;
+  let worker;
+  let during;
+  prisma.$executeRaw = function (...args) {
+    const sql = Array.isArray(args[0]) ? args[0].join(" ") : "";
+    const pending = originalExecute.apply(prisma, args);
+    if (armed || !sql.includes('INSERT INTO "BlobCleanup"') || sql.includes("ON CONFLICT")) return pending;
+    const storagePath = args[1];
+    if (typeof storagePath !== "string" || !storagePath.startsWith(`${workspace.id}/`)) return pending;
+    armed = true;
+    planned = storagePath;
+    return pending.then(async (result) => {
+      await originalExecute`
+        UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "storagePath" = ${storagePath}`;
+      worker = processBlobCleanup(prisma, storage, { paths: [storagePath], limit: 1 });
+      worker.catch(() => {});
+      let waitTimer;
+      try {
+        await Promise.race([
+          deleteEntered,
+          new Promise((_, reject) => {
+            waitTimer = setTimeout(() => reject(new Error("sweeper did not reach unlink")), 10_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(waitTimer);
+      }
+      return result;
+    });
+  };
+  storage.delete = async (storagePath, options) => {
+    if (storagePath === planned) {
+      noteDelete();
+      await deleteGate;
+    }
+    return originalDelete(storagePath, options);
+  };
+  storage.saveStream = async (...args) => {
+    const written = await originalSave(...args);
+    during = {
+      row: await observer.blobCleanup.findUnique({ where: { storagePath: planned } }),
+      onDisk: await storage.exists(planned),
+      bytes: await storage.read(planned),
+      files: await observer.file.count({ where: { storagePath: planned } }),
+    };
+    releaseDelete();
+    await worker;
+    return written;
+  };
+  try {
+    const pending = uploadFileStream(
+      prisma,
+      storage,
+      workspace.id,
+      user.id,
+      undefined,
+      "owned.txt",
+      "text/plain",
+      Readable.from([bytes]),
+      { workspaceId: workspace.id, userId: user.id, workspaceRole: "ADMIN" },
+    ).then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error }),
+    );
+    let settleTimer;
+    const settled = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        settleTimer = setTimeout(() => resolve({ ok: false, error: new Error("owned-claim upload did not settle") }), 15_000);
+      }),
+    ]);
+    clearTimeout(settleTimer);
+    const afterSweep = await observer.blobCleanup.findUnique({ where: { storagePath: planned } });
+    assert.equal(during.files, 0);
+    assert.equal(during.onDisk, true);
+    assert.equal(Buffer.from(during.bytes).equals(bytes), true);
+    assert.ok(during.row, "the cleanup row must still exist after the write and before the sweeper returns");
+    assert.equal(afterSweep?.storagePath, planned);
+    assert.equal(await storage.exists(planned), true);
+    assert.equal(Buffer.from(await storage.read(planned)).equals(bytes), true);
+    assert.equal(await prisma.file.count({ where: { storagePath: planned } }), 0);
+    assert.equal(settled.ok, false);
+  } finally {
+    releaseDelete();
+    if (worker) await worker.catch(() => {});
+    prisma.$executeRaw = originalExecute;
+    storage.delete = originalDelete;
     storage.saveStream = originalSave;
   }
 });

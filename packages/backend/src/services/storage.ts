@@ -84,8 +84,10 @@ export interface StorageProvider {
   /**
    * Idempotent: a blob that is already gone counts as deleted. Any other
    * storage failure is thrown so durable cleanup can retry it.
+   * `beforeUnlink` runs after the caller has paused and before the path is
+   * removed. Returning false leaves the bytes in place.
    */
-  delete(storagePath: string): Promise<void>;
+  delete(storagePath: string, options?: { beforeUnlink?: () => Promise<boolean> }): Promise<void>;
   exists(storagePath: string): Promise<boolean>;
 }
 
@@ -304,7 +306,11 @@ export class LocalStorageProvider implements StorageProvider {
     return this.openBlob(storagePath, "read");
   }
 
-  async delete(storagePath: string): Promise<void> {
+  async delete(
+    storagePath: string,
+    options?: { beforeUnlink?: () => Promise<boolean> },
+  ): Promise<void> {
+    if (options?.beforeUnlink && !(await options.beforeUnlink())) return;
     let root: StorageRoot;
     try {
       root = await this.root();

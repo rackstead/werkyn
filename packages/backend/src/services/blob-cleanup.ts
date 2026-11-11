@@ -265,7 +265,23 @@ export async function processBlobCleanup(
         continue;
       }
       try {
-        await storage.delete(storagePath);
+        // A writer that already replaced this claim, before its bytes landed,
+        // still owns the path. Unlink only while the claim we captured is the
+        // row's current identity, and do not retire a row we did not unlink.
+        let checked = false;
+        let stillOwned = false;
+        await storage.delete(storagePath, {
+          beforeUnlink: async () => {
+            checked = true;
+            const current = await prisma.blobCleanup.findUnique({ where: { storagePath } });
+            stillOwned = current?.attempts === attempts
+              && current.availableAt.getTime() === availableAt.getTime();
+            return stillOwned;
+          },
+        });
+        // A storage double that drops the options still unlinked. Only a
+        // check that saw a replaced claim skips retirement.
+        if (checked && !stillOwned) continue;
         result.deleted++;
         done.push(claim);
       } catch (error) {

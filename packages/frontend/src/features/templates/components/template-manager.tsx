@@ -206,33 +206,34 @@ function preserveNearbyEntities(beforeMid: string, afterMid: string, pieces: str
   return escapeDisallowedTags(text);
 }
 
-// Order-preserving edit script for the middle. Null when the edit is too large
-// to trace; the caller then escapes only disallowed tags and does not stamp
-// entity brackets onto other tags.
+// Order-preserving edit script for the middle. The frontier is O(edit distance),
+// not O(description length): a long note must not retain a copy of both strings
+// at every depth. Null when the edit is too large to trace.
 function equalCharPairs(before: string, after: string): Array<[number, number]> | null {
   const n = before.length;
   const m = after.length;
   if (n === 0 || m === 0) return [];
-  const max = n + m;
-  const off = max;
-  const v = new Int32Array(2 * max + 1);
+  const cap = 256;
+  const off = cap + 1;
+  const width = 2 * cap + 3;
+  let v = new Int32Array(width);
   v[off + 1] = 0;
   const trace: Int32Array[] = [];
   let found = -1;
-  const cap = 8192;
-  for (let d = 0; d <= max && d <= cap; d++) {
+  for (let d = 0; d <= cap; d++) {
     trace.push(v.slice());
+    const next = new Int32Array(width);
     let done = false;
     for (let k = -d; k <= d; k += 2) {
-      const idx = off + k;
       let x: number;
-      if (k === -d || (k !== d && v[idx - 1] < v[idx + 1])) x = v[idx + 1];
-      else x = v[idx - 1] + 1;
+      if (k === -d || (k !== d && v[off + k - 1] < v[off + k + 1])) x = v[off + k + 1];
+      else x = v[off + k - 1] + 1;
       let y = x - k;
       while (x < n && y < m && before[x] === after[y]) { x++; y++; }
-      v[idx] = x;
+      next[off + k] = x;
       if (x >= n && y >= m) { found = d; done = true; break; }
     }
+    v = next;
     if (done) break;
   }
   if (found < 0) return null;

@@ -86,8 +86,16 @@ export interface StorageProvider {
    * storage failure is thrown so durable cleanup can retry it.
    * `beforeUnlink` runs after the caller has paused and before the path is
    * removed. Returning false leaves the bytes in place.
+   * `unlinkUnderClaim` replaces that unlink. It must call `unlink` only while
+   * it holds the cleanup row, and skip `unlink` when the claim has moved.
    */
-  delete(storagePath: string, options?: { beforeUnlink?: () => Promise<boolean> }): Promise<void>;
+  delete(
+    storagePath: string,
+    options?: {
+      beforeUnlink?: () => Promise<boolean>;
+      unlinkUnderClaim?: (unlink: () => Promise<void>) => Promise<void>;
+    },
+  ): Promise<void>;
   exists(storagePath: string): Promise<boolean>;
 }
 
@@ -308,9 +316,20 @@ export class LocalStorageProvider implements StorageProvider {
 
   async delete(
     storagePath: string,
-    options?: { beforeUnlink?: () => Promise<boolean> },
+    options?: {
+      beforeUnlink?: () => Promise<boolean>;
+      unlinkUnderClaim?: (unlink: () => Promise<void>) => Promise<void>;
+    },
   ): Promise<void> {
+    if (options?.unlinkUnderClaim) {
+      await options.unlinkUnderClaim(() => this.unlinkStored(storagePath));
+      return;
+    }
     if (options?.beforeUnlink && !(await options.beforeUnlink())) return;
+    await this.unlinkStored(storagePath);
+  }
+
+  private async unlinkStored(storagePath: string): Promise<void> {
     let root: StorageRoot;
     try {
       root = await this.root();

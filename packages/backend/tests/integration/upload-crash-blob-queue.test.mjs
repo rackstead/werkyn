@@ -477,5 +477,121 @@ test("a sweeper that owns the claim cannot unlink or retire bytes written after 
     storage.saveStream = originalSave;
   }
 });
+
+test("a stale claim read cannot unlink bytes written after the lease moved", { timeout: 30_000 }, async () => {
+  const bytes = Buffer.from("123456789012345678901");
+  assert.equal(bytes.length, 21);
+  const originalExecute = prisma.$executeRaw.bind(prisma);
+  const originalFind = prisma.blobCleanup.findUnique.bind(prisma.blobCleanup);
+  const originalSave = storage.saveStream.bind(storage);
+  let releaseRead = () => {};
+  const readGate = new Promise((resolve) => {
+    releaseRead = resolve;
+  });
+  let noteRead = () => {};
+  const readEntered = new Promise((resolve) => {
+    noteRead = resolve;
+  });
+  let armed = false;
+  let planned;
+  let worker;
+  let stale;
+  prisma.blobCleanup.findUnique = async (args) => {
+    const row = await originalFind(args);
+    if (!armed || args?.where?.storagePath !== planned || !row) return row;
+    stale = {
+      attempts: row.attempts,
+      availableAt: new Date(row.availableAt.getTime()),
+    };
+    noteRead();
+    await readGate;
+    return {
+      ...row,
+      attempts: stale.attempts,
+      availableAt: stale.availableAt,
+    };
+  };
+  prisma.$executeRaw = function (...args) {
+    const sql = Array.isArray(args[0]) ? args[0].join(" ") : "";
+    const pending = originalExecute.apply(prisma, args);
+    if (armed || !sql.includes('INSERT INTO "BlobCleanup"') || sql.includes("ON CONFLICT")) return pending;
+    const storagePath = args[1];
+    if (typeof storagePath !== "string" || !storagePath.startsWith(`${workspace.id}/`)) return pending;
+    armed = true;
+    planned = storagePath;
+    return pending.then(async (result) => {
+      await originalExecute`
+        UPDATE "BlobCleanup" SET "availableAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "storagePath" = ${storagePath}`;
+      worker = processBlobCleanup(prisma, storage, { paths: [storagePath], limit: 1 });
+      worker.catch(() => {});
+      let waitTimer;
+      try {
+        await Promise.race([
+          readEntered,
+          new Promise((_, reject) => {
+            waitTimer = setTimeout(() => reject(new Error("sweeper did not read the claim")), 10_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(waitTimer);
+      }
+      return result;
+    });
+  };
+  storage.saveStream = async (...args) => {
+    const written = await originalSave(...args);
+    const during = {
+      row: await observer.blobCleanup.findUnique({ where: { storagePath: planned } }),
+      onDisk: await storage.exists(planned),
+      body: await storage.read(planned),
+    };
+    assert.equal(during.onDisk, true);
+    assert.equal(Buffer.from(during.body).equals(bytes), true);
+    assert.equal(during.row?.attempts, 1);
+    assert.ok(during.row.availableAt.getTime() > stale.availableAt.getTime());
+    releaseRead();
+    await worker;
+    return written;
+  };
+  try {
+    const pending = uploadFileStream(
+      prisma,
+      storage,
+      workspace.id,
+      user.id,
+      undefined,
+      "stale.txt",
+      "text/plain",
+      Readable.from([bytes]),
+      { workspaceId: workspace.id, userId: user.id, workspaceRole: "ADMIN" },
+    ).then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error }),
+    );
+    let settleTimer;
+    const settled = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        settleTimer = setTimeout(() => resolve({ ok: false, error: new Error("stale-read upload did not settle") }), 15_000);
+      }),
+    ]);
+    clearTimeout(settleTimer);
+    const afterSweep = await observer.blobCleanup.findUnique({ where: { storagePath: planned } });
+    assert.equal(settled.ok, false);
+    assert.equal(settled.error.statusCode, 503);
+    assert.equal(await prisma.file.count({ where: { storagePath: planned } }), 0);
+    assert.equal(await storage.exists(planned), true, "the sweeper unlinked bytes written after the lease moved");
+    assert.equal(Buffer.from(await storage.read(planned)).equals(bytes), true);
+    assert.equal(afterSweep?.attempts, 1);
+    assert.ok(afterSweep.availableAt.getTime() > stale.availableAt.getTime());
+  } finally {
+    releaseRead();
+    if (worker) await worker.catch(() => {});
+    prisma.$executeRaw = originalExecute;
+    prisma.blobCleanup.findUnique = originalFind;
+    storage.saveStream = originalSave;
+  }
+});
 });
 

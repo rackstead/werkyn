@@ -265,23 +265,37 @@ export async function processBlobCleanup(
         continue;
       }
       try {
-        // A writer that already replaced this claim, before its bytes landed,
-        // still owns the path. Unlink only while the claim we captured is the
-        // row's current identity, and do not retire a row we did not unlink.
-        let checked = false;
-        let stillOwned = false;
+        // A plain read of this claim is not enough: it can return the lease
+        // from before a writer moved it. Lock the captured identity and hold
+        // that lock until the unlink finishes. A replaced claim is left
+        // alone, row and bytes.
+        let handled = false;
+        let removed = false;
         await storage.delete(storagePath, {
-          beforeUnlink: async () => {
-            checked = true;
-            const current = await prisma.blobCleanup.findUnique({ where: { storagePath } });
-            stillOwned = current?.attempts === attempts
-              && current.availableAt.getTime() === availableAt.getTime();
-            return stillOwned;
+          unlinkUnderClaim: async (unlink) => {
+            handled = true;
+            await prisma.blobCleanup.findUnique({ where: { storagePath } });
+            const leaseTimestamp = availableAt.toISOString();
+            removed = await prisma.$transaction(async (tx) => {
+              await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;
+              const locked = await tx.$queryRaw<Array<{ storagePath: string }>>`
+                SELECT "storagePath" FROM "BlobCleanup"
+                WHERE "storagePath" = ${storagePath}
+                  AND "attempts" = ${attempts}
+                  AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+                FOR UPDATE`;
+              if (locked.length !== 1) return false;
+              await unlink();
+              return true;
+            }, {
+              isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+              maxWait: 5_000,
+              timeout: 20_000,
+            });
           },
         });
-        // A storage double that drops the options still unlinked. Only a
-        // check that saw a replaced claim skips retirement.
-        if (checked && !stillOwned) continue;
+        if (handled && !removed) continue;
+        // A storage double that drops the callback still unlinked.
         result.deleted++;
         done.push(claim);
       } catch (error) {

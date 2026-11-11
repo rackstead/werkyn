@@ -8,7 +8,7 @@ import {
 } from "../api";
 
 interface DependencyListProps {
-  task: TaskDetail;
+  task: Pick<TaskDetail, "id" | "projectId" | "blockedBy" | "blocking">;
   canEdit: boolean;
 }
 
@@ -98,6 +98,8 @@ export function DependencyList({ task, canEdit }: DependencyListProps) {
                 </div>
                 {canEdit && (
                   <button
+                    type="button"
+                    aria-label={`Remove dependency ${dep.blockingTask.title}`}
                     onClick={() =>
                       removeDep.mutate({
                         depId: dep.id,

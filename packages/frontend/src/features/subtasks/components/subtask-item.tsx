@@ -66,9 +66,11 @@ export function SubtaskItem({
     >
       {canEdit && (
         <button
+          type="button"
           {...attributes}
           {...listeners}
-          className="cursor-grab touch-none text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+          aria-label={`Reorder ${subtask.title}`}
+          className="cursor-grab touch-none text-muted-foreground opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity"
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
@@ -79,6 +81,7 @@ export function SubtaskItem({
         checked={subtask.completed}
         onChange={() => onToggle(subtask.id)}
         disabled={!canEdit}
+        aria-label={subtask.title}
         className="h-3.5 w-3.5 rounded border-input accent-primary"
       />
 
@@ -111,8 +114,10 @@ export function SubtaskItem({
 
       {canEdit && (
         <button
+          type="button"
+          aria-label={`Delete ${subtask.title}`}
           onClick={() => onDelete(subtask.id)}
-          className="text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
+          className="text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity"
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>

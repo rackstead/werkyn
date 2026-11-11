@@ -85,6 +85,18 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+it("names the description textbox Description", async () => {
+  const id = `task-name-${++suffix}`;
+  const view = render(
+    <TaskDescription descriptionRevision={0} taskId={id} description="<p>Notes</p>" canEdit />,
+    { wrapper },
+  );
+  await tick();
+  const textbox = view.getByRole("textbox", { name: "Description" });
+  expect(textbox.getAttribute("aria-label")).toBe("Description");
+  expect(textbox.getAttribute("role")).toBe("textbox");
+});
+
 it("real Tiptap editor remounts for another task and flushes pending text to the original ID", async () => {
   const a = `task-a-${++suffix}`,
     b = `task-b-${suffix}`;

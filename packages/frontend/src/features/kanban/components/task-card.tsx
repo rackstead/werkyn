@@ -57,6 +57,14 @@ export function TaskCard({ task, onClick, isDragDisabled }: TaskCardProps) {
       style={style}
       {...attributes}
       {...listeners}
+      onKeyDown={(event) => {
+        listeners?.onKeyDown?.(event);
+        // Enter is not a drag key. A div does not activate on Enter by itself.
+        if (event.key === "Enter" && !event.defaultPrevented && !isDragging) {
+          event.preventDefault();
+          onClick();
+        }
+      }}
       onClick={(e) => {
         // Don't open slideover if dragging
         if (!isDragging) {

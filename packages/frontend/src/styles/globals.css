@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tippy.js/dist/tippy.css";
+@import "./toast-pointer.css";
 
 @custom-variant dark (&:is(.dark *));
 

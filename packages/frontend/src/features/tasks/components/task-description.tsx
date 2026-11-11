@@ -116,6 +116,10 @@ function TaskDescriptionEditor({
     ),
     editable: canEdit && revisionAvailable,
     editorProps: {
+      attributes: {
+        "aria-label": "Description",
+        role: "textbox",
+      },
       transformPastedHTML: pastedHtml,
       transformPastedText: pastedText,
     },

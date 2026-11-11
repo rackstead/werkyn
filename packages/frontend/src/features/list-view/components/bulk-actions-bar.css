@@ -1,0 +1,36 @@
+/* The desktop sidebar is w-64 (16rem) and sits in normal flow. This bar is
+   fixed to the viewport, so on that breakpoint it has to start after the
+   sidebar or it covers the sidebar's bottom links. Below 768px the sidebar
+   is off-canvas and the bar uses the full viewport. */
+.bulk-actions-shell {
+  position: fixed;
+  z-index: 30;
+  right: 0;
+  bottom: 1.5rem;
+  left: 0;
+  display: flex;
+  justify-content: center;
+  box-sizing: border-box;
+  padding-left: 0.75rem;
+  padding-right: 0.75rem;
+  pointer-events: none;
+}
+
+@media (min-width: 768px) {
+  .bulk-actions-shell {
+    left: 16rem;
+  }
+}
+
+.bulk-actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 100%;
+  min-width: 0;
+  pointer-events: auto;
+}

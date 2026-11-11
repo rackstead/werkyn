@@ -98,6 +98,82 @@ async function assertNewFileWithinDepth(
   if (over.length > 0) graphTooLarge();
 }
 
+// Same one-hour grace as restore staging. Copy and upload both commit the
+// planned path before writing bytes. Expiry can refuse a slow copy or upload.
+const STAGED_COPY_GRACE_SECONDS = 60 * 60;
+
+function unavailableUpload() {
+  return new AppError(
+    503,
+    "Service Unavailable",
+    "The upload could not keep its stored file; nothing was stored. Please try again.",
+  );
+}
+
+async function queueStagedUpload(prisma: PrismaClient, storagePath: string) {
+  const inserted = await prisma.$executeRaw`
+    INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+    VALUES (${storagePath}, CURRENT_TIMESTAMP + ${STAGED_COPY_GRACE_SECONDS}::integer * interval '1 second')`;
+  if (inserted !== 1) throw unavailableUpload();
+}
+
+/**
+ * A sweeper may already hold this path's claim. Move that claim's lease
+ * before any new bytes exist, so its unlink and its row retirement no
+ * longer match. An unclaimed grace row is left on its original hour.
+ */
+async function supersedeOwnedClaim(prisma: PrismaClient, storagePath: string) {
+  await prisma.$executeRaw`
+    UPDATE "BlobCleanup"
+    SET "availableAt" = GREATEST("availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+    WHERE "storagePath" = ${storagePath} AND "attempts" > 0`;
+}
+
+/** Drops the grace rows only when every one is still unclaimed. */
+async function claimStagedUploads(tx: Prisma.TransactionClient, paths: string[]) {
+  const staged = [...new Set(paths)];
+  if (staged.length === 0) throw unavailableUpload();
+  const claimed = await tx.$queryRaw<Array<{ storagePath: string }>>`
+    DELETE FROM "BlobCleanup"
+    WHERE "storagePath" = ANY(${staged}::text[]) AND "attempts" = 0
+    RETURNING "storagePath"`;
+  if (claimed.length !== staged.length) throw unavailableUpload();
+}
+
+/**
+ * A caught failure still has to remove the bytes. Unclaimed grace rows are
+ * made due so discardStagedBlobs can take them. A sweeper that already
+ * claimed one keeps its attempts; the lease moves by at least one stored
+ * millisecond so that sweeper cannot retire this later write's row.
+ */
+async function releaseStagedUploads(
+  prisma: PrismaClient,
+  storage: StorageProvider,
+  paths: Array<string | null | undefined>,
+) {
+  const staged = [...new Set(paths.filter((p): p is string => !!p))];
+  if (staged.length === 0) return;
+  try {
+    for (const storagePath of staged) {
+      await prisma.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "availableAt") VALUES (
+          ${storagePath}, date_trunc('milliseconds', CURRENT_TIMESTAMP))
+        ON CONFLICT ("storagePath") DO UPDATE SET "availableAt" =
+          CASE WHEN "BlobCleanup"."attempts" = 0
+            THEN date_trunc('milliseconds', CURRENT_TIMESTAMP)
+          ELSE GREATEST("BlobCleanup"."availableAt" + interval '1 millisecond', CURRENT_TIMESTAMP)
+          END`;
+    }
+  } catch (error) {
+    logger.error(
+      { err: error, paths: staged },
+      "Could not renew a failed upload's staged blobs; left until grace expiry",
+    );
+    return;
+  }
+  await discardStagedBlobs(prisma, storage, staged);
+}
+
 export async function uploadFileStream(
   prisma: PrismaClient,
   storage: StorageProvider,
@@ -121,55 +197,72 @@ export async function uploadFileStream(
   const fileId = crypto.randomUUID();
 
   const scopeId = isTeamContext ? `groupfolders/${teamFolderId}` : uploadedById;
+  const category = `${workspaceId}/files`;
+  const plannedPath = path.join(category, scopeId, `${fileId}${ext}`);
+  const staged: string[] = [];
 
-  // Stream to disk with size enforcement
-  const { storagePath, size } = await storage.saveStream(
-    `${workspaceId}/files`,
-    scopeId,
-    fileId,
-    ext,
-    stream,
-    { maxSize: env.MAX_FILE_SIZE },
-  );
+  // Queue before either write. A crash after the bytes land and before the
+  // File insert leaves these rows for the sweeper; create consumes them.
+  try {
+    await queueStagedUpload(prisma, plannedPath);
+    staged.push(plannedPath);
+    await supersedeOwnedClaim(prisma, plannedPath);
 
-  // The declared type only decides whether to try. The stored bytes decide
-  // whether and how they are decoded, in a memory-limited worker process; a
-  // busy server waits a bounded time for a transform turn and then stores the
-  // upload without one (thumbnails.ts).
-  let thumbnailPath: string | null = null;
-  if (
-    mimeType.startsWith("image/") &&
-    !mimeType.includes("svg") &&
-    size <= THUMBNAIL_SOURCE_MAX_BYTES
-  ) {
-    const thumbBuffer = await createThumbnail(
-      {
-        size,
-        head: (signal) => readHead(storage, storagePath, signal),
-        path: await storage.decoderLocation(storagePath),
-      },
-      { workspaceId, fileId },
+    const saved = await storage.saveStream(
+      category,
+      scopeId,
+      fileId,
+      ext,
+      stream,
+      { maxSize: env.MAX_FILE_SIZE },
     );
-    if (thumbBuffer) {
-      try {
-        thumbnailPath = await storage.save(
-          `${workspaceId}/files`,
-          scopeId,
-          `${fileId}_thumb`,
-          ".webp",
-          thumbBuffer,
-        );
-      } catch {
-        // Non-blocking: continue without thumbnail
+    // Do not adopt, queue or delete an arbitrary unexpected returned path.
+    if (saved.storagePath !== plannedPath) throw unavailableUpload();
+    const { storagePath, size } = saved;
+
+    // The declared type only decides whether to try. The stored bytes decide
+    // whether and how they are decoded, in a memory-limited worker process; a
+    // busy server waits a bounded time for a transform turn and then stores the
+    // upload without one (thumbnails.ts).
+    let thumbnailPath: string | null = null;
+    if (
+      mimeType.startsWith("image/") &&
+      !mimeType.includes("svg") &&
+      size <= THUMBNAIL_SOURCE_MAX_BYTES
+    ) {
+      const thumbBuffer = await createThumbnail(
+        {
+          size,
+          head: (signal) => readHead(storage, storagePath, signal),
+          path: await storage.decoderLocation(storagePath),
+        },
+        { workspaceId, fileId },
+      );
+      if (thumbBuffer) {
+        const plannedThumb = path.join(category, scopeId, `${fileId}_thumb.webp`);
+        try {
+          await queueStagedUpload(prisma, plannedThumb);
+          staged.push(plannedThumb);
+          await supersedeOwnedClaim(prisma, plannedThumb);
+          const savedThumb = await storage.save(
+            category,
+            scopeId,
+            `${fileId}_thumb`,
+            ".webp",
+            thumbBuffer,
+          );
+          if (savedThumb === plannedThumb) thumbnailPath = savedThumb;
+        } catch {
+          // Non-blocking: continue without thumbnail. A path already queued
+          // stays staged so success consumes the row and failure discards it.
+        }
       }
     }
-  }
 
-  // Create DB record — clean up file on failure. The destination is resolved
-  // again under the workspace graph lock: while bytes streamed, the parent may
-  // have been moved to another scope, trashed or deleted, or the uploader's
-  // rights may have changed. Stored blob paths are immutable either way.
-  try {
+    // Create DB record — clean up file on failure. The destination is resolved
+    // again under the workspace graph lock: while bytes streamed, the parent may
+    // have been moved to another scope, trashed or deleted, or the uploader's
+    // rights may have changed. Stored blob paths are immutable either way.
     return await withWorkspaceLock(prisma, workspaceId, async (tx) => {
       const current = await resolveFileDestination(
         tx,
@@ -177,6 +270,7 @@ export async function uploadFileStream(
         parentId,
       );
       await assertNewFileWithinDepth(tx, workspaceId, current.parentId);
+      await claimStagedUploads(tx, staged);
       return tx.file.create({
         data: {
           workspaceId,
@@ -194,7 +288,7 @@ export async function uploadFileStream(
       });
     });
   } catch (err) {
-    await discardStagedBlobs(prisma, storage, [storagePath, thumbnailPath]);
+    await releaseStagedUploads(prisma, storage, staged);
     throw err;
   }
 }
@@ -672,9 +766,6 @@ export async function listStarredFiles(
 
   return starred.map((s) => ({ ...s.file, starred: true }));
 }
-
-// Same grace as restore staging; expiry can refuse a slow copy.
-const STAGED_COPY_GRACE_SECONDS = 60 * 60;
 
 function unavailableCopy() {
   return new AppError(

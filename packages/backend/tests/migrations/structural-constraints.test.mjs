@@ -430,7 +430,13 @@ test("R35 constraint migrations refuse legacy rows with a report and apply to cl
       const data = await dataSnapshot(clean);
       const deploy = await prismaCli(["migrate", "deploy", "--schema", currentSchema]);
       assert(deploy.ok, deploy.output);
-      assert.deepEqual(await dataSnapshot(clean), data);
+      // membershipRevision is appended with default 0. It is not a rewrite of
+      // the columns this fixture stored before that migration.
+      const withoutRevision = (snapshot) => ({
+        ...snapshot,
+        User: snapshot.User.map((row) => row.replace(/,0\)$/, ")")),
+      });
+      assert.deepEqual(withoutRevision(await dataSnapshot(clean)), withoutRevision(data));
       assert.match((await prismaCli(["migrate", "deploy", "--schema", currentSchema])).output, /No pending migrations/);
       // Prisma sees no drift between the migrated database and schema.prisma.
       const drift = await prismaCli([

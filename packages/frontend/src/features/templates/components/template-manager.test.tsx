@@ -1,4 +1,6 @@
 import { writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { afterAll, afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -11,6 +13,26 @@ import { queryKeys } from "@/lib/query-keys";
 import { useAuthStore } from "@/stores/auth-store";
 import { TemplateManager } from "./template-manager";
 import type { TaskTemplate } from "../api";
+
+// Production options from packages/backend/src/utils/description-html.ts.
+// The allow-list is not widened here. Vitest serves this file over http, so
+// the backend package is taken from the /@fs path rather than a file URL.
+function backendPackageJson(): string {
+  const url = new URL("../../../../../backend/package.json", import.meta.url);
+  if (url.protocol === "file:") return fileURLToPath(url);
+  const marker = "/@fs";
+  const at = url.href.indexOf(marker);
+  return at >= 0 ? decodeURIComponent(url.href.slice(at + marker.length)) : url.pathname;
+}
+const requireBackend = createRequire(backendPackageJson());
+const sanitizeHtml = requireBackend("sanitize-html") as (html: string, options: object) => string;
+const PRODUCTION_SANITIZE = {
+  allowedTags: ["b", "i", "em", "strong", "p", "br", "ul", "ol", "li", "a", "h1", "h2", "h3", "blockquote", "code", "pre"],
+  allowedAttributes: { a: ["href", "target", "rel"] },
+  allowedSchemes: ["http", "https", "mailto"],
+  disallowedTagsMode: "discard",
+};
+const savedBySanitizer = (html: string) => sanitizeHtml(html, PRODUCTION_SANITIZE);
 
 const transport = vi.hoisted(() => {
   vi.stubGlobal("BroadcastChannel", class { addEventListener() {} removeEventListener() {} postMessage() {} close() {} });
@@ -191,8 +213,10 @@ test("omits unchanged blank legacy title while trimming only the changed name", 
   expect(writes()).toHaveLength(1); expect(writes()[0].data).toEqual({ name: "Revised name" }); expect(rows()[0].title).toBe("");
 });
 test("sends only an explicitly edited literal description without decoding text", async () => {
-  await mount(); await open(); change(descriptionInput(), "Revised &amp; notes\nΩ"); await save();
-  expect(writes()[0].data).toEqual({ description: "Revised &amp; notes\nΩ" });
+  await mount({ description: "Fish &amp; chips" }); await open();
+  expect(descriptionInput().value).toBe("Fish & chips");
+  change(descriptionInput(), "Fish & chips today"); await save();
+  expect(writes()[0].data).toEqual({ description: "Fish & chips today" });
 });
 test("clears only the description with null", async () => {
   await mount(); await open(); change(descriptionInput(), ""); await save(); expect(writes()[0].data).toEqual({ description: null });
@@ -340,8 +364,213 @@ test("text contract: changed controls-only description sends explicit null", asy
   await mount(); await open(); change(descriptionInput(), "\u0000\u0001"); await save(); expect(writes()[0].data).toEqual({ description: null }); expect(writes()[0].status).toBe(200);
 });
 test("text contract: unrelated edit omits unchanged legacy-invalid description", async () => {
-  const legacy = "Legacy\u0000 &amp; <b>text</b>"; await mount({ description: legacy }); await open(); change(titleInput(), "Other field"); await save();
+  const legacy = "Legacy\u0000 &amp; <b>text</b>"; await mount({ description: legacy }); await open();
+  expect(descriptionInput().value).toBe("Legacy\u0000 & <b>text</b>");
+  change(titleInput(), "Other field"); await save();
   expect(writes()[0].data).toEqual({ title: "Other field" }); expect(writes()[0].status).toBe(200); expect(rows()[0].description).toBe(legacy);
+});
+test("text contract: one display decode is not resent and does not accumulate", async () => {
+  rows("a")[0].description = "Notes &amp; follow-up";
+  rows("a")[1].description = "Fish &amp;amp; chips";
+  await mount(); await open(0);
+  expect(descriptionInput().value).toBe("Notes & follow-up");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe("Notes &amp; follow-up");
+  await open(0);
+  expect(descriptionInput().value).toBe("Notes & follow-up");
+  cancel(); await open(1);
+  expect(descriptionInput().value).toBe("Fish &amp; chips");
+  change(titleInput(), "Second field"); await save();
+  expect(writes()[1].data).toEqual({ title: "Second field" });
+  expect(rows()[1].description).toBe("Fish &amp;amp; chips");
+});
+test("text contract: editing other words keeps escaped brackets and quotes", async () => {
+  const stored = "Fish &amp; chips Use &lt;div&gt; <b>bold</b> say &quot;hi&quot; end";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("Fish & chips Use <div> <b>bold</b> say \"hi\" end");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe(stored);
+  await open();
+  change(descriptionInput(), "Fish & chips today Use <div> <b>bold</b> say \"hi\" fin"); await save();
+  expect(writes()[1].data).toEqual({
+    description: "Fish & chips today Use &lt;div&gt; <b>bold</b> say &quot;hi&quot; fin",
+  });
+});
+test("text contract: long edits on both ends keep an escaped code sample", async () => {
+  const gap = "x".repeat(1001);
+  const stored = "A&lt;div&gt;" + gap + "Z";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("A<div>" + gap + "Z");
+  change(descriptionInput(), "B<div>" + gap + "Y"); await save();
+  expect(writes()[0].data).toEqual({ description: "B&lt;div&gt;" + gap + "Y" });
+});
+test("text contract: a new tag does not steal a code sample's stored spelling", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <b><div> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use <b>&lt;div&gt; end" });
+});
+test("text contract: editing inside a code sample keeps its brackets escaped", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <span> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use &lt;span&gt; end" });
+});
+test("text contract: a word beside an escaped sample does not escape a real tag", async () => {
+  const stored = "Use &lt;div&gt; please <p>Keep</p> <b>me</b>";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("Use <div> please <p>Keep</p> <b>me</b>");
+  change(descriptionInput(), "Use <div> now <p>Keep</p> <b>me</b>"); await save();
+  const sent = writes()[0].data?.description as string;
+  const saved = savedBySanitizer(sent);
+  expect(saved).toContain("&lt;div&gt;");
+  expect(saved).toContain("<p>Keep</p>");
+  expect(saved).toContain("<b>me</b>");
+  expect(saved).not.toContain("Keepme");
+});
+test("text contract: editing a sample beside a real tag keeps both", async () => {
+  await mount({ description: "Use &lt;div&gt; <b>end</b>" }); await open();
+  change(descriptionInput(), "Use <span> <b>end</b>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;span&gt;");
+  expect(saved).toContain("<b>end</b>");
+  expect(saved).not.toBe("Use end");
+});
+test("text contract: editing a sample beside a paragraph keeps the paragraph", async () => {
+  const stored = "Prefer &lt;div&gt; for layout <p>Keep this whole paragraph.</p>";
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), "Prefer <span> for layout <p>Keep this whole paragraph.</p>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;span&gt;");
+  expect(saved).toContain("<p>Keep this whole paragraph.</p>");
+});
+test("text contract: a second div with a different tail stays a sample", async () => {
+  await mount({ description: "Prefer &lt;div&gt; for layout" }); await open();
+  change(descriptionInput(), "Prefer <div> for layout and <div> in the footer"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("Prefer &lt;div&gt; for layout");
+  expect(saved).toContain("&lt;div&gt; in the footer");
+});
+test("text contract: a shared b prefix does not escape the real tag", async () => {
+  await mount({ description: "Try &lt;b&gt;one <b>two</b>" }); await open();
+  change(descriptionInput(), "Try <b>1 <b>two</b>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;b&gt;1");
+  expect(saved).toContain("<b>two</b>");
+});
+test("text contract: inserting 256 characters and editing a word keeps the sample", async () => {
+  const stored = "See &lt;b&gt;sample&lt;/b&gt; please <p>Keep</p>";
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), "x".repeat(256) + "See <b>sample</b> now <p>Keep</p>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toBe("x".repeat(256) + "See &lt;b&gt;sample&lt;/b&gt; now <p>Keep</p>");
+});
+test("text contract: inserting 257 characters and editing a word keeps the sample", async () => {
+  const stored = "See &lt;b&gt;sample&lt;/b&gt; please <p>Keep</p>";
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), "x".repeat(257) + "See <b>sample</b> now <p>Keep</p>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toBe("x".repeat(257) + "See &lt;b&gt;sample&lt;/b&gt; now <p>Keep</p>");
+});
+test("text contract: inserting 300 characters and editing a word keeps the sample escaped", async () => {
+  const stored = "See &lt;b&gt;sample&lt;/b&gt; please <p>Keep</p>";
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), "x".repeat(300) + "See <b>sample</b> now <p>Keep</p>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toBe("x".repeat(300) + "See &lt;b&gt;sample&lt;/b&gt; now <p>Keep</p>");
+});
+test("text contract: deleting a sample does not escape a real paragraph", async () => {
+  const stored = "a".repeat(80) + "&lt;b&gt;sample&lt;/b&gt;<p>keep</p>" + "c".repeat(300);
+  await mount({ description: stored }); await open();
+  const edited = "b".repeat(80) + "<p>keep</p>" + "d".repeat(300);
+  change(descriptionInput(), edited); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toBe(edited);
+  expect(saved).toContain("<p>keep</p>");
+  expect(saved).not.toContain("&lt;p&gt;");
+});
+test("text contract: a moved copy of an allow-listed sample stays escaped", async () => {
+  await mount({ description: "Q&lt;b&gt;sample&lt;/b&gt;END" }); await open();
+  change(descriptionInput(), "b".repeat(400) + "<b>sample</b>FIN"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toBe("b".repeat(400) + "&lt;b&gt;sample&lt;/b&gt;FIN");
+});
+test("text contract: inserting before an escaped closing tag keeps the sample", async () => {
+  const stored = "A &lt;b&gt;sample&lt;/b&gt;";
+  await mount({ description: stored }); await open();
+  const edited = "A <b>sample" + "x".repeat(300) + "</b>";
+  change(descriptionInput(), edited); await save();
+  const sent = writes()[0].data?.description as string;
+  const saved = savedBySanitizer(sent);
+  expect(sent).toContain("&lt;b&gt;sample");
+  expect(sent).toContain("&lt;/b&gt;");
+  expect(saved).toContain("&lt;/b&gt;");
+  expect(saved).not.toContain("<b>");
+});
+test("text contract: a large replacement keeps a new bold tag as markup", async () => {
+  await mount({ description: "&lt;b&gt;sample&lt;/b&gt;" }); await open();
+  change(descriptionInput(), "x".repeat(300) + "<b>new</b>"); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("<b>new</b>");
+  expect(saved).not.toContain("&lt;b&gt;");
+});
+test("text contract: a large edit keeps an escaped bold sample literal", async () => {
+  const stored = "A &lt;b&gt;" + "a".repeat(300) + "&lt;/b&gt; Z";
+  await mount({ description: stored }); await open();
+  const edited = "B <b>" + "b".repeat(300) + "</b> Y";
+  change(descriptionInput(), edited); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain("&lt;b&gt;");
+  expect(saved).toContain("&lt;/b&gt;");
+  expect(saved).toContain("b".repeat(300));
+  expect(saved).not.toContain("<b>");
+});
+test("text contract: a shared 32 character prefix does not escape the real tag", async () => {
+  const hello = "Hello world this is plenty of matching text";
+  const stored = `&lt;b&gt;${hello} <b>${hello}</b>`;
+  await mount({ description: stored }); await open();
+  change(descriptionInput(), `Note <b>${hello} <b>${hello}</b>`); await save();
+  const saved = savedBySanitizer(writes()[0].data?.description as string);
+  expect(saved).toContain(`&lt;b&gt;${hello}`);
+  expect(saved).toContain(`<b>${hello}</b>`);
+});
+test("text contract: a long insertion before a code sample keeps its spelling", async () => {
+  const inserted = "n".repeat(4001);
+  await mount({ description: "Keep &lt;div&gt; tail" }); await open();
+  change(descriptionInput(), inserted + "Keep <div> tail"); await save();
+  expect(writes()[0].data).toEqual({ description: inserted + "Keep &lt;div&gt; tail" });
+});
+test("text contract: a duplicated code sample keeps both copies escaped", async () => {
+  await mount({ description: "Use &lt;div&gt; end" }); await open();
+  change(descriptionInput(), "Use <div> endUse <div> end"); await save();
+  expect(writes()[0].data).toEqual({ description: "Use &lt;div&gt; endUse &lt;div&gt; end" });
+});
+test("text contract: many escaped samples do not escape real formatting tags", async () => {
+  const items = Array.from({ length: 251 }, () => "&lt;item&gt;").join(" ");
+  const stored = "<p>Intro " + items + " end</p>";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value.startsWith("<p>Intro ")).toBe(true);
+  expect(descriptionInput().value.endsWith(" end</p>")).toBe(true);
+  change(descriptionInput(), descriptionInput().value.replace("Intro", "Opening")); await save();
+  const sent = writes()[0].data?.description as string;
+  expect(sent.startsWith("<p>Opening ")).toBe(true);
+  expect(sent.endsWith(" end</p>")).toBe(true);
+  expect(sent).toContain("&lt;item&gt;");
+  expect(sent).not.toContain("<item>");
+});
+test("text contract: replacing a long description without entities sends the new text", async () => {
+  await mount({ description: "a".repeat(5000) }); await open();
+  const next = "b".repeat(5000);
+  change(descriptionInput(), next); await save();
+  expect(writes()[0].data).toEqual({ description: next });
+});
+test("text contract: description display decodes sanitizer entities once without parsing tags", async () => {
+  const stored = "A &lt; B &gt; C &quot;q&quot; it's &amp;lt; <b>keep</b>\u0000";
+  await mount({ description: stored }); await open();
+  expect(descriptionInput().value).toBe("A < B > C \"q\" it's &lt; <b>keep</b>\u0000");
+  change(titleInput(), "Other field"); await save();
+  expect(writes()[0].data).toEqual({ title: "Other field" });
+  expect(rows()[0].description).toBe(stored);
 });
 test("text contract: allowed markup entities tabs Unicode and newlines stay verbatim", async () => {
   const allowed = "<p>Résumé &amp; &lt;copy&gt;\tΩ\nnext line</p>"; await mount(); createFields(allowed); await createSave();

@@ -60,10 +60,300 @@ interface TemplateEdit {
   generation: number;
   initial: TemplateFormData;
   values: TemplateFormData;
+  descriptionPieces: string[];
 }
 
 function sameOrderedIds(left: string[], right: string[]) {
   return left.length === right.length && left.every((id, i) => id === right[i]);
+}
+
+// One pass over the entities sanitize-html writes. Apostrophes are stored as
+// characters. pieces[i] is the stored spelling of text[i]. Not an HTML parse:
+// tags and NULs stay. A second pass would decode &amp;amp; again.
+function decodeTemplateDescription(value: string): { text: string; pieces: string[] } {
+  const pieces: string[] = [];
+  let text = "";
+  const entities = /&(?:amp|lt|gt|quot);/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = entities.exec(value)) !== null) {
+    for (let i = last; i < match.index; i++) {
+      pieces.push(value[i]);
+      text += value[i];
+    }
+    const entity = match[0];
+    pieces.push(entity);
+    text += entity === "&amp;" ? "&" : entity === "&lt;" ? "<" : entity === "&gt;" ? ">" : "\"";
+    last = match.index + entity.length;
+  }
+  for (let i = last; i < value.length; i++) {
+    pieces.push(value[i]);
+    text += value[i];
+  }
+  return { text, pieces };
+}
+
+// Same allow-list as sanitizeDescription. Used only to keep a pasted sample such
+// as <div> when it is new text. Real stored tags are not rewritten here.
+const ALLOWED_TEMPLATE_TAGS = new Set([
+  "b", "i", "em", "strong", "p", "br", "ul", "ol", "li", "a",
+  "h1", "h2", "h3", "blockquote", "code", "pre",
+]);
+
+function tagNameAt(text: string, lt: number): string {
+  let i = lt + 1;
+  if (text[i] === "/") i++;
+  let name = "";
+  while (i < text.length) {
+    const c = text[i];
+    const letter = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9");
+    if (!letter) break;
+    name += c;
+    i++;
+  }
+  return name.toLowerCase();
+}
+
+function unclosedOpenTag(text: string, index: number): number {
+  for (let k = index - 1; k >= 0; k--) {
+    if (text[k] === ">") return -1;
+    if (text[k] === "<") return k;
+  }
+  return -1;
+}
+
+function tagNameEndingAt(text: string, gt: number): string {
+  for (let k = gt - 1; k >= 0; k--) {
+    if (text[k] === ">") return "";
+    if (text[k] === "<") return tagNameAt(text, k);
+  }
+  return "";
+}
+
+// Stop a shared prefix or suffix on a bracket whose tag name changed, so an
+// entity bracket is not glued onto a different tag that only shares "<" or "> ".
+function tagAwarePrefix(before: string, after: string): number {
+  let i = 0;
+  const n = Math.min(before.length, after.length);
+  while (i < n && before[i] === after[i]) i++;
+  const lt = unclosedOpenTag(before, i);
+  if (lt >= 0 && tagNameAt(before, lt) !== tagNameAt(after, lt)) return lt;
+  return i;
+}
+
+function tagAwareSuffix(before: string, after: string, prefix: number): number {
+  const max = Math.min(before.length - prefix, after.length - prefix);
+  let suffix = 0;
+  while (suffix < max && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
+  if (suffix === 0) return 0;
+  const beforeAt = before.length - suffix;
+  const afterAt = after.length - suffix;
+  // A shared "</b>" is a different tag when the text before it was replaced.
+  // A pure insertion or deletion before that tag keeps the stored closing sample.
+  // An opening tag such as "<div>" stays in the suffix.
+  if (before[beforeAt] === "<" && before[beforeAt + 1] === "/" && after[afterAt] === "<" && after[afterAt + 1] === "/") {
+    const oldBefore = before.slice(0, beforeAt);
+    const newBefore = after.slice(0, afterAt);
+    const pureEdit = oldBefore.startsWith(newBefore) || newBefore.startsWith(oldBefore);
+    if (!pureEdit) {
+      const gt = before.indexOf(">", beforeAt);
+      if (gt >= 0) {
+        const drop = gt - beforeAt + 1;
+        if (drop <= suffix) suffix -= drop;
+      }
+    }
+  }
+  if (suffix === 0) return 0;
+  const beforeGt = before.length - suffix;
+  if (before[beforeGt] === ">" && after[after.length - suffix] === ">") {
+    if (tagNameEndingAt(before, beforeGt) !== tagNameEndingAt(after, after.length - suffix)) return suffix - 1;
+  }
+  return suffix;
+}
+
+function escapeDisallowedTags(text: string): string {
+  return text.replace(/<\/?([A-Za-z][A-Za-z0-9]*)\b[^<>]*>/g, (whole, name: string) => {
+    if (ALLOWED_TEMPLATE_TAGS.has(name.toLowerCase())) return whole;
+    return whole.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  });
+}
+
+// An entity bracket matched hundreds of characters away is a different tag, not
+// the stored sample. A new <b> after a long replacement must stay markup.
+const MAX_ENTITY_DRIFT = 256;
+
+function entityPiece(piece: string): boolean {
+  return piece === "&lt;" || piece === "&gt;" || piece === "&quot;";
+}
+
+function pieceChar(piece: string): string {
+  return piece === "&amp;" ? "&" : piece;
+}
+
+type MidTag = { start: number; gt: number; name: string; closing: boolean };
+
+function tagsOf(text: string): MidTag[] {
+  const tags: MidTag[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "<") continue;
+    const gt = text.indexOf(">", i + 1);
+    if (gt < 0) break;
+    const nested = text.indexOf("<", i + 1);
+    if (nested !== -1 && nested < gt) continue;
+    const name = tagNameAt(text, i);
+    if (!name) continue;
+    tags.push({ start: i, gt, name, closing: text[i + 1] === "/" });
+    i = gt;
+  }
+  return tags;
+}
+
+function tagIsEntity(pieces: string[], prefix: number, tag: MidTag): boolean {
+  return entityPiece(pieces[prefix + tag.start]) && entityPiece(pieces[prefix + tag.gt]);
+}
+
+// Past the distance cap, an intact sample keeps its own brackets wherever it
+// moved. A deleted sample must not mark a different tag, and a real tag that
+// stayed put keeps the spelling it was stored with.
+function preserveNearbyEntities(beforeMid: string, afterMid: string, pieces: string[], prefix: number): string {
+  const marks = new Map<number, string>();
+  const taken: Array<[number, number]> = [];
+  const blocked = (at: number, len: number) => taken.some(([start, end]) => at < end && start < at + len);
+  const beforeTags = tagsOf(beforeMid);
+  for (const tag of beforeTags) {
+    const text = beforeMid.slice(tag.start, tag.gt + 1);
+    if (!afterMid.startsWith(text, tag.start)) continue;
+    if (!tagIsEntity(pieces, prefix, tag)) {
+      taken.push([tag.start, tag.gt + 1]);
+      continue;
+    }
+    marks.set(tag.start, pieces[prefix + tag.start]);
+    marks.set(tag.gt, pieces[prefix + tag.gt]);
+  }
+  const used = new Set<number>();
+  for (let t = 0; t < beforeTags.length; t++) {
+    if (used.has(t)) continue;
+    const tag = beforeTags[t];
+    if (tag.closing || !tagIsEntity(pieces, prefix, tag)) continue;
+    let close = -1;
+    for (let j = t + 1; j < beforeTags.length; j++) {
+      if (beforeTags[j].name !== tag.name || !beforeTags[j].closing) continue;
+      if (tagIsEntity(pieces, prefix, beforeTags[j])) close = j;
+      break;
+    }
+    const end = close >= 0 ? beforeTags[close].gt : tag.gt;
+    if (close >= 0) used.add(close);
+    else if (ALLOWED_TEMPLATE_TAGS.has(tag.name)) continue;
+    const sample = beforeMid.slice(tag.start, end + 1);
+    let from = 0;
+    while (from < afterMid.length) {
+      const at = afterMid.indexOf(sample, from);
+      if (at < 0) break;
+      from = at + 1;
+      if (blocked(at, sample.length)) continue;
+      for (let k = tag.start; k <= end; k++) {
+        if ((beforeMid[k] === "<" || beforeMid[k] === ">") && entityPiece(pieces[prefix + k])) {
+          marks.set(at + (k - tag.start), pieces[prefix + k]);
+        }
+      }
+      taken.push([at, at + sample.length]);
+      break;
+    }
+  }
+  const limit = Math.min(beforeMid.length, afterMid.length);
+  for (let i = 0; i < limit; i++) {
+    if (beforeMid[i] !== "\"" || afterMid[i] !== "\"") continue;
+    const piece = pieces[prefix + i];
+    if (piece === "&quot;") marks.set(i, piece);
+  }
+  let text = "";
+  for (let i = 0; i < afterMid.length; i++) text += marks.get(i) ?? afterMid[i];
+  return escapeDisallowedTags(text);
+}
+
+// Order-preserving edit script for the middle. The frontier is O(edit distance),
+// not O(description length): a long note must not retain a copy of both strings
+// at every depth. Null when the edit is too large to trace.
+function equalCharPairs(before: string, after: string): Array<[number, number]> | null {
+  const n = before.length;
+  const m = after.length;
+  if (n === 0 || m === 0) return [];
+  const cap = 256;
+  const off = cap + 1;
+  const width = 2 * cap + 3;
+  let v = new Int32Array(width);
+  v[off + 1] = 0;
+  const trace: Int32Array[] = [];
+  let found = -1;
+  for (let d = 0; d <= cap; d++) {
+    trace.push(v.slice());
+    const next = new Int32Array(width);
+    let done = false;
+    for (let k = -d; k <= d; k += 2) {
+      let x: number;
+      if (k === -d || (k !== d && v[off + k - 1] < v[off + k + 1])) x = v[off + k + 1];
+      else x = v[off + k - 1] + 1;
+      let y = x - k;
+      while (x < n && y < m && before[x] === after[y]) { x++; y++; }
+      next[off + k] = x;
+      if (x >= n && y >= m) { found = d; done = true; break; }
+    }
+    v = next;
+    if (done) break;
+  }
+  if (found < 0) return null;
+  const pairs: Array<[number, number]> = [];
+  let x = n;
+  let y = m;
+  for (let d = found; d > 0; d--) {
+    const snap = trace[d];
+    const k = x - y;
+    const prevK = k === -d || (k !== d && snap[off + k - 1] < snap[off + k + 1]) ? k + 1 : k - 1;
+    const prevX = snap[off + prevK];
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) { x--; y--; pairs.push([x, y]); }
+    x = prevX;
+    y = prevY;
+  }
+  while (x > 0 && y > 0 && before[x - 1] === after[y - 1]) { x--; y--; pairs.push([x, y]); }
+  pairs.reverse();
+  return pairs;
+}
+
+// Runs only when a changed description is submitted, not while the editor renders.
+// Equal characters keep the stored spelling of &lt; &gt; and &quot;. A visible &
+// is sent as &. New disallowed tags are escaped so a pasted sample is not deleted.
+// A real allow-listed tag is left as markup.
+function descriptionForEdit(pieces: string[], decoded: string, edited: string): string {
+  if (pieces.length !== decoded.length || edited === decoded) return edited;
+  let anchors = 0;
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i];
+    if (piece === "&lt;" || piece === "&gt;" || piece === "&quot;") anchors++;
+  }
+  if (anchors === 0) return edited;
+  const prefix = tagAwarePrefix(decoded, edited);
+  const suffix = tagAwareSuffix(decoded, edited, prefix);
+  let out = "";
+  for (let i = 0; i < prefix; i++) out += pieceChar(pieces[i]);
+  const beforeMid = decoded.slice(prefix, decoded.length - suffix);
+  const afterMid = edited.slice(prefix, edited.length - suffix);
+  const pairs = equalCharPairs(beforeMid, afterMid);
+  if (pairs === null) {
+    out += preserveNearbyEntities(beforeMid, afterMid, pieces, prefix);
+  } else {
+    let cursor = 0;
+    for (const [a, b] of pairs) {
+      const piece = pieces[prefix + a];
+      if (entityPiece(piece) && Math.abs(a - b) > MAX_ENTITY_DRIFT) continue;
+      if (b > cursor) out += escapeDisallowedTags(afterMid.slice(cursor, b));
+      out += pieceChar(piece);
+      cursor = b + 1;
+    }
+    if (cursor < afterMid.length) out += escapeDisallowedTags(afterMid.slice(cursor));
+  }
+  for (let i = decoded.length - suffix; i < decoded.length; i++) out += pieceChar(pieces[i]);
+  return out;
 }
 
 /** Compare the raw edit snapshot before applying the existing encodings. */
@@ -71,6 +361,8 @@ function templateChanges(form: TemplateFormData, initial: TemplateFormData): Upd
   const changes: UpdateTemplateInput = {};
   if (form.name !== initial.name) changes.name = form.name.trim();
   if (form.title !== initial.title) changes.title = form.title.trim();
+  // Equality is the one-pass display decode, so an unedited legacy entity
+  // string is omitted. The stored spelling is applied at submit, not here.
   if (form.description !== initial.description)
     changes.description = stripDisallowedControlCharacters(form.description) || null;
   if (form.priority !== initial.priority) changes.priority = form.priority;
@@ -335,17 +627,21 @@ function TemplateForm({
   );
 }
 
-function templateToForm(t: TaskTemplate): TemplateFormData {
+function templateToForm(t: TaskTemplate): { form: TemplateFormData; descriptionPieces: string[] } {
+  const description = decodeTemplateDescription(t.description ?? "");
   return {
-    name: t.name,
-    title: t.title,
-    description: t.description ?? "",
-    priority: t.priority,
-    statusId: t.statusId ?? "",
-    dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",
-    assigneeIds: t.assigneeIds,
-    labelIds: t.labelIds,
-    subtasks: t.subtasks,
+    descriptionPieces: description.pieces,
+    form: {
+      name: t.name,
+      title: t.title,
+      description: description.text,
+      priority: t.priority,
+      statusId: t.statusId ?? "",
+      dueOffset: t.dueOffset !== null ? String(t.dueOffset) : "",
+      assigneeIds: t.assigneeIds,
+      labelIds: t.labelIds,
+      subtasks: t.subtasks,
+    },
   };
 }
 
@@ -416,8 +712,14 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
       edit.projectId !== currentProject.current || edit.generation !== identityGeneration() ||
       Object.keys(editChanges).length === 0 || invalidChangedName || invalidChangedTitle
     ) return;
+    const changes = { ...editChanges };
+    if (changes.description !== undefined) {
+      changes.description = stripDisallowedControlCharacters(
+        descriptionForEdit(edit.descriptionPieces, edit.initial.description, edit.values.description),
+      ) || null;
+    }
     updateTemplate.mutate(
-      { id: edit.id, ...editChanges },
+      { id: edit.id, ...changes },
       {
         onSuccess: () => {
           // Keep the existing close-on-success policy, including pending edits.
@@ -492,8 +794,15 @@ export function TemplateManager({ projectId }: TemplateManagerProps) {
                       projectId !== currentProject.current || t.projectId !== projectId ||
                       generation !== identityGeneration()
                     ) return;
-                    const initial = templateToForm(t);
-                    setEdit({ id: t.id, projectId, generation, initial, values: initial });
+                    const loaded = templateToForm(t);
+                    setEdit({
+                      id: t.id,
+                      projectId,
+                      generation,
+                      initial: loaded.form,
+                      values: loaded.form,
+                      descriptionPieces: loaded.descriptionPieces,
+                    });
                   }}
                   className="text-muted-foreground hover:text-foreground shrink-0"
                 >

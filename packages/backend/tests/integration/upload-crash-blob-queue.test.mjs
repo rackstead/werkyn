@@ -11,7 +11,7 @@ if (!process.env.TEST_DATABASE_URL) {
 }
 const testURL = new URL(process.env.TEST_DATABASE_URL);
 const testDatabase = decodeURIComponent(testURL.pathname.slice(1));
-assert.equal(testDatabase.startsWith("werkyn_audit_"), true, testDatabase);
+assert.equal(testDatabase === "werkyn_ci" || testDatabase.startsWith("werkyn_audit_"), true, testDatabase);
 assert.equal(["127.0.0.1", "localhost", "[::1]"].includes(testURL.hostname), true);
 const storageDir = await mkdtemp(path.join(os.tmpdir(), "werkyn-upload-crash-"));
 Object.assign(process.env, {

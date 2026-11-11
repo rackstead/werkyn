@@ -148,13 +148,14 @@ function tagAwareSuffix(before: string, after: string, prefix: number): number {
   if (suffix === 0) return 0;
   const beforeAt = before.length - suffix;
   const afterAt = after.length - suffix;
-  // A shared "</b>" at the end is not the same tag when the text before it differs.
-  // An opening tag such as "<div>" stays in the suffix: a new tag typed in front
-  // of a sample must not take the sample's stored spelling.
+  // A shared "</b>" is a different tag when the text before it was replaced.
+  // A pure insertion or deletion before that tag keeps the stored closing sample.
+  // An opening tag such as "<div>" stays in the suffix.
   if (before[beforeAt] === "<" && before[beforeAt + 1] === "/" && after[afterAt] === "<" && after[afterAt + 1] === "/") {
-    const prevBefore = beforeAt > 0 ? before[beforeAt - 1] : "";
-    const prevAfter = afterAt > 0 ? after[afterAt - 1] : "";
-    if (prevBefore !== prevAfter) {
+    const oldBefore = before.slice(0, beforeAt);
+    const newBefore = after.slice(0, afterAt);
+    const pureEdit = oldBefore.startsWith(newBefore) || newBefore.startsWith(oldBefore);
+    if (!pureEdit) {
       const gt = before.indexOf(">", beforeAt);
       if (gt >= 0) {
         const drop = gt - beforeAt + 1;

@@ -458,6 +458,18 @@ test("text contract: a shared b prefix does not escape the real tag", async () =
   expect(saved).toContain("&lt;b&gt;1");
   expect(saved).toContain("<b>two</b>");
 });
+test("text contract: inserting before an escaped closing tag keeps the sample", async () => {
+  const stored = "A &lt;b&gt;sample&lt;/b&gt;";
+  await mount({ description: stored }); await open();
+  const edited = "A <b>sample" + "x".repeat(300) + "</b>";
+  change(descriptionInput(), edited); await save();
+  const sent = writes()[0].data?.description as string;
+  const saved = savedBySanitizer(sent);
+  expect(sent).toContain("&lt;b&gt;sample");
+  expect(sent).toContain("&lt;/b&gt;");
+  expect(saved).toContain("&lt;/b&gt;");
+  expect(saved).not.toContain("<b>");
+});
 test("text contract: a large replacement keeps a new bold tag as markup", async () => {
   await mount({ description: "&lt;b&gt;sample&lt;/b&gt;" }); await open();
   change(descriptionInput(), "x".repeat(300) + "<b>new</b>"); await save();

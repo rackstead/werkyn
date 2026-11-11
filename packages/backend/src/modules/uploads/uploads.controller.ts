@@ -1,3 +1,4 @@
+import type { PrismaClient } from "@prisma/client";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -8,6 +9,8 @@ import {
   ValidationError,
 } from "../../utils/errors.js";
 import { env } from "../../config/env.js";
+import { logger } from "../../utils/logger.js";
+import type { StorageProvider } from "../../services/storage.js";
 import {
   receiveUpload,
   UploadTooLargeError,
@@ -24,6 +27,10 @@ const ALLOWED_AVATAR_TYPES = [
 const SAFE_ID = /^[A-Za-z0-9_-]{1,100}$/;
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const WIKI_MAX_BYTES = 25 * 1024 * 1024;
+// Same one-hour grace as a staged Drive copy. A page or version save that
+// names the URL consumes the row. The sweeper may delete the bytes only
+// after the grace, and only if nothing saved them.
+const WIKI_UPLOAD_GRACE_SECONDS = 60 * 60;
 
 export async function uploadHandler(
   request: FastifyRequest,
@@ -125,17 +132,74 @@ async function storeUpload(
     );
   } else {
     // Wiki media is streamed to storage; a failed or refused upload removes
-    // its partial file.
-    ({ storagePath } = await request.server.storage.saveStream(
+    // its partial file. The queue row is inserted before any byte is written,
+    // on the same path saveStream will return. A caught failure drops that
+    // row only when the partial is already gone. A crash after the write
+    // leaves the row, and the sweeper deletes the bytes once the grace ends.
+    const ext = path.extname(upload.filename) || ".bin";
+    const plannedPath = path.join(
       `${workspaceId}/uploads`,
       scopeId,
-      fileId,
-      path.extname(upload.filename) || ".bin",
-      upload.stream,
-    ));
+      `${fileId}${ext}`,
+    );
+    let staged = false;
+    try {
+      const inserted = await request.server.prisma.$executeRaw`
+        INSERT INTO "BlobCleanup" ("storagePath", "availableAt")
+        VALUES (
+          ${plannedPath},
+          CURRENT_TIMESTAMP + ${WIKI_UPLOAD_GRACE_SECONDS}::integer * interval '1 second'
+        )`;
+      if (inserted !== 1) {
+        throw new ValidationError("Wiki upload could not be stored");
+      }
+      staged = true;
+      const saved = await request.server.storage.saveStream(
+        `${workspaceId}/uploads`,
+        scopeId,
+        fileId,
+        ext,
+        upload.stream,
+      );
+      if (saved.storagePath !== plannedPath) {
+        throw new ValidationError("Wiki upload could not be stored");
+      }
+      staged = false;
+      storagePath = saved.storagePath;
+    } catch (error) {
+      if (staged) {
+        await releaseAbandonedWikiUpload(
+          request.server.prisma,
+          request.server.storage,
+          plannedPath,
+        );
+      }
+      throw error;
+    }
   }
 
   const url = `/storage/${storagePath}`;
 
   return reply.status(201).send({ data: { url } });
+}
+
+// The request does not delete bytes. saveStream already removed a partial
+// it could not finish; this only drops the grace row for a path that is gone.
+async function releaseAbandonedWikiUpload(
+  prisma: PrismaClient,
+  storage: Pick<StorageProvider, "exists">,
+  plannedPath: string,
+) {
+  try {
+    if (await storage.exists(plannedPath)) return;
+    await prisma.$executeRaw`
+      DELETE FROM "BlobCleanup"
+      WHERE "storagePath" = ${plannedPath} AND "attempts" = 0
+    `;
+  } catch (error) {
+    logger.error(
+      { err: error, storagePath: plannedPath },
+      "Could not release an abandoned wiki upload; its grace row remains",
+    );
+  }
 }

@@ -5,6 +5,7 @@ import {
   avatarStoragePath,
   canonicalAvatarUrl,
 } from "../modules/uploads/avatar-storage-path.js";
+import { wikiStoragePath } from "../modules/uploads/wiki-storage-path.js";
 import type { StorageProvider } from "./storage.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -33,7 +34,10 @@ import {
  * - an uploaded avatar path still named by User.avatarUrl is kept the same
  *   way. The sweep holds that path's BlobCleanup row across the reference
  *   check and the delete. A profile save that adopts the path locks the same
- *   row first, so it either keeps the bytes or learns they are already gone.
+ *   row first, so it either keeps the bytes or learns they are already gone;
+ * - a wiki upload path still named by WikiPageMedia or WikiVersionMedia is
+ *   kept the same way. Those rows are the page and version bodies, with only
+ *   the "/storage" prefix folded, and the lookup is their primary key.
  */
 
 const BATCH_SIZE = 100;
@@ -153,6 +157,78 @@ async function cleanupQueuedAvatar(
   }
 }
 
+// A page or version save locks this same row (the trigger's queue write)
+// across its reference change. Hold it from the check through the delete.
+async function cleanupQueuedWiki(
+  prisma: PrismaClient,
+  storage: StorageProvider,
+  claim: { storagePath: string; attempts: number; availableAt: Date },
+): Promise<AvatarCleanupOutcome> {
+  const { storagePath, attempts, availableAt } = claim;
+  const leaseTimestamp = availableAt.toISOString();
+  const delay = Math.min(
+    BASE_BACKOFF_SECONDS * 2 ** Math.min(attempts - 1, 16),
+    MAX_BACKOFF_SECONDS,
+  );
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('lock_timeout', '8000ms', true)`;
+      const locked = await tx.$queryRaw<Array<{ storagePath: string }>>`
+        SELECT "storagePath" FROM "BlobCleanup"
+        WHERE "storagePath" = ${storagePath}
+          AND "attempts" = ${attempts}
+          AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        FOR UPDATE
+      `;
+      if (locked.length !== 1) return "skipped";
+      // Index lookup on WikiPageMedia / WikiVersionMedia, not a scan of
+      // page bodies. The path after the "/storage" prefix matches exactly.
+      const [holder] = await tx.$queryRaw<Array<{ present: boolean }>>`
+        SELECT wiki_media_still_referenced(${storagePath}) AS present
+      `;
+      if (holder?.present) {
+        await tx.$executeRaw`
+          UPDATE "BlobCleanup"
+          SET "lastError" = ${"Still referenced by wiki content"},
+            "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
+          WHERE "storagePath" = ${storagePath}
+            AND "attempts" = ${attempts}
+            AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        `;
+        return "retained";
+      }
+      try {
+        await storage.delete(storagePath);
+      } catch (error) {
+        const message = errorMessage(error).slice(0, 1000);
+        await tx.$executeRaw`
+          UPDATE "BlobCleanup"
+          SET "lastError" = ${message},
+            "availableAt" = CURRENT_TIMESTAMP + ${delay}::integer * interval '1 second'
+          WHERE "storagePath" = ${storagePath}
+            AND "attempts" = ${attempts}
+            AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+        `;
+        return "failed";
+      }
+      await tx.$executeRaw`
+        DELETE FROM "BlobCleanup"
+        WHERE "storagePath" = ${storagePath}
+          AND "attempts" = ${attempts}
+          AND "availableAt" = ${leaseTimestamp}::text::timestamptz(3)
+      `;
+      return "deleted";
+    }, {
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      maxWait: 5_000,
+      timeout: 20_000,
+    });
+  } catch (error) {
+    if (isLockTimeoutError(error) || isRetryableDatabaseError(error)) return "failed";
+    throw error;
+  }
+}
+
 /**
  * Processes one batch of due cleanup rows (optionally only the given paths).
  * Never deletes a row whose blob deletion failed.
@@ -214,6 +290,11 @@ export async function processBlobCleanup(
       (storagePath) => avatarStoragePath(`/storage/${storagePath}`) === storagePath,
     ),
   );
+  const wikiPaths = new Set(
+    paths.filter(
+      (storagePath) => wikiStoragePath(`/storage/${storagePath}`) === storagePath,
+    ),
+  );
 
   const retry = async (storagePath: string, attempts: number, availableAt: Date, reason: string) => {
     const delay = Math.min(
@@ -252,6 +333,25 @@ export async function processBlobCleanup(
           log.warn(
             { storagePath, attempts },
             "Queued stored blob is still referenced by a live avatar; kept",
+          );
+        } else if (outcome === "deleted") {
+          result.deleted++;
+        } else if (outcome === "failed") {
+          result.failed++;
+          log.warn(
+            { storagePath, attempts },
+            "Stored blob cleanup failed; it will be retried",
+          );
+        }
+        continue;
+      }
+      if (wikiPaths.has(storagePath)) {
+        const outcome = await cleanupQueuedWiki(prisma, storage, claim);
+        if (outcome === "retained") {
+          result.retained++;
+          log.warn(
+            { storagePath, attempts },
+            "Queued stored blob is still referenced by wiki content; kept",
           );
         } else if (outcome === "deleted") {
           result.deleted++;

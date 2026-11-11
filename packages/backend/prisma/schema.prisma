@@ -9,7 +9,8 @@ datasource db {
 
 // Rules the schema language cannot express are added by migrations: CHECK
 // constraints, the same-project triggers on TaskLabel, CustomFieldValue and
-// TaskDependency, and deferred time-entry keys (docs/remediation/r35-constraints.md).
+// TaskDependency, deferred time-entry keys (docs/remediation/r35-constraints.md),
+// and the wiki media reference triggers on WikiPage and WikiPageVersion.
 
 // ─── Users & Auth ────────────────────────────────────────
 
@@ -1116,6 +1117,8 @@ model WikiPage {
   lock         WikiPageLock?
   comments     WikiPageComment[]
   share        WikiPageShare?
+  // Paths named by this page. The sweep looks these up by storagePath.
+  mediaRefs    WikiPageMedia[]
 
   @@index([spaceId, parentId, position])
   @@index([parentId])
@@ -1138,8 +1141,32 @@ model WikiPageVersion {
 
   page      WikiPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
   createdBy User     @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  mediaRefs WikiVersionMedia[]
 
   @@index([pageId, createdAt])
+}
+
+// Wiki upload paths named by one page or one version. A trigger fills these
+// from content; page content itself is not rewritten. The primary key starts
+// with storagePath, so the sweep's existence check is that index and not a
+// scan of every wiki row. Only the "/storage" prefix is case-folded; the
+// rest of the path is stored exactly.
+model WikiPageMedia {
+  storagePath String
+  pageId      String
+  page        WikiPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@id([storagePath, pageId])
+  @@index([pageId])
+}
+
+model WikiVersionMedia {
+  storagePath String
+  versionId   String
+  version     WikiPageVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@id([storagePath, versionId])
+  @@index([versionId])
 }
 
 model WikiPageLock {

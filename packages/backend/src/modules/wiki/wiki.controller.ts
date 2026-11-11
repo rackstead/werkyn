@@ -130,6 +130,7 @@ export async function createPageHandler(
     sid,
     request.user!.id,
     body,
+    request.server.storage,
   );
 
   request.server.broadcastToWorkspace(
@@ -180,6 +181,7 @@ export async function updatePageHandler(
     pgid,
     request.user!.id,
     body,
+    request.server.storage,
   );
 
   request.server.broadcastToWorkspace(
@@ -311,6 +313,7 @@ export async function restoreVersionHandler(
     vid,
     request.user!.id,
     expectedRevision,
+    request.server.storage,
   );
 
   request.server.broadcastToWorkspace(

@@ -7,8 +7,13 @@ import {
   lockPageRow,
   snapshotPage,
 } from "./wiki-page-writes.js";
+import type { StorageProvider } from "../../services/storage.js";
 import { pageWithContentSelect } from "./wiki-pages.service.js";
 import { assertWikiJson } from "./wiki-json.js";
+import {
+  adoptedWikiMedia,
+  assertWikiMediaAvailable,
+} from "./wiki-media-availability.js";
 
 /** Records the page as stored now, numbered after every earlier version. */
 export async function createNamedVersion(
@@ -82,6 +87,7 @@ export async function restoreVersion(
   versionId: string,
   actorId: string,
   expectedRevision: number,
+  storage: Pick<StorageProvider, "exists">,
 ) {
   return prisma.$transaction(async (tx) => {
     const version = await tx.wikiPageVersion.findUnique({
@@ -94,6 +100,15 @@ export async function restoreVersion(
     await assertNotLockedByOther(tx, version.pageId, actorId, current);
     assertRevision(expectedRevision, current);
     assertWikiJson(version.content, "content");
+    const existing = await tx.wikiPage.findUnique({
+      where: { id: version.pageId },
+      select: { content: true },
+    });
+    await assertWikiMediaAvailable(
+      tx,
+      storage,
+      await adoptedWikiMedia(tx, existing?.content, version.content),
+    );
     await snapshotPage(tx, version.pageId, actorId);
 
     return tx.wikiPage.update({

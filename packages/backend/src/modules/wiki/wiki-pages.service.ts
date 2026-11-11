@@ -11,9 +11,15 @@ import {
   NotFoundError,
   ValidationError,
 } from "../../utils/errors.js";
+import type { StorageProvider } from "../../services/storage.js";
 import { batches, graphLimits } from "../../utils/graph-limits.js";
 import { withWorkspaceLock } from "../../utils/workspace-lock.js";
 import { assertWikiJson } from "./wiki-json.js";
+import {
+  adoptedWikiMedia,
+  assertWikiMediaAvailable,
+  wikiMediaPaths,
+} from "./wiki-media-availability.js";
 import {
   PAGE_WRITE_TRANSACTION,
   assertNotLockedByOther,
@@ -198,6 +204,7 @@ export async function createPage(
   spaceId: string,
   actorId: string,
   data: CreateWikiPageInput,
+  storage: Pick<StorageProvider, "exists">,
 ) {
   const content = data.content;
   assertWikiJson(content, "content");
@@ -206,6 +213,11 @@ export async function createPage(
   return withWorkspaceLock(prisma, workspaceId, async (tx) => {
     await assertWikiRole(tx, workspaceId, actorId, ["ADMIN", "MEMBER"]);
     await findSpace(tx, workspaceId, spaceId);
+    await assertWikiMediaAvailable(
+      tx,
+      storage,
+      await wikiMediaPaths(tx, content),
+    );
 
     if (data.parentId) {
       const parent = await tx.wikiPage.findFirst({
@@ -285,6 +297,7 @@ export async function updatePage(
   pageId: string,
   actorId: string,
   data: UpdateWikiPageInput,
+  storage: Pick<StorageProvider, "exists">,
 ) {
   if (!WikiPageRevisionSchema.safeParse(data.expectedRevision).success)
     throw new ValidationError("A valid page revision is required");
@@ -294,6 +307,20 @@ export async function updatePage(
     const current = await lockPageRow(tx, pageId);
     await assertNotLockedByOther(tx, pageId, actorId, current);
     assertRevision(data.expectedRevision, current);
+    // Lock a blob the sweeper may be deleting before this save publishes it.
+    // A miss rolls the transaction back, so the previous body stays and no
+    // WikiPageMedia row is committed for the missing path.
+    if (content !== undefined) {
+      const existing = await tx.wikiPage.findUnique({
+        where: { id: pageId },
+        select: { content: true },
+      });
+      await assertWikiMediaAvailable(
+        tx,
+        storage,
+        await adoptedWikiMedia(tx, existing?.content, content),
+      );
+    }
     await snapshotPage(tx, pageId, actorId, { throttle: true });
 
     const updateData: Prisma.WikiPageUpdateInput = {

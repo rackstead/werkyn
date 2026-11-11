@@ -284,19 +284,42 @@ test("null, unchanged, external, and wiki avatar values are not queued", async (
   assert.equal(wiki.statusCode, 201, wiki.body);
   const wikiUrl = wiki.json().data.url;
   const wikiPath = storagePathFromUrl(wikiUrl);
+  // A wiki upload keeps its own grace row. Using that URL as an avatar must
+  // not pull the grace due, and must still queue the replaced avatar.
+  const grace = await app.prisma.blobCleanup.findUniqueOrThrow({
+    where: { storagePath: wikiPath },
+  });
+  assert.equal(grace.attempts, 0);
+  assert.ok(grace.availableAt.getTime() > Date.now() + 30 * 60 * 1000);
   const asAvatar = await patchProfile(token, { avatarUrl: wikiUrl });
   assert.equal(asAvatar.statusCode, 200, asAvatar.body);
   assert.deepEqual(
-    (await cleanupRows([avatar.path, wikiPath])).map((row) => row.storagePath),
-    [avatar.path],
+    (await cleanupRows([avatar.path, wikiPath])).map((row) => row.storagePath).sort(),
+    [avatar.path, wikiPath].sort(),
+  );
+  const wikiAfterAvatar = await app.prisma.blobCleanup.findUniqueOrThrow({
+    where: { storagePath: wikiPath },
+  });
+  assert.equal(wikiAfterAvatar.attempts, 0);
+  assert.ok(
+    wikiAfterAvatar.availableAt.getTime() > Date.now() + 30 * 60 * 1000,
+    "a wiki upload used as an avatar is not queued",
   );
 
   const cleared = await patchProfile(token, { avatarUrl: null });
   assert.equal(cleared.statusCode, 200, cleared.body);
   assert.equal(cleared.json().data.avatarUrl, null);
-  assert.deepEqual(
-    (await cleanupRows([avatar.path, wikiPath])).map((row) => row.storagePath),
-    [avatar.path],
+  const wikiAfterClear = await app.prisma.blobCleanup.findUniqueOrThrow({
+    where: { storagePath: wikiPath },
+  });
+  assert.equal(wikiAfterClear.attempts, 0);
+  assert.ok(wikiAfterClear.availableAt.getTime() > Date.now() + 30 * 60 * 1000);
+  assert.ok(
+    (
+      await app.prisma.blobCleanup.findUniqueOrThrow({
+        where: { storagePath: avatar.path },
+      })
+    ).availableAt.getTime() <= Date.now() + 5_000,
   );
   assert.equal(await app.storage.exists(wikiPath), true);
   assert.equal(await app.storage.exists(avatar.path), true);
